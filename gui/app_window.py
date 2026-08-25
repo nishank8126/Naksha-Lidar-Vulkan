@@ -9261,31 +9261,99 @@ class NakshaApp(QMainWindow):
         self.vtk_widget.render()
 
     # --- Status Bar ---
+    def _classified_point_count(self):
+        """Return a cached count of points outside LAS class 0 (Unclassified)."""
+        data = getattr(self, "data", None)
+        classification = data.get("classification") if isinstance(data, dict) else None
+        if classification is None:
+            self._classified_count_cache = 0
+            self._classified_count_data_id = None
+            return 0
+
+        data_id = id(classification)
+        if getattr(self, "_classified_count_data_id", None) != data_id:
+            self._classified_count_cache = int(np.count_nonzero(np.asarray(classification) != 0))
+            self._classified_count_data_id = data_id
+        return int(getattr(self, "_classified_count_cache", 0))
+
+    def _apply_classified_point_count_delta(self, changed_mask, old_classes=None):
+        """Update the cached header count using only points changed by an edit."""
+        data = getattr(self, "data", None)
+        classification = data.get("classification") if isinstance(data, dict) else None
+        if classification is None or changed_mask is None:
+            return False
+        self._classified_point_count()
+        undo_stack = getattr(self, "undo_stack", None) or []
+        step = undo_stack[-1] if undo_stack else {}
+        changed_indices = step.get("indices")
+        changed = np.asarray(changed_mask)
+        if changed_indices is not None:
+            changed_indices = np.asarray(changed_indices, dtype=np.int64).ravel()
+            new_classes = np.asarray(classification)[changed_indices]
+        elif changed.dtype == bool:
+            new_classes = np.asarray(classification)[changed]
+        else:
+            new_classes = np.asarray(classification)[changed.astype(np.int64, copy=False).ravel()]
+        if new_classes.size == 0:
+            return False
+        if old_classes is None:
+            old_classes = step.get("old_classes")
+            if old_classes is None:
+                old_classes = step.get("oldclasses")
+        if old_classes is None:
+            return False
+        old_classes = np.asarray(old_classes).ravel()
+        new_classes = np.asarray(new_classes).ravel()
+        if old_classes.size != new_classes.size:
+            return False
+        delta = int(np.count_nonzero(new_classes)) - int(np.count_nonzero(old_classes))
+        total = len(classification)
+        self._classified_count_cache = max(0, min(total, self._classified_point_count() + delta))
+        return True
+
+    def _refresh_window_title_classification_count(self):
+        """Refresh the title from the cached count without scanning the dataset."""
+        filename = getattr(self, "_window_title_filename", None)
+        if filename:
+            self._update_window_title(filename, getattr(self, "_window_title_crs_epsg", None))
     def _update_window_title(self, filename, crs_epsg):
-        """Update main window title with filename + CRS."""
+        """Update the title with file, total/classified point counts, and CRS."""
         self.update_epsg_display()
         base_title = "NakshaAI-Lidar"
 
         if not filename:
+            self._window_title_filename = None
+            self._window_title_crs_epsg = None
             self.setWindowTitle(base_title)
             return
+
+        self._window_title_filename = filename
+        self._window_title_crs_epsg = crs_epsg
+        file_label = os.path.basename(filename)
+        data = getattr(self, "data", None)
+        xyz = data.get("xyz") if isinstance(data, dict) else None
+        total_points = len(xyz) if xyz is not None else 0
+        classified_points = self._classified_point_count()
+        if total_points and " pts)" not in file_label:
+            file_label = f"{file_label} ({total_points:,} pts)"
+        if total_points:
+            file_label = f"{file_label} | Classified: {classified_points:,}"
 
         if crs_epsg:
             try:
                 crs = CRS.from_epsg(crs_epsg)
                 crs_name = crs.to_authority() or crs.to_string()
                 self.setWindowTitle(
-                    f"{base_title} - {os.path.basename(filename)} | EPSG:{crs_epsg} ({crs_name})"
+                    f"{base_title} - {file_label} | EPSG:{crs_epsg} ({crs_name})"
                 )
             except Exception:
                 self.setWindowTitle(
-                    f"{base_title} - {os.path.basename(filename)} | EPSG:{crs_epsg}"
+                    f"{base_title} - {file_label} | EPSG:{crs_epsg}"
                 )
         else:
             self.setWindowTitle(
-                f"{base_title} - {os.path.basename(filename)} | CRS: Unknown"
+                f"{base_title} - {file_label} | CRS: Unknown"
             )
-            
     def _force_main_view_refresh_after_undo(self, changed_mask):
         """
         ✅ NEW METHOD: Guaranteed main view refresh after undo/redo
@@ -9823,6 +9891,8 @@ class NakshaApp(QMainWindow):
         # 1. Revert CPU RAM
         classes_before_undo = self.data["classification"][mask].copy()
         self.data["classification"][mask] = old_cls
+        if self._apply_classified_point_count_delta(mask, classes_before_undo):
+            self._refresh_window_title_classification_count()
         self.redo_stack.append(step)
         
         try:
@@ -17403,6 +17473,13 @@ class NakshaApp(QMainWindow):
             traceback.print_exc()
 
         finally:
+            # Keep header accounting off the render hot path: inspect only the
+            # changed subset and reuse the edit's existing undo metadata.
+            try:
+                if self._apply_classified_point_count_delta(changed_mask):
+                    self._refresh_window_title_classification_count()
+            except Exception as title_error:
+                print(f"Window title classification count refresh failed: {title_error}")
             if hasattr(self, "_last_classified_to_class"):
                 delattr(self, "_last_classified_to_class")
 

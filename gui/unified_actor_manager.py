@@ -7122,10 +7122,8 @@ def _expected_main_actor_point_count(current_n: int, app=None) -> int:
     effective_n = current_n
     if app is not None:
         try:
-            from gui.flight_line_filter import flight_line_visibility_mask
-            effective_n = int(np.count_nonzero(
-                flight_line_visibility_mask(app, current_n)
-            ))
+            from gui.flight_line_filter import flight_line_visible_count
+            effective_n = flight_line_visible_count(app, current_n)
         except Exception:
             effective_n = current_n
     if MAIN_VIEW_RENDER_ALL_POINTS:
