@@ -239,7 +239,13 @@ class PointTableModel(QAbstractTableModel):
 
     # -- required model API ----------------------------------------------
     def rowCount(self, parent=QModelIndex()):
-        return int(self._order.shape[0])
+        # Defensive: the main app can replace/clear its `data` dict (e.g.
+        # loading a new file) while this non-modal table is still open, so
+        # never report more rows than the live array actually has.
+        xyz = self._data.get("xyz")
+        if xyz is None:
+            return 0
+        return min(int(self._order.shape[0]), len(xyz))
 
     def columnCount(self, parent=QModelIndex()):
         return len(self._columns)
@@ -250,13 +256,26 @@ class PointTableModel(QAbstractTableModel):
         return None
 
     def _raw_value(self, header, kind, key, row):
-        """Return the unformatted value for a (row, column)."""
-        r = self._order[row]
+        """Return the unformatted value for a (row, column).
+
+        Defensive against the underlying app data dict being replaced,
+        cleared, or resized by the main app (e.g. loading a new file, or a
+        delete operation) while this non-modal table is still open.
+        """
+        try:
+            r = self._order[row]
+        except IndexError:
+            return None
+
         if key in ("x", "y", "z"):
+            xyz = self._data.get("xyz")
+            if xyz is None or r >= len(xyz):
+                return None
             axis = {"x": 0, "y": 1, "z": 2}[key]
-            return self._data["xyz"][r, axis]
+            return xyz[r, axis]
+
         arr = self._data.get(key)
-        if arr is None:
+        if arr is None or r >= len(arr):
             return None
         return arr[r]
 
@@ -326,8 +345,11 @@ class PointTableModel(QAbstractTableModel):
                     rgb[:, 1].astype(np.float64) * 0.587 +
                     rgb[:, 2].astype(np.float64) * 0.114)
         if key in ("x", "y", "z"):
+            xyz = self._data.get("xyz")
+            if xyz is None:
+                return None
             axis = {"x": 0, "y": 1, "z": 2}[key]
-            return self._data["xyz"][:, axis]
+            return xyz[:, axis]
         return self._data.get(key)
 
     def sort(self, column, order):
@@ -354,8 +376,14 @@ class PointTableModel(QAbstractTableModel):
         return int(matches[0]) if matches.size else None
 
     def xyz_for_row(self, row):
-        r = self._order[row]
-        return self._data["xyz"][r]
+        try:
+            r = self._order[row]
+        except IndexError:
+            return None
+        xyz = self._data.get("xyz")
+        if xyz is None or r >= len(xyz):
+            return None
+        return xyz[r]
 
 
 class _ExtraFieldLoader(QThread):
@@ -817,6 +845,40 @@ class ViewFieldsTableDialog(QDialog):
                 self.app_data[k] = v
             self.model.refresh_columns()
 
+    # -- keep in sync with the main app --------------------------------
+    def refresh_data(self, filename, app_data):
+        """
+        Re-point this (possibly still-open, non-modal) table at the app's
+        current point cloud.
+
+        The app replaces `app.data` with a brand-new dict on every (re)load
+        rather than mutating the old one in place, so a table opened before
+        a reload would otherwise keep showing/computing against the old,
+        now-orphaned dict — this is what made the table look "stale" or
+        blank across a reload.  Called from the same place the app already
+        refreshes point-count statistics after any load/edit, so this stays
+        in sync automatically without extra wiring at each load call site.
+        """
+        app_data = app_data if isinstance(app_data, dict) else {}
+
+        if filename == self.filename and app_data is self.app_data:
+            # Same dataset (e.g. after a delete, which mutates the same
+            # dict in place) — just resync row/column counts; no need to
+            # re-kick the background extra-field file read.
+            self.model.refresh_columns()
+            return
+
+        self.filename = filename
+        self.app_data = app_data
+        self.model._data = app_data
+        self.model.refresh_columns()
+
+        n_points = len(app_data.get("xyz", []))
+        title = os.path.basename(filename) if filename else "point cloud"
+        self.setWindowTitle("%s - %s points" % (title, format(n_points, ",")))
+
+        self._load_extra_fields()
+
     # -- row interactions -------------------------------------------------
     def _on_row_clicked(self, index):
         if not index.isValid():
@@ -824,6 +886,8 @@ class ViewFieldsTableDialog(QDialog):
         self._highlight_point(self.model.xyz_for_row(index.row()))
 
     def _highlight_point(self, xyz):
+        if xyz is None:
+            return
         app = self.parent()
         if app is None or not hasattr(app, "vtk_widget"):
             return

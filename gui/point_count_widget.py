@@ -473,3 +473,13 @@ def refresh_point_statistics(app):
     """Refresh the statistics display."""
     if hasattr(app, "point_count_widget") and app.point_count_widget:
         app.point_count_widget.schedule_update()
+
+    # Keep an open "View Fields" table (Display > Fields) in sync — it holds
+    # its own reference to app.data, which every load/reload replaces with a
+    # brand-new dict rather than mutating the old one in place.
+    fields_dialog = getattr(app, "_view_fields_table_dialog", None)
+    if fields_dialog is not None and hasattr(fields_dialog, "refresh_data"):
+        try:
+            fields_dialog.refresh_data(getattr(app, "loaded_file", None), app.data)
+        except Exception as exc:
+            print(f"[FieldsTable] refresh failed: {exc}")

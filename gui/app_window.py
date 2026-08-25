@@ -14989,6 +14989,7 @@ class NakshaApp(QMainWindow):
         # bring it to the front instead of creating a duplicate.
         existing = getattr(self, "_view_fields_table_dialog", None)
         if existing is not None and existing.isVisible():
+            existing.refresh_data(self.loaded_file, self.data)
             existing.setWindowState(
                 existing.windowState() & ~Qt.WindowMinimized
                 | Qt.WindowActive)
