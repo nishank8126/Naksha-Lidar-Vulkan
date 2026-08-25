@@ -1185,6 +1185,12 @@ class ClassificationInteractor:
                         f"✅ {len(indices):,} points → class {to_class}", 3000
                     )
 
+                # 🖌️ Final exact stroke count → top bar center
+                try:
+                    self.app._update_classify_count_display(int(len(indices)))
+                except Exception:
+                    pass
+
             if getattr(self.app, "display_mode", "class") != "shaded_class":
                 self.app._gpu_sync_done = True
                 self.app._section_visibility_refresh_required = False
@@ -3697,6 +3703,14 @@ class ClassificationInteractor:
                                     classes[fresh] = to_class
                                     self._brush_accumulated_mask[fresh] = True
 
+                                    # 🖌️ Live brush stroke total → top bar center
+                                    try:
+                                        self.app._update_classify_count_display(
+                                            int(np.count_nonzero(self._brush_accumulated_mask))
+                                        )
+                                    except Exception:
+                                        pass
+
                                     # 3. Accumulate for GPU tick
                                     self._brush_frame_chunks.append(fresh)
                                     self._brush_needs_render = True
@@ -3962,6 +3976,14 @@ class ClassificationInteractor:
                                                 classes[global_indices] = to_class
                                                 self._brush_section_local_mask[fresh_local] = True
 
+                                                # 🖌️ Live brush stroke total → top bar center
+                                                try:
+                                                    self.app._update_classify_count_display(
+                                                        int(np.count_nonzero(self._brush_section_local_mask))
+                                                    )
+                                                except Exception:
+                                                    pass
+
                                 self._last_brush_center_uv = (u, z)
 
                                 # ── REAL-TIME GPU INJECTION (Phase 2) ──────────
@@ -4133,6 +4155,14 @@ class ClassificationInteractor:
             self._brush_accumulated_mask[fresh] = True
             self._brush_frame_chunks.append(fresh)
             self._brush_needs_render = True
+
+            # 🖌️ Live brush stroke total → top bar center
+            try:
+                self.app._update_classify_count_display(
+                    int(np.count_nonzero(self._brush_accumulated_mask))
+                )
+            except Exception:
+                pass
 
         except Exception as e:
             print(f"⚠️ _on_brush_worker_result: {e}")
@@ -4760,6 +4790,13 @@ class ClassificationInteractor:
                     _count = len(indices) if 'indices' in locals() else 0
                     elapsed = (time.time() - start) * 1000
                     print(f"✅ Main Brush stroke complete: {_count:,} points in {elapsed:.0f}ms")
+
+                    # 🖌️ Final exact stroke count → top bar center
+                    if _count > 0:
+                        try:
+                            self.app._update_classify_count_display(int(_count))
+                        except Exception:
+                            pass
 
                 # ── Save mask BEFORE nulling — needed for shading refresh below ──
                 _final_mask = self._brush_accumulated_mask
@@ -6433,6 +6470,13 @@ class ClassificationInteractor:
         classes[changed_indices] = to_class
         self.app._last_changed_mask = mask
         self.app._last_changed_indices = changed_indices.copy()
+
+        # 🎯 Exact classified count → top bar center (point tool, main-view
+        # circle/rect/polygon/freehand via interactor, etc.)
+        try:
+            self.app._update_classify_count_display(int(changed_indices.size))
+        except Exception:
+            pass
 
         # ✅ Store from_classes for undo
         self.app._last_from_classes = list(getattr(self.app, "from_classes", []) or [])

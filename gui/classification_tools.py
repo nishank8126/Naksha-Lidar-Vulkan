@@ -8020,6 +8020,13 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
     except Exception:
         ENABLE_DEBUG_LOGGING = False
     changed_count = int(update_idx.size)
+
+    # Show the exact count of classified points in the top bar center.
+    try:
+        app._update_classify_count_display(changed_count)
+    except Exception:
+        pass
+
     if ENABLE_DEBUG_LOGGING:
         print("[CLASS-COMMIT]")
         print(f"  changed_count={changed_count}")

@@ -48,6 +48,12 @@ class UltraFastClassifier:
         
         # Apply classification change (in-place)
         self.app.data["classification"][region_mask] = new_class
+
+        # Show the exact count of classified points in the top bar center.
+        try:
+            self.app._update_classify_count_display(n_changed)
+        except Exception:
+            pass
         
         # Update display WITHOUT geometry rebuild.
         # In Surface mode, refresh the Surface mesh only when Surface membership changes.

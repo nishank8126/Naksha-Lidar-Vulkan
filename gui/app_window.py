@@ -2252,6 +2252,12 @@ class NakshaApp(QMainWindow):
             print("🧹 CLEARING PROJECT")
             print("="*60)
 
+            # --- Hide the classification count label in the top bar ---
+            if hasattr(app, "_classify_count_label"):
+                app._classify_count_label.hide()
+            if hasattr(app, "_classify_count_timer"):
+                app._classify_count_timer.stop()
+
             # --- Clear main viewer ---
             if hasattr(app, "vtk_widget") and app.vtk_widget:
                 app.vtk_widget.clear()
@@ -2937,6 +2943,25 @@ class NakshaApp(QMainWindow):
         add_menu_button("AI", "ai")
         add_menu_button("Block", "block")
         add_menu_button("Plugins", "plugins")
+
+        # --- Centered classification count label (exact middle of top bar) ---
+        from PySide6.QtWidgets import QLabel
+        from PySide6.QtCore import QTimer
+
+        self._classify_count_label = QLabel("")
+        self._classify_count_label.setObjectName("ClassifyCountLabel")
+        self._classify_count_label.setAlignment(Qt.AlignCenter)
+        self._classify_count_label.setStyleSheet(
+            "color: #FFD54F; font-weight: bold; font-size: 11px; "
+            "background: transparent; padding: 0 8px;"
+        )
+        self._classify_count_label.hide()
+        self._classify_count_timer = QTimer(self)
+        self._classify_count_timer.setSingleShot(True)
+        self._classify_count_timer.setInterval(3000)
+        self._classify_count_timer.timeout.connect(self._classify_count_label.hide)
+        # stretch=1 makes this label occupy the free middle space -> centered
+        top_layout.addWidget(self._classify_count_label, 1)
 
         top_layout.addStretch()
 
@@ -9267,6 +9292,28 @@ class NakshaApp(QMainWindow):
         total = len(classification)
         self._classified_count_cache = max(0, min(total, self._classified_point_count() + delta))
         return True
+
+    def _update_classify_count_display(self, count):
+        """Show the exact count of points being classified in the top bar center.
+
+        The label appears at the exact middle of the tab bar while a
+        classification operation runs, then auto-hides after 3 seconds.
+        """
+        label = getattr(self, "_classify_count_label", None)
+        if label is None:
+            return
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            label.setText(f"Classifying: {count:,} points")
+            label.show()
+            timer = getattr(self, "_classify_count_timer", None)
+            if timer is not None:
+                timer.start()  # restart the 3s auto-hide countdown
+        else:
+            label.hide()
 
     def _refresh_window_title_classification_count(self):
         """Refresh the title from the cached count without scanning the dataset."""
