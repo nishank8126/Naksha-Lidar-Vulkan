@@ -703,10 +703,34 @@ class GlobalShortcutFilter(QObject):
                         if event.key() in (Qt.Key_Z, Qt.Key_Y):
                             return True
 
-                # ═══════════════════════════════════════════════════════════════════
-                # ✅ PRE-CHECK: Is ANY "other" tool active that owns undo/redo?
+                # =================================================================
+                # LEVEL 1.5: TEMP FENCE TOOL (ACTIVE DRAWING)
+                # While the temp fence tool is active and drawing (or has redo
+                # history), Ctrl+Z/Y exclusively undo/redo fence vertices.
+                # =================================================================
+                _tft = getattr(self.app_window, 'temp_fence_tool', None)
+                if _tft is not None and getattr(_tft, 'active', False) and (
+                        getattr(_tft, '_drawing', False)
+                        or bool(getattr(_tft, '_redo_stack', None))):
+                    if event.key() == Qt.Key_Z:
+                        print("Ctrl+Z -> Temp Fence Undo Vertex (EXCLUSIVE)")
+                        try:
+                            _tft.undo_vertex()
+                        except Exception as e:
+                            print(f"Temp fence undo failed: {e}")
+                        return True
+                    elif event.key() == Qt.Key_Y:
+                        print("Ctrl+Y -> Temp Fence Redo Vertex (EXCLUSIVE)")
+                        try:
+                            _tft.redo_vertex()
+                        except Exception as e:
+                            print(f"Temp fence redo failed: {e}")
+                        return True
+
+                # =================================================================
+                # PRE-CHECK: Is ANY "other" tool active that owns undo/redo?
                 # If yes, curve/digitizer completed undo should be BLOCKED
-                # ═══════════════════════════════════════════════════════════════════
+                # =================================================================
                 classification_active = self._is_classification_active()
                 cross_section_active = getattr(self.app_window, 'cross_section_active', False)
                 cut_section_waiting = False

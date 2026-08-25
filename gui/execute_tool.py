@@ -8,6 +8,7 @@
     "Freehand": "freehand",
     "Brush": "brush",
     "Point": "point",
+    "TempFence": "temp_fence",
     "CrossSectionRect": "cross_section",
     "CutSectionRect": "cut_section",
     "CutFromCross": "CutFromCross",  
@@ -1059,6 +1060,16 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         
         if hasattr(app_window, "cut_section_controller"):
             app_window.cut_section_controller.activate_from_cut_shortcut()
+        return
+
+    # ========================================================================
+    # TEMP FENCE (standalone fence tool — no ClassPicker, no classification)
+    # ========================================================================
+    if tool_name == "temp_fence":
+        _deactivate_curve_tool_safely(app_window, "switching to temp fence")
+        _deactivate_measurement_tool_safely(app_window, "switching to temp fence")
+        if hasattr(app_window, "set_classify_tool"):
+            app_window.set_classify_tool("temp_fence")
         return
 
     # ========================================================================

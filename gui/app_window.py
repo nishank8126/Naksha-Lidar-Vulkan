@@ -1,4 +1,4 @@
-import os
+﻿import os
 import random
 import vtk
 import time
@@ -8768,6 +8768,17 @@ class NakshaApp(QMainWindow):
                     self.digitizer.enabled = True
                     print("✅ Digitizer re-enabled")
                 return
+
+            # ✅ Temp Fence tool lifecycle: switching to any other tool stands
+            # down the vertex capture. A finalized fence + popup intentionally
+            # stay alive until replaced / used / Esc'd (handled inside the tool).
+            if tool_name != "temp_fence":
+                try:
+                    _tft = getattr(self, "temp_fence_tool", None)
+                    if _tft is not None:
+                        _tft.deactivate()
+                except Exception as _e:
+                    print(f"⚠️ Temp fence stand-down failed: {_e}")
    
             # Brush size dialog — skip during right-click reactivation to avoid blocking
             if tool_name == "brush" and not getattr(self, "_right_click_reactivating", False):
@@ -8810,7 +8821,38 @@ class NakshaApp(QMainWindow):
                     }.get(tool_name, lambda a: None)(self)
                 except Exception as e:
                     print(f"⚠️ Algorithm dialog failed ({tool_name}): {e}")
-                return  ###    
+                return  ###
+
+            # ✅ NEW: Temporary Fence tool — draw a throwaway polygon fence on
+            # the main view, then pick a By Class tool from the popup that
+            # appears (the fence is pre-applied in that dialog). Fully
+            # standalone: never touches the digitizer or classification
+            # interactors.
+            if tool_name == "temp_fence":
+                if self.data is None:
+                    QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+                    return
+                # Stand down any active classification tool first so its
+                # interactor doesn't fight the fence drawing.
+                try:
+                    if getattr(self, "active_classify_tool", None):
+                        self.set_classify_tool(None)
+                except Exception as _e:
+                    print(f"⚠️ Temp Fence: failed to stand down classify tool: {_e}")
+                try:
+                    if hasattr(self, 'digitizer'):
+                        self.digitizer.enabled = False
+                    from gui.temp_fence_tool import TempFenceTool
+                    tft = getattr(self, "temp_fence_tool", None)
+                    if tft is None:
+                        tft = TempFenceTool(self)
+                        self.temp_fence_tool = tft
+                    tft.activate()
+                    self.active_classify_tool = "temp_fence"
+                except Exception as e:
+                    print(f"⚠️ Temp Fence activation failed: {e}")
+                    import traceback; traceback.print_exc()
+                return
            
             # Stand down conflicting tools so their VTK observers don't fight the
             # classification interactor — same direction the element-select tool
@@ -12378,6 +12420,14 @@ class NakshaApp(QMainWindow):
 
         self._shutdown_in_progress = True
         print("🧹 Main window closing - cleaning up child dialogs")
+
+        # ✅ Temp Fence tool: full teardown (actors + popup + timer)
+        try:
+            _tft = getattr(self, "temp_fence_tool", None)
+            if _tft is not None:
+                _tft.shutdown()
+        except Exception as _e:
+            print(f"⚠️ Temp fence shutdown failed: {_e}")
 
         # Classifiers cooperatively mutate the shared class array in QThreads.
         # Join them before deleting dialogs, point data, or VTK resources.

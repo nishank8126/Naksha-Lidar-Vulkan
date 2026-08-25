@@ -1282,6 +1282,12 @@ class FenceSelectorWidget(QWidget):
                 # validation.  restore_fence_mode() clears these when the dialog
                 # is reopened from the toolbar.
                 is_valid = True
+            elif fence.get('_temp_fence'):
+                # ✅ Temp Fence tool fence — a coordinate copy, not a live
+                # digitizer object, so skip id-based validation. Its lifetime
+                # (replacement / removal after conversion) is managed entirely
+                # by the Temp Fence tool.
+                is_valid = True
             else:
                 # Digitizer drawing
                 if id(fence) in drawing_ids:

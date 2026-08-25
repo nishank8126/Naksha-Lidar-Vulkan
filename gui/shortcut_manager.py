@@ -16,7 +16,7 @@ from .theme_manager import get_dialog_stylesheet
 
 TOOLS = [
     "AboveLine", "BelowLine", "ParallelLine", "Rectangle", "Circle",
-    "Polygon", "Freehand", "Brush", "Point",
+    "Polygon", "Freehand", "Brush", "Point", "TempFence",
     "CrossSectionRect", "CutSectionRect",
     "CutFromCross", "CutFromCut",
     "TopView",
@@ -36,7 +36,7 @@ TOOLS = [
 
 SIMPLE_SHORTCUT_TOOLS = (
     "CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut",
-    "TopView", "Depth", "RGB", "Intensity", "Elevation", "Class", "Surface",
+    "TopView","TempFence", "Depth", "RGB", "Intensity", "Elevation", "Class", "Surface",
     "MeasureLine", "MeasurePath", "ClearMeasurements",
     "Pan",
     "Save", "SaveAs",
