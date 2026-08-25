@@ -1,0 +1,48 @@
+============================================================
+PATCH 11: app_window.py - DXF folder search
+File: app_window.py
+Function: load_las_for_grid() - DXF folder search
+Lines: ~13864-13876
+Purpose: Search ALL immediate subfolders for LAZ/LAS files
+============================================================
+
+--- OLD BLOCK (before) ---
+                            # Check subfolders
+                            for subfolder_name in ['lazz', 'LAZZ', 'laz', 'LAZ', 'las', 'LAS']:
+                                potential_folder = dxf_folder / subfolder_name
+                                if potential_folder.exists():
+                                    las_files = list(potential_folder.glob("*.laz")) + list(potential_folder.glob("*.las"))
+                                    if las_files:
+                                        las_folder = potential_folder
+                                        print(f"   ✅ FOUND in subfolder: {las_folder}")
+                                        break
+                            
+                            if las_folder:
+                                break
+
++++ NEW BLOCK (after) +++
+                            # Check common subfolder names first
+                            for subfolder_name in ['lazz', 'LAZZ', 'laz', 'LAZ', 'las', 'LAS']:
+                                potential_folder = dxf_folder / subfolder_name
+                                if potential_folder.exists():
+                                    las_files = list(potential_folder.glob("*.laz")) + list(potential_folder.glob("*.las"))
+                                    if las_files:
+                                        las_folder = potential_folder
+                                        print(f"   ✅ FOUND in subfolder: {las_folder}")
+                                        break
+                            
+                            # Also check ALL immediate subfolders
+                            if not las_folder:
+                                try:
+                                    for entry in dxf_folder.iterdir():
+                                        if entry.is_dir():
+                                            las_files = list(entry.glob("*.laz")) + list(entry.glob("*.las"))
+                                            if las_files:
+                                                las_folder = entry
+                                                print(f"   ✅ FOUND in subfolder: {las_folder}")
+                                                break
+                                except Exception:
+                                    pass
+                            
+                            if las_folder:
+                                break

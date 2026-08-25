@@ -1,0 +1,41 @@
+TARGET FILE: gui/grid_label_system.py
+
+REPLACEMENT 1 — inside open_grid_with_buffer_points()
+
+OLD BLOCK
+```python
+        scan = self.get_snt_blocks_intersecting_polygon(buffered_polygon)
+```
+
+NEW BLOCK
+```python
+        # This polygon was created from PRJ boundary coordinates and is already
+        # in the world coordinate system. Do not transform it a second time.
+        scan = self.get_snt_blocks_intersecting_polygon(
+            buffered_polygon,
+            coordinates_are_world=True,
+        )
+```
+
+REPLACEMENT 2 — get_snt_blocks_intersecting_polygon() function beginning
+
+OLD BLOCK
+```python
+    def get_snt_blocks_intersecting_polygon(self, fence_polygon_world: List[Tuple[float, float]]):
+        fence_polygon = self.screen_to_world_polygon(fence_polygon_world)
+```
+
+NEW BLOCK
+```python
+    def get_snt_blocks_intersecting_polygon(
+        self,
+        fence_polygon_world: List[Tuple[float, float]],
+        *,
+        coordinates_are_world: bool = False,
+    ):
+        fence_polygon = (
+            _normalize_ring_xy(fence_polygon_world)
+            if coordinates_are_world
+            else self.screen_to_world_polygon(fence_polygon_world)
+        )
+```

@@ -1,0 +1,243 @@
+TARGET FILE: gui\app_window.py
+
+================ OLD BLOCK ================
+class MainWheelZoomEventFilter(QObject):
+    """Route main-canvas 2D wheel input through the custom eased zoom exactly once."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self._wheel_delta = 0
+
+    def eventFilter(self, obj, event):
+        app = self.app
+        if app is None or getattr(app, "_shutdown_in_progress", False):
+            return False
+        if event.type() != QEvent.Wheel:
+            return False
+        if getattr(app, "is_3d_mode", False):
+            self._wheel_delta = 0
+            return False
+        try:
+            delta = int(event.angleDelta().y())
+        except Exception:
+            return False
+        if delta == 0:
+            return False
+        return False
+================ NEW / REPLACE BLOCK ================
+class MainWheelZoomEventFilter(QObject):
+    """Route main-canvas 2D wheel input through the immediate zoom controller."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+
+    def eventFilter(self, obj, event):
+        app = self.app
+        if app is None:
+            return False
+        if event.type() != QEvent.Wheel:
+            return False
+        if getattr(app, "_shutdown_in_progress", False):
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return True
+        if getattr(app, "is_3d_mode", False):
+            return False
+
+        try:
+            delta = float(event.angleDelta().y())
+            if delta == 0.0:
+                delta = float(event.pixelDelta().y())
+        except Exception:
+            return False
+        if delta == 0.0:
+            return False
+
+        display_position = None
+        try:
+            vtk_widget = getattr(app, "vtk_widget", None)
+            render_window = vtk_widget.GetRenderWindow() if vtk_widget is not None else None
+            render_size = render_window.GetSize() if render_window is not None else None
+            position = event.position()
+            from gui.zoom_navigation import qt_position_to_vtk_display
+            display_position = qt_position_to_vtk_display(
+                position.x(), position.y(), obj.width(), obj.height(),
+                render_size[0], render_size[1],
+            )
+        except Exception:
+            display_position = None
+
+        handler = getattr(app, "_handle_fast_main_wheel", None)
+        if not callable(handler) or not handler(delta, display_position=display_position):
+            return False
+        try:
+            event.accept()
+        except Exception:
+            pass
+        return True
+
+================ OLD BLOCK ================
+        self.zoom_behavior = settings.value("view_zoom_behavior", "center", type=str)
+        if self.zoom_behavior not in {"center", "cursor", "picked_point"}:
+            self.zoom_behavior = "center"
+================ NEW / REPLACE BLOCK ================
+        self.zoom_behavior = settings.value("view_zoom_behavior", "cursor", type=str)
+        if self.zoom_behavior not in {"center", "cursor", "picked_point"}:
+            self.zoom_behavior = "cursor"
+
+================ OLD BLOCK ================
+    def _zoom_widget_at_cursor(self, vtk_widget, factor, interactor=None, *, render=True):
+================ NEW / REPLACE BLOCK ================
+    def _zoom_widget_at_cursor(
+        self,
+        vtk_widget,
+        factor,
+        interactor=None,
+        *,
+        display_position=None,
+        render=True,
+    ):
+
+================ OLD BLOCK ================
+        display_x, display_y = interactor.GetEventPosition()
+================ NEW / REPLACE BLOCK ================
+        if display_position is None:
+            display_x, display_y = interactor.GetEventPosition()
+        else:
+            display_x, display_y = display_position
+
+================ OLD BLOCK ================
+    def _on_main_left_click_for_zoom_anchor(self, obj, evt):
+================ NEW / REPLACE BLOCK ================
+    def _handle_fast_main_wheel(self, wheel_delta, *, display_position=None):
+        """Apply one immediate, bounded 2D zoom and schedule one repaint."""
+        if getattr(self, "_shutdown_in_progress", False):
+            return False
+        if getattr(self, "is_3d_mode", False):
+            return False
+
+        vtk_widget = getattr(self, "vtk_widget", None)
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        if renderer is None:
+            return False
+        camera = renderer.GetActiveCamera()
+        if camera is None:
+            return False
+
+        try:
+            from gui.zoom_navigation import fast_wheel_zoom_factor
+            factor = fast_wheel_zoom_factor(wheel_delta)
+        except (TypeError, ValueError):
+            return False
+
+        snapshot = {
+            "position": tuple(camera.GetPosition()),
+            "focal_point": tuple(camera.GetFocalPoint()),
+            "parallel_scale": float(camera.GetParallelScale()),
+            "view_angle": float(camera.GetViewAngle()),
+            "parallel_projection": bool(camera.GetParallelProjection()),
+        }
+
+        def _restore_camera():
+            try:
+                camera.SetPosition(snapshot["position"])
+                camera.SetFocalPoint(snapshot["focal_point"])
+                camera.SetParallelScale(snapshot["parallel_scale"])
+                camera.SetViewAngle(snapshot["view_angle"])
+                if snapshot["parallel_projection"]:
+                    camera.ParallelProjectionOn()
+                else:
+                    camera.ParallelProjectionOff()
+            except Exception:
+                pass
+
+        behavior = getattr(self, "zoom_behavior", "cursor")
+        applied = False
+        try:
+            if behavior == "picked_point":
+                anchor = getattr(self, "_zoom_anchor_points", {}).get(id(vtk_widget))
+                if anchor is not None:
+                    applied = self._zoom_widget_at_anchor(
+                        vtk_widget, factor, anchor, render=False,
+                    )
+            elif behavior == "cursor":
+                applied = self._zoom_widget_at_cursor(
+                    vtk_widget,
+                    factor,
+                    interactor=getattr(vtk_widget, "interactor", None),
+                    display_position=display_position,
+                    render=False,
+                )
+
+            if not applied:
+                _restore_camera()
+                camera.Zoom(factor)
+                applied = True
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            _restore_camera()
+            return False
+        except Exception:
+            _restore_camera()
+            return False
+
+        if not applied:
+            return False
+
+        try:
+            if camera.GetParallelProjection():
+                scale = float(camera.GetParallelScale())
+                if not np.isfinite(scale) or scale <= 0.0:
+                    _restore_camera()
+                    return False
+                camera.SetParallelScale(max(1.0e-6, min(1.0e12, scale)))
+            else:
+                view_angle = float(camera.GetViewAngle())
+                if not np.isfinite(view_angle) or view_angle <= 0.0:
+                    _restore_camera()
+                    return False
+                camera.SetViewAngle(max(0.1, min(179.0, view_angle)))
+        except Exception:
+            _restore_camera()
+            return False
+
+        render_manager = getattr(self, "gpu_render_manager", None)
+        if render_manager is not None:
+            try:
+                point_count = len(self.data.get("xyz", ())) if self.data else 0
+            except Exception:
+                point_count = 0
+            try:
+                render_manager.begin_wheel_interaction(point_count=point_count)
+                render_manager.request_render(vtk_widget)
+            except Exception:
+                try:
+                    vtk_widget.render()
+                except Exception:
+                    pass
+        else:
+            try:
+                vtk_widget.render()
+            except Exception:
+                pass
+
+        self._update_zoom_level_display(factor)
+        self._schedule_main_view_history_commit("fast_cursor_wheel_zoom", delay_ms=180)
+
+        digitizer = getattr(self, "digitizer", None)
+        if digitizer is not None and hasattr(digitizer, "_on_zoom"):
+            try:
+                vtk_event = (
+                    "MouseWheelForwardEvent"
+                    if float(wheel_delta) > 0.0
+                    else "MouseWheelBackwardEvent"
+                )
+                digitizer._on_zoom(getattr(vtk_widget, "interactor", None), vtk_event)
+            except Exception:
+                pass
+        return True
+
+    def _on_main_left_click_for_zoom_anchor(self, obj, evt):

@@ -1,0 +1,20 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Grid body fill -->
+  <rect x="2.75" y="2.75" width="18.5" height="18.5" rx="3" fill="currentColor" fill-opacity="0.1"/>
+  <rect x="2.75" y="2.75" width="18.5" height="18.5" rx="3" stroke="currentColor" stroke-width="1.5"/>
+  <!-- Grid vertical lines -->
+  <line x1="9.5" y1="2.75" x2="9.5" y2="21.25" stroke="currentColor" stroke-width="1.1" stroke-opacity="0.35"/>
+  <line x1="14.5" y1="2.75" x2="14.5" y2="21.25" stroke="currentColor" stroke-width="1.1" stroke-opacity="0.35"/>
+  <!-- Grid horizontal lines -->
+  <line x1="2.75" y1="9.5" x2="21.25" y2="9.5" stroke="currentColor" stroke-width="1.1" stroke-opacity="0.35"/>
+  <line x1="2.75" y1="14.5" x2="21.25" y2="14.5" stroke="currentColor" stroke-width="1.1" stroke-opacity="0.35"/>
+  <!-- Label dots in cells (text indicators) -->
+  <circle cx="6.1" cy="6.1" r="1" fill="currentColor" fill-opacity="0.4"/>
+  <circle cx="12" cy="6.1" r="1" fill="currentColor" fill-opacity="0.4"/>
+  <circle cx="17.9" cy="6.1" r="1" fill="currentColor" fill-opacity="0.4"/>
+  <circle cx="6.1" cy="12" r="1" fill="currentColor" fill-opacity="0.4"/>
+  <circle cx="6.1" cy="17.9" r="1" fill="currentColor" fill-opacity="0.4"/>
+  <!-- Checkmark badge (bottom right) -->
+  <circle cx="18.5" cy="18.5" r="5.5" fill="currentColor"/>
+  <path d="M15.5 18.5L17.5 20.5L21.5 16.5" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

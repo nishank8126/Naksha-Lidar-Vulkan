@@ -1,0 +1,46 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments (recreate from requirements.txt)
+chiru/
+.venv/
+venv/
+
+# Generated packaging output
+build/
+dist/
+installer_output/
+*.spec.bak
+
+# Local point-cloud test/customer data and automatic backups
+TESTIGN _FILES/
+**/backup/
+*.laz
+*.las
+*.snt
+*.dwg
+*.dxf
+
+# Local archives and transient patches
+NAKSHA-LIDAR.zip
+NAKSHA-LIDAR.rar
+*.log
+*.tmp
+
+# Credentials and machine-local configuration
+crash_config.json
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

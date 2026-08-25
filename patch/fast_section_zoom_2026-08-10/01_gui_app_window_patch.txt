@@ -1,0 +1,120 @@
+TARGET FILE: gui\app_window.py
+
+================ OLD BLOCK ================
+        self.sec_vtk.renderer.SetBackground2(*bg_rgb)
+        self.sec_vtk.renderer.GradientBackgroundOff()
+        self.section_layout.addWidget(self.sec_vtk.interactor)
+        self.section_frame.setLayout(self.section_layout)
+
+        # Splitter setup (main + optional section view)
+================ NEW / REPLACE BLOCK ================
+        self.sec_vtk.renderer.SetBackground2(*bg_rgb)
+        self.sec_vtk.renderer.GradientBackgroundOff()
+        self.section_layout.addWidget(self.sec_vtk.interactor)
+        self.section_frame.setLayout(self.section_layout)
+        self._install_section_wheel_zoom(self.sec_vtk)
+
+        # Splitter setup (main + optional section view)
+
+================ OLD BLOCK ================
+        except Exception as e:
+            print(f"Failed to register canvas cursor widget: {e}")
+            return False
+
+    def _schedule_canvas_cursor_refresh(self, widget):
+================ NEW / REPLACE BLOCK ================
+        except Exception as e:
+            print(f"Failed to register canvas cursor widget: {e}")
+            return False
+
+    def _install_section_wheel_zoom(self, vtk_widget):
+        """Install fast section zoom without removing the legacy VTK fallback."""
+        try:
+            from gui.cross_section.section_zoom import install_section_wheel_zoom
+
+            return install_section_wheel_zoom(self, vtk_widget)
+        except Exception as e:
+            # Section creation must never fail because an optional navigation
+            # enhancement could not be installed.  The existing VTK style will
+            # continue to provide wheel zoom in this case.
+            print(f"Section wheel zoom install skipped: {e}")
+            return None
+
+    def _schedule_canvas_cursor_refresh(self, widget):
+
+================ OLD BLOCK ================
+        if hasattr(self, "_shortcut_filter"):
+            vtk_widget.interactor.installEventFilter(self._shortcut_filter)
+        self._register_canvas_cursor_widget(vtk_widget.interactor)
+        
+        if hasattr(self, 'identification_tool') and self.identification_tool.active:
+================ NEW / REPLACE BLOCK ================
+        if hasattr(self, "_shortcut_filter"):
+            vtk_widget.interactor.installEventFilter(self._shortcut_filter)
+        self._register_canvas_cursor_widget(vtk_widget.interactor)
+        self._install_section_wheel_zoom(vtk_widget)
+        
+        if hasattr(self, 'identification_tool') and self.identification_tool.active:
+
+================ OLD BLOCK ================
+        try:
+            from gui.cross_section.interactor_classify import install_camera_2d_lock
+            install_camera_2d_lock(vtk_widget, self)
+        except Exception as e:
+            print(f"⚠️ Lock install in _apply_plain_section_2d_style failed: {e}")
+
+        return style
+================ NEW / REPLACE BLOCK ================
+        try:
+            from gui.cross_section.interactor_classify import install_camera_2d_lock
+            install_camera_2d_lock(vtk_widget, self)
+        except Exception as e:
+            print(f"⚠️ Lock install in _apply_plain_section_2d_style failed: {e}")
+
+        # The Qt-level filter survives interactor-style swaps and consumes a
+        # wheel event only after applying a valid camera update.  The observers
+        # above intentionally remain installed as a fallback.
+        self._install_section_wheel_zoom(vtk_widget)
+
+        return style
+
+================ OLD BLOCK ================
+    def _zoom_widget_at_anchor(self, vtk_widget, factor, anchor_data):
+================ NEW / REPLACE BLOCK ================
+    def _zoom_widget_at_anchor(self, vtk_widget, factor, anchor_data, *, render=True):
+
+================ OLD BLOCK ================
+        vtk_widget.render()
+        return True
+
+    def _zoom_widget_at_cursor(self, vtk_widget, factor, interactor=None):
+================ NEW / REPLACE BLOCK ================
+        if render:
+            vtk_widget.render()
+        return True
+
+    def _zoom_widget_at_cursor(self, vtk_widget, factor, interactor=None, *, render=True):
+
+================ OLD BLOCK ================
+            camera.SetFocalPoint(
+                focal_point[0] + delta[0],
+                focal_point[1] + delta[1],
+                focal_point[2] + delta[2],
+            )
+
+        vtk_widget.render()
+        return True
+
+    def _on_main_left_click_for_zoom_anchor(self, obj, evt):
+================ NEW / REPLACE BLOCK ================
+            camera.SetFocalPoint(
+                focal_point[0] + delta[0],
+                focal_point[1] + delta[1],
+                focal_point[2] + delta[2],
+            )
+
+        if render:
+            vtk_widget.render()
+        return True
+
+    def _on_main_left_click_for_zoom_anchor(self, obj, evt):

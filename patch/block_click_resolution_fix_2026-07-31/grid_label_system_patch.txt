@@ -1,0 +1,99 @@
+================ OLD BLOCK ================
+        for blk in candidate_blocks:
+            grid_name = str(blk.get("grid_name") or "").strip()
+            block_id = str(blk.get("block_id") or grid_name or "BLOCK")
+            snt_filename = str(blk.get("snt_filename") or "").strip()
+            snt_stem = Path(snt_filename).stem if snt_filename else ""
+            owner_folder = self._find_las_folder_from_snt(snt_filename) if snt_filename else None
+            search_folder = owner_folder or las_folder
+            all_files = _files_for_folder(search_folder)
+
+            laz_file = None
+            candidate_names = [grid_name, block_id, snt_stem]
+            for candidate_name in candidate_names:
+                if not candidate_name:
+                    continue
+                laz_file = self._resolve_las_file_for_grid_name(all_files, candidate_name)
+                if laz_file is None and search_folder is not None:
+                    laz_file = self._find_matching_las_file(search_folder, candidate_name)
+                if laz_file is not None:
+                    break
+            if laz_file is None:
+                missing.append(block_id)
+                continue
+================ NEW / REPLACE BLOCK ================
+        for blk in candidate_blocks:
+            grid_name = str(blk.get("grid_name") or "").strip()
+            block_id = str(blk.get("block_id") or grid_name or "BLOCK")
+            snt_filename = str(blk.get("snt_filename") or "").strip()
+            snt_stem = Path(snt_filename).stem if snt_filename else ""
+            owner_folder = self._find_las_folder_from_snt(snt_filename) if snt_filename else None
+            search_folder = owner_folder or las_folder
+            all_files = _files_for_folder(search_folder)
+
+            laz_file = None
+            candidate_names = [grid_name, block_id, snt_stem]
+            block_file = str(blk.get("block_file") or "").strip()
+            if block_file and block_file not in candidate_names:
+                candidate_names.append(block_file)
+            for alt_name in (blk.get("alt_names") or []):
+                alt_name = str(alt_name or "").strip()
+                if alt_name and alt_name not in candidate_names:
+                    candidate_names.append(alt_name)
+            for candidate_name in candidate_names:
+                if not candidate_name:
+                    continue
+                laz_file = self._resolve_las_file_for_grid_name(all_files, candidate_name)
+                if laz_file is None and search_folder is not None:
+                    laz_file = self._find_matching_las_file(search_folder, candidate_name)
+                if laz_file is not None:
+                    break
+            if laz_file is None:
+                missing.append(block_id)
+                continue
+================ OLD BLOCK ================
+        # Collect ALL candidate names: primary + alternatives + DXF grid labels
+        all_candidates = []
+        if grid_name:
+            all_candidates.append(grid_name)
+        for n in (alt_names or []):
+            if (
+                n
+                and n not in all_candidates
+                and names_share_numeric_identity(grid_name, n)
+            ):
+                all_candidates.append(n)
+
+        # Also gather DXF grid label names inside any BL polygon for this area
+        for blk in (getattr(self.app, 'snt_block_polygons', None) or []):
+            if blk.get("grid_name") == grid_name:
+                for an in blk.get("alt_names", []):
+                    if (
+                        an
+                        and an not in all_candidates
+                        and names_share_numeric_identity(grid_name, an)
+                    ):
+                        all_candidates.append(an)
+================ NEW / REPLACE BLOCK ================
+        # Collect ALL candidate names: primary + direct aliases + block-file labels.
+        # The safe matcher already rejects ambiguous or incorrect identities, so
+        # we can try every block-local alias instead of filtering too early.
+        all_candidates = []
+        if grid_name:
+            all_candidates.append(grid_name)
+        block_file = ""
+        for blk in (getattr(self.app, 'snt_block_polygons', None) or []):
+            if blk.get("grid_name") == grid_name:
+                block_file = str(blk.get("block_file") or "").strip()
+                if block_file:
+                    break
+        for n in (block_file, *(alt_names or [])):
+            if n and n not in all_candidates:
+                all_candidates.append(n)
+
+        # Also gather DXF grid label names inside any BL polygon for this area
+        for blk in (getattr(self.app, 'snt_block_polygons', None) or []):
+            if blk.get("grid_name") == grid_name:
+                for an in blk.get("alt_names", []):
+                    if an and an not in all_candidates:
+                        all_candidates.append(an)

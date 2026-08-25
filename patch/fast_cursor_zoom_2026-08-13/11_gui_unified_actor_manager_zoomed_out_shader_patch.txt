@@ -1,0 +1,100 @@
+FILE: gui/unified_actor_manager.py
+
+OLD BLOCK 1:
+        if ring_val <= 0.001:
+            frag_code = (
+                "//VTK::Color::Impl\n"
+                "if (length(gl_PointCoord.xy - vec2(0.5)) * 2.0 > 1.0) discard;\n"
+                "opacity = 1.0;\n"
+            )
+        else:
+            ring_frac = min(0.25, ring_val * 0.5)
+            inner     = 1.0 - ring_frac
+            frag_code = (
+                "//VTK::Color::Impl\n"
+                "// Naksha per-class fallback border (round-circle)\n"
+                "float r_pc = length(gl_PointCoord.xy - vec2(0.5)) * 2.0;\n"
+                "if (r_pc > 1.0) discard;\n"
+                f"if (r_pc >= {inner:.6f}) {{\n"
+                "    diffuseColor = vec3(0.0, 0.0, 0.0);\n"
+                "    ambientColor = vec3(0.0, 0.0, 0.0);\n"
+                "}\n"
+                "opacity = 1.0;\n"
+            )
+
+NEW/REPLACE BLOCK 1:
+        if ring_val <= 0.001:
+            frag_code = (
+                "//VTK::Color::Impl\n"
+                "vec2 naksha_uv = gl_PointCoord.xy - vec2(0.5);\n"
+                "if (dot(naksha_uv, naksha_uv) > 0.25) discard;\n"
+                "opacity = 1.0;\n"
+            )
+        else:
+            ring_frac = min(0.25, ring_val * 0.5)
+            inner     = 1.0 - ring_frac
+            inner_sq  = 0.25 * inner * inner
+            frag_code = (
+                "//VTK::Color::Impl\n"
+                "// Naksha per-class fallback border (round-circle)\n"
+                "vec2 naksha_uv = gl_PointCoord.xy - vec2(0.5);\n"
+                "float naksha_radius_sq = dot(naksha_uv, naksha_uv);\n"
+                "if (naksha_radius_sq > 0.25) discard;\n"
+                f"if (naksha_radius_sq >= {inner_sq:.8f}) {{\n"
+                "    diffuseColor = vec3(0.0, 0.0, 0.0);\n"
+                "    ambientColor = vec3(0.0, 0.0, 0.0);\n"
+                "}\n"
+                "opacity = 1.0;\n"
+            )
+
+OLD BLOCK 2:
+    if not hasattr(actor, "_shaders_finalized_v28"):
+
+NEW/REPLACE BLOCK 2:
+    if not hasattr(actor, "_shaders_finalized_v29"):
+
+OLD BLOCK 3:
+            "//VTK::Color::Impl\n"
+            "vec2  uv25    = gl_PointCoord.xy - vec2(0.5);\n"
+            "float dist_px = length(uv25) * v_point_size;\n"
+            "if (dist_px > v_point_size * 0.5) discard;\n"
+            "\n"
+            "if (border_ring_val > 0.001) {\n"
+            "  if (structured_border_mode > 1.5) {\n"
+            "    // ── HYBRID: ring on every point, tiny depth nudge ──────────\n"
+            "    if (dist_px >= v_core_size * 0.5) {\n"
+
+NEW/REPLACE BLOCK 3:
+            "//VTK::Color::Impl\n"
+            "vec2 uv25 = gl_PointCoord.xy - vec2(0.5);\n"
+            "float radial_sq = dot(uv25, uv25);\n"
+            "if (radial_sq > 0.25) discard;\n"
+            "\n"
+            "if (border_ring_val > 0.001) {\n"
+            "  float sprite_dist_sq = radial_sq * v_point_size * v_point_size;\n"
+            "  float core_radius_sq = 0.25 * v_core_size * v_core_size;\n"
+            "  bool is_border_fragment = sprite_dist_sq >= core_radius_sq;\n"
+            "  if (structured_border_mode > 1.5) {\n"
+            "    // ── HYBRID: ring on every point, tiny depth nudge ──────────\n"
+            "    if (is_border_fragment) {\n"
+
+OLD BLOCK 4:
+            "      if (dist_px >= v_core_size * 0.5) {\n"
+
+NEW/REPLACE BLOCK 4:
+            "      if (is_border_fragment) {\n"
+
+OLD BLOCK 5:
+            "    if (dist_px >= v_core_size * 0.5) {\n"
+
+NEW/REPLACE BLOCK 5:
+            "    if (is_border_fragment) {\n"
+
+OLD BLOCK 6:
+        actor._shaders_finalized_v28 = True
+        print(f"      ✅ GPU Shader v27 (per-mode depth bias): {actor_name}")
+
+NEW/REPLACE BLOCK 6:
+        actor._shaders_finalized_v28 = True
+        actor._shaders_finalized_v29 = True
+        print(f"      ✅ GPU Shader v29 (squared-radius point sprites): {actor_name}")

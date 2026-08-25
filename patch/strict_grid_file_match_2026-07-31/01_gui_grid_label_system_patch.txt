@@ -1,0 +1,288 @@
+TARGET FILE: gui\grid_label_system.py
+
+================ OLD BLOCK 1 ================
+import numpy as np
+
+
+def _normalize_ring_xy(points) -> List[Tuple[float, float]]:
+================ NEW / REPLACE BLOCK 1 ================
+import numpy as np
+
+from gui.lidar_file_matcher import (
+    find_matching_lidar_file,
+    names_share_numeric_identity,
+    normalized_stem,
+    numeric_identity,
+    strip_lidar_extension,
+)
+
+
+def _normalize_ring_xy(points) -> List[Tuple[float, float]]:
+
+================ OLD BLOCK 2 ================
+    def _resolve_las_file_for_grid_name(self, all_files: List[Path], grid_name: str) -> Optional[Path]:
+        if not grid_name:
+            return None
+
+        patterns = self._extract_patterns(grid_name)
+        if not patterns:
+            return None
+
+        by_stem = {f.stem.lower(): f for f in all_files}
+
+        for pattern in patterns:
+            exact = by_stem.get(str(pattern).lower())
+            if exact is not None:
+                return exact
+
+        stems = [(f.stem, f) for f in all_files]
+        for pattern in patterns:
+            p_l = str(pattern).lower()
+            for stem, path in stems:
+                if stem.lower().endswith(p_l):
+                    return path
+
+        for pattern in patterns:
+            regex = re.compile(rf"(?<!\d){re.escape(str(pattern))}(?!\d)", re.IGNORECASE)
+            for stem, path in stems:
+                if regex.search(stem):
+                    return path
+
+        return None
+================ NEW / REPLACE BLOCK 2 ================
+    def _resolve_las_file_for_grid_name(self, all_files: List[Path], grid_name: str) -> Optional[Path]:
+        return find_matching_lidar_file(all_files, grid_name)
+
+================ OLD BLOCK 3 ================
+        # Collect ALL candidate names: primary + alternatives + DXF grid labels
+        all_candidates = []
+        if grid_name:
+            all_candidates.append(grid_name)
+        for n in (alt_names or []):
+            if n and n not in all_candidates:
+                all_candidates.append(n)
+
+        # Also gather DXF grid label names inside any BL polygon for this area
+        for blk in (getattr(self.app, 'snt_block_polygons', None) or []):
+            if blk.get("grid_name") == grid_name:
+                for an in blk.get("alt_names", []):
+                    if an and an not in all_candidates:
+                        all_candidates.append(an)
+
+        # Try each candidate against the folder's files
+        for candidate in all_candidates:
+            las_file = self._find_matching_las_file(las_folder, candidate)
+            if las_file:
+                if candidate != grid_name:
+                    print(f"   ✅ Matched via alternative name '{candidate}'")
+                self._load_las_file(las_file, grid_name)
+                return
+
+        # Last resort: scan all files in folder and find best match across ALL names
+        print(f"\n   🔎 All candidates failed, scanning folder for best overall match...")
+        import re as _re
+        all_files = list(Path(las_folder).glob("*.laz")) + list(Path(las_folder).glob("*.las"))
+        if all_files:
+            def _norm(text):
+                return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+            best_score = 0
+            best_file = None
+            best_candidate = None
+            for candidate in all_candidates:
+                c_norm = _norm(candidate)
+                c_suffix = ""
+                m = _re.search(r"(\d+)(?!.*\d)", str(candidate))
+                if m:
+                    c_suffix = m.group(1)
+                for fp in all_files:
+                    s_norm = _norm(fp.stem)
+                    s_suffix = ""
+                    m2 = _re.search(r"(\d+)(?!.*\d)", str(fp.stem))
+                    if m2:
+                        s_suffix = m2.group(1)
+                    score = 0
+                    if fp.stem.lower() == candidate.lower():
+                        score += 2000
+                    if s_norm == c_norm:
+                        score += 1500
+                    if c_suffix and s_suffix == c_suffix:
+                        score += 1200
+                    if c_norm and s_norm.endswith(c_norm[-8:]):
+                        score += 200
+                    if c_norm and c_norm in s_norm:
+                        score += 100
+                    if c_norm and s_norm in c_norm:
+                        score += 50
+                    if score > best_score:
+                        best_score = score
+                        best_file = fp
+                        best_candidate = candidate
+            if best_file and best_score > 0:
+                print(f"   ✅ Best overall match: {best_file.name} (score={best_score}, via '{best_candidate}')")
+                self._load_las_file(best_file, grid_name)
+                return
+
+        self._show_file_selection_dialog(las_folder, grid_name)
+================ NEW / REPLACE BLOCK 3 ================
+        # Collect ALL candidate names: primary + alternatives + DXF grid labels
+        all_candidates = []
+        if grid_name:
+            all_candidates.append(grid_name)
+        for n in (alt_names or []):
+            if (
+                n
+                and n not in all_candidates
+                and names_share_numeric_identity(grid_name, n)
+            ):
+                all_candidates.append(n)
+
+        # Also gather DXF grid label names inside any BL polygon for this area
+        for blk in (getattr(self.app, 'snt_block_polygons', None) or []):
+            if blk.get("grid_name") == grid_name:
+                for an in blk.get("alt_names", []):
+                    if (
+                        an
+                        and an not in all_candidates
+                        and names_share_numeric_identity(grid_name, an)
+                    ):
+                        all_candidates.append(an)
+
+        # Try each candidate against the folder's files
+        for candidate in all_candidates:
+            las_file = self._find_matching_las_file(las_folder, candidate)
+            if las_file:
+                if candidate != grid_name:
+                    print(f"   ✅ Matched via alternative name '{candidate}'")
+                self._load_las_file(las_file, grid_name)
+                return
+
+        print(
+            f"\n   ❌ No exact file identity found for '{grid_name}'. "
+            "Opening the owning folder for manual selection."
+        )
+        self._show_file_selection_dialog(las_folder, grid_name)
+
+================ OLD BLOCK 4 ================
+    def _find_matching_las_file(self, las_folder, grid_name):
+        """
+        Find LAZ/LAS file matching grid name using a strict scored match.
+
+        Preference order:
+        - exact full stem match
+        - exact numeric suffix match
+        - suffix-ending stem match
+        - normalized stem match
+        """
+        print(f"\n🔍 Searching for file matching: {grid_name}")
+        
+        las_folder_path = Path(las_folder)
+        
+        # Get all LAZ/LAS files
+        all_files = list(las_folder_path.glob("*.laz")) + list(las_folder_path.glob("*.las"))
+        
+        print(f"   Total files in folder: {len(all_files)}")
+        
+        if not all_files:
+            return None
+
+        def _norm(text: str) -> str:
+            return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+
+        def _suffix_digits(text: str) -> str:
+            m = re.search(r"(\d+)(?!.*\d)", str(text))
+            return m.group(1) if m else ""
+
+        def _strip_las_ext(name: str) -> str:
+            """Strip .laz/.las extension from name if present."""
+            lower = name.lower()
+            if lower.endswith(".laz"):
+                return name[:-4]
+            if lower.endswith(".las"):
+                return name[:-4]
+            return name
+
+        # Strip extension from grid_name to avoid mismatch with file stems
+        grid_name_clean = _strip_las_ext(grid_name)
+        grid_norm = _norm(grid_name_clean)
+        grid_suffix = _suffix_digits(grid_name_clean)
+        scores = []
+
+        for file_path in all_files:
+            stem = file_path.stem
+            stem_norm = _norm(stem)
+            stem_suffix = _suffix_digits(stem)
+
+            score = 0
+            if stem.lower() == grid_name_clean.lower():
+                score += 2000
+            if stem_norm == grid_norm:
+                score += 1500
+            if grid_suffix and stem_suffix == grid_suffix:
+                score += 1200
+            if grid_suffix and stem_norm.endswith(grid_suffix):
+                score += 800
+            if grid_norm and stem_norm.endswith(grid_norm[-8:]):
+                score += 200
+            if grid_norm and grid_norm in stem_norm:
+                score += 100
+            if grid_norm and stem_norm in grid_norm:
+                score += 50
+
+            if score > 0:
+                scores.append((score, len(stem_norm), file_path))
+
+        if not scores:
+            print(f"   ❌ No match found for '{grid_name_clean}' (norm='{grid_norm}', suffix='{grid_suffix}')")
+            print(f"   📄 Available files:")
+            for fp in all_files[:10]:
+                print(f"      - {fp.name} (stem_norm='{_norm(fp.stem)}', suffix='{_suffix_digits(fp.stem)}')")
+            return None
+
+        scores.sort(key=lambda x: (-x[0], x[1], x[2].name.lower()))
+        best = scores[0][2]
+        print(f"   ✅ MATCH FOUND: {best.name} (score={scores[0][0]})")
+        if len(scores) > 1:
+            preview = ", ".join(f"{item[2].name}(s={item[0]})" for item in scores[:5])
+            print(f"   ℹ️ Ranked candidates: {preview}")
+        return best
+================ NEW / REPLACE BLOCK 4 ================
+    def _find_matching_las_file(self, las_folder, grid_name):
+        """
+        Find the unique LAZ/LAS file with the same complete grid identity.
+
+        A partial coordinate (for example, matching only the northing) is never
+        accepted. Missing or ambiguous matches return None so the caller opens
+        the owning folder instead of loading a neighbouring grid.
+        """
+        print(f"\n🔍 Searching for file matching: {grid_name}")
+        
+        las_folder_path = Path(las_folder)
+        
+        # Get all LAZ/LAS files
+        all_files = list(las_folder_path.glob("*.laz")) + list(las_folder_path.glob("*.las"))
+        
+        print(f"   Total files in folder: {len(all_files)}")
+        
+        if not all_files:
+            return None
+
+        grid_name_clean = strip_lidar_extension(grid_name)
+        best = find_matching_lidar_file(all_files, grid_name_clean)
+
+        if best is None:
+            print(
+                f"   ❌ No unique full-identity match for '{grid_name_clean}' "
+                f"(norm='{normalized_stem(grid_name_clean)}', "
+                f"numbers={numeric_identity(grid_name_clean)})"
+            )
+            print(f"   📄 Available files:")
+            for fp in all_files[:10]:
+                print(
+                    f"      - {fp.name} "
+                    f"(norm='{normalized_stem(fp.stem)}', "
+                    f"numbers={numeric_identity(fp.stem)})"
+                )
+            return None
+
+        print(f"   ✅ EXACT GRID MATCH FOUND: {best.name}")
+        return best

@@ -1,0 +1,40 @@
+FILE: gui/unified_actor_manager.py
+
+OLD BLOCK
+    cloud = pv.PolyData(vis_xyz)
+
+NEW / REPLACE BLOCK
+    cloud = pv.PolyData(vis_xyz)
+    print(
+        "      COORD_TRACE PRE-VTK/POLYDATA: "
+        f"X=[{vis_xyz[:, 0].min():.3f}, {vis_xyz[:, 0].max():.3f}] "
+        f"Y=[{vis_xyz[:, 1].min():.3f}, {vis_xyz[:, 1].max():.3f}] "
+        f"polydata={tuple(float(v) for v in cloud.GetBounds())}"
+    )
+
+OLD BLOCK
+    if actor:
+        actor.GetProperty().LightingOff()
+
+NEW / REPLACE BLOCK
+    if actor:
+        actor.GetProperty().LightingOff()
+        actor.SetPosition(0.0, 0.0, 0.0)
+        actor.SetOrigin(0.0, 0.0, 0.0)
+        actor.SetScale(1.0, 1.0, 1.0)
+        actor.SetUserTransform(None)
+
+OLD BLOCK
+        if mesh is None:
+            raise RuntimeError("build_unified_actor: mapper has no input after _ensure_opengl_polydata_mapper")
+
+NEW / REPLACE BLOCK
+        if mesh is None:
+            raise RuntimeError("build_unified_actor: mapper has no input after _ensure_opengl_polydata_mapper")
+        print(
+            "      COORD_TRACE MAPPER/ACTOR: "
+            f"mapper={tuple(float(v) for v in mesh.GetBounds())} "
+            f"actor={tuple(float(v) for v in actor.GetBounds())} "
+            f"position={tuple(float(v) for v in actor.GetPosition())} "
+            f"origin={tuple(float(v) for v in actor.GetOrigin())}"
+        )

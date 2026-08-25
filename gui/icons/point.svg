@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Crosshair lines (gap at center) -->
+  <line x1="12" y1="2.75" x2="12" y2="8.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="12" y1="15.5" x2="12" y2="21.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="2.75" y1="12" x2="8.5" y2="12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <line x1="15.5" y1="12" x2="21.25" y2="12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <!-- Center dot -->
+  <circle cx="12" cy="12" r="2" fill="currentColor"/>
+</svg>

@@ -1,0 +1,121 @@
+============================================================
+PATCH 10: app_window.py - _candidate_score() scoring fix
+File: app_window.py
+Function: load_las_for_grid() - _candidate_score()
+Lines: ~13935-13976
+Purpose: Strip .laz/.las extension from grid_name before scoring,
+         add reverse match scoring, add debug logging
+============================================================
+
+--- OLD BLOCK (before) ---
+            def _norm_key(text: str) -> str:
+                return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+
+            def _suffix_digits(text: str) -> str:
+                import re
+                m = re.search(r"(\d+)(?!.*\d)", str(text))
+                return m.group(1) if m else ""
+
+            def _candidate_score(file_path):
+                stem = file_path.stem
+                stem_norm = _norm_key(stem)
+                grid_norm = _norm_key(grid_name)
+                grid_suffix = _suffix_digits(grid_name)
+                stem_suffix = _suffix_digits(stem)
+                score = 0
+                if stem.lower() == grid_name.lower():
+                    score += 2000
+                if stem_norm == grid_norm:
+                    score += 1500
+                if grid_suffix and stem_suffix == grid_suffix:
+                    score += 1200
+                if grid_suffix and stem_norm.endswith(grid_suffix):
+                    score += 800
+                if grid_norm and stem_norm.endswith(grid_norm[-8:]):
+                    score += 200
+                if grid_norm and grid_norm in stem_norm:
+                    score += 100
+                return score, stem_norm
+
+            scored_matches = []
+            for file_path in all_files:
+                score, stem_norm = _candidate_score(file_path)
+                if score > 0:
+                    scored_matches.append((score, len(stem_norm), file_path))
+
+            if scored_matches:
+                scored_matches.sort(key=lambda x: (-x[0], x[1], x[2].name.lower()))
+                las_file = scored_matches[0][2]
+                print(f"   ✅ MATCH FOUND: {las_file.name}")
+                if len(scored_matches) > 1:
+                    preview = ", ".join(item[2].name for item in scored_matches[:5])
+                    print(f"   ℹ️ Ranked candidates: {preview}")
+            else:
+                las_file = None
+            
+            if not las_file:
+                print(f"   ❌ No automatic match found")
+
++++ NEW BLOCK (after) +++
+            def _norm_key(text: str) -> str:
+                return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+
+            def _suffix_digits(text: str) -> str:
+                import re
+                m = re.search(r"(\d+)(?!.*\d)", str(text))
+                return m.group(1) if m else ""
+
+            def _strip_las_ext(name: str) -> str:
+                lower = name.lower()
+                if lower.endswith(".laz"):
+                    return name[:-4]
+                if lower.endswith(".las"):
+                    return name[:-4]
+                return name
+
+            grid_name_clean = _strip_las_ext(grid_name)
+
+            def _candidate_score(file_path):
+                stem = file_path.stem
+                stem_norm = _norm_key(stem)
+                grid_norm = _norm_key(grid_name_clean)
+                grid_suffix = _suffix_digits(grid_name_clean)
+                stem_suffix = _suffix_digits(stem)
+                score = 0
+                if stem.lower() == grid_name_clean.lower():
+                    score += 2000
+                if stem_norm == grid_norm:
+                    score += 1500
+                if grid_suffix and stem_suffix == grid_suffix:
+                    score += 1200
+                if grid_suffix and stem_norm.endswith(grid_suffix):
+                    score += 800
+                if grid_norm and stem_norm.endswith(grid_norm[-8:]):
+                    score += 200
+                if grid_norm and grid_norm in stem_norm:
+                    score += 100
+                if grid_norm and stem_norm in grid_norm:
+                    score += 50
+                return score, stem_norm
+
+            scored_matches = []
+            for file_path in all_files:
+                score, stem_norm = _candidate_score(file_path)
+                if score > 0:
+                    scored_matches.append((score, len(stem_norm), file_path))
+
+            if scored_matches:
+                scored_matches.sort(key=lambda x: (-x[0], x[1], x[2].name.lower()))
+                las_file = scored_matches[0][2]
+                print(f"   ✅ MATCH FOUND: {las_file.name} (score={scored_matches[0][0]})")
+                if len(scored_matches) > 1:
+                    preview = ", ".join(f"{item[2].name}(s={item[0]})" for item in scored_matches[:5])
+                    print(f"   ℹ️ Ranked candidates: {preview}")
+            else:
+                las_file = None
+            
+            if not las_file:
+                print(f"   ❌ No automatic match found for '{grid_name_clean}'")
+                print(f"   📄 Available files:")
+                for fp in all_files[:10]:
+                    print(f"      - {fp.name}")

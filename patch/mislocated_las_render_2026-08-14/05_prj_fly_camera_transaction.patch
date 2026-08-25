@@ -1,0 +1,79 @@
+FILE: gui/app_window.py
+
+OLD BLOCK
+        if event_type != QEvent.Wheel:
+            return False
+        if getattr(app, "_shutdown_in_progress", False):
+
+NEW / REPLACE BLOCK
+        if event_type != QEvent.Wheel:
+            return False
+        if getattr(app, "_prj_fly_camera_active", False):
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return True
+        if getattr(app, "_shutdown_in_progress", False):
+
+FILE: gui/prj_block_identifier.py
+
+OLD BLOCK
+            renderer   = self.app.vtk_widget.renderer
+            camera     = renderer.GetActiveCamera()
+            render_win = self.app.vtk_widget.GetRenderWindow()
+
+NEW / REPLACE BLOCK
+            renderer   = self.app.vtk_widget.renderer
+            camera     = renderer.GetActiveCamera()
+            render_win = self.app.vtk_widget.GetRenderWindow()
+
+            fly_generation = int(getattr(self.app, "_prj_fly_generation", 0)) + 1
+            self.app._prj_fly_generation = fly_generation
+            self.app._prj_fly_camera_active = True
+            cancel_zoom = getattr(self.app, "_cancel_smooth_zoom_for_pan", None)
+            if callable(cancel_zoom):
+                cancel_zoom()
+
+OLD BLOCK
+            STEPS         = 40
+            step_duration = max(1, duration // STEPS)
+
+NEW / REPLACE BLOCK
+            try:
+                loaded_count = len((getattr(self.app, "data", None) or {}).get("xyz", ()))
+            except Exception:
+                loaded_count = 0
+            STEPS = 1 if loaded_count >= 1_000_000 else 40
+            step_duration = 1 if STEPS == 1 else max(1, duration // STEPS)
+
+OLD BLOCK
+            def animate_step():
+                step = current_step[0]
+
+NEW / REPLACE BLOCK
+            def animate_step():
+                if int(getattr(self.app, "_prj_fly_generation", 0)) != fly_generation:
+                    return
+                step = current_step[0]
+
+OLD BLOCK
+                    print(f"✈️  Fly-to complete → ({x:.2f}, {y:.2f})")
+                    return
+
+NEW / REPLACE BLOCK
+                    print(
+                        f"✈️  Fly-to complete → ({x:.2f}, {y:.2f}) "
+                        f"focal={tuple(round(v, 3) for v in camera.GetFocalPoint())} "
+                        f"scale={camera.GetParallelScale():.3f}"
+                    )
+
+                    def _release_fly_camera():
+                        if int(getattr(self.app, "_prj_fly_generation", 0)) == fly_generation:
+                            self.app._prj_fly_camera_active = False
+                            commit = getattr(self.app, "_commit_main_view_history", None)
+                            if callable(commit):
+                                commit("prj_fly_to")
+
+                    QTimer.singleShot(250, _release_fly_camera)
+                    return

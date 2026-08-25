@@ -1,0 +1,13 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Back doc -->
+  <rect x="7.75" y="5.75" width="13.5" height="15.5" rx="2.75" fill="currentColor" fill-opacity="0.07"/>
+  <rect x="7.75" y="5.75" width="13.5" height="15.5" rx="2.75" stroke="currentColor" stroke-width="1.35" stroke-opacity="0.4"/>
+  <!-- Front doc fill -->
+  <rect x="2.75" y="2.75" width="13.5" height="15.5" rx="2.75" fill="currentColor" fill-opacity="0.1"/>
+  <!-- Front doc outline -->
+  <rect x="2.75" y="2.75" width="13.5" height="15.5" rx="2.75" stroke="currentColor" stroke-width="1.5"/>
+  <!-- Content lines on front -->
+  <path d="M5.75 8.5H13.25" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-opacity="0.4"/>
+  <path d="M5.75 11H13.25" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-opacity="0.35"/>
+  <path d="M5.75 13.5H10.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-opacity="0.25"/>
+</svg>

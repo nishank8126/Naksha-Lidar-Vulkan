@@ -1,0 +1,27 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Dashed border frame (top and left solid portions with arrows) -->
+  <!-- Top edge dashed line -->
+  <line x1="5" y1="2" x2="20" y2="2" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2.5,1.8" stroke-linecap="round"/>
+  <!-- Left edge dashed line -->
+  <line x1="2" y1="5" x2="2" y2="20" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2.5,1.8" stroke-linecap="round"/>
+  <!-- Right edge dashed line -->
+  <line x1="22" y1="5" x2="22" y2="20" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2.5,1.8" stroke-linecap="round"/>
+  <!-- Bottom edge dashed line -->
+  <line x1="5" y1="22" x2="20" y2="22" stroke="currentColor" stroke-width="1.4" stroke-dasharray="2.5,1.8" stroke-linecap="round"/>
+  <!-- Top-left corner: up arrow -->
+  <polyline points="4 5.2 2 3 3.8 5.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Bottom-right corner: right arrow -->
+  <polyline points="18.8 20 21 22 18.8 22" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Back map layer (outermost, most offset) -->
+  <path d="M6 16.5L4.5 13.5L7.5 9L13 7L17.5 9.5L18.5 13L15.5 17.5L9.5 18.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="currentColor" fill-opacity="0.05" opacity="0.5"/>
+  <!-- Middle map layer -->
+  <path d="M6.5 15.8L5.2 13L7.8 9L13.2 7.8L17 10L18 13.2L15.2 17L9.8 17.8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" fill="currentColor" fill-opacity="0.06" opacity="0.7"/>
+  <!-- Front/main map layer -->
+  <path d="M7 15L5.8 12.5L8.2 8.5L13.5 7.2L16.5 9.5L17.5 12.5L14.8 16.2L9.5 17Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="currentColor" fill-opacity="0.1"/>
+  <!-- Map detail lines on front layer -->
+  <path d="M8.5 11L11.5 10.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" opacity="0.45"/>
+  <path d="M8.2 13L12 12.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+  <path d="M9 14.8L12.5 14.2" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" opacity="0.35"/>
+  <path d="M12.5 10.5L15 11.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" opacity="0.45"/>
+  <path d="M12.5 12.5L15.2 13.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" opacity="0.4"/>
+</svg>

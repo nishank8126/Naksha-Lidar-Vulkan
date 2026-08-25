@@ -1,0 +1,7 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Closed polygon (pentagon-ish) -->
+  <path d="M12 3.5L20 8.5V15.5L12 20.5L4 15.5V8.5L12 3.5Z" fill="currentColor" fill-opacity="0.1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Circular conversion arrow (small, bottom right) -->
+  <path d="M17 16C17.8 15 18 13.5 17.5 12" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+  <path d="M15.5 17.5L17 16L16 14.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

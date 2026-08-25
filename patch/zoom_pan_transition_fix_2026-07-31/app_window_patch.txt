@@ -1,0 +1,38 @@
+================ OLD BLOCK ================
+
+        self._zoom_anim_timer.start(16)
+
+    def _finish_smooth_zoom(self):
+        """Stop easing and settle the render manager exactly once."""
+
+================ NEW / REPLACE BLOCK ================
+
+        self._zoom_anim_timer.start(16)
+
+    def _cancel_smooth_zoom_for_pan(self):
+        """End pending wheel easing immediately when direct panning begins.
+
+        The camera already contains every step applied so far, so cancellation
+        only clears the pending multiplier/timer. It does not alter framing or
+        trigger a competing render while the pan gesture is starting.
+        """
+        was_active = bool(
+            getattr(self, "_zoom_anim_active", False)
+            or abs(float(getattr(self, "_zoom_target_factor", 1.0)) - 1.0)
+            > 1e-12
+        )
+        self._zoom_target_factor = 1.0
+        self._zoom_anim_active = False
+        timer = getattr(self, "_zoom_anim_timer", None)
+        if timer is not None:
+            timer.stop()
+        if was_active:
+            self._schedule_main_view_history_commit(
+                "smooth_mouse_wheel_zoom",
+                delay_ms=80,
+            )
+            print("Wheel zoom cancelled cleanly for middle-button pan")
+        return was_active
+
+    def _finish_smooth_zoom(self):
+        """Stop easing and settle the render manager exactly once."""

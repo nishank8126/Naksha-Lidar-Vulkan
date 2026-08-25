@@ -1,0 +1,56 @@
+File: gui/cross_section/interactor_classify.py
+
+OLD BLOCK
+```python
+        if (
+            bool(getattr(self.app, "_gpu_sync_done", False))
+            and not bool(getattr(self.app, "_section_visibility_refresh_required", False))
+        ):
+            self.app._gpu_sync_done = False
+            return
+```
+
+REPLACE BLOCK
+```python
+        if (
+            bool(getattr(self.app, "_gpu_sync_done", False))
+            and not bool(getattr(self.app, "_section_visibility_refresh_required", False))
+        ):
+            # A cross-section RGB injection only synchronizes the point actors.
+            # In single-class shading the main view is a separate triangulated
+            # mesh, so it still needs its topology delta applied before this
+            # commit can be considered visually complete.
+            if display_mode == "shaded_class":
+                try:
+                    from gui.unified_actor_manager import (
+                        guarantee_main_view_visual_refresh,
+                    )
+
+                    shaded_refresh_ok = guarantee_main_view_visual_refresh(
+                        self.app,
+                        changed_mask=getattr(self.app, "_last_changed_mask", None),
+                        to_class=to_class,
+                        reason="cross_section_gpu_commit",
+                        origin_view="cross_section",
+                    )
+                    if shaded_refresh_ok:
+                        self.app._gpu_sync_done = False
+                        return
+                    print(
+                        "⚠️ Shaded main-view commit refresh was not handled; "
+                        "continuing with the normal refresh fallback"
+                    )
+                except Exception as exc:
+                    print(
+                        "⚠️ Shaded main-view commit refresh failed; "
+                        f"continuing with the normal refresh fallback: {exc}"
+                    )
+
+                # The GPU point buffers are synchronized, but the shaded mesh
+                # is not. Clear the marker and continue into the established
+                # fallback path below instead of suppressing the refresh.
+                self.app._gpu_sync_done = False
+            else:
+                self.app._gpu_sync_done = False
+                return
+```

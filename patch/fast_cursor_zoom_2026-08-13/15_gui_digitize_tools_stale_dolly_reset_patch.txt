@@ -1,0 +1,55 @@
+FILE: gui/digitize_tools.py
+
+OLD BLOCK:
+    def _reset_stale_zoom_mouse_state(self):
+        """Clear stale mouse state left behind by a fast zoom click combo."""
+        try:
+            style = self.interactor.GetInteractorStyle()
+            if style:
+                if hasattr(style, "OnLeftButtonUp"):
+                    style.OnLeftButtonUp()
+                if hasattr(style, "OnRightButtonUp"):
+                    style.OnRightButtonUp()
+                if hasattr(style, "OnMiddleButtonUp"):
+                    style.OnMiddleButtonUp()
+        except Exception:
+            pass
+
+NEW/REPLACE BLOCK:
+    def _reset_stale_zoom_mouse_state(self):
+        """Clear stale mouse state, including VTK's right-drag Dolly state."""
+        style = None
+        try:
+            style = self.interactor.GetInteractorStyle()
+            if style:
+                if hasattr(style, "OnLeftButtonUp"):
+                    style.OnLeftButtonUp()
+                if hasattr(style, "OnRightButtonUp"):
+                    style.OnRightButtonUp()
+                if hasattr(style, "OnMiddleButtonUp"):
+                    style.OnMiddleButtonUp()
+        except Exception:
+            pass
+
+        # Grid labels are opened by right-click. A long synchronous grid load
+        # can prevent VTK from receiving the physical release, leaving the
+        # interactor in VTKIS_DOLLY. Button-up callbacks alone are not reliable
+        # once that release was lost, so explicitly terminate the style state.
+        try:
+            if style is not None and hasattr(style, "GetState"):
+                if int(style.GetState()) != 0 and hasattr(style, "StopState"):
+                    style.StopState()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self.interactor, "SetControlKey"):
+                self.interactor.SetControlKey(0)
+            if hasattr(self.interactor, "SetShiftKey"):
+                self.interactor.SetShiftKey(0)
+            if hasattr(self.interactor, "SetAltKey"):
+                self.interactor.SetAltKey(0)
+            if hasattr(self.interactor, "ReleaseFocus"):
+                self.interactor.ReleaseFocus()
+        except Exception:
+            pass

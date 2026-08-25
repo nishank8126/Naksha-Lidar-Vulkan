@@ -1,0 +1,248 @@
+TARGET FILE: tests\test_section_zoom.py
+
+================ OLD BLOCK ================
+FILE DOES NOT EXIST
+================ NEW / REPLACE BLOCK ================
+import math
+
+import pytest
+from PySide6.QtCore import QCoreApplication, QObject, QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
+
+from gui.cross_section.section_zoom import (
+    MAX_WHEEL_STEPS_PER_EVENT,
+    SECTION_WHEEL_ZOOM_FACTOR,
+    SectionWheelZoomEventFilter,
+    install_section_wheel_zoom,
+    section_wheel_zoom_factor,
+)
+
+
+class _FakeCamera:
+    def __init__(self, scale=100.0):
+        self.scale = float(scale)
+        self.position = (0.0, -100.0, 0.0)
+        self.focal_point = (0.0, 0.0, 0.0)
+        self.parallel = True
+
+    def GetPosition(self):
+        return self.position
+
+    def SetPosition(self, value):
+        self.position = tuple(value)
+
+    def GetFocalPoint(self):
+        return self.focal_point
+
+    def SetFocalPoint(self, value):
+        self.focal_point = tuple(value)
+
+    def GetParallelScale(self):
+        return self.scale
+
+    def SetParallelScale(self, value):
+        self.scale = float(value)
+
+    def GetParallelProjection(self):
+        return int(self.parallel)
+
+    def ParallelProjectionOn(self):
+        self.parallel = True
+
+    def ParallelProjectionOff(self):
+        self.parallel = False
+
+
+class _FakeRenderer:
+    def __init__(self, camera):
+        self.camera = camera
+        self.clipping_resets = 0
+
+    def GetActiveCamera(self):
+        return self.camera
+
+    def ResetCameraClippingRange(self):
+        self.clipping_resets += 1
+
+
+class _FakeRenderWindow:
+    def __init__(self, interactor):
+        self.interactor = interactor
+
+    def GetInteractor(self):
+        return self.interactor
+
+
+class _FakeWidget:
+    def __init__(self, interactor, scale=100.0):
+        self.interactor = interactor
+        self.camera = _FakeCamera(scale)
+        self.renderer = _FakeRenderer(self.camera)
+        self.render_window = _FakeRenderWindow(interactor)
+        self.render_count = 0
+        self.visible = True
+        self._naksha_skip_render = False
+        self._naksha_view_finalized = False
+
+    def GetRenderWindow(self):
+        return self.render_window
+
+    def isVisible(self):
+        return self.visible
+
+    def render(self):
+        self.render_count += 1
+
+
+class _FakeApp:
+    def __init__(self):
+        self._shutdown_in_progress = False
+        self.zoom_behavior = "center"
+        self.cut_section_controller = None
+
+
+def _make_filter(scale=100.0):
+    QCoreApplication.instance() or QCoreApplication([])
+    app = _FakeApp()
+    interactor = QObject()
+    widget = _FakeWidget(interactor, scale=scale)
+    wheel_filter = SectionWheelZoomEventFilter(app, widget, interactor)
+    # Keep these alive independently of the filter's weak references.
+    wheel_filter._test_app = app
+    wheel_filter._test_widget = widget
+    wheel_filter._test_interactor = interactor
+    return wheel_filter, app, widget
+
+
+def _flush_timer(wheel_filter):
+    wheel_filter._render_timer.stop()
+    wheel_filter._flush_render()
+
+
+def _wheel_event(delta):
+    return QWheelEvent(
+        QPointF(10.0, 10.0),
+        QPointF(10.0, 10.0),
+        QPoint(0, 0),
+        QPoint(0, int(delta)),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.ScrollUpdate,
+        False,
+    )
+
+
+def test_standard_notch_uses_fast_reciprocal_zoom():
+    assert section_wheel_zoom_factor(120) == pytest.approx(SECTION_WHEEL_ZOOM_FACTOR)
+    assert section_wheel_zoom_factor(-120) == pytest.approx(1.0 / SECTION_WHEEL_ZOOM_FACTOR)
+
+
+def test_raw_multi_notch_delta_is_preserved_and_bounded():
+    assert section_wheel_zoom_factor(240) == pytest.approx(SECTION_WHEEL_ZOOM_FACTOR**2)
+    assert section_wheel_zoom_factor(12000) == pytest.approx(
+        SECTION_WHEEL_ZOOM_FACTOR**MAX_WHEEL_STEPS_PER_EVENT
+    )
+    assert section_wheel_zoom_factor(-12000) == pytest.approx(
+        SECTION_WHEEL_ZOOM_FACTOR ** -MAX_WHEEL_STEPS_PER_EVENT
+    )
+
+
+def test_non_finite_delta_is_rejected_without_camera_access():
+    with pytest.raises(ValueError):
+        section_wheel_zoom_factor(math.inf)
+
+
+def test_camera_updates_immediately_but_rapid_renders_are_coalesced():
+    wheel_filter, _app, widget = _make_filter(scale=100.0)
+
+    assert wheel_filter.handle_wheel_delta(120)
+    assert widget.camera.scale == pytest.approx(80.0)
+    assert wheel_filter._render_timer.isActive()
+    assert widget.render_count == 0
+
+    assert wheel_filter.handle_wheel_delta(120)
+    assert widget.camera.scale == pytest.approx(64.0)
+    assert widget.render_count == 0
+
+    _flush_timer(wheel_filter)
+    assert widget.render_count == 1
+    assert widget.renderer.clipping_resets == 1
+
+
+def test_qt_wheel_event_is_consumed_only_after_camera_update():
+    wheel_filter, _app, widget = _make_filter(scale=100.0)
+    event = _wheel_event(240)
+
+    assert wheel_filter.eventFilter(wheel_filter.parent(), event)
+    assert widget.camera.scale == pytest.approx(64.0)
+    assert wheel_filter._render_timer.isActive()
+
+
+def test_filter_install_is_idempotent_for_each_widget():
+    _existing_filter, app, widget = _make_filter()
+    first = install_section_wheel_zoom(app, widget)
+    second = install_section_wheel_zoom(app, widget)
+
+    assert first is not None
+    assert second is first
+
+
+def test_failed_anchor_helper_is_rolled_back_before_center_fallback():
+    wheel_filter, app, widget = _make_filter(scale=100.0)
+    app.zoom_behavior = "cursor"
+
+    def _failed_cursor_zoom(vtk_widget, factor, interactor=None, *, render=True):
+        vtk_widget.camera.SetParallelScale(vtk_widget.camera.GetParallelScale() / 2.0)
+        return False
+
+    app._zoom_widget_at_cursor = _failed_cursor_zoom
+
+    assert wheel_filter.handle_wheel_delta(120)
+    assert widget.camera.scale == pytest.approx(80.0)
+
+
+def test_zoom_in_then_out_restores_original_parallel_scale():
+    wheel_filter, _app, widget = _make_filter(scale=73.5)
+
+    assert wheel_filter.handle_wheel_delta(120)
+    assert wheel_filter.handle_wheel_delta(-120)
+    assert widget.camera.scale == pytest.approx(73.5)
+
+
+def test_pending_render_is_dropped_after_view_finalization():
+    wheel_filter, _app, widget = _make_filter()
+
+    assert wheel_filter.handle_wheel_delta(120)
+    widget._naksha_view_finalized = True
+    _flush_timer(wheel_filter)
+
+    assert widget.render_count == 0
+    assert widget.renderer.clipping_resets == 0
+
+
+def test_invalid_render_window_falls_back_without_changing_camera():
+    wheel_filter, _app, widget = _make_filter(scale=50.0)
+    widget.render_window.interactor = None
+
+    assert not wheel_filter.handle_wheel_delta(120)
+    assert widget.camera.scale == pytest.approx(50.0)
+    assert not wheel_filter._render_timer.isActive()
+
+
+def test_shutdown_drops_pending_render():
+    wheel_filter, app, widget = _make_filter()
+
+    assert wheel_filter.handle_wheel_delta(120)
+    app._shutdown_in_progress = True
+    _flush_timer(wheel_filter)
+
+    assert widget.render_count == 0
+
+
+def test_shutdown_time_wheel_is_consumed_without_touching_vtk():
+    wheel_filter, app, widget = _make_filter(scale=42.0)
+    app._shutdown_in_progress = True
+
+    assert wheel_filter.eventFilter(wheel_filter.parent(), _wheel_event(120))
+    assert widget.camera.scale == pytest.approx(42.0)
+    assert not wheel_filter._render_timer.isActive()

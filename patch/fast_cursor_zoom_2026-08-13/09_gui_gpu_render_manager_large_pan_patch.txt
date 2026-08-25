@@ -1,0 +1,104 @@
+TARGET FILE: gui\gpu_render_manager.py
+
+================ OLD BLOCK ================
+        self._pan_in_progress = False
+        self._interaction_active = False
+================ NEW / REPLACE BLOCK ================
+        self._pan_in_progress = False
+        self._pan_frame_started = False
+        self._pan_last_frame_monotonic = 0.0
+        self._interaction_active = False
+
+================ OLD BLOCK ================
+        try:
+            from gui.zoom_navigation import interaction_frame_interval_ms
+            self.interaction_frame_ms = interaction_frame_interval_ms(point_count)
+================ NEW / REPLACE BLOCK ================
+        try:
+            self._wheel_idle_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.render_timer.stop()
+        except Exception:
+            pass
+        self.pending_render = False
+
+        try:
+            from gui.zoom_navigation import pan_frame_interval_ms
+            self.interaction_frame_ms = pan_frame_interval_ms(point_count)
+
+================ OLD BLOCK ================
+        self._pan_in_progress = True
+        self._interaction_active = True
+        return True
+================ NEW / REPLACE BLOCK ================
+        self._pan_in_progress = True
+        self._pan_frame_started = False
+        self._pan_last_frame_monotonic = 0.0
+        self._interaction_active = True
+        return True
+
+================ OLD BLOCK ================
+        was_active = bool(self._pan_in_progress)
+        self._pan_in_progress = False
+        self._interaction_active = False
+================ NEW / REPLACE BLOCK ================
+        was_active = bool(self._pan_in_progress)
+        self._pan_in_progress = False
+        self._pan_frame_started = False
+        self._pan_last_frame_monotonic = 0.0
+        self._interaction_active = False
+
+================ OLD BLOCK ================
+        self._camera_interactor = None
+        self._pan_in_progress = False
+        self._interaction_active = False
+================ NEW / REPLACE BLOCK ================
+        self._camera_interactor = None
+        self._pan_in_progress = False
+        self._pan_frame_started = False
+        self._pan_last_frame_monotonic = 0.0
+        self._interaction_active = False
+
+================ OLD BLOCK ================
+        if self._pan_in_progress or self._interaction_active:
+            if not self.pending_render:
+                self.pending_render = True
+                self.render_timer.start(self.interaction_frame_ms)
+            else:
+                self.skipped_renders += 1
+            return
+================ NEW / REPLACE BLOCK ================
+        if self._pan_in_progress:
+            if self.pending_render:
+                self.skipped_renders += 1
+                return
+
+            delay_ms = 0
+            if self._pan_frame_started:
+                elapsed_ms = (
+                    time.monotonic() - self._pan_last_frame_monotonic
+                ) * 1000.0
+                delay_ms = max(0, int(round(self.interaction_frame_ms - elapsed_ms)))
+
+            self.pending_render = True
+            self.render_timer.start(delay_ms)
+            return
+
+        if self._interaction_active:
+            if not self.pending_render:
+                self.pending_render = True
+                self.render_timer.start(self.interaction_frame_ms)
+            else:
+                self.skipped_renders += 1
+            return
+
+================ OLD BLOCK ================
+            # Use original render method
+================ NEW / REPLACE BLOCK ================
+            if self._pan_in_progress:
+                self._pan_frame_started = True
+                self._pan_last_frame_monotonic = time.monotonic()
+
+            # Use original render method

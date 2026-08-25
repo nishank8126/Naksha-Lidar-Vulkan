@@ -1,0 +1,1186 @@
+diff -ruN a/gui/gis/gdb/domains_dialog.py b/gui/gis/gdb/domains_dialog.py
+--- a/gui/gis/gdb/domains_dialog.py	2026-06-26 06:58:31.958583672 +0000
++++ b/gui/gis/gdb/domains_dialog.py	2026-06-26 06:58:31.958922231 +0000
+@@ -30,8 +30,12 @@
+ log = logging.getLogger("GDBEngine")
+ 
+ 
+-FIELD_TYPES = ["Double", "Float", "Integer", "Long", "Short",
+-               "SmallInteger", "String", "Date", "OID", "Geometry", "Blob"]
++FIELD_TYPES = [
++    "Double", "Float", "Integer", "Long", "Short", "SmallInteger",
++    "BigInteger", "String", "Date", "DateOnly", "TimeOnly",
++    "TimestampOffset", "OID", "GUID", "GlobalID", "Geometry", "Blob",
++    "Raster", "XML",
++]
+ DOMAIN_TYPES = ["CodedValue", "Range"]
+ SPLIT_POLICIES = ["DefaultValue", "Duplicate", "GeometryRatio"]
+ MERGE_POLICIES = ["DefaultValue", "SumValues", "AreaWeighted"]
+diff -ruN a/gui/gis/gdb/engine.py b/gui/gis/gdb/engine.py
+--- a/gui/gis/gdb/engine.py	2026-06-26 06:58:31.956777489 +0000
++++ b/gui/gis/gdb/engine.py	2026-06-26 06:58:31.957403224 +0000
+@@ -94,12 +94,17 @@
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def check_gdal_version() -> tuple:
+-    """Return (ok, version_string). ok = True if GDAL >= 3.3 (for full FileGDB support)."""
++    """Return (ok, version_string). ok=True for GDAL >= 3.6.
++
++    GDAL 3.3 can read domains; 3.6 is the practical minimum for the current
++    create/update workflow with OpenFileGDB. Newer features such as BigInteger
++    metadata and 64-bit OBJECTID support still benefit from GDAL 3.9/3.10+.
++    """
+     ver = gdal.VersionInfo("RELEASE_NAME")
+     try:
+         parts = ver.split('.')
+         major, minor = int(parts[0]), int(parts[1])
+-        return (major > 3 or (major == 3 and minor >= 3)), ver
++        return (major > 3 or (major == 3 and minor >= 6)), ver
+     except (ValueError, IndexError):
+         return False, ver
+ 
+@@ -121,9 +126,16 @@
+ 
+ 
+ def open_gdb(path: str, update: bool = False):
+-    """Open a GDB folder. Tries OpenFileGDB first (always present), then FileGDB."""
+-    ds = ogr.Open(path, 1 if update else 0)
+-    return ds
++    """Open a FileGDB using explicit vector flags and driver fallback."""
++    flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if update else gdal.OF_READONLY)
++    drivers = [d for d in ("OpenFileGDB", "FileGDB") if gdal.GetDriverByName(d)]
++    try:
++        ds = gdal.OpenEx(path, flags, allowed_drivers=drivers or None)
++    except TypeError:
++        ds = gdal.OpenEx(path, flags)
++    if ds is not None:
++        return ds
++    return ogr.Open(path, 1 if update else 0)
+ 
+ 
+ def list_layer_names(path: str) -> list[str]:
+@@ -272,6 +284,11 @@
+         self._all_layer_fields: dict = {}
+         self._non_nullable: dict = {}
+         self._field_types: dict = {}
++        self._field_defaults: dict = {}
++        self._subtype_defaults: dict = {}
++        self._layer_feature_types: dict = {}
++        self._layer_has_z: dict = {}
++        self._layer_has_m: dict = {}
+         self._cascade_layers: dict = {}
+         self._layer_display_names: dict = {}
+         self._layer_groups: dict = {}
+@@ -315,6 +332,8 @@
+             self._layer_display_names.setdefault(key, name)
+             self._field_domains[key] = {}
+             self._all_layer_fields[key] = []
++            self._field_types.setdefault(key, {})
++            self._field_defaults.setdefault(key, {})
+             defn = lyr.GetLayerDefn()
+             for j in range(defn.GetFieldCount()):
+                 fdefn = defn.GetFieldDefn(j)
+@@ -323,6 +342,10 @@
+                 dname = fdefn.GetDomainName()
+                 if dname:
+                     self._field_domains[key][fname] = dname
++                try:
++                    self._field_types[key][fname.lower()] = fdefn.GetTypeName()
++                except Exception:
++                    pass
+ 
+             # CRS from GDAL (preferred — GDAL reads the FileGDB SRS correctly)
+             srs = lyr.GetSpatialRef()
+@@ -480,6 +503,24 @@
+             self._all_layer_fields[lname_lower] = []
+         if lname_lower not in self._field_types:
+             self._field_types[lname_lower] = {}
++        if lname_lower not in self._field_defaults:
++            self._field_defaults[lname_lower] = {}
++
++        feature_type = (root.findtext("./FeatureType") or root.findtext(".//FeatureType") or "").strip()
++        if feature_type:
++            self._layer_feature_types[lname_lower] = feature_type
++            if canonical and canonical != lname_lower:
++                self._layer_feature_types[canonical] = feature_type
++        for xml_name, target in (("HasZ", self._layer_has_z), ("HasM", self._layer_has_m)):
++            val = (root.findtext(f"./{xml_name}") or root.findtext(f".//{xml_name}") or "").strip().lower()
++            if val in ("true", "1", "yes"):
++                target[lname_lower] = True
++                if canonical and canonical != lname_lower:
++                    target[canonical] = True
++            elif val in ("false", "0", "no"):
++                target[lname_lower] = False
++                if canonical and canonical != lname_lower:
++                    target[canonical] = False
+ 
+         for field in root.findall(".//GPFieldInfoEx"):
+             fname_node = field.find("Name")
+@@ -503,6 +544,10 @@
+             if ftype_node is not None and ftype_node.text:
+                 self._field_types[lname_lower][fname.lower()] = ftype_node.text.strip()
+ 
++            default_node = field.find("DefaultValue")
++            if default_node is not None and default_node.text is not None:
++                self._field_defaults[lname_lower][fname.lower()] = default_node.text.strip()
++
+         sr_node = self._find_spatial_reference_node(root)
+         selected_wkt, selected_source = self._select_best_layer_crs_wkt(
+             lname_raw, lname_lower, root, sr_node)
+@@ -635,6 +680,7 @@
+             default_subtype_code = default_subtype_node.text.strip()
+         subtype_domain = {}
+         dependent_field_domains = {}
++        subtype_default_values = {}
+ 
+         for st in subtypes:
+             st_name = st.find("SubtypeName")
+@@ -647,11 +693,17 @@
+ 
+             for fi in st.findall(".//SubtypeFieldInfo"):
+                 fi_fname = fi.find("FieldName")
+-                fi_domain = fi.find("DomainName")
+-                if not (fi_fname is not None and fi_fname.text
+-                        and fi_domain is not None and fi_domain.text):
++                if fi_fname is None or not fi_fname.text:
+                     continue
+                 dep_field = fi_fname.text.strip()
++
++                fi_default = fi.find("DefaultValue")
++                if fi_default is not None and fi_default.text is not None:
++                    subtype_default_values.setdefault(code, {})[dep_field.lower()] = fi_default.text.strip()
++
++                fi_domain = fi.find("DomainName")
++                if fi_domain is None or not fi_domain.text:
++                    continue
+                 dep_domain_name = fi_domain.text.strip()
+                 if dep_field.lower() == subtype_field.lower():
+                     continue
+@@ -665,7 +717,9 @@
+                 'default_subtype_code': default_subtype_code,
+                 'subtype_domain':      subtype_domain,
+                 'dependent_field_domains': dependent_field_domains,
++                'subtype_default_values': subtype_default_values,
+             }
++            self._subtype_defaults[lname_lower] = subtype_default_values
+ 
+     # ── Public API ────────────────────────────────────────────────────────
+ 
+@@ -689,6 +743,7 @@
+             'subtype_domain': dict(raw['subtype_domain']),
+             'dependent_fields': dependent_fields,
+             'dependent_field_domains': copy.deepcopy(raw.get('dependent_field_domains', {})),
++            'subtype_default_values': copy.deepcopy(raw.get('subtype_default_values', {})),
+         }
+ 
+     def get_layer_display_name(self, lname: str) -> str:
+@@ -796,7 +851,8 @@
+ 
+         Returns:  {field_name_lower: 'value-as-string'}
+         """
+-        _INT_TYPES = {'esrifieldtypeoid', 'esrifieldtypeinteger', 'esrifieldtypesmallinteger'}
++        _INT_TYPES = {'esrifieldtypeoid', 'esrifieldtypeinteger', 'esrifieldtypesmallinteger',
++                      'esrifieldtypebiginteger'}
+         _FLOAT_TYPES = {'esrifieldtypesingle', 'esrifieldtypedouble'}
+         _TEXT_TYPES = {'esrifieldtypestring', 'esrifieldtypeglobalid',
+                        'esrifieldtypeguid', 'esrifieldtypexml'}
+@@ -810,12 +866,32 @@
+         type_key = self._resolve_key(lname, self._field_types)
+         ftypes = self._field_types.get(type_key, {}) if type_key else {}
+ 
++        defaults_key = self._resolve_key(lname, self._field_defaults)
++        schema_defaults = self._field_defaults.get(defaults_key, {}) if defaults_key else {}
++
+         result = {}
+         for fname_lower in non_null:
+             if ('shape' in fname_lower or fname_lower.startswith('st_') or
+                     fname_lower in ('objectid', 'globalid', 'fid', 'oid')):
+                 continue
+             esri_type = ftypes.get(fname_lower, '').lower()
++            if fname_lower in schema_defaults:
++                raw_default = str(schema_defaults[fname_lower])
++                if esri_type in _INT_TYPES:
++                    try:
++                        result[fname_lower] = str(int(float(raw_default)))
++                    except (TypeError, ValueError):
++                        result[fname_lower] = '0'
++                elif esri_type in _FLOAT_TYPES:
++                    try:
++                        result[fname_lower] = str(float(raw_default))
++                    except (TypeError, ValueError):
++                        result[fname_lower] = '0'
++                else:
++                    escaped = raw_default.replace("'", "''")
++                    result[fname_lower] = f"'{escaped}'"
++                continue
++
+             domain_name = self.get_domain_for_field(lname, lname, fname_lower)
+             domain_values = self.all_domains.get(domain_name, {}) if domain_name else {}
+             first_code = next(iter(domain_values.keys()), None)
+@@ -851,7 +927,8 @@
+         """Same as `get_non_nullable_defaults` but returns Python values
+         (int / float / str) suitable for `feature.SetField()` directly.
+         """
+-        _INT_TYPES = {'esrifieldtypeoid', 'esrifieldtypeinteger', 'esrifieldtypesmallinteger'}
++        _INT_TYPES = {'esrifieldtypeoid', 'esrifieldtypeinteger', 'esrifieldtypesmallinteger',
++                      'esrifieldtypebiginteger'}
+         _FLOAT_TYPES = {'esrifieldtypesingle', 'esrifieldtypedouble'}
+         _TEXT_TYPES = {'esrifieldtypestring', 'esrifieldtypeglobalid',
+                        'esrifieldtypeguid', 'esrifieldtypexml'}
+@@ -865,6 +942,9 @@
+         type_key = self._resolve_key(lname, self._field_types)
+         ftypes = self._field_types.get(type_key, {}) if type_key else {}
+ 
++        defaults_key = self._resolve_key(lname, self._field_defaults)
++        schema_defaults = self._field_defaults.get(defaults_key, {}) if defaults_key else {}
++
+         result = {}
+         for fname_lower in non_null:
+             if ('shape' in fname_lower or fname_lower.startswith('st_') or
+@@ -872,7 +952,28 @@
+                 continue
+ 
+             esri_type = ftypes.get(fname_lower, '').lower()
+-            if esri_type in _SKIP_TYPES or 'date' in esri_type:
++            if esri_type in _SKIP_TYPES:
++                continue
++
++            if fname_lower in schema_defaults:
++                raw_default = schema_defaults[fname_lower]
++                if esri_type in _INT_TYPES:
++                    try:
++                        result[fname_lower] = int(float(str(raw_default)))
++                    except (TypeError, ValueError):
++                        result[fname_lower] = 0
++                elif esri_type in _FLOAT_TYPES:
++                    try:
++                        result[fname_lower] = float(str(raw_default))
++                    except (TypeError, ValueError):
++                        result[fname_lower] = 0.0
++                else:
++                    result[fname_lower] = str(raw_default)
++                continue
++
++            if 'date' in esri_type or 'time' in esri_type:
++                # Do not invent temporal values. If the schema has no default,
++                # the Create Features UI must collect one from the user.
+                 continue
+ 
+             domain_name = self.get_domain_for_field(lname, lname, fname_lower)
+@@ -984,6 +1085,22 @@
+             return {}
+         return dict(self._field_types.get(key, {}))
+ 
++    def get_layer_feature_type(self, lname: str) -> str | None:
++        key = self._resolve_key(lname, self._layer_feature_types)
++        return self._layer_feature_types.get(key) if key else None
++
++    def layer_has_z(self, lname: str) -> bool | None:
++        key = self._resolve_key(lname, self._layer_has_z)
++        return self._layer_has_z.get(key) if key else None
++
++    def layer_has_m(self, lname: str) -> bool | None:
++        key = self._resolve_key(lname, self._layer_has_m)
++        return self._layer_has_m.get(key) if key else None
++
++    def get_field_defaults(self, lname: str) -> dict:
++        key = self._resolve_key(lname, self._field_defaults)
++        return dict(self._field_defaults.get(key, {})) if key else {}
++
+     def has_crs(self, lname: str) -> bool:
+         return self.get_layer_crs_wkt(lname) is not None
+ 
+@@ -1051,7 +1168,9 @@
+             tokens.extend(part.strip().lower() for part in normalized_path.split('/') if part.strip())
+         return any(
+             token.startswith(('gdb_', 'sde_', 'sqlite_')) or
+-            token in {'gdb_items', 'gdb_itemrelationships', 'gdb_itemtypes', 'gdb_systemcatalog'}
++            token.endswith(('__attach', '__attachrel')) or
++            token in {'gdb_items', 'gdb_itemrelationships', 'gdb_itemtypes',
++                      'gdb_systemcatalog', 'gdb_spatialrefs'}
+             for token in tokens if token
+         )
+ 
+diff -ruN a/gui/gis/gdb/features_panel.py b/gui/gis/gdb/features_panel.py
+--- a/gui/gis/gdb/features_panel.py	2026-06-26 06:58:31.957786720 +0000
++++ b/gui/gis/gdb/features_panel.py	2026-06-26 06:58:31.958044262 +0000
+@@ -15,14 +15,14 @@
+ import logging
+ import re
+ 
+-from PySide6.QtCore import Qt
++from PySide6.QtCore import Qt, QRegularExpression
+ from PySide6.QtWidgets import (
+     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+     QComboBox, QTextEdit, QGroupBox, QFormLayout, QWidget, QScrollArea,
+     QMessageBox, QCheckBox, QSizePolicy, QFrame, QSplitter,
+     QRadioButton, QButtonGroup,
+ )
+-from PySide6.QtGui import QIntValidator, QDoubleValidator
++from PySide6.QtGui import QIntValidator, QDoubleValidator, QRegularExpressionValidator
+ 
+ from .engine import GDBEngine, get_engine
+ from . import reader as gdb_reader
+@@ -283,6 +283,19 @@
+             elif isinstance(w, QLineEdit):
+                 # For non-domain fields that are dependent, show info
+                 pass
++        # Apply subtype-specific default values, when present in GDB XML.
++        subtype_defaults = self._cascade.get("subtype_default_values", {}) if self._cascade else {}
++        for fname_lower, default_value in subtype_defaults.get(str(code), {}).items():
++            w = self._field_widgets.get(fname_lower.lower())
++            if isinstance(w, QLineEdit):
++                w.setText(str(default_value))
++            elif isinstance(w, QComboBox):
++                idx = w.findData(default_value)
++                if idx < 0:
++                    idx = w.findData(str(default_value))
++                if idx >= 0:
++                    w.setCurrentIndex(idx)
++
+         # Update description
+         desc_parts = []
+         for field_name, subtype_map in dep_domains.items():
+@@ -383,9 +396,26 @@
+                 if not nullable:
+                     label += " *"
+                 self._fields_layout.addRow(label, le)
+-            elif esri_type == "esriFieldTypeDate":
++            elif esri_type == "esriFieldTypeBigInteger":
++                le = QLineEdit()
++                le.setValidator(QRegularExpressionValidator(QRegularExpression(r"[-+]?\d{0,19}")))
++                le.setPlaceholderText("64-bit integer / safe ArcGIS value")
++                self._field_widgets[fname_lower] = le
++                label = fname
++                if not nullable:
++                    label += " *"
++                self._fields_layout.addRow(label, le)
++            elif esri_type in ("esriFieldTypeDate", "esriFieldTypeDateOnly",
++                               "esriFieldTypeTimeOnly", "esriFieldTypeTimestampOffset"):
+                 le = QLineEdit()
+-                le.setPlaceholderText("YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
++                if esri_type == "esriFieldTypeDateOnly":
++                    le.setPlaceholderText("YYYY-MM-DD")
++                elif esri_type == "esriFieldTypeTimeOnly":
++                    le.setPlaceholderText("HH:MM:SS")
++                elif esri_type == "esriFieldTypeTimestampOffset":
++                    le.setPlaceholderText("YYYY-MM-DD HH:MM:SS+05:30")
++                else:
++                    le.setPlaceholderText("YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+                 self._field_widgets[fname_lower] = le
+                 label = fname
+                 if not nullable:
+@@ -402,6 +432,22 @@
+                     label += " *"
+                 self._fields_layout.addRow(label, le)
+ 
++        # Pre-fill layer-level schema defaults from the GDB XML.
++        try:
++            defaults = self.engine.get_field_defaults(layer_name)
++        except Exception:
++            defaults = {}
++        for fname_lower, default_value in defaults.items():
++            w = self._field_widgets.get(fname_lower)
++            if isinstance(w, QLineEdit) and not w.text():
++                w.setText(str(default_value))
++            elif isinstance(w, QComboBox):
++                idx = w.findData(default_value)
++                if idx < 0:
++                    idx = w.findData(str(default_value))
++                if idx >= 0:
++                    w.setCurrentIndex(idx)
++
+     # ── Geometry mode ────────────────────────────────────────────────
+ 
+     def _on_mode_changed(self, checked):
+@@ -436,6 +482,20 @@
+             if fname_lower not in attributes and fname_lower in nn_defaults:
+                 attributes[fname_lower] = nn_defaults[fname_lower]
+ 
++        missing = []
++        for fname_lower in self.engine.get_non_nullable_fields(layer_name):
++            if fname_lower in attributes:
++                continue
++            w = self._field_widgets.get(fname_lower)
++            if isinstance(w, QComboBox) and w.currentData() is not None:
++                continue
++            missing.append(fname_lower)
++        if missing:
++            QMessageBox.warning(
++                self, "Create",
++                "Fill required non-nullable field(s): " + ", ".join(sorted(missing)))
++            return
++
+         # Collect geometry
+         geom_type_name = self.cmb_geom_type.currentText()
+         geom_type_map = {
+diff -ruN a/gui/gis/gdb/import_panel.py b/gui/gis/gdb/import_panel.py
+--- a/gui/gis/gdb/import_panel.py	2026-06-26 06:58:31.959354079 +0000
++++ b/gui/gis/gdb/import_panel.py	2026-06-26 06:58:31.959676173 +0000
+@@ -478,6 +478,11 @@
+             start = state["gdb_path"] or str(Path.home())
+             d = QFileDialog.getExistingDirectory(
+                 app, "Open ESRI File Geodatabase folder", start)
++            if not d:
++                f, _ = QFileDialog.getOpenFileName(
++                    app, "Open zipped File Geodatabase", start,
++                    "File Geodatabase ZIP (*.gdb.zip);;GDB table (*.gdbtable);;All files (*)")
++                d = f
+             if d:
+                 _set_gdb_path(d)
+ 
+diff -ruN a/gui/gis/gdb/reader.py b/gui/gis/gdb/reader.py
+--- a/gui/gis/gdb/reader.py	2026-06-26 06:58:31.953774529 +0000
++++ b/gui/gis/gdb/reader.py	2026-06-26 06:58:31.954280188 +0000
+@@ -37,40 +37,59 @@
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def _is_gdb_folder(path: str) -> bool:
+-    """True if `path` is a directory that looks like a File Geodatabase.
++    """True if `path` is a directory that looks like an Esri FileGDB.
+ 
+-    A GDB folder always contains a 'gdb' table file plus several
+-    'aXXXXXXX.gdbtable' files (the small `gdb` file is the signature).
++    Normal FileGDBs are folders ending in .gdb and containing the small
++    catalog file named ``gdb`` plus table files. Some export tools omit the
++    extension casing or produce incomplete-but-openable folders, so this check
++    is intentionally tolerant.
+     """
+     if not path:
+         return False
+     p = Path(path)
+     if not p.is_dir():
+         return False
+-    # A GDB must contain both a 'gdb' (the table index) and at least one
+-    # *.gdbtable file. We allow loose matching because some tools create
+-    # GDBs without the .gdbtable extension in odd ways.
+     try:
+         names = {e.name.lower() for e in p.iterdir()}
+     except OSError:
+         return False
+-    has_gdb = 'gdb' in names
+-    has_table = any(n.endswith('.gdbtable') for n in names) or has_gdb
+-    return has_gdb and has_table
++    has_gdb = "gdb" in names
++    has_table = any(n.endswith(".gdbtable") for n in names)
++    # Accept a real catalog signature, but do not require .gdbtable because
++    # damaged / partially-copied GDBs can still expose metadata through GDAL.
++    return has_gdb or (p.name.lower().endswith(".gdb") and has_table)
++
++
++def _is_zipped_gdb(path: str) -> bool:
++    return str(path or "").lower().endswith(".gdb.zip")
++
++
++def _is_direct_gdbtable(path: str) -> bool:
++    return str(path or "").lower().endswith(".gdbtable")
+ 
+ 
+ def _resolve_gdb_path(path: str) -> str | None:
+-    """Accept either a .gdb folder, a file inside a .gdb folder, or a directory
+-    whose only sub-folder is a .gdb. Returns the .gdb folder path, or None."""
++    """Resolve FileGDB inputs accepted by GDAL/ArcGIS-style workflows.
++
++    Accepts:
++      * a .gdb folder
++      * a .gdb.zip archive for read-only imports
++      * a single .gdbtable for diagnostics/read-only single-layer opening
++      * a file inside a .gdb folder
++      * a parent folder containing exactly one .gdb folder
++    """
+     if not path:
+         return None
+     p = Path(path)
+     if not p.exists():
+         return None
++
++    if p.is_file() and (_is_zipped_gdb(str(p)) or _is_direct_gdbtable(str(p))):
++        return str(p)
++
+     if p.is_dir():
+         if _is_gdb_folder(str(p)):
+             return str(p)
+-        # Maybe it's a parent directory containing exactly one .gdb folder
+         try:
+             subs = [c for c in p.iterdir() if c.is_dir() and _is_gdb_folder(str(c))]
+         except OSError:
+@@ -78,9 +97,9 @@
+         if len(subs) == 1:
+             return str(subs[0])
+         return None
+-    # It's a file: walk up looking for a .gdb ancestor
++
+     cur = p.parent
+-    for _ in range(6):
++    for _ in range(12):
+         if _is_gdb_folder(str(cur)):
+             return str(cur)
+         if cur.parent == cur:
+@@ -89,33 +108,81 @@
+     return None
+ 
+ 
++def _gdb_lock_files(gdb_path: str) -> list[str]:
++    """Return lock-file paths for diagnostics. Stale locks are not deleted."""
++    try:
++        p = Path(gdb_path)
++        if not p.is_dir():
++            return []
++        return sorted(str(x) for x in p.glob("*.lock"))
++    except Exception:
++        return []
++
++
++def _open_gdb_dataset(gdb_path: str, *, update: bool = False):
++    """Open a FileGDB with explicit vector flags and driver fallback.
++
++    ``ogr.Open`` usually works, but ``gdal.OpenEx`` lets us prefer the built-in
++    OpenFileGDB driver and still fall back to the Esri FileGDB SDK driver when
++    available. It also opens .gdb.zip archives, which OpenFileGDB documents as
++    supported for read-only use.
++    """
++    flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if update else gdal.OF_READONLY)
++    drivers = [d for d in ("OpenFileGDB", "FileGDB") if gdal.GetDriverByName(d)]
++    if not drivers:
++        drivers = None
++    try:
++        ds = gdal.OpenEx(gdb_path, flags, allowed_drivers=drivers)
++    except TypeError:
++        ds = gdal.OpenEx(gdb_path, flags)
++    if ds is not None:
++        return ds
++    # Last fallback for older GDAL Python bindings.
++    return ogr.Open(gdb_path, 1 if update else 0)
++
++
+ # ─────────────────────────────────────────────────────────────────────────────
+ #  OGR feature-class introspection
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def open_gdb_for_read(path: str):
+-    """Open a GDB in read mode. Returns an OGR DataSource or None."""
++    """Open a FileGDB in read mode. Returns a GDAL/OGR dataset or None."""
+     gdb = _resolve_gdb_path(path)
+     if gdb is None:
+-        log.error("open_gdb_for_read: not a GDB: %s", path)
++        log.error("open_gdb_for_read: not a supported FileGDB input: %s", path)
+         return None
+     try:
+-        return ogr.Open(gdb, 0)
++        ds = _open_gdb_dataset(gdb, update=False)
++        if ds is None:
++            log.error("open_gdb_for_read: GDAL could not open %s", gdb)
++        return ds
+     except Exception as exc:
+-        log.error("open_gdb_for_read: ogr.Open failed: %s", exc)
++        log.error("open_gdb_for_read: open failed for %s: %s", gdb, exc)
+         return None
+ 
+ 
+ def open_gdb_for_update(path: str):
+-    """Open a GDB in update mode (needed for create/update/delete features)."""
++    """Open a FileGDB in update mode for create/update/delete features."""
+     gdb = _resolve_gdb_path(path)
+     if gdb is None:
+-        log.error("open_gdb_for_update: not a GDB: %s", path)
++        log.error("open_gdb_for_update: not a supported FileGDB input: %s", path)
++        return None
++    if _is_zipped_gdb(gdb) or _is_direct_gdbtable(gdb):
++        log.error("open_gdb_for_update: %s is read-only in this app", gdb)
+         return None
+     try:
+-        return ogr.Open(gdb, 1)
++        ds = _open_gdb_dataset(gdb, update=True)
++        if ds is None:
++            locks = _gdb_lock_files(gdb)
++            if locks:
++                log.error(
++                    "open_gdb_for_update: GDAL could not acquire update access. "
++                    "Lock files exist in the GDB folder: %s", locks[:5])
++            else:
++                log.error("open_gdb_for_update: GDAL could not open %s for update", gdb)
++        return ds
+     except Exception as exc:
+-        log.error("open_gdb_for_update: ogr.Open(update=1) failed: %s", exc)
++        log.error("open_gdb_for_update: open failed for %s: %s", gdb, exc)
+         return None
+ 
+ 
+@@ -284,104 +351,147 @@
+     return "unknown"
+ 
+ 
+-# ─────────────────────────────────────────────────────────────────────────────
+-#  Coordinate extraction
+-# ─────────────────────────────────────────────────────────────────────────────
+-
+-def _iter_xyz(geom) -> tuple:
+-    """Yield (x, y, z) for every vertex of an OGR geometry.
++def _flat_geom_type(geom) -> int:
++    try:
++        return ogr.GT_Flatten(geom.GetGeometryType())
++    except Exception:
++        try:
++            return geom.GetGeometryType() & ~(_WKB_M_BIT_OLD | _WKB_M_BIT_ISO | _WKB_Z_BIT)
++        except Exception:
++            return ogr.wkbUnknown
+ 
+-    Z defaults to 0.0 when the geometry is 2D. Measured (M) values
+-    are intentionally dropped — we only want 3D positions for VTK.
+ 
+-    Robust against ISO 19107 supertypes (MultiSurface, MultiCurve) where
+-    direct calls to GetPointCount() / GetX() can fail with
+-    "Incompatible geometry for operation" — in that case we recurse into
+-    sub-geometries instead.
+-    """
+-    if geom is None or geom.IsEmpty():
+-        return
++def _geom_type_name(geom) -> str:
+     try:
+-        gtype = geom.GetGeometryType()
++        return (ogr.GeometryTypeToName(geom.GetGeometryType()) or "").lower()
+     except Exception:
+-        return
++        return ""
++
++
++def _linearized_geom(geom):
++    """Return a display-safe linear geometry for ArcGIS curve types."""
++    if geom is None:
++        return None
++    name = _geom_type_name(geom)
++    if "curve" not in name and "circular" not in name:
++        return geom
+     try:
+-        flat = ogr.GT_Flatten(gtype)
++        linear = geom.GetLinearGeometry()
++        return linear if linear is not None else geom
+     except Exception:
+-        flat = gtype & 0xFFFFFFFC
+-    name = (ogr.GeometryTypeToName(gtype) or "").lower()
++        return geom
+ 
+-    # 1) Point — single vertex, handled directly.
+-    if flat == ogr.wkbPoint:
++
++def _point_list_from_geom(geom) -> list[tuple[float, float, float]]:
++    """Read direct vertices from Point/LineString/LinearRing/Triangle-like geometry."""
++    geom = _linearized_geom(geom)
++    pts = []
++    if geom is None or geom.IsEmpty():
++        return pts
++    try:
++        n = geom.GetPointCount()
++    except Exception:
++        n = 0
++    for i in range(n):
+         try:
+-            x, y, z = geom.GetX(0), geom.GetY(0), geom.GetZ(0)
+-            yield (x, y, z if z == z else 0.0)
++            x, y, z = geom.GetX(i), geom.GetY(i), geom.GetZ(i)
+         except Exception:
+             try:
+-                yield (geom.GetX(0), geom.GetY(0), 0.0)
++                x, y, z = geom.GetX(i), geom.GetY(i), 0.0
+             except Exception:
+-                pass
+-        return
++                continue
++        pts.append((float(x), float(y), float(z) if z == z else 0.0))
++    return pts
+ 
+-    # 2) Container geometries — recurse into sub-geometries first. This is
+-    #    the only safe path for Polygon, MultiPolygon, MultiSurface, etc.,
+-    #    because GetPointCount() on a Polygon returns 0 (it has no points
+-    #    of its own — its RINGS do), and on a Multi Surface it raises.
+-    container_types = (
+-        ogr.wkbPolygon, ogr.wkbMultiPolygon,
+-        ogr.wkbMultiPoint, ogr.wkbGeometryCollection,
+-        ogr.wkbCurvePolygon, ogr.wkbCompoundCurve,
+-    )
+-    is_container = (
+-        flat in container_types
+-        or "polygon" in name or "surface" in name
+-        or "geometrycollection" in name or "compoundcurve" in name
+-    )
+-    if is_container:
++
++def _iter_line_parts(geom) -> list[list[tuple[float, float, float]]]:
++    """Return independent line parts without connecting multipart features."""
++    if geom is None or geom.IsEmpty():
++        return []
++    geom = _linearized_geom(geom)
++    flat = _flat_geom_type(geom)
++    name = _geom_type_name(geom)
++
++    line_types = {
++        ogr.wkbLineString, getattr(ogr, "wkbLinearRing", -1),
++        getattr(ogr, "wkbCircularString", -1), getattr(ogr, "wkbCompoundCurve", -1),
++    }
++    if flat in line_types or ("line" in name and "multi" not in name) or "curve" in name:
++        pts = _sanitize_ring_points(_point_list_from_geom(geom))
++        return [pts] if len(pts) >= 2 else []
++
++    if (flat in (ogr.wkbMultiLineString, ogr.wkbGeometryCollection)
++            or "multicurve" in name or "multiline" in name):
++        parts = []
+         try:
+             n_sub = geom.GetGeometryCount()
+         except Exception:
+             n_sub = 0
+         for i in range(n_sub):
+             sub = geom.GetGeometryRef(i)
+-            if sub is None:
+-                continue
+-            for v in _iter_xyz(sub):
+-                yield v
++            if sub is not None:
++                parts.extend(_iter_line_parts(sub))
++        return parts
++
++    pts = _sanitize_ring_points(list(_iter_xyz(geom)))
++    return [pts] if len(pts) >= 2 else []
++
++
++def _has_real_vertex_z(geom, tolerance: float = 1e-4) -> bool:
++    vals = [z for _x, _y, z in _iter_xyz(geom)
++            if z is not None and z == z and -1000000.0 <= z <= 1000000.0]
++    if not vals:
++        return False
++    return (max(vals) - min(vals)) > tolerance or any(abs(z) > tolerance for z in vals)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++#  Coordinate extraction
++# ─────────────────────────────────────────────────────────────────────────────
++
++def _iter_xyz(geom) -> tuple:
++    """Yield (x, y, z) for every vertex of an OGR geometry.
++
++    Handles normal OGR types plus ArcGIS curve/multi-surface/multipatch
++    geometries exposed through GDAL as GeometryCollection, TIN, Triangle,
++    PolyhedralSurface, MultiSurface, and related 25D/M variants. M values are
++    ignored because VTK needs display coordinates only.
++    """
++    if geom is None or geom.IsEmpty():
+         return
++    geom = _linearized_geom(geom)
++    flat = _flat_geom_type(geom)
++    name = _geom_type_name(geom)
+ 
+-    # 3) Curve-like geometries (LineString, LinearRing, MultiLineString)
+-    #    — iterate points directly.
+-    try:
+-        n = geom.GetPointCount()
+-        for i in range(n):
+-            try:
+-                x, y, z = geom.GetX(i), geom.GetY(i), geom.GetZ(i)
+-                yield (x, y, z if z == z else 0.0)
+-            except Exception:
+-                try:
+-                    yield (geom.GetX(i), geom.GetY(i), 0.0)
+-                except Exception:
+-                    pass
+-        # Only short-circuit multi-part curves when the parent geometry
+-        # actually exposed points directly. Some FileGDB measured multi-line
+-        # types report zero parent points and require recursion into children.
+-        if "multi" in name and n > 0:
++    if flat == ogr.wkbPoint:
++        for pt in _point_list_from_geom(geom):
++            yield pt
++        return
++
++    container_types = {
++        ogr.wkbPolygon, ogr.wkbMultiPolygon, ogr.wkbMultiPoint,
++        ogr.wkbMultiLineString, ogr.wkbGeometryCollection,
++        getattr(ogr, "wkbCurvePolygon", -1), getattr(ogr, "wkbCompoundCurve", -1),
++        getattr(ogr, "wkbMultiCurve", -1), getattr(ogr, "wkbMultiSurface", -1),
++        getattr(ogr, "wkbPolyhedralSurface", -1), getattr(ogr, "wkbTIN", -1),
++    }
++    if (flat in container_types or "polygon" in name or "surface" in name
++            or "geometrycollection" in name or "tin" in name
++            or "multicurve" in name or "multiline" in name):
++        try:
++            n_sub = geom.GetGeometryCount()
++        except Exception:
++            n_sub = 0
++        if n_sub > 0:
++            for i in range(n_sub):
++                sub = geom.GetGeometryRef(i)
++                if sub is not None:
++                    for v in _iter_xyz(sub):
++                        yield v
+             return
+-    except Exception:
+-        pass
+ 
+-    # 4) Last resort: recurse into sub-geometries.
+-    try:
+-        n_sub = geom.GetGeometryCount()
+-    except Exception:
+-        return
+-    for i in range(n_sub):
+-        sub = geom.GetGeometryRef(i)
+-        if sub is None:
+-            continue
+-        for v in _iter_xyz(sub):
+-            yield v
++    for pt in _point_list_from_geom(geom):
++        yield pt
+ 
+ 
+ def _iter_rings(geom) -> list:
+@@ -465,28 +575,43 @@
+ 
+ 
+ def _iter_polygon_parts(geom) -> list:
+-    """Return polygon parts as [[outer_ring, hole1, hole2], ...]."""
++    """Return polygon parts as [[outer_ring, hole1, hole2], ...].
++
++    The important ArcGIS case is Multipatch: GDAL can expose it as a
++    GeometryCollection containing TIN/Triangle/PolyhedralSurface pieces mixed
++    with MultiPolygon pieces. Treat triangles as one-ring polygon parts so they
++    render instead of silently disappearing.
++    """
+     if geom is None or geom.IsEmpty():
+         return []
+ 
+-    try:
+-        raw_type = geom.GetGeometryType()
+-    except Exception:
+-        return []
+-    try:
+-        gtype = ogr.GT_Flatten(raw_type)
+-    except Exception:
+-        gtype = raw_type & 0xFFFFFFFC
+-    name = (ogr.GeometryTypeToName(raw_type) or "").lower()
+-
+-    polygon_types = {
+-        ogr.wkbPolygon,
+-        getattr(ogr, "wkbCurvePolygon", -1),
++    geom = _linearized_geom(geom)
++    gtype = _flat_geom_type(geom)
++    name = _geom_type_name(geom)
++
++    polygon_types = {ogr.wkbPolygon, getattr(ogr, "wkbCurvePolygon", -1)}
++    triangle_types = {getattr(ogr, "wkbTriangle", -1)}
++    collection_types = {
++        ogr.wkbMultiPolygon, ogr.wkbGeometryCollection,
++        getattr(ogr, "wkbMultiSurface", -1),
++        getattr(ogr, "wkbPolyhedralSurface", -1),
++        getattr(ogr, "wkbTIN", -1),
+     }
+ 
++    if gtype in triangle_types or "triangle" in name:
++        ring = _sanitize_ring_points(_point_list_from_geom(geom))
++        return [[ring]] if len(ring) >= 3 else []
++
+     if gtype in polygon_types:
+         part = []
+-        for ring_idx in range(geom.GetGeometryCount()):
++        try:
++            n_rings = geom.GetGeometryCount()
++        except Exception:
++            n_rings = 0
++        if n_rings == 0:
++            ring = _sanitize_ring_points(_point_list_from_geom(geom))
++            return [[ring]] if len(ring) >= 3 else []
++        for ring_idx in range(n_rings):
+             ring = geom.GetGeometryRef(ring_idx)
+             if ring is None:
+                 continue
+@@ -495,13 +620,17 @@
+                 part.append(pts)
+         return [part] if part else []
+ 
+-    if gtype == ogr.wkbMultiPolygon or "surface" in name or gtype == ogr.wkbGeometryCollection:
++    if (gtype in collection_types or "surface" in name or "tin" in name
++            or gtype == ogr.wkbGeometryCollection):
+         parts = []
+-        for i in range(geom.GetGeometryCount()):
++        try:
++            n_sub = geom.GetGeometryCount()
++        except Exception:
++            n_sub = 0
++        for i in range(n_sub):
+             sub = geom.GetGeometryRef(i)
+-            if sub is None:
+-                continue
+-            parts.extend(_iter_polygon_parts(sub))
++            if sub is not None:
++                parts.extend(_iter_polygon_parts(sub))
+         return parts
+ 
+     return []
+@@ -598,28 +727,26 @@
+ 
+ 
+ def _build_line_polydata(geoms: list, scene_z: float) -> tuple:
+-    """Build a vtkPolyData containing one polyline per input geometry."""
++    """Build a vtkPolyData containing one polyline per independent line part."""
+     import vtk
+     pts = vtk.vtkPoints()
+     lines = vtk.vtkCellArray()
+     for g in geoms:
+         if g is None or g.IsEmpty():
+             continue
+-        # Collect all (x, y, z) for this geometry
+-        ring_pts = list(_iter_xyz(g))
+-        if len(ring_pts) < 2:
+-            continue
+-            
++        use_vertex_z = _has_real_vertex_z(g)
+         flat_z = _determine_feature_flat_z(g, scene_z)
+-        
+-        start = pts.GetNumberOfPoints()
+-        for x, y, z in ring_pts:
+-            pts.InsertNextPoint(x, y, flat_z)
+-        line = vtk.vtkPolyLine()
+-        line.GetPointIds().SetNumberOfIds(len(ring_pts))
+-        for i in range(len(ring_pts)):
+-            line.GetPointIds().SetId(i, start + i)
+-        lines.InsertNextCell(line)
++        for ring_pts in _iter_line_parts(g):
++            if len(ring_pts) < 2:
++                continue
++            start = pts.GetNumberOfPoints()
++            for x, y, z in ring_pts:
++                pts.InsertNextPoint(x, y, _clean_z(z, flat_z) if use_vertex_z else flat_z)
++            line = vtk.vtkPolyLine()
++            line.GetPointIds().SetNumberOfIds(len(ring_pts))
++            for i in range(len(ring_pts)):
++                line.GetPointIds().SetId(i, start + i)
++            lines.InsertNextCell(line)
+ 
+     if pts.GetNumberOfPoints() == 0:
+         return None
+@@ -630,7 +757,7 @@
+     return pd
+ 
+ 
+-def _triangulate_polygon_part(rings: list, flat_z: float):
++def _triangulate_polygon_part(rings: list, flat_z: float, use_vertex_z: bool = False):
+     """Triangulate one polygon part (outer ring + holes) into fill triangles."""
+     import vtk
+ 
+@@ -649,8 +776,8 @@
+         polyline = vtk.vtkPolyLine()
+         polyline.GetPointIds().SetNumberOfIds(len(ring) + 1)
+         start = contour_pts.GetNumberOfPoints()
+-        for i, (x, y, _z) in enumerate(ring):
+-            pid = contour_pts.InsertNextPoint(x, y, flat_z)
++        for i, (x, y, z) in enumerate(ring):
++            pid = contour_pts.InsertNextPoint(x, y, _clean_z(z, flat_z) if use_vertex_z else flat_z)
+             polyline.GetPointIds().SetId(i, pid)
+         polyline.GetPointIds().SetId(len(ring), start)
+         contour_lines.InsertNextCell(polyline)
+@@ -680,8 +807,8 @@
+     polys = vtk.vtkCellArray()
+     poly = vtk.vtkPolygon()
+     poly.GetPointIds().SetNumberOfIds(len(valid_rings[0]))
+-    for i, (x, y, _z) in enumerate(valid_rings[0]):
+-        pid = pts.InsertNextPoint(x, y, flat_z)
++    for i, (x, y, z) in enumerate(valid_rings[0]):
++        pid = pts.InsertNextPoint(x, y, _clean_z(z, flat_z) if use_vertex_z else flat_z)
+         poly.GetPointIds().SetId(i, pid)
+     polys.InsertNextCell(poly)
+ 
+@@ -713,12 +840,13 @@
+             continue
+ 
+         flat_z = _determine_feature_flat_z(g, scene_z)
++        use_vertex_z = _has_real_vertex_z(g)
+ 
+         polygon_parts = _iter_polygon_parts(g)
+         for part in polygon_parts:
+             if not part:
+                 continue
+-            fill_pd = _triangulate_polygon_part(part, flat_z)
++            fill_pd = _triangulate_polygon_part(part, flat_z, use_vertex_z=use_vertex_z)
+             if fill_pd is not None and fill_pd.GetNumberOfPolys() > 0:
+                 fill_append.AddInputData(fill_pd)
+                 fill_inputs += 1
+@@ -733,8 +861,8 @@
+                 polyline = vtk.vtkPolyLine()
+                 polyline.GetPointIds().SetNumberOfIds(len(ring) + 1)
+                 start = outline_pts.GetNumberOfPoints()
+-                for i, (x, y, _z) in enumerate(ring):
+-                    pid = outline_pts.InsertNextPoint(x, y, flat_z)
++                for i, (x, y, z) in enumerate(ring):
++                    pid = outline_pts.InsertNextPoint(x, y, _clean_z(z, flat_z) if use_vertex_z else flat_z)
+                     polyline.GetPointIds().SetId(i, pid)
+                 polyline.GetPointIds().SetId(len(ring), start)
+                 outline_lines.InsertNextCell(polyline)
+@@ -1177,37 +1305,97 @@
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def _to_ogr_geometry(coords, geom_type_hint: int = ogr.wkbUnknown):
+-    """Build an OGR geometry from a list of 3D points.
++    """Build an OGR geometry from user coordinates using the target type.
+ 
+-    For polygons: coords is a list of rings, each a list of (x, y, z).
+-    For lines/points: coords is a list of (x, y, z).
++    The old implementation inferred polygons from ``list[tuple]`` and therefore
++    broke LineString/Point creation from the UI. This version honours
++    ``geom_type_hint`` first and only falls back to polygon detection when the
++    hint is unknown.
+     """
+     if not coords:
+         return None
++
++    def as_point_tuple(pt):
++        if pt is None or len(pt) < 2:
++            return None
++        z = float(pt[2]) if len(pt) >= 3 else 0.0
++        return (float(pt[0]), float(pt[1]), z)
++
++    flat_hint = geom_type_hint
++    try:
++        flat_hint = ogr.GT_Flatten(geom_type_hint)
++    except Exception:
++        pass
++
++    # Normalise flat coordinate lists and polygon ring lists.
+     first = coords[0]
+-    if not isinstance(first, (list, tuple)):
+-        # Flat list of points
+-        if len(coords) < 2:
++    is_ring_list = (
++        isinstance(first, (list, tuple)) and first and
++        isinstance(first[0], (list, tuple))
++    )
++
++    if flat_hint == ogr.wkbPoint:
++        pts = coords[0] if is_ring_list else coords
++        pt = as_point_tuple(pts[0] if pts and isinstance(pts[0], (list, tuple)) else pts)
++        if pt is None:
+             return None
+-        line = ogr.Geometry(ogr.wkbLineString)
+-        for pt in coords:
+-            line.AddPoint_2D(float(pt[0]), float(pt[1]))
+-        return line
+-    # Polygon: list of rings
++        g = ogr.Geometry(ogr.wkbPoint)
++        g.AddPoint(pt[0], pt[1], pt[2])
++        return g
++
++    if flat_hint in (ogr.wkbLineString, getattr(ogr, "wkbCircularString", -999)):
++        points = coords[0] if is_ring_list else coords
++        if len(points) < 2:
++            return None
++        g = ogr.Geometry(ogr.wkbLineString)
++        for raw in points:
++            pt = as_point_tuple(raw)
++            if pt is not None:
++                g.AddPoint(pt[0], pt[1], pt[2])
++        return g if not g.IsEmpty() and g.GetPointCount() >= 2 else None
++
++    # Default/fallback: polygon. Accept either [pt, pt, pt] or [[ring], [hole]].
++    rings = coords if is_ring_list else [coords]
+     poly = ogr.Geometry(ogr.wkbPolygon)
+-    for ring in coords:
++    for ring in rings:
+         if not ring or len(ring) < 3:
+             continue
+         r = ogr.Geometry(ogr.wkbLinearRing)
+-        for pt in ring:
+-            r.AddPoint(float(pt[0]), float(pt[1]))
+-        r.CloseRings()
+-        poly.AddGeometry(r)
++        for raw in ring:
++            pt = as_point_tuple(raw)
++            if pt is not None:
++                r.AddPoint(pt[0], pt[1], pt[2])
++        if r.GetPointCount() >= 3:
++            r.CloseRings()
++            poly.AddGeometry(r)
+     if poly.IsEmpty():
+         return None
+     return poly
+ 
+ 
++def _coerce_attribute_value(value, esri_type: str = ""):
++    """Best-effort value conversion before OGR Feature.SetField()."""
++    if value is None:
++        return None
++    et = (esri_type or "").lower()
++    if isinstance(value, str):
++        value = value.strip()
++        if value == "":
++            return None
++    if et in {"esrifieldtypeinteger", "esrifieldtypesmallinteger",
++              "esrifieldtypeoid", "esrifieldtypebiginteger"}:
++        try:
++            return int(float(value))
++        except Exception:
++            return value
++    if et in {"esrifieldtypedouble", "esrifieldtypesingle"}:
++        try:
++            return float(value)
++        except Exception:
++            return value
++    return value
++
++
+ def create_feature(gdb_path: str, layer_name: str, attributes: dict,
+                    coords, geom_type: int = ogr.wkbPolygon) -> int:
+     """Create a new feature in `layer_name`.
+@@ -1277,34 +1465,35 @@
+                 if eng else {}
+         except Exception:
+             nn_defaults = {}
++        try:
++            field_types = eng.get_field_types(layer_name) if eng else {}
++        except Exception:
++            field_types = {}
+ 
+-        # Set fields
++        attrs = attributes or {}
++        attrs_lower = {str(k).lower(): v for k, v in attrs.items()}
++
++        # Set fields. The UI stores lower-case names, while OGR definitions keep
++        # original casing, so always resolve both.
+         for i in range(defn.GetFieldCount()):
+             fdefn = defn.GetFieldDefn(i)
+             fname = fdefn.GetName()
+-            if fname.lower() in ('shape', 'objectid', 'globalid', 'fid', 'oid'):
++            fname_lower = fname.lower()
++            if fname_lower in ('shape', 'objectid', 'globalid', 'fid', 'oid'):
+                 continue
+-            if fname in attributes and attributes[fname] is not None:
+-                try:
+-                    feat.SetField(fname, attributes[fname])
+-                except Exception as exc:
+-                    log.debug("SetField(%s) failed: %s", fname, exc)
+-            elif fname.lower() in nn_defaults:
+-                try:
+-                    feat.SetField(fname, nn_defaults[fname.lower()])
+-                except Exception:
+-                    pass
+-            else:
+-                # Check nullable — OGR's CreateFeature will fail on non-null + None
+-                try:
+-                    nullable = bool(fdefn.IsNullable())
+-                except Exception:
+-                    nullable = True
+-                if not nullable and fname.lower() in nn_defaults:
+-                    try:
+-                        feat.SetField(fname, nn_defaults[fname.lower()])
+-                    except Exception:
+-                        pass
++
++            value = attrs.get(fname, attrs_lower.get(fname_lower, None))
++            if value is None and fname_lower in nn_defaults:
++                value = nn_defaults[fname_lower]
++            if value is None:
++                continue
++
++            try:
++                value = _coerce_attribute_value(value, field_types.get(fname_lower, ''))
++                if value is not None:
++                    feat.SetField(fname, value)
++            except Exception as exc:
++                log.debug("SetField(%s=%r) failed: %s", fname, value, exc)
+ 
+         result = lyr.CreateFeature(feat)
+         if result != ogr.OGRERR_NONE:

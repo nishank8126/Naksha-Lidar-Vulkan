@@ -1,0 +1,66 @@
+============================== OLD BLOCK ==============================
+        self._shutdown_in_progress = True
+        print("🧹 Main window closing - cleaning up child dialogs")
+        try:
+            self._shutdown_canvas_cursor_system()
+        except Exception:
+            pass
+
+========================= NEW / REPLACE BLOCK =========================
+        self._shutdown_in_progress = True
+        print("🧹 Main window closing - cleaning up child dialogs")
+
+        # Classifiers cooperatively mutate the shared class array in QThreads.
+        # Join them before deleting dialogs, point data, or VTK resources.
+        classification_workers = list(
+            getattr(self, "_lidar_classification_workers", [])
+        )
+        for worker in classification_workers:
+            try:
+                if worker is not None and worker.isRunning():
+                    worker.abort()
+            except Exception:
+                pass
+        unfinished_classifiers = []
+        for worker in classification_workers:
+            try:
+                if (
+                    worker is not None
+                    and worker.isRunning()
+                    and not worker.wait(15000)
+                ):
+                    unfinished_classifiers.append(worker)
+            except Exception:
+                unfinished_classifiers.append(worker)
+        if unfinished_classifiers:
+            self._shutdown_in_progress = False
+            event.ignore()
+            QMessageBox.warning(
+                self,
+                "Classification Still Cancelling",
+                "A LiDAR classification is still reaching a safe stop point. "
+                "The application has not closed. Please try again shortly.",
+            )
+            return
+        active_classification_dialog = getattr(
+            self,
+            "_lidar_classification_active_dialog",
+            None,
+        )
+        if active_classification_dialog is not None:
+            try:
+                active_classification_dialog._rollback_classification_snapshot(
+                    getattr(
+                        active_classification_dialog,
+                        "_active_old_cls",
+                        None,
+                    )
+                )
+                active_classification_dialog._active_old_cls = None
+            except Exception:
+                pass
+
+        try:
+            self._shutdown_canvas_cursor_system()
+        except Exception:
+            pass

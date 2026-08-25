@@ -1,0 +1,177 @@
+TARGET FILE: gui/snt_attachment.py
+
+REPLACEMENT 1 — import section
+
+OLD BLOCK
+```python
+import math
+import mmap
+import os
+import struct
+```
+
+NEW BLOCK
+```python
+import math
+import mmap
+import os
+import re
+import struct
+```
+
+REPLACEMENT 2 — immediately before _parse_snt_adjacent_prj_blocks()
+
+OLD BLOCK
+```python
+def _parse_snt_adjacent_prj_blocks(snt_filename: str) -> List[Dict[str, object]]:
+```
+
+NEW BLOCK
+```python
+def _normalized_delivery_project_stem(filename: str) -> str:
+    """Return a conservative project identity for classified SNT copies."""
+    stem = Path(str(filename)).stem.strip()
+    return re.sub(
+        r"(?:[ _-]+class(?:ification)?(?:[ _-]*\d+)?)$",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    ).strip(" _-").casefold()
+
+
+def _parse_snt_adjacent_prj_blocks(snt_filename: str) -> List[Dict[str, object]]:
+```
+
+REPLACEMENT 3 — adjacent PRJ fallback inside _parse_snt_adjacent_prj_blocks()
+
+OLD BLOCK
+```python
+            if len(adjacent_prjs) == 1:
+                fallback_prj = adjacent_prjs[0]
+                prj_candidates.extend(
+                    [fallback_prj, Path(f"{fallback_prj}.bak")]
+                )
+                print(
+                    f"[SNT block polygons] Using sole adjacent PRJ "
+                    f"'{fallback_prj.name}' for SNT '{snt_path.name}'"
+                )
+            elif len(adjacent_prjs) > 1:
+                print(
+                    f"[SNT block polygons] No same-name PRJ for "
+                    f"'{snt_path.name}'; {len(adjacent_prjs)} adjacent PRJs "
+                    "are ambiguous"
+                )
+```
+
+NEW BLOCK
+```python
+            matching_prjs = [
+                path for path in adjacent_prjs
+                if _normalized_delivery_project_stem(path.name)
+                == _normalized_delivery_project_stem(snt_path.name)
+            ]
+            fallback_prj = None
+            if len(matching_prjs) == 1:
+                fallback_prj = matching_prjs[0]
+                print(
+                    f"[SNT block polygons] Matched classified SNT "
+                    f"'{snt_path.name}' to PRJ '{fallback_prj.name}'"
+                )
+            elif len(adjacent_prjs) == 1:
+                fallback_prj = adjacent_prjs[0]
+
+            if fallback_prj is not None:
+                prj_candidates.extend(
+                    [fallback_prj, Path(f"{fallback_prj}.bak")]
+                )
+                print(
+                    f"[SNT block polygons] Using adjacent PRJ "
+                    f"'{fallback_prj.name}' for SNT '{snt_path.name}'"
+                )
+            elif len(adjacent_prjs) > 1:
+                print(
+                    f"[SNT block polygons] No same-name PRJ for "
+                    f"'{snt_path.name}'; {len(adjacent_prjs)} adjacent PRJs "
+                    "are ambiguous"
+                )
+```
+
+REPLACEMENT 4 — final stored-block print at the end of build_snt_block_polygons()
+
+OLD BLOCK
+```python
+    print(f"[SNT block polygons] stored {len(bl_polys)} block entries "
+          f"({sum(1 for b in app.snt_block_polygons[-len(bl_polys):] if b['grid_name'])} with grid_name)")
+```
+
+NEW BLOCK
+```python
+    # Classified/edited SNT exports may contain no grid polygons, or only a few
+    # incidental polygons that spatially match unrelated PRJ tiles. The PRJ is
+    # the authoritative complete grid/file index, so merge every distinct PRJ
+    # block instead of using it only when the SNT selection is completely empty.
+    if prj_blocks:
+        prj_names = {
+            str(block.get("label") or "").strip().casefold()
+            for block in prj_blocks
+            if str(block.get("label") or "").strip()
+        }
+        # Replace any approximate/incidental SNT entry carrying a PRJ label;
+        # the PRJ boundary and its direct source path are authoritative.
+        app.snt_block_polygons = [
+            entry for entry in app.snt_block_polygons
+            if not (
+                entry.get("snt_filename") == snt_filename
+                and str(entry.get("grid_name") or "").strip().casefold() in prj_names
+            )
+        ]
+        indexed_prj_names = set()
+        retained_prj_count = 0
+        for block in prj_blocks:
+            points_xy = _open_polygon_xy(block.get("points_2d") or [])
+            grid_name = str(block.get("label") or "").strip()
+            if len(points_xy) < 3 or not grid_name:
+                continue
+            normalized_grid_name = grid_name.casefold()
+            if normalized_grid_name in indexed_prj_names:
+                continue
+
+            block_file = str(block.get("block_file") or "").strip()
+            alt_names = []
+            if block_file:
+                block_file_stem = Path(block_file).stem
+                if block_file_stem and block_file_stem.casefold() != grid_name.casefold():
+                    alt_names.append(block_file_stem)
+
+            app.snt_block_polygons.append({
+                "points_2d": [(float(x), float(y)) for x, y in points_xy],
+                "grid_name": grid_name,
+                "block_file": block_file,
+                "alt_names": alt_names,
+                "file_path": (
+                    str(block.get("file_path"))
+                    if block.get("file_path")
+                    else None
+                ),
+                "source": "prj_authority",
+                "snt_filename": snt_filename,
+                "prj_path": block.get("prj_path"),
+                "poly_layer": "PRJ",
+            })
+            indexed_prj_names.add(normalized_grid_name)
+            retained_prj_count += 1
+
+        print(
+            f"[SNT block polygons] retained {retained_prj_count} distinct "
+            f"PRJ authority block(s) alongside {len(bl_polys)} SNT polygon(s)"
+        )
+
+    stored_for_owner = [
+        block for block in app.snt_block_polygons
+        if block.get("snt_filename") == snt_filename
+    ]
+    print(
+        f"[SNT block polygons] stored {len(stored_for_owner)} block entries "
+        f"({sum(1 for block in stored_for_owner if block.get('grid_name'))} with grid_name)"
+    )
+```

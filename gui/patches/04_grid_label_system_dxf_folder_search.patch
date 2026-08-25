@@ -1,0 +1,52 @@
+============================================================
+PATCH 4: grid_label_system.py - _find_las_folder_from_dxf()
+File: grid_label_system.py
+Function: _find_las_folder_from_dxf()
+Lines: ~2342-2355
+Purpose: Search ALL immediate subfolders for LAZ/LAS files
+============================================================
+
+--- OLD BLOCK (before) ---
+            # Check subfolders
+            for subfolder_name in ['lazz', 'LAZZ', 'laz', 'LAZ', 'las', 'LAS']:
+                subfolder = dxf_folder / subfolder_name
+                
+                if subfolder.exists() and subfolder.is_dir():
+                    las_files = list(subfolder.glob("*.laz")) + list(subfolder.glob("*.las"))
+                    
+                    if las_files:
+                        print(f"   ✅ FOUND {len(las_files)} files in '{subfolder_name}' subfolder")
+                        self.folder_cache[str(dxf_folder)] = subfolder
+                        self._save_folder_to_settings(subfolder)
+                        return subfolder
+        
+        return None
+
++++ NEW BLOCK (after) +++
+            # Check subfolders
+            for subfolder_name in ['lazz', 'LAZZ', 'laz', 'LAZ', 'las', 'LAS']:
+                subfolder = dxf_folder / subfolder_name
+                
+                if subfolder.exists() and subfolder.is_dir():
+                    las_files = list(subfolder.glob("*.laz")) + list(subfolder.glob("*.las"))
+                    
+                    if las_files:
+                        print(f"   ✅ FOUND {len(las_files)} files in '{subfolder_name}' subfolder")
+                        self.folder_cache[str(dxf_folder)] = subfolder
+                        self._save_folder_to_settings(subfolder)
+                        return subfolder
+
+            # Also check ALL immediate subfolders
+            try:
+                for entry in dxf_folder.iterdir():
+                    if entry.is_dir():
+                        las_files = list(entry.glob("*.laz")) + list(entry.glob("*.las"))
+                        if las_files:
+                            print(f"   ✅ FOUND {len(las_files)} files in '{entry.name}' subfolder")
+                            self.folder_cache[str(dxf_folder)] = entry
+                            self._save_folder_to_settings(entry)
+                            return entry
+            except Exception:
+                pass
+        
+        return None

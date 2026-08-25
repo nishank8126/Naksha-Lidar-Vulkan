@@ -1,0 +1,25 @@
+File: gui/curve_tools.py
+
+OLD BLOCK
+```python
+        if hasattr(self.app, 'set_cross_cursor_active'):
+            self.app.set_cross_cursor_active(False, "curve")
+
+        self._clear_preview()
+        print("⏸️ Curve Point tool SUSPENDED (in-progress curve preserved)")
+```
+
+REPLACE BLOCK
+```python
+        if hasattr(self.app, 'set_cross_cursor_active'):
+            self.app.set_cross_cursor_active(False, "curve")
+
+        # Preserve the frozen curve preview so the user can see the unfinished
+        # shape while temporarily using cross-section or another tool.
+        # Only remove the transient cursor-linked bits.
+        if self.dynamic_line_actor:
+            self._remove_prop_safe(self.dynamic_line_actor)
+            self.dynamic_line_actor = None
+        self._clear_snap_indicator()
+        print("⏸️ Curve Point tool SUSPENDED (in-progress curve preserved)")
+```

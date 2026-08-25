@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Path with vertices -->
+  <path d="M4 18L10 7L17 14L21 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.45"/>
+  <!-- Vertex handle squares -->
+  <rect x="2.5" y="16.5" width="3" height="3" rx="0.75" fill="currentColor" fill-opacity="0.9" stroke="currentColor" stroke-width="0.75"/>
+  <rect x="8.5" y="5.5" width="3" height="3" rx="0.75" fill="currentColor" fill-opacity="0.9" stroke="currentColor" stroke-width="0.75"/>
+  <rect x="15.5" y="12.5" width="3" height="3" rx="0.75" fill="currentColor" fill-opacity="0.9" stroke="currentColor" stroke-width="0.75"/>
+  <rect x="19.5" y="4.5" width="3" height="3" rx="0.75" fill="currentColor" fill-opacity="0.9" stroke="currentColor" stroke-width="0.75"/>
+</svg>

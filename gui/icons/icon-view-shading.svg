@@ -1,0 +1,56 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .vp-fill   { fill: #F8F8F8; }
+    .vp-line   { stroke: #CCCCCC; }
+    .sun-dot   { fill: #EF9F27; }
+    .sun-ray   { stroke: #EF9F27; }
+    .shadow    { fill: #2C2C2A; }
+
+    @media (prefers-color-scheme: dark) {
+      .vp-fill   { fill: #111318; }
+      .vp-line   { stroke: #2A2A35; }
+      .sun-dot   { fill: #FAC775; }
+      .sun-ray   { stroke: #FAC775; }
+      .shadow    { fill: #042C53; }
+    }
+  </style>
+  <defs>
+    <!-- Light mode sphere: white highlight → mid gray → dark shadow -->
+    <radialGradient id="sh-light" cx="35%" cy="30%" r="65%">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="25%"  stop-color="#D3D1C7"/>
+      <stop offset="60%"  stop-color="#888780"/>
+      <stop offset="85%"  stop-color="#444441"/>
+      <stop offset="100%" stop-color="#2C2C2A"/>
+    </radialGradient>
+    <!-- Dark mode sphere: white highlight → blue mid → deep navy shadow -->
+    <radialGradient id="sh-dark" cx="35%" cy="30%" r="65%">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="20%"  stop-color="#B5D4F4"/>
+      <stop offset="45%"  stop-color="#185FA5"/>
+      <stop offset="75%"  stop-color="#0C447C"/>
+      <stop offset="100%" stop-color="#042C53"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Viewport frame -->
+  <rect x="2" y="2" width="20" height="20" rx="2.5"
+        class="vp-fill vp-line" stroke-width="0.8"/>
+
+  <!-- Shaded sphere — light mode fill (dark mode uses CSS override via class) -->
+  <circle cx="12" cy="13" r="8" fill="url(#sh-light)"/>
+
+  <!-- Specular highlight — bright spot top-left -->
+  <circle cx="9" cy="9" r="1.8" fill="#FFFFFF" opacity="0.65"/>
+
+  <!-- Sun / light source dot — top-left corner -->
+  <circle cx="4" cy="4" r="1.2" class="sun-dot"/>
+
+  <!-- Light ray lines from sun toward sphere -->
+  <line x1="4"   y1="4"   x2="7.5" y2="7.5" class="sun-ray" stroke-width="0.7" stroke-linecap="round" opacity="0.6"/>
+  <line x1="5.5" y1="3"   x2="7"   y2="5"   class="sun-ray" stroke-width="0.6" stroke-linecap="round" opacity="0.4"/>
+  <line x1="3"   y1="5.5" x2="5"   y2="7"   class="sun-ray" stroke-width="0.6" stroke-linecap="round" opacity="0.4"/>
+
+  <!-- Drop shadow beneath sphere -->
+  <ellipse cx="13" cy="21.5" rx="5" ry="1.2" class="shadow" opacity="0.2"/>
+</svg>

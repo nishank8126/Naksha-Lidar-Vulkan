@@ -1,0 +1,30 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .vp-fill  { fill: #F8F8F8; }
+    .vp-line  { stroke: #CCCCCC; }
+    .r-circle { fill: #E24B4A; opacity: 0.75; }
+    .g-circle { fill: #639922; opacity: 0.75; }
+    .b-circle { fill: #185FA5; opacity: 0.75; }
+
+    @media (prefers-color-scheme: dark) {
+      .vp-fill  { fill: #111318; }
+      .vp-line  { stroke: #2A2A35; }
+      .r-circle { fill: #E24B4A; opacity: 0.85; }
+      .g-circle { fill: #639922; opacity: 0.85; }
+      .b-circle { fill: #378ADD; opacity: 0.85; }
+    }
+  </style>
+
+  <!-- Viewport frame -->
+  <rect x="2" y="2" width="20" height="20" rx="2.5"
+        class="vp-fill vp-line" stroke-width="0.8"/>
+
+  <!-- R — Red circle, top-left -->
+  <circle cx="9"  cy="10" r="5.5" class="r-circle"/>
+
+  <!-- G — Green circle, top-right -->
+  <circle cx="15" cy="10" r="5.5" class="g-circle"/>
+
+  <!-- B — Blue circle, bottom-center -->
+  <circle cx="12" cy="15" r="5.5" class="b-circle"/>
+</svg>

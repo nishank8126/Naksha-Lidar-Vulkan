@@ -1,0 +1,82 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .vp-fill  { fill: #F8F8F8; }
+    .vp-line  { stroke: #CCCCCC; }
+    /* LAS standard class colors — light mode */
+    .ground   { fill: #BA7517; }   /* class 2  — ground */
+    .low-veg  { fill: #97C459; }   /* class 3  — low vegetation */
+    .med-veg  { fill: #639922; }   /* class 4  — medium vegetation */
+    .high-veg { fill: #27500A; }   /* class 5  — high vegetation */
+    .building { fill: #D85A30; }   /* class 6  — building */
+    .water    { fill: #378ADD; }   /* class 9  — water */
+    .noise    { fill: #E24B4A; }   /* class 7  — noise */
+
+    @media (prefers-color-scheme: dark) {
+      .vp-fill  { fill: #111318; }
+      .vp-line  { stroke: #2A2A35; }
+      .ground   { fill: #EF9F27; }
+      .low-veg  { fill: #C0DD97; }
+      .med-veg  { fill: #639922; }
+      .high-veg { fill: #3B6D11; }
+      .building { fill: #F0997B; }
+      .water    { fill: #85B7EB; }
+      .noise    { fill: #F09595; }
+    }
+  </style>
+
+  <!-- Viewport frame -->
+  <rect x="2" y="2" width="20" height="20" rx="2.5"
+        class="vp-fill vp-line" stroke-width="0.8"/>
+
+  <!-- GROUND — bottom strip -->
+  <circle cx="4"    cy="19"   r="0.85" class="ground"/>
+  <circle cx="7"    cy="18.5" r="0.85" class="ground"/>
+  <circle cx="10.5" cy="19"   r="0.85" class="ground"/>
+  <circle cx="14"   cy="18.5" r="0.85" class="ground"/>
+  <circle cx="17.5" cy="19"   r="0.85" class="ground"/>
+
+  <!-- LOW VEGETATION — just above ground -->
+  <circle cx="4"    cy="16.5" r="0.85" class="low-veg"/>
+  <circle cx="7"    cy="16"   r="0.85" class="low-veg"/>
+  <circle cx="10.5" cy="16.5" r="0.85" class="low-veg"/>
+
+  <!-- MED VEGETATION -->
+  <circle cx="4"    cy="14"   r="0.85" class="med-veg"/>
+  <circle cx="7"    cy="13.5" r="0.85" class="med-veg"/>
+  <circle cx="10.5" cy="14"   r="0.85" class="med-veg"/>
+
+  <!-- HIGH VEGETATION — tallest left cluster -->
+  <circle cx="4"    cy="11"   r="0.85" class="high-veg"/>
+  <circle cx="6.5"  cy="10.5" r="0.85" class="high-veg"/>
+  <circle cx="9"    cy="11"   r="0.85" class="high-veg"/>
+  <circle cx="4"    cy="8.5"  r="0.85" class="high-veg"/>
+  <circle cx="7"    cy="8"    r="0.85" class="high-veg"/>
+
+  <!-- BUILDING — right cluster, vertical wall -->
+  <circle cx="15"   cy="16.5" r="0.85" class="building"/>
+  <circle cx="18"   cy="16"   r="0.85" class="building"/>
+  <circle cx="15"   cy="14"   r="0.85" class="building"/>
+  <circle cx="18"   cy="13.5" r="0.85" class="building"/>
+  <circle cx="15"   cy="11.5" r="0.85" class="building"/>
+  <circle cx="18"   cy="11"   r="0.85" class="building"/>
+  <circle cx="15"   cy="9"    r="0.85" class="building"/>
+  <circle cx="18"   cy="8.5"  r="0.85" class="building"/>
+
+  <!-- WATER — mid-left -->
+  <circle cx="5"    cy="6"    r="0.85" class="water"/>
+  <circle cx="8"    cy="5.5"  r="0.85" class="water"/>
+  <circle cx="11"   cy="6"    r="0.85" class="water"/>
+
+  <!-- NOISE — isolated outliers -->
+  <circle cx="13"   cy="4.5"  r="0.75" class="noise"/>
+  <circle cx="19"   cy="5"    r="0.75" class="noise"/>
+
+  <!-- Legend strip — one dot per class -->
+  <circle cx="3.5"  cy="21.5" r="0.7"  class="ground"/>
+  <circle cx="6"    cy="21.5" r="0.7"  class="low-veg"/>
+  <circle cx="8.5"  cy="21.5" r="0.7"  class="med-veg"/>
+  <circle cx="11"   cy="21.5" r="0.7"  class="high-veg"/>
+  <circle cx="13.5" cy="21.5" r="0.7"  class="building"/>
+  <circle cx="16"   cy="21.5" r="0.7"  class="water"/>
+  <circle cx="18.5" cy="21.5" r="0.7"  class="noise"/>
+</svg>

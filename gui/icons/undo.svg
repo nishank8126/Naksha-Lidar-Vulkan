@@ -1,0 +1,6 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Curved arc -->
+  <path d="M5.5 8C7 5.5 9.8 3.75 13 3.75C17.556 3.75 21.25 7.444 21.25 12C21.25 16.556 17.556 20.25 13 20.25C9.5 20.25 6.5 18.2 5.1 15.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <!-- Arrow head on the arc start (pointing left-down) -->
+  <path d="M2.75 8H5.5V5.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

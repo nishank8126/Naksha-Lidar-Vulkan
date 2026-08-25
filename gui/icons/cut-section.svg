@@ -1,0 +1,14 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Solid body (left half after cut) -->
+  <path d="M2.75 5.75H12V18.25H2.75C2.75 18.25 2.75 18.25 2.75 18.25C2.199 18.25 1.75 17.801 1.75 17.25V6.75C1.75 6.199 2.199 5.75 2.75 5.75Z" fill="currentColor" fill-opacity="0.1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Cut face hatch lines (showing material cross-section) -->
+  <line x1="12" y1="6.5" x2="8.5" y2="10" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" stroke-opacity="0.45"/>
+  <line x1="12" y1="9.5" x2="7" y2="14.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" stroke-opacity="0.45"/>
+  <line x1="12" y1="13" x2="8.5" y2="16.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" stroke-opacity="0.45"/>
+  <line x1="12" y1="16.5" x2="11" y2="17.5" stroke="currentColor" stroke-width="0.9" stroke-linecap="round" stroke-opacity="0.45"/>
+  <!-- Cut plane edge (right edge of left half) -->
+  <line x1="12" y1="5.75" x2="12" y2="18.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <!-- Arrow showing cut direction -->
+  <path d="M15 12H21.25" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M18.5 9L21.25 12L18.5 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

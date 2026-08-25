@@ -1,0 +1,313 @@
+TARGET FILE: gui\app_window.py
+
+================ OLD BLOCK ================
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+================ NEW / REPLACE BLOCK ================
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self._owns_middle_pan = False
+
+================ OLD BLOCK ================
+        event_type = event.type()
+
+        if event_type != QEvent.Wheel:
+            return False
+================ NEW / REPLACE BLOCK ================
+        event_type = event.type()
+
+        if event_type in (
+            QEvent.MouseButtonPress,
+            QEvent.MouseMove,
+            QEvent.MouseButtonRelease,
+        ):
+            if getattr(app, "_shutdown_in_progress", False):
+                return False
+            if getattr(app, "is_3d_mode", False):
+                return False
+            if getattr(app, "active_classify_tool", None) is not None:
+                return False
+
+            active = bool(getattr(app, "_qt_main_pan_active", False))
+            try:
+                middle_button = Qt.MiddleButton
+                if event_type == QEvent.MouseButtonPress:
+                    if event.button() != middle_button:
+                        return False
+                    handler = getattr(app, "_handle_fast_main_pan_press", None)
+                    handled = bool(
+                        handler(event.position(), obj.width(), obj.height())
+                    ) if callable(handler) else False
+                    if handled:
+                        self._owns_middle_pan = True
+                elif event_type == QEvent.MouseMove:
+                    if not active:
+                        return False
+                    middle_down = bool(event.buttons() & middle_button)
+                    handler = getattr(app, "_handle_fast_main_pan_move", None)
+                    handled = bool(
+                        handler(
+                            event.position(),
+                            obj.width(),
+                            obj.height(),
+                            middle_down=middle_down,
+                        )
+                    ) if callable(handler) else False
+                else:
+                    if event.button() != middle_button or not (
+                        active or self._owns_middle_pan
+                    ):
+                        return False
+                    if active:
+                        handler = getattr(app, "_handle_fast_main_pan_release", None)
+                        handled = bool(handler()) if callable(handler) else False
+                    else:
+                        handled = True
+                    self._owns_middle_pan = False
+            except Exception:
+                handled = False
+
+            if handled:
+                try:
+                    event.accept()
+                except Exception:
+                    pass
+                return True
+            return False
+
+        if event_type != QEvent.Wheel:
+            return False
+
+================ OLD BLOCK ================
+    def _handle_fast_main_wheel(self, wheel_delta, *, display_position=None):
+================ NEW / REPLACE BLOCK ================
+    def _main_pan_display_position(self, position, canvas_width, canvas_height):
+        vtk_widget = getattr(self, "vtk_widget", None)
+        render_window = (
+            vtk_widget.GetRenderWindow() if vtk_widget is not None else None
+        )
+        render_size = render_window.GetSize() if render_window is not None else None
+        if not render_size or render_size[0] <= 0 or render_size[1] <= 0:
+            return None
+
+        from gui.zoom_navigation import qt_position_to_vtk_display
+        return qt_position_to_vtk_display(
+            position.x(),
+            position.y(),
+            canvas_width,
+            canvas_height,
+            render_size[0],
+            render_size[1],
+        )
+
+    def _set_digitizer_qt_pan_guard(self, active):
+        digitizer = getattr(self, "digitizer", None)
+        if digitizer is None:
+            return
+
+        guarded = bool(active)
+        try:
+            digitizer._middle_button_down = guarded
+            digitizer.middle_down = guarded
+            digitizer._is_panning = guarded
+            digitizer._pan_start_pos = None
+            digitizer._last_pos = None
+            digitizer._blocked_fake_middle = False
+            digitizer._pan_press_monotonic = 0.0
+            digitizer._pan_button_miss_count = 0
+            if not guarded:
+                digitizer._move_vertex_pan_block_until = 0.0
+                digitizer._ignore_move_vertex_finish_until = 0.0
+        except Exception:
+            pass
+
+    def _handle_fast_main_pan_press(self, position, canvas_width, canvas_height):
+        if getattr(self, "_shutdown_in_progress", False):
+            return False
+        if getattr(self, "is_3d_mode", False):
+            return False
+        if getattr(self, "active_classify_tool", None) is not None:
+            return False
+
+        zoom_tool = getattr(self, "zoom_rectangle_tool", None)
+        if (
+            zoom_tool is not None
+            and getattr(zoom_tool, "active", False)
+            and getattr(zoom_tool, "start_pos", None) is not None
+        ):
+            return False
+
+        vtk_widget = getattr(self, "vtk_widget", None)
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        if camera is None:
+            return False
+
+        try:
+            display_position = self._main_pan_display_position(
+                position, canvas_width, canvas_height
+            )
+        except (TypeError, ValueError, AttributeError, RuntimeError):
+            return False
+        if display_position is None:
+            return False
+
+        self._cancel_smooth_zoom_for_pan()
+        self._qt_main_pan_last_display = tuple(display_position)
+        self._qt_main_pan_active = True
+        self._set_digitizer_qt_pan_guard(True)
+
+        try:
+            render_window = vtk_widget.GetRenderWindow()
+            if render_window is not None:
+                render_window.SetDesiredUpdateRate(30.0)
+        except Exception:
+            pass
+
+        manager = getattr(self, "gpu_render_manager", None)
+        self._qt_main_pan_manager_started = False
+        if manager is not None and hasattr(manager, "begin_pan_interaction"):
+            try:
+                point_count = len(self.data.get("xyz", ())) if self.data else 0
+            except Exception:
+                point_count = 0
+            try:
+                self._qt_main_pan_manager_started = bool(
+                    manager.begin_pan_interaction(point_count=point_count)
+                )
+            except Exception:
+                self._qt_main_pan_manager_started = False
+        return True
+
+    def _handle_fast_main_pan_move(
+        self,
+        position,
+        canvas_width,
+        canvas_height,
+        *,
+        middle_down=True,
+    ):
+        if not getattr(self, "_qt_main_pan_active", False):
+            return False
+        if not middle_down:
+            return self._handle_fast_main_pan_release()
+
+        vtk_widget = getattr(self, "vtk_widget", None)
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        if camera is None:
+            self._handle_fast_main_pan_release()
+            return True
+
+        try:
+            current_display = self._main_pan_display_position(
+                position, canvas_width, canvas_height
+            )
+            previous_display = getattr(self, "_qt_main_pan_last_display", None)
+            self._qt_main_pan_last_display = tuple(current_display)
+        except (TypeError, ValueError, AttributeError, RuntimeError):
+            return True
+
+        if previous_display is None or tuple(current_display) == tuple(previous_display):
+            return True
+
+        try:
+            world_previous = self._display_to_world_on_focal_plane(
+                renderer, previous_display[0], previous_display[1]
+            )
+            world_current = self._display_to_world_on_focal_plane(
+                renderer, current_display[0], current_display[1]
+            )
+            if world_previous is None or world_current is None:
+                return True
+
+            delta = tuple(
+                float(world_previous[index]) - float(world_current[index])
+                for index in range(3)
+            )
+            if not all(np.isfinite(value) for value in delta):
+                return True
+
+            camera_position = camera.GetPosition()
+            focal_point = camera.GetFocalPoint()
+            camera.SetPosition(
+                camera_position[0] + delta[0],
+                camera_position[1] + delta[1],
+                camera_position[2] + delta[2],
+            )
+            camera.SetFocalPoint(
+                focal_point[0] + delta[0],
+                focal_point[1] + delta[1],
+                focal_point[2] + delta[2],
+            )
+        except (RuntimeError, AttributeError, OSError, ReferenceError):
+            return True
+
+        manager = getattr(self, "gpu_render_manager", None)
+        if manager is not None and hasattr(manager, "request_render"):
+            try:
+                manager.request_render(vtk_widget)
+                return True
+            except Exception:
+                pass
+        try:
+            vtk_widget.render()
+        except Exception:
+            pass
+        return True
+
+    def _handle_fast_main_pan_release(self):
+        if not getattr(self, "_qt_main_pan_active", False):
+            return False
+
+        self._qt_main_pan_active = False
+        self._qt_main_pan_last_display = None
+        self._set_digitizer_qt_pan_guard(False)
+
+        vtk_widget = getattr(self, "vtk_widget", None)
+        renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
+        try:
+            if renderer is not None:
+                renderer.ResetCameraClippingRange()
+            render_window = vtk_widget.GetRenderWindow() if vtk_widget is not None else None
+            if render_window is not None:
+                render_window.SetDesiredUpdateRate(0.001)
+        except Exception:
+            pass
+
+        manager = getattr(self, "gpu_render_manager", None)
+        settled = False
+        if (
+            manager is not None
+            and getattr(self, "_qt_main_pan_manager_started", False)
+            and hasattr(manager, "finish_pan_interaction")
+        ):
+            try:
+                settled = bool(manager.finish_pan_interaction())
+            except Exception:
+                settled = False
+        self._qt_main_pan_manager_started = False
+        if not settled and vtk_widget is not None:
+            try:
+                vtk_widget.render()
+            except Exception:
+                pass
+
+        self._schedule_main_view_history_commit("pan_or_view_change", delay_ms=80)
+
+        digitizer = getattr(self, "digitizer", None)
+        if (
+            digitizer is not None
+            and getattr(digitizer, "temp_points", None)
+            and getattr(digitizer, "active_tool", None)
+            and hasattr(digitizer, "_deferred_preview_update")
+        ):
+            try:
+                QTimer.singleShot(0, digitizer._deferred_preview_update)
+            except Exception:
+                pass
+        return True
+
+    def _handle_fast_main_wheel(self, wheel_delta, *, display_position=None):

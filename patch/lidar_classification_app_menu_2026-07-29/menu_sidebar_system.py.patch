@@ -1,0 +1,133 @@
+============================== OLD BLOCK ==============================
+    def open_low_points_dialog(self):
+        try:
+            from gui.lidar_classification_tools import ClassifyLowPointsDialog
+        except ImportError:
+            from lidar_classification_tools import ClassifyLowPointsDialog
+        if self.low_points_dialog is None:
+            self.low_points_dialog = ClassifyLowPointsDialog(self.app, parent=self.app)
+            from PySide6.QtCore import Qt
+            self.low_points_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.low_points_dialog.destroyed.connect(lambda: setattr(self, "low_points_dialog", None))
+        self._show_or_raise_dialog(self.low_points_dialog, "ClassifyLowPointsDialog")
+
+    def open_isolated_dialog(self):
+        try:
+            from gui.lidar_classification_tools import ClassifyIsolatedPointsDialog
+        except ImportError:
+            from lidar_classification_tools import ClassifyIsolatedPointsDialog
+        if self.isolated_dialog is None:
+            self.isolated_dialog = ClassifyIsolatedPointsDialog(self.app, parent=self.app)
+            from PySide6.QtCore import Qt
+            self.isolated_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.isolated_dialog.destroyed.connect(lambda: setattr(self, "isolated_dialog", None))
+        self._show_or_raise_dialog(self.isolated_dialog, "ClassifyIsolatedPointsDialog")
+
+    def open_ground_dialog(self):
+        try:
+            from gui.lidar_classification_tools import ClassifyGroundDialog
+        except ImportError:
+            from lidar_classification_tools import ClassifyGroundDialog
+        if self.ground_dialog is None:
+            self.ground_dialog = ClassifyGroundDialog(self.app, parent=self.app)
+            from PySide6.QtCore import Qt
+            self.ground_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.ground_dialog.destroyed.connect(lambda: setattr(self, "ground_dialog", None))
+        self._show_or_raise_dialog(self.ground_dialog, "ClassifyGroundDialog")
+
+    def open_surface_points_dialog(self):
+        try:
+            from gui.lidar_classification_tools import ClassifySurfacePointsDialog
+        except ImportError:
+            from lidar_classification_tools import ClassifySurfacePointsDialog
+        if self.surface_points_dialog is None:
+            self.surface_points_dialog = ClassifySurfacePointsDialog(
+                self.app,
+                parent=self.app,
+            )
+            from PySide6.QtCore import Qt
+            self.surface_points_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.surface_points_dialog.destroyed.connect(
+                lambda: setattr(self, "surface_points_dialog", None)
+            )
+        self._show_or_raise_dialog(
+            self.surface_points_dialog,
+            "ClassifySurfacePointsDialog",
+        )
+
+    def open_below_surface_dialog(self):
+        try:
+            from gui.lidar_classification_tools import ClassifyBelowSurfaceDialog
+        except ImportError:
+            from lidar_classification_tools import ClassifyBelowSurfaceDialog
+        if self.below_surface_dialog is None:
+            self.below_surface_dialog = ClassifyBelowSurfaceDialog(self.app, parent=self.app)
+            from PySide6.QtCore import Qt
+            self.below_surface_dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self.below_surface_dialog.destroyed.connect(lambda: setattr(self, "below_surface_dialog", None))
+        self._show_or_raise_dialog(self.below_surface_dialog, "ClassifyBelowSurfaceDialog")
+
+========================= NEW / REPLACE BLOCK =========================
+    def _remember_classifier_dialog(self, attr, dialog):
+        """Track the app-owned canonical classifier without creating a copy."""
+        previous = getattr(self, attr, None)
+        setattr(self, attr, dialog)
+        if dialog is None or previous is dialog:
+            return
+        dialog.destroyed.connect(
+            lambda _obj=None, ref=dialog, name=attr: setattr(
+                self, name, None
+            )
+            if getattr(self, name, None) is ref
+            else None
+        )
+
+    def open_low_points_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_low_points
+        except ImportError:
+            from lidar_classification_tools import open_classify_low_points
+        self._remember_classifier_dialog(
+            "low_points_dialog",
+            open_classify_low_points(self.app),
+        )
+
+    def open_isolated_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_isolated_points
+        except ImportError:
+            from lidar_classification_tools import open_classify_isolated_points
+        self._remember_classifier_dialog(
+            "isolated_dialog",
+            open_classify_isolated_points(self.app),
+        )
+
+    def open_ground_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_ground
+        except ImportError:
+            from lidar_classification_tools import open_classify_ground
+        self._remember_classifier_dialog(
+            "ground_dialog",
+            open_classify_ground(self.app),
+        )
+
+    def open_surface_points_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_surface_points
+        except ImportError:
+            from lidar_classification_tools import open_classify_surface_points
+        self._remember_classifier_dialog(
+            "surface_points_dialog",
+            open_classify_surface_points(self.app),
+        )
+
+    def open_below_surface_dialog(self):
+        try:
+            from gui.lidar_classification_tools import open_classify_below_surface
+        except ImportError:
+            from lidar_classification_tools import open_classify_below_surface
+        self._remember_classifier_dialog(
+            "below_surface_dialog",
+            open_classify_below_surface(self.app),
+        )

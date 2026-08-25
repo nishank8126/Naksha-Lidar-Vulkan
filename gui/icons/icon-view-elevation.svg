@@ -1,0 +1,77 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .vp-fill { fill: #F8F8F8; }
+    .vp-line { stroke: #CCCCCC; }
+    /* Low elevation dots */
+    .e-low   { fill: #185FA5; }
+    /* Mid-low dots */
+    .e-mid1  { fill: #1D9E75; }
+    /* Mid dots */
+    .e-mid2  { fill: #639922; }
+    /* Mid-high dots */
+    .e-mid3  { fill: #EF9F27; }
+    /* High dots */
+    .e-high  { fill: #E24B4A; }
+    /* Peak dots */
+    .e-peak  { fill: #FFFFFF; }
+
+    @media (prefers-color-scheme: dark) {
+      .vp-fill { fill: #111318; }
+      .vp-line { stroke: #2A2A35; }
+      .e-low   { fill: #378ADD; }
+      .e-mid1  { fill: #5DCAA5; }
+      .e-mid2  { fill: #97C459; }
+      .e-mid3  { fill: #FAC775; }
+      .e-high  { fill: #F09595; }
+      .e-peak  { fill: #FFFFFF; }
+    }
+  </style>
+  <defs>
+    <!-- Vertical elevation ramp: bottom = blue (low), top = white (peak) -->
+    <linearGradient id="elev" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%"   stop-color="#185FA5"/>
+      <stop offset="30%"  stop-color="#1D9E75"/>
+      <stop offset="55%"  stop-color="#639922"/>
+      <stop offset="75%"  stop-color="#EF9F27"/>
+      <stop offset="90%"  stop-color="#E24B4A"/>
+      <stop offset="100%" stop-color="#FFFFFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Viewport frame -->
+  <rect x="2" y="2" width="20" height="20" rx="2.5"
+        class="vp-fill vp-line" stroke-width="0.8"/>
+
+  <!-- Point cloud — colored by vertical position (elevation) -->
+  <!-- Bottom row — blue (low elevation) -->
+  <circle cx="5"  cy="17" r="0.85" class="e-low"/>
+  <circle cx="9"  cy="16" r="0.85" class="e-low"/>
+  <circle cx="14" cy="17" r="0.85" class="e-low"/>
+  <circle cx="18" cy="16" r="0.85" class="e-low"/>
+
+  <!-- Mid-low row — teal -->
+  <circle cx="4"  cy="14" r="0.85" class="e-mid1"/>
+  <circle cx="8"  cy="13" r="0.85" class="e-mid1"/>
+  <circle cx="13" cy="14" r="0.85" class="e-mid1"/>
+  <circle cx="17" cy="13" r="0.85" class="e-mid1"/>
+
+  <!-- Mid row — amber -->
+  <circle cx="5"  cy="10" r="0.85" class="e-mid3"/>
+  <circle cx="9"  cy="9"  r="0.85" class="e-mid3"/>
+  <circle cx="14" cy="10" r="0.85" class="e-mid3"/>
+  <circle cx="18" cy="9"  r="0.85" class="e-mid3"/>
+
+  <!-- High row — red -->
+  <circle cx="4"  cy="7"  r="0.85" class="e-high"/>
+  <circle cx="8"  cy="6"  r="0.85" class="e-high"/>
+  <circle cx="13" cy="7"  r="0.85" class="e-high"/>
+
+  <!-- Peak row — white -->
+  <circle cx="6"  cy="4"  r="0.85" class="e-peak" opacity="0.95"/>
+  <circle cx="11" cy="3.5" r="0.85" class="e-peak" opacity="0.95"/>
+  <circle cx="16" cy="4"  r="0.85" class="e-peak" opacity="0.95"/>
+
+  <!-- Vertical elevation ramp bar — right edge -->
+  <rect x="20.5" y="3" width="1.5" height="18" rx="0.75"
+        fill="url(#elev)"/>
+</svg>

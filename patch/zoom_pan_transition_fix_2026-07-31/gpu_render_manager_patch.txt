@@ -1,0 +1,77 @@
+================ OLD BLOCK ================
+
+            # ✅ FIX: Track middle-mouse pan so renders are immediate during the gesture
+            id4 = interactor.AddObserver("MiddleButtonPressEvent", self._on_pan_start)
+            id5 = interactor.AddObserver("MiddleButtonReleaseEvent", self._on_pan_end)
+
+================ NEW / REPLACE BLOCK ================
+
+            # ✅ FIX: Track middle-mouse pan so renders are immediate during the gesture
+            # Run before Digitizer's priority-20 handlers. Digitizer may abort
+            # the VTK event because it performs manual camera panning; the
+            # render manager must still receive the matched press/release pair.
+            id4 = interactor.AddObserver(
+                "MiddleButtonPressEvent",
+                self._on_pan_start,
+                30.0,
+            )
+            id5 = interactor.AddObserver(
+                "MiddleButtonReleaseEvent",
+                self._on_pan_end,
+                30.0,
+            )
+
+================ OLD BLOCK ================
+
+    def _on_pan_start(self, obj, event):
+        """Middle mouse pressed — disable render throttle for smooth pan."""
+        self._pan_in_progress = True
+        # Engage coarse LOD proxy for the gesture (no-op if unavailable).
+        self._engage_lod()
+
+    def _on_pan_end(self, obj, event):
+        """Middle mouse released — restore normal render throttle and settle frame."""
+        self._pan_in_progress = False
+        # Guard: don't fire a final render if the app is tearing down
+        app = self.app
+        if app is None or getattr(app, "_shutdown_in_progress", False):
+            return
+        self._restore_full_detail()
+        self._execute_render()
+
+================ NEW / REPLACE BLOCK ================
+
+    def _on_pan_start(self, obj, event):
+        """Atomically transition any wheel animation into direct panning."""
+        try:
+            self._wheel_idle_timer.stop()
+        except Exception:
+            pass
+        self._wheel_interaction_active = False
+        self._interaction_active = True
+        self._pan_in_progress = True
+        app = self.app
+        cancel_zoom = getattr(app, "_cancel_smooth_zoom_for_pan", None)
+        if callable(cancel_zoom):
+            try:
+                cancel_zoom()
+            except Exception:
+                pass
+        # Engage coarse LOD proxy for the gesture (no-op if unavailable).
+        self._engage_lod()
+
+    def _on_pan_end(self, obj, event):
+        """Middle mouse released — restore normal render throttle and settle frame."""
+        self._pan_in_progress = False
+        self._interaction_active = False
+        self._wheel_interaction_active = False
+        try:
+            self._wheel_idle_timer.stop()
+        except Exception:
+            pass
+        # Guard: don't fire a final render if the app is tearing down
+        app = self.app
+        if app is None or getattr(app, "_shutdown_in_progress", False):
+            return
+        self._restore_full_detail()
+        self._execute_render()

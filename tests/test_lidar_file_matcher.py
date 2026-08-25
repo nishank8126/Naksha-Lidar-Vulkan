@@ -1,0 +1,64 @@
+from pathlib import Path
+
+from gui.lidar_file_matcher import (
+    find_matching_lidar_file,
+    names_share_numeric_identity,
+)
+
+
+def _paths(*names):
+    return [Path(name) for name in names]
+
+
+def test_exact_grid_match_wins():
+    files = _paths("609000_676000.laz", "613000_676000.laz")
+
+    assert find_matching_lidar_file(files, "613000_676000") == files[1]
+
+
+def test_same_northing_different_easting_is_not_a_match():
+    files = _paths("609000_676000.laz", "614000_676000.laz")
+
+    assert find_matching_lidar_file(files, "613000_676000") is None
+
+
+def test_same_easting_different_northing_is_not_a_match():
+    files = _paths("613000_676000.laz", "613000_678000.laz")
+
+    assert find_matching_lidar_file(files, "613000_677000") is None
+
+
+def test_safe_filename_prefix_can_wrap_complete_grid_identity():
+    files = _paths("survey_export_613000_677000.laz", "609000_677000.laz")
+
+    assert find_matching_lidar_file(files, "613000_677000") == files[0]
+
+
+def test_ambiguous_prefixed_files_require_manual_selection():
+    files = _paths(
+        "raw_613000_677000.laz",
+        "edited_613000_677000.las",
+    )
+
+    assert find_matching_lidar_file(files, "613000_677000") is None
+
+
+def test_separator_and_case_normalization_remains_supported():
+    files = _paths("GRID-613000-677000.LAZ")
+
+    assert find_matching_lidar_file(files, "grid_613000_677000") == files[0]
+
+
+def test_leading_zero_block_tokens_remain_supported():
+    files = _paths("DW3032726_5.laz")
+
+    assert find_matching_lidar_file(files, "DW3032726_000005") == files[0]
+
+
+def test_alternative_name_must_not_change_coordinate_identity():
+    assert names_share_numeric_identity(
+        "613000_677000", "survey_613000_677000"
+    )
+    assert not names_share_numeric_identity(
+        "613000_677000", "609000_677000"
+    )

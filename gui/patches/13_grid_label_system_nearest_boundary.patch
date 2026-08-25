@@ -1,0 +1,52 @@
+============================================================
+PATCH 13: grid_label_system.py - Nearest Boundary Selection
+============================================================
+Issue: At corners where BL polygons overlap, insideness
+       (both raw and normalized) picks the wrong block.
+
+Fix: Use NEAREST BOUNDARY — among all polygons containing the
+     click, pick the one whose edge is CLOSEST to the click.
+
+Why this works:
+  At a corner where block A overlaps block B:
+  - Click is at B's corner, near B's edge (e.g., 6m from B's edge)
+  - A's polygon extends into B's area, so click is far from A's edge (e.g., 37m)
+  - Picking the polygon with SMALLEST edge distance → B wins ✓
+
+OLD BLOCK:
+============================================================
+                hit_block = None
+                all_hit_alt_names = []
+                best_insideness = -1.0
+                for blk in block_polygons:
+                    pts = blk.get("points_2d", [])
+                    if len(pts) >= 3 and _pip(wx, wy, pts):
+                        min_edge_dist = float('inf')
+                        n = len(pts)
+                        for i in range(n):
+                            ...
+                        if hit_block is None or min_edge_dist > best_insideness:
+                            hit_block = blk
+                            best_insideness = min_edge_dist
+
+NEW BLOCK:
+============================================================
+                hit_block = None
+                all_hit_alt_names = []
+                best_edge_dist = float('inf')
+                for blk in block_polygons:
+                    pts = blk.get("points_2d", [])
+                    if len(pts) >= 3 and _pip(wx, wy, pts):
+                        # NEAREST BOUNDARY: pick the polygon whose edge is closest
+                        # to the click point. At corners where polygons overlap,
+                        # the click is physically closer to the correct block's
+                        # boundary because it sits at that block's corner edge.
+                        min_edge_dist = float('inf')
+                        n = len(pts)
+                        for i in range(n):
+                            ...
+                        if hit_block is None or min_edge_dist < best_edge_dist:
+                            hit_block = blk
+                            best_edge_dist = min_edge_dist
+
+KEY CHANGE: Comparison flipped from > (largest) to < (smallest)

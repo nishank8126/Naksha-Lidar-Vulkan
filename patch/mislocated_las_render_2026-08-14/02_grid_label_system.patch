@@ -1,0 +1,19 @@
+FILE: gui/grid_label_system.py
+
+OLD BLOCK
+            self.app.data = {
+                "xyz": tile_data["xyz"],
+                "classification": tile_data["classification"]
+            }
+
+NEW / REPLACE BLOCK
+            self.app.data = {
+                "xyz": tile_data["xyz"],
+                "classification": tile_data["classification"]
+            }
+            xyz_app = self.app.data["xyz"]
+            print(
+                "   COORD_TRACE APP.DATA: "
+                f"X=[{xyz_app[:, 0].min():.3f}, {xyz_app[:, 0].max():.3f}] "
+                f"Y=[{xyz_app[:, 1].min():.3f}, {xyz_app[:, 1].max():.3f}]"
+            )

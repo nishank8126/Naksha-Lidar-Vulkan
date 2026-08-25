@@ -1,0 +1,8 @@
+{
+  "name": "Trace Tool",
+  "version": "1.0",
+  "author": "Naksha Developer",
+  "description": "Trace polyline coordinates by snapping and following existing drawing vertices.",
+  "entry": "__init__.py",
+  "class": "TracePlugin"
+}

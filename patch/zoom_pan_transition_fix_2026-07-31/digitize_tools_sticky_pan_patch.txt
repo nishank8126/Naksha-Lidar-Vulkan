@@ -1,0 +1,189 @@
+================ OLD BLOCK ================
+    def _is_real_middle_button_down(self):
+        """Return True only while the physical middle mouse button is pressed."""
+        try:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt as _Qt
+        except Exception:
+            try:
+                from PyQt5.QtWidgets import QApplication
+                from PyQt5.QtCore import Qt as _Qt
+            except Exception:
+                return True
+
+        try:
+            panning_button = getattr(self.app, "panning_button", "scroll") if self.app else "scroll"
+            buttons = QApplication.mouseButtons()
+            if panning_button == "left":
+                return bool((buttons & _Qt.MiddleButton) or (buttons & _Qt.LeftButton))
+            return bool(buttons & _Qt.MiddleButton)
+        except Exception:
+            return True
+
+    def _on_middle_press(self, obj, evt):
+================ NEW / REPLACE BLOCK ================
+    def _is_real_middle_button_down(self):
+        """Return True while the physical pan button is pressed."""
+        try:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt as _Qt
+        except Exception:
+            try:
+                from PyQt5.QtWidgets import QApplication
+                from PyQt5.QtCore import Qt as _Qt
+            except Exception:
+                return True
+
+        try:
+            panning_button = getattr(self.app, "panning_button", "scroll") if self.app else "scroll"
+            buttons = QApplication.mouseButtons()
+            if panning_button == "left":
+                return bool((buttons & _Qt.MiddleButton) or (buttons & _Qt.LeftButton))
+            return bool(buttons & _Qt.MiddleButton)
+        except Exception:
+            return True
+
+    def _physical_pan_button_down(self):
+        """
+        Best-effort physical button check for stale-pan cleanup.
+
+        This is only used after a short grace window to recover from a missed
+        release event. It is not the primary source of truth for starting pan.
+        """
+        try:
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt as _Qt
+        except Exception:
+            try:
+                from PyQt5.QtWidgets import QApplication
+                from PyQt5.QtCore import Qt as _Qt
+            except Exception:
+                return None
+
+        try:
+            buttons = QApplication.mouseButtons()
+            try:
+                middle_button = _Qt.MouseButton.MiddleButton
+                left_button = _Qt.MouseButton.LeftButton
+            except Exception:
+                middle_button = _Qt.MiddleButton
+                left_button = _Qt.LeftButton
+
+            panning_button = getattr(self.app, "panning_button", "scroll") if self.app else "scroll"
+            if panning_button == "left":
+                return bool((buttons & middle_button) or (buttons & left_button))
+            return bool(buttons & middle_button)
+        except Exception:
+            return None
+
+    def _on_middle_press(self, obj, evt):
+================ OLD BLOCK ================
+        # Skip when classification tool is active — classification handles
+        # its own pan release (_on_safe_pan_stop) and consuming the event here
+        # would prevent the style from ever receiving MiddleButtonReleaseEvent,
+        # leaving _is_panning stuck at True on the classification interactor.
+        if getattr(self.app, "active_classify_tool", None) is not None:
+            return
+        if getattr(self, "_blocked_fake_middle", False):
+================ NEW / REPLACE BLOCK ================
+        # Skip when classification tool is active — classification handles
+        # its own pan release (_on_safe_pan_stop) and consuming the event here
+        # would prevent the style from ever receiving MiddleButtonReleaseEvent,
+        # leaving _is_panning stuck at True on the classification interactor.
+        if getattr(self.app, "active_classify_tool", None) is not None:
+            self.middle_down = False
+            self._is_panning = False
+            self._pan_start_pos = None
+            self._last_pos = None
+            return
+        if getattr(self, "_blocked_fake_middle", False):
+================ OLD BLOCK ================
+        # Let VTK's built-in pan handler do the actual work
+        try:
+            if obj is not None and hasattr(obj, "AbortFlagOn"):
+                obj.AbortFlagOn()
+        except Exception:
+            pass
+================ NEW / REPLACE BLOCK ================
+        # Let VTK's built-in pan handler do the actual work
+        try:
+            import time
+            self._pan_started_at = time.monotonic()
+            if obj is not None and hasattr(obj, "AbortFlagOn"):
+                obj.AbortFlagOn()
+        except Exception:
+            pass
+================ OLD BLOCK ================
+        self._pan_start_pos = None
+        self._last_pos = None
+        self._blocked_fake_middle = False
+
+        if hasattr(self, "_middle_button_down"):
+            self._middle_button_down = False
+================ NEW / REPLACE BLOCK ================
+        self._pan_start_pos = None
+        self._last_pos = None
+        self._blocked_fake_middle = False
+        self._pan_started_at = 0.0
+
+        if hasattr(self, "_middle_button_down"):
+            self._middle_button_down = False
+================ OLD BLOCK ================
+        if getattr(self.app, "active_classify_tool", None) is not None:
+            return
+        if getattr(self, "_blocked_fake_middle", False):
+================ NEW / REPLACE BLOCK ================
+        if getattr(self.app, "active_classify_tool", None) is not None:
+            self.middle_down = False
+            self._is_panning = False
+            self._pan_start_pos = None
+            self._last_pos = None
+            return
+        if getattr(self, "_blocked_fake_middle", False):
+================ OLD BLOCK ================
+        # ── PANNING takes absolute priority — never block middle-mouse pan ──────
+        if self._is_panning:
+            # Trust the matched VTK press/release pair. QApplication.mouseButtons()
+            # is not reliable inside a VTK MouseMoveEvent on Windows and was
+            # falsely reporting NoButton immediately after a valid press.
+            if not self.middle_down:
+                self._is_panning = False
+                self._pan_start_pos = None
+                self._last_pos = None
+                self.app.vtk_widget.render()
+                return
+================ NEW / REPLACE BLOCK ================
+        # ── PANNING takes absolute priority — never block middle-mouse pan ──────
+        if self._is_panning:
+            physical_down = self._physical_pan_button_down()
+            if physical_down is False:
+                try:
+                    import time
+                    pan_started_at = float(getattr(self, "_pan_started_at", 0.0) or 0.0)
+                    pan_age = time.monotonic() - pan_started_at if pan_started_at > 0.0 else 999.0
+                except Exception:
+                    pan_age = 999.0
+
+                # If the gesture has already been alive for a moment and the
+                # real pan button is no longer down, do not keep panning.
+                if pan_age >= 0.12 or not self.middle_down:
+                    self.middle_down = False
+                    self._is_panning = False
+                    self._pan_start_pos = None
+                    self._last_pos = None
+                    self._middle_button_down = False
+                    self._pan_started_at = 0.0
+                    self.app.vtk_widget.render()
+                    return
+
+            if physical_down is True and not self.middle_down:
+                self.middle_down = True
+
+            if not self.middle_down:
+                self._is_panning = False
+                self._pan_start_pos = None
+                self._last_pos = None
+                self._middle_button_down = False
+                self._pan_started_at = 0.0
+                self.app.vtk_widget.render()
+                return

@@ -1,0 +1,14 @@
+TARGET FILE: gui\cross_section\section_controller.py
+
+================ OLD BLOCK ================
+        self.app.sec_vtk.set_background(bg_color)
+        sec_layout.addWidget(self.app.sec_vtk.interactor)
+   
+        # ✅ Install shortcut filter here (now sec_vtk exists)
+================ NEW / REPLACE BLOCK ================
+        self.app.sec_vtk.set_background(bg_color)
+        sec_layout.addWidget(self.app.sec_vtk.interactor)
+        if hasattr(self.app, "_install_section_wheel_zoom"):
+            self.app._install_section_wheel_zoom(self.app.sec_vtk)
+   
+        # ✅ Install shortcut filter here (now sec_vtk exists)

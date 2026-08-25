@@ -1,0 +1,57 @@
+FILE: gui/prj_block_identifier.py
+
+OLD BLOCK
+            cam_offset = [
+                start_pos[0] - start_focal[0],
+                start_pos[1] - start_focal[1],
+                start_pos[2] - start_focal[2],
+            ]
+
+            target_focal = [x, y, start_focal[2]]
+            target_pos = [
+                x + cam_offset[0],
+                y + cam_offset[1],
+                start_pos[2],
+            ]
+
+NEW / REPLACE BLOCK
+            camera_distance = abs(float(start_pos[2]) - float(start_focal[2]))
+            if camera_distance < 1.0:
+                camera_distance = 1000.0
+
+            target_z = float(start_focal[2])
+            try:
+                xyz = (getattr(self.app, "data", None) or {}).get("xyz")
+                if xyz is not None and len(xyz):
+                    target_z = 0.5 * (
+                        float(xyz[:, 2].min()) + float(xyz[:, 2].max())
+                    )
+            except Exception:
+                pass
+
+            target_focal = [x, y, target_z]
+            target_pos = [x, y, target_z + camera_distance]
+
+OLD BLOCK
+                new_focal = [
+                    start_focal[0] + (target_focal[0] - start_focal[0]) * t,
+                    start_focal[1] + (target_focal[1] - start_focal[1]) * t,
+                    start_focal[2],
+                ]
+                new_pos = [
+                    new_focal[0] + cam_offset[0],
+                    new_focal[1] + cam_offset[1],
+                    start_pos[2],
+                ]
+
+NEW / REPLACE BLOCK
+                new_focal = [
+                    start_focal[0] + (target_focal[0] - start_focal[0]) * t,
+                    start_focal[1] + (target_focal[1] - start_focal[1]) * t,
+                    start_focal[2] + (target_focal[2] - start_focal[2]) * t,
+                ]
+                new_pos = [
+                    start_pos[0] + (target_pos[0] - start_pos[0]) * t,
+                    start_pos[1] + (target_pos[1] - start_pos[1]) * t,
+                    start_pos[2] + (target_pos[2] - start_pos[2]) * t,
+                ]

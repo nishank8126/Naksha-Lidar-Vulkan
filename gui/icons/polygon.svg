@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 2.75L21.25 9.5L17.75 20.5H6.25L2.75 9.5L12 2.75Z" fill="currentColor" fill-opacity="0.1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Vertex dots -->
+  <circle cx="12" cy="2.75" r="1.5" fill="currentColor"/>
+  <circle cx="21.25" cy="9.5" r="1.5" fill="currentColor"/>
+  <circle cx="17.75" cy="20.5" r="1.5" fill="currentColor"/>
+  <circle cx="6.25" cy="20.5" r="1.5" fill="currentColor"/>
+  <circle cx="2.75" cy="9.5" r="1.5" fill="currentColor"/>
+</svg>

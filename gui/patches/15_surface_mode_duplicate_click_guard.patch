@@ -1,0 +1,116 @@
+============================================================
+PATCH 15: surface_mode.py - duplicate Surface click guard
+File: surface_mode.py
+============================================================
+
+--- REPLACE BLOCK 1: add helper to remember successful Surface signature ---
+OLD BLOCK:
+def surface_visible_class_signature(app):
+    """
+    Return the class visibility signature used for Surface generation.
+
+    Used to detect Display Mode changes like:
+    All Classes Surface -> Ground Only Surface.
+    """
+    try:
+        xyz = app.data.get("xyz") if getattr(app, "data", None) else None
+        classes = app.data.get("classification") if getattr(app, "data", None) else None
+
+        if xyz is None:
+            return ("NO_DATA",)
+
+        if classes is None:
+            return ("NO_CLASSIFICATION", int(len(xyz)))
+
+        palette = surface_palette(app)
+        visible_codes = []
+
+        for code in np.unique(classes):
+            code_int = int(code)
+            entry = palette.get(code_int, {"show": True})
+            if _surface_support_entry(code_int, entry):
+                visible_codes.append(code_int)
+
+        return tuple(sorted(visible_codes))
+
+    except Exception:
+        return ("SURFACE_SIGNATURE_ERROR",)
+NEW BLOCK:
+def surface_visible_class_signature(app):
+    """
+    Return the class visibility signature used for Surface generation.
+
+    Used to detect Display Mode changes like:
+    All Classes Surface -> Ground Only Surface.
+    """
+    try:
+        xyz = app.data.get("xyz") if getattr(app, "data", None) else None
+        classes = app.data.get("classification") if getattr(app, "data", None) else None
+
+        if xyz is None:
+            return ("NO_DATA",)
+
+        if classes is None:
+            return ("NO_CLASSIFICATION", int(len(xyz)))
+
+        palette = surface_palette(app)
+        visible_codes = []
+
+        for code in np.unique(classes):
+            code_int = int(code)
+            entry = palette.get(code_int, {"show": True})
+            if _surface_support_entry(code_int, entry):
+                visible_codes.append(code_int)
+
+        return tuple(sorted(visible_codes))
+
+    except Exception:
+        return ("SURFACE_SIGNATURE_ERROR",)
+
+
+def _remember_surface_signature(app) -> None:
+    """
+    Remember the class-visibility signature that produced the active Surface.
+
+    This lets duplicate Surface clicks be ignored safely after a successful
+    build or cache restore instead of being misread as a filter change.
+    """
+    try:
+        app._surface_visible_class_signature = surface_visible_class_signature(app)
+        app._surface_last_completed_at = time.perf_counter()
+    except Exception:
+        pass
+
+--- REPLACE BLOCK 2: remember signature after cached Surface restore ---
+OLD BLOCK:
+        app.display_mode = "surface"
+        app.current_display_mode = "surface"
+        app._surface_shortcut_signature = expected
+
+        try:
+            _restore_snt_grid_above_surface(app)
+NEW BLOCK:
+        app.display_mode = "surface"
+        app.current_display_mode = "surface"
+        app._surface_shortcut_signature = expected
+        _remember_surface_signature(app)
+
+        try:
+            _restore_snt_grid_above_surface(app)
+
+--- REPLACE BLOCK 3: remember signature after successful Surface rebuild ---
+OLD BLOCK:
+        if ok:
+            app.display_mode = "surface"
+            app.current_display_mode = "surface"
+            app.surface_color_ramp = getattr(app, "surface_color_ramp", None) or getattr(app, "elevation_color_ramp", None)
+
+            # Surface mode owns right-click.
+NEW BLOCK:
+        if ok:
+            app.display_mode = "surface"
+            app.current_display_mode = "surface"
+            app.surface_color_ramp = getattr(app, "surface_color_ramp", None) or getattr(app, "elevation_color_ramp", None)
+            _remember_surface_signature(app)
+
+            # Surface mode owns right-click.

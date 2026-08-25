@@ -1,0 +1,396 @@
+============================================================
+PATCH 14: snt_attachment.py - _remove_from_vtk()
+File: snt_attachment.py
+Function: _remove_from_vtk()
+============================================================
+
+--- REPLACE BLOCK 1: normalize filename matching and detect Surface overlay renderers ---
+OLD BLOCK:
+    def _remove_from_vtk(self, filename: str):
+        try:
+            target = os.path.basename(filename)
+
+            # Collect the layer names that belong to the SNT file being removed,
+            # BEFORE its attachment metadata is dropped below. Used to also take
+            # this file's committed on-screen drawings off the canvas.
+            removed_layers = set()
+            try:
+                for a in getattr(self.app, "snt_attachments", []) or []:
+                    if os.path.basename(a.get("filename", "")) == target:
+                        parsed = a.get("parsed") or {}
+                        for l in parsed.get("layers", []) or []:
+                            nm = l.get("name")
+                            if nm:
+                                removed_layers.add(str(nm))
+            except Exception:
+                pass
+
+            renderer = None
+            try:
+                if (
+                    hasattr(self.app, "vtk_widget")
+                    and self.app.vtk_widget is not None
+                    and hasattr(self.app.vtk_widget, "renderer")
+                ):
+                    renderer = self.app.vtk_widget.renderer
+            except Exception:
+                renderer = None
+NEW BLOCK:
+    def _remove_from_vtk(self, filename: str):
+        try:
+            target = os.path.basename(str(filename or ""))
+            target_lower = target.lower()
+
+            def _norm_name(value) -> str:
+                if not value:
+                    return ""
+                try:
+                    return os.path.basename(str(value)).strip().lower()
+                except Exception:
+                    return str(value).strip().lower()
+
+            def _norm_path(value) -> str:
+                if not value:
+                    return ""
+                try:
+                    return str(Path(str(value)).resolve()).strip().lower()
+                except Exception:
+                    return str(value).strip().lower()
+
+            def _matches_record(record) -> bool:
+                if not isinstance(record, dict):
+                    return False
+                record_name = _norm_name(record.get("filename"))
+                record_full = _norm_path(record.get("full_path"))
+                return bool(
+                    (target_lower and record_name == target_lower)
+                    or (target_lower and record_full and os.path.basename(record_full) == target_lower)
+                )
+
+            # Collect the layer names that belong to the SNT file being removed,
+            # BEFORE its attachment metadata is dropped below. Used to also take
+            # this file's committed on-screen drawings off the canvas.
+            removed_layers = set()
+            try:
+                for a in getattr(self.app, "snt_attachments", []) or []:
+                    if _matches_record(a):
+                        parsed = a.get("parsed") or {}
+                        for l in parsed.get("layers", []) or []:
+                            nm = l.get("name")
+                            if nm:
+                                removed_layers.add(str(nm))
+            except Exception:
+                pass
+
+            renderer = None
+            try:
+                if (
+                    hasattr(self.app, "vtk_widget")
+                    and self.app.vtk_widget is not None
+                    and hasattr(self.app.vtk_widget, "renderer")
+                ):
+                    renderer = self.app.vtk_widget.renderer
+            except Exception:
+                renderer = None
+
+            extra_renderers = []
+            try:
+                digitizer = getattr(self.app, "digitizer", None)
+                for extra in (
+                    getattr(digitizer, "overlay_renderer", None),
+                    getattr(digitizer, "text_overlay_renderer", None),
+                ):
+                    if extra is not None and extra is not renderer and extra not in extra_renderers:
+                        extra_renderers.append(extra)
+            except Exception:
+                pass
+
+            removed_actor_ids = set()
+
+--- REPLACE BLOCK 2: actor removal must clean main renderer + Surface overlay renderers ---
+OLD BLOCK:
+            # 1) Remove real SNT/DXF actors matching the removed SNT filename
+            for store_name in ["snt_actors", "dxf_actors"]:
+                if not hasattr(self.app, store_name):
+                    continue
+
+                store = getattr(self.app, store_name, [])
+                indices_to_remove = []
+
+                for i, snt_data in enumerate(store):
+                    if os.path.basename(snt_data.get("filename", "")) == target:
+                        indices_to_remove.append(i)
+
+                        if renderer is not None:
+                            for actor in snt_data.get("actors", []):
+                                try:
+                                    if actor is not None:
+                                        renderer.RemoveActor(actor)
+                                except Exception:
+                                    pass
+
+                for i in reversed(indices_to_remove):
+                    try:
+                        store.pop(i)
+                    except IndexError:
+                        pass
+NEW BLOCK:
+            # 1) Remove real SNT/DXF actors matching the removed SNT filename
+            for store_name in ["snt_actors", "dxf_actors"]:
+                if not hasattr(self.app, store_name):
+                    continue
+
+                store = getattr(self.app, store_name, [])
+                indices_to_remove = []
+
+                for i, snt_data in enumerate(store):
+                    if _matches_record(snt_data):
+                        indices_to_remove.append(i)
+
+                        for actor in snt_data.get("actors", []):
+                            try:
+                                if actor is not None:
+                                    removed_actor_ids.add(id(actor))
+                                    if renderer is not None:
+                                        renderer.RemoveActor(actor)
+                            except Exception:
+                                pass
+
+                for i in reversed(indices_to_remove):
+                    try:
+                        store.pop(i)
+                    except IndexError:
+                        pass
+
+            # 1b) Sweep the live renderer for any tagged SNT actors that escaped
+            # the actor stores above. This is the final guard against stale
+            # geometry remaining visible after the popup row has been removed.
+            all_renderers = [r for r in [renderer] + extra_renderers if r is not None]
+            if all_renderers:
+                try:
+                    doomed = []
+
+                    def _collect_matching_props(vtk_renderer, getter_name: str):
+                        try:
+                            collection = getattr(vtk_renderer, getter_name)()
+                            collection.InitTraversal()
+                            while True:
+                                getter = getattr(
+                                    collection,
+                                    "GetNextActor2D" if getter_name == "GetActors2D" else "GetNextActor",
+                                )
+                                actor = getter()
+                                if actor is None:
+                                    break
+                                actor_name = _norm_name(getattr(actor, "_naksha_snt_filename", ""))
+                                if id(actor) in removed_actor_ids or (target_lower and actor_name == target_lower):
+                                    doomed.append((vtk_renderer, actor))
+                        except Exception:
+                            pass
+
+                    for vtk_renderer in all_renderers:
+                        _collect_matching_props(vtk_renderer, "GetActors")
+                        _collect_matching_props(vtk_renderer, "GetActors2D")
+
+                    seen_pairs = set()
+                    for vtk_renderer, actor in doomed:
+                        pair_key = (id(vtk_renderer), id(actor))
+                        if pair_key in seen_pairs:
+                            continue
+                        seen_pairs.add(pair_key)
+                        try:
+                            vtk_renderer.RemoveActor(actor)
+                        except Exception:
+                            pass
+                        try:
+                            vtk_renderer.RemoveActor2D(actor)
+                        except Exception:
+                            pass
+                        try:
+                            vtk_renderer.RemoveViewProp(actor)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    print(f"  [warn] renderer sweep after SNT remove failed: {exc}")
+
+            # Remove tagged SNT props from overlay renderers even when they are not
+            # present in GetActors()/GetActors2D() anymore but still registered as
+            # generic view props after Surface-mode promotion.
+            for vtk_renderer in extra_renderers:
+                try:
+                    props = vtk_renderer.GetViewProps()
+                    props.InitTraversal()
+                    while True:
+                        actor = props.GetNextProp()
+                        if actor is None:
+                            break
+                        actor_name = _norm_name(getattr(actor, "_naksha_snt_filename", ""))
+                        if id(actor) in removed_actor_ids or (target_lower and actor_name == target_lower):
+                            try:
+                                vtk_renderer.RemoveViewProp(actor)
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    print(f"  [warn] overlay view-prop sweep after SNT remove failed: {exc}")
+
+--- REPLACE BLOCK 3: metadata cleanup, stale state reset, cache invalidation, render update ---
+OLD BLOCK:
+            # 2) Remove SNT attachment metadata
+            for list_name in ["snt_attachments", "dxf_attachments"]:
+                if hasattr(self.app, list_name):
+                    try:
+                        current_list = getattr(self.app, list_name)
+                        setattr(
+                            self.app,
+                            list_name,
+                            [
+                                a for a in current_list
+                                if os.path.basename(a.get("filename", "")) != target
+                            ],
+                        )
+                    except Exception:
+                        pass
+
+            # 3) Remove cached SNT block polygons for this removed SNT file
+            #    Otherwise PRJ Hide Missing can reuse stale polygon data later.
+            try:
+                if hasattr(self.app, "snt_block_polygons"):
+                    self.app.snt_block_polygons = [
+                        poly for poly in getattr(self.app, "snt_block_polygons", [])
+                        if os.path.basename(str(poly.get("snt_filename", ""))) != target
+                    ]
+            except Exception:
+                pass
+
+            # 4) Clear PRJ Hide Missing Blocks overlay actors.
+            #    These overlay actors use filename "_prj_boundary_overlay",
+            #    so the normal SNT filename removal above will not remove them.
+            try:
+                prj_dlg = getattr(self.app, "block_identifier_dialog", None)
+
+                if prj_dlg is not None and hasattr(prj_dlg, "clear_snt_filter_overlays_on_snt_removed"):
+                    prj_dlg.clear_snt_filter_overlays_on_snt_removed()
+                elif prj_dlg is not None and hasattr(prj_dlg, "_restore_bl_polygon_actors"):
+                    prj_dlg._restore_bl_polygon_actors()
+
+            except Exception as exc:
+                print(f"  [warn] PRJ hide-missing cleanup after SNT remove failed: {exc}")
+
+            # 5) Update point count
+            if hasattr(self.app, "update_total_points_label"):
+                self.app.update_total_points_label()
+
+            # 6) Disable SNT/DXF layer pick tool if no SNT or DXF remains
+            try:
+                has_any_data = bool(getattr(self.app, "snt_attachments", []) or getattr(self.app, "dxf_attachments", []))
+                if not has_any_data:
+                    tool = getattr(self.app, "snt_layer_pick_tool", None)
+                    if tool is not None and getattr(tool, "active", False):
+                        tool.deactivate()
+
+                    if hasattr(self.app, "_set_snt_layer_pick_footer_text"):
+                        self.app._set_snt_layer_pick_footer_text(None, None, None)
+            except Exception:
+                pass
+
+            # 7) Render once at end
+            if renderer is not None:
+                try:
+                    rw = self.app.vtk_widget.GetRenderWindow()
+                    if rw is not None:
+                        rw.Render()
+                except Exception:
+                    pass
+NEW BLOCK:
+            # 2) Remove SNT attachment metadata
+            for list_name in ["snt_attachments", "dxf_attachments"]:
+                if hasattr(self.app, list_name):
+                    try:
+                        current_list = getattr(self.app, list_name)
+                        setattr(
+                            self.app,
+                            list_name,
+                            [
+                                a for a in current_list
+                                if not _matches_record(a)
+                            ],
+                        )
+                    except Exception:
+                        pass
+
+            # 3) Remove cached SNT block polygons for this removed SNT file
+            #    Otherwise PRJ Hide Missing can reuse stale polygon data later.
+            try:
+                if hasattr(self.app, "snt_block_polygons"):
+                    self.app.snt_block_polygons = [
+                        poly for poly in getattr(self.app, "snt_block_polygons", [])
+                        if _norm_name(poly.get("snt_filename", "")) != target_lower
+                    ]
+            except Exception:
+                pass
+
+            # 4) Clear PRJ Hide Missing Blocks overlay actors.
+            #    These overlay actors use filename "_prj_boundary_overlay",
+            #    so the normal SNT filename removal above will not remove them.
+            try:
+                prj_dlg = getattr(self.app, "block_identifier_dialog", None)
+
+                if prj_dlg is not None and hasattr(prj_dlg, "clear_snt_filter_overlays_on_snt_removed"):
+                    prj_dlg.clear_snt_filter_overlays_on_snt_removed()
+                elif prj_dlg is not None and hasattr(prj_dlg, "_restore_bl_polygon_actors"):
+                    prj_dlg._restore_bl_polygon_actors()
+
+            except Exception as exc:
+                print(f"  [warn] PRJ hide-missing cleanup after SNT remove failed: {exc}")
+
+            # 5) Reset any active SNT drawing context that pointed to the
+            # removed file so follow-up draw/edit actions cannot target a stale
+            # attachment.
+            try:
+                active_file = _norm_name(getattr(self.app, "active_snt_filename", ""))
+                if target_lower and active_file == target_lower:
+                    self.app.active_snt_layer = None
+                    self.app.active_snt_filename = None
+                    self.app.active_snt_color = None
+            except Exception:
+                pass
+
+            # 6) Invalidate vector/unified caches so later refreshes cannot
+            # resurrect actors from stale attachment state.
+            try:
+                from gui.unified_actor_manager import invalidate_unified_actor, sync_palette_to_gpu
+                invalidate_unified_actor(self.app)
+                sync_palette_to_gpu(self.app, 0, render=False)
+            except Exception:
+                pass
+
+            # 7) Update point count
+            if hasattr(self.app, "update_total_points_label"):
+                self.app.update_total_points_label()
+
+            # 8) Disable SNT/DXF layer pick tool if no SNT or DXF remains
+            try:
+                has_any_data = bool(getattr(self.app, "snt_attachments", []) or getattr(self.app, "dxf_attachments", []))
+                if not has_any_data:
+                    tool = getattr(self.app, "snt_layer_pick_tool", None)
+                    if tool is not None and getattr(tool, "active", False):
+                        tool.deactivate()
+
+                    if hasattr(self.app, "_set_snt_layer_pick_footer_text"):
+                        self.app._set_snt_layer_pick_footer_text(None, None, None)
+            except Exception:
+                pass
+
+            # 9) Render once at end
+            for vtk_renderer in all_renderers:
+                try:
+                    vtk_renderer.Modified()
+                except Exception:
+                    pass
+            if renderer is not None:
+                try:
+                    rw = self.app.vtk_widget.GetRenderWindow()
+                    if rw is not None:
+                        rw.Render()
+                except Exception:
+                    pass

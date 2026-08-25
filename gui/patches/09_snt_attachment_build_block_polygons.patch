@@ -1,0 +1,174 @@
+============================================================
+PATCH 9: snt_attachment.py - build_snt_block_polygons()
+File: snt_attachment.py
+Function: build_snt_block_polygons()
+Lines: ~431-511
+Purpose: Store ALL text labels inside each polygon as alt_names,
+         collect both filename_text and other_text
+============================================================
+
+--- OLD BLOCK (before) ---
+    for poly_pts, poly_layer in bl_polys:
+        grid_name = None
+        file_path = None
+        prj_block = None
+
+        poly_layer_u = poly_layer.upper()
+        is_grid_poly = (
+            "GRID" in poly_layer_u
+            or "TILE" in poly_layer_u
+            or "BBOX" in poly_layer_u
+            or "BOUND" in poly_layer_u
+        )
+
+        if prj_blocks:
+            # Use a guaranteed interior point rather than the arithmetic centroid.
+            # TerraScan block polygons are often long narrow diagonal strips whose
+            # centroid falls *outside* the boundary, causing both PRJ match stages
+            # to fail silently and leaving the polygon matched by the wrong text label.
+            cx, cy = _snt_polygon_interior_point(poly_pts)
+            for block in prj_blocks:
+                label = str(block.get("label") or "")
+                if label in used_prj_labels:
+                    continue
+                prj_poly = block.get("points_2d") or []
+                if len(prj_poly) >= 3 and _snt_point_in_polygon_2d(cx, cy, prj_poly):
+                    prj_block = block
+                    break
+            if prj_block is None:
+                best_score = None
+                for block in prj_blocks:
+                    label = str(block.get("label") or "")
+                    if label in used_prj_labels:
+                        continue
+                    prj_poly = block.get("points_2d") or []
+                    if len(prj_poly) < 3:
+                        continue
+                    # Use interior point of PRJ polygon too — its centroid may also
+                    # fall outside for thin strip blocks.
+                    pcx, pcy = _snt_polygon_interior_point(prj_poly)
+                    if not _snt_point_in_polygon_2d(pcx, pcy, poly_pts):
+                        continue
+                    score = (pcx - cx) * (pcx - cx) + (pcy - cy) * (pcy - cy)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        prj_block = block
+            if prj_block is not None:
+                grid_name = str(prj_block.get("label") or "").strip() or None
+                file_path = prj_block.get("file_path")
+                if grid_name:
+                    used_prj_labels.add(grid_name)
+                    print(f"[SNT block polygons] PRJ matched BL polygon -> {grid_name}")
+
+        # Prefer FileNames/BLOCKS layer labels (actual file names)
+        if grid_name is None:
+            for tx, ty, tval in filename_text:
+                if _snt_point_in_polygon_2d(tx, ty, poly_pts):
+                    grid_name = tval
+                    break
+        # Fall back to any text label inside the polygon.
+        # IMPORTANT: exclude raw .laz/.las tile-reference text strings — these are
+        # individual LAZ file name annotations scattered throughout the polygon area
+        # (e.g. "D83033597_000021.laz") and must never be used as the block label.
+        # The correct block label (e.g. "D83033597 12 LIDO000002") does not end in
+        # a LiDAR file extension.
+        if grid_name is None:
+            for tx, ty, tval in other_text:
+                tval_lo = tval.strip().lower()
+                if (tval_lo.endswith(".laz") or tval_lo.endswith(".las")) and not is_grid_poly:
+                    continue  # skip tile-ref annotations only for normal blocks, not for grid blocks
+                if _snt_point_in_polygon_2d(tx, ty, poly_pts):
+                    grid_name = tval
+                    break
+
+        app.snt_block_polygons.append({
+            "points_2d": poly_pts,
+            "grid_name": grid_name,
+            "file_path": file_path,
+            "source": "snt_grid" if is_grid_poly else ("prj" if prj_block is not None else "snt_text"),
+            "snt_filename": snt_filename,
+            "poly_layer": poly_layer,
+        })
+
++++ NEW BLOCK (after) +++
+    for poly_pts, poly_layer in bl_polys:
+        grid_name = None
+        file_path = None
+        prj_block = None
+        alt_names = []
+
+        poly_layer_u = poly_layer.upper()
+        is_grid_poly = (
+            "GRID" in poly_layer_u
+            or "TILE" in poly_layer_u
+            or "BBOX" in poly_layer_u
+            or "BOUND" in poly_layer_u
+        )
+
+        if prj_blocks:
+            cx, cy = _snt_polygon_interior_point(poly_pts)
+            for block in prj_blocks:
+                label = str(block.get("label") or "")
+                if label in used_prj_labels:
+                    continue
+                prj_poly = block.get("points_2d") or []
+                if len(prj_poly) >= 3 and _snt_point_in_polygon_2d(cx, cy, prj_poly):
+                    prj_block = block
+                    break
+            if prj_block is None:
+                best_score = None
+                for block in prj_blocks:
+                    label = str(block.get("label") or "")
+                    if label in used_prj_labels:
+                        continue
+                    prj_poly = block.get("points_2d") or []
+                    if len(prj_poly) < 3:
+                        continue
+                    pcx, pcy = _snt_polygon_interior_point(prj_poly)
+                    if not _snt_point_in_polygon_2d(pcx, pcy, poly_pts):
+                        continue
+                    score = (pcx - cx) * (pcx - cx) + (pcy - cy) * (pcy - cy)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        prj_block = block
+            if prj_block is not None:
+                grid_name = str(prj_block.get("label") or "").strip() or None
+                file_path = prj_block.get("file_path")
+                if grid_name:
+                    used_prj_labels.add(grid_name)
+                    print(f"[SNT block polygons] PRJ matched BL polygon -> {grid_name}")
+
+        # Collect ALL text labels inside polygon as alternative names for fallback matching
+        for tx, ty, tval in filename_text:
+            if _snt_point_in_polygon_2d(tx, ty, poly_pts):
+                if grid_name is None:
+                    grid_name = tval
+                elif tval != grid_name:
+                    alt_names.append(tval)
+
+        # IMPORTANT: exclude raw .laz/.las tile-reference text strings for normal blocks
+        if grid_name is None:
+            for tx, ty, tval in other_text:
+                tval_lo = tval.strip().lower()
+                if (tval_lo.endswith(".laz") or tval_lo.endswith(".las")) and not is_grid_poly:
+                    continue
+                if _snt_point_in_polygon_2d(tx, ty, poly_pts):
+                    grid_name = tval
+                    break
+        else:
+            for tx, ty, tval in other_text:
+                tval_lo = tval.strip().lower()
+                if (tval_lo.endswith(".laz") or tval_lo.endswith(".las")) and not is_grid_poly:
+                    continue
+                if _snt_point_in_polygon_2d(tx, ty, poly_pts) and tval != grid_name:
+                    alt_names.append(tval)
+
+        app.snt_block_polygons.append({
+            "points_2d": poly_pts,
+            "grid_name": grid_name,
+            "alt_names": alt_names,
+            "file_path": file_path,
+            "source": "snt_grid" if is_grid_poly else ("prj" if prj_block is not None else "snt_text"),
+            "snt_filename": snt_filename,
+            "poly_layer": poly_layer,
+        })

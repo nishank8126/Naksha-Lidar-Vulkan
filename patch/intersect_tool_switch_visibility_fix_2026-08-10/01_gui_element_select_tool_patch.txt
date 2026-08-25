@@ -1,0 +1,188 @@
+FILE: gui/element_select_tool.py
+
+OLD BLOCK
+        self._intersect_hidden_drawings = [] # source drawings hidden during intersect session
+        self._intersect_delete_history = []  # stack of part indices deleted this session (for Ctrl+Z)
+
+NEW / REPLACE BLOCK
+        self._intersect_hidden_drawings = [] # source drawings hidden during intersect session
+        self._intersect_visibility_states = [] # exact pre-intersect visibility for every hidden actor
+        self._intersect_delete_history = []  # stack of part indices deleted this session (for Ctrl+Z)
+
+
+OLD BLOCK
+        self._intersect_hidden_drawings = []
+        sources_with_parts = {id(p["source_drawing"]): p["source_drawing"] for p in parts}
+        for src in sources_with_parts.values():
+            hidden = False
+            actor = src.get("actor")
+            if actor is not None:
+                try:
+                    actor.VisibilityOff()
+                    hidden = True
+                except Exception:
+                    pass
+            for key in ("start_marker", "end_marker"):
+                m = src.get(key)
+                if m is not None:
+                    try:
+                        m.VisibilityOff()
+                    except Exception:
+                        pass
+            for m in src.get("vertex_markers") or []:
+                if m is not None:
+                    try:
+                        m.VisibilityOff()
+                    except Exception:
+                        pass
+            arrows = src.get("arrow_actor")
+            if arrows is not None:
+                if not isinstance(arrows, list):
+                    arrows = [arrows]
+                for arr in arrows:
+                    if arr is not None:
+                        try:
+                            arr.VisibilityOff()
+                        except Exception:
+                            pass
+            if hidden:
+                self._intersect_hidden_drawings.append(src)
+
+NEW / REPLACE BLOCK
+        self._intersect_hidden_drawings = []
+        self._intersect_visibility_states = []
+        sources_with_parts = {id(p["source_drawing"]): p["source_drawing"] for p in parts}
+        for src in sources_with_parts.values():
+            self._hide_intersect_source_drawing(src)
+
+
+OLD BLOCK
+    def _restore_intersect_hidden_drawings(self):
+        """Restore visibility of all actors hidden when entering intersect mode."""
+        for src in getattr(self, "_intersect_hidden_drawings", []):
+            actor = src.get("actor")
+            if actor is not None:
+                try:
+                    actor.VisibilityOn()
+                except Exception:
+                    pass
+            for key in ("start_marker", "end_marker"):
+                m = src.get(key)
+                if m is not None:
+                    try:
+                        m.VisibilityOn()
+                    except Exception:
+                        pass
+            for m in src.get("vertex_markers") or []:
+                if m is not None:
+                    try:
+                        m.VisibilityOn()
+                    except Exception:
+                        pass
+            arrows = src.get("arrow_actor")
+            if arrows is not None:
+                if not isinstance(arrows, list):
+                    arrows = [arrows]
+                for arr in arrows:
+                    if arr is not None:
+                        try:
+                            arr.VisibilityOn()
+                        except Exception:
+                            pass
+
+NEW / REPLACE BLOCK
+    @staticmethod
+    def _actor_visibility(actor):
+        """Return an actor's visibility without assuming a specific VTK actor type."""
+        if actor is None:
+            return None
+        try:
+            return bool(actor.GetVisibility())
+        except Exception:
+            return None
+
+    def _hide_intersect_source_drawing(self, src):
+        """Hide one source while remembering every actor's exact prior visibility."""
+        actors = []
+        seen = set()
+
+        def remember_and_hide(actor):
+            if actor is None or id(actor) in seen:
+                return
+            seen.add(id(actor))
+            visible = self._actor_visibility(actor)
+            if visible is None:
+                return
+            actors.append((actor, visible))
+            try:
+                actor.SetVisibility(False)
+            except Exception:
+                try:
+                    actor.VisibilityOff()
+                except Exception:
+                    pass
+
+        remember_and_hide(src.get("actor"))
+        for key in ("start_marker", "end_marker"):
+            remember_and_hide(src.get(key))
+        for marker in src.get("vertex_markers") or []:
+            remember_and_hide(marker)
+        arrows = src.get("arrow_actor")
+        if arrows is not None:
+            if not isinstance(arrows, (list, tuple)):
+                arrows = [arrows]
+            for arrow in arrows:
+                remember_and_hide(arrow)
+
+        self._intersect_hidden_drawings.append(src)
+        self._intersect_visibility_states.append({"drawing": src, "actors": actors})
+
+    def _restore_intersect_hidden_drawings(self):
+        """Restore the exact visibility captured when intersect mode started."""
+        states = getattr(self, "_intersect_visibility_states", [])
+        if states:
+            for state in states:
+                for actor, was_visible in state.get("actors", []):
+                    try:
+                        actor.SetVisibility(bool(was_visible))
+                    except Exception:
+                        try:
+                            actor.VisibilityOn() if was_visible else actor.VisibilityOff()
+                        except Exception:
+                            pass
+            return
+
+        for src in getattr(self, "_intersect_hidden_drawings", []):
+            actor = src.get("actor")
+            if actor is not None:
+                try:
+                    actor.VisibilityOn()
+                except Exception:
+                    pass
+
+
+OLD BLOCK
+    def deactivate(self):
+        if not self._active:
+            return
+        self._cancel_intersect_history_render()
+        self._cancel_in_progress_pick()
+
+NEW / REPLACE BLOCK
+    def deactivate(self):
+        if not self._active:
+            return
+        if self._intersect_mode:
+            self.exit_intersect_mode()
+        self._cancel_intersect_history_render()
+        self._cancel_in_progress_pick()
+
+
+OLD BLOCK — REPLACE ALL THREE RESET OCCURRENCES
+        self._intersect_hidden_drawings = []
+        self._intersect_delete_history = []
+
+NEW / REPLACE BLOCK
+        self._intersect_hidden_drawings = []
+        self._intersect_visibility_states = []
+        self._intersect_delete_history = []

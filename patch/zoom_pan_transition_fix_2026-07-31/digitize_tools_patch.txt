@@ -1,0 +1,43 @@
+================ OLD BLOCK ================
+
+        # ── PANNING takes absolute priority — never block middle-mouse pan ──────
+        if self._is_panning:
+            # Don't consume the event during pan — let VTK style handle it
+            if not self._is_real_middle_button_down():
+                print("Manual pan auto-stopped - real middle button not down")
+
+                self.middle_down = False
+                self._is_panning = False
+                self._pan_start_pos = None
+                self._last_pos = None
+                self._blocked_fake_middle = False
+
+                if hasattr(self, "_middle_button_down"):
+                    self._middle_button_down = False
+
+                try:
+                    rw = self.interactor.GetRenderWindow()
+                    if rw is not None:
+                        rw.SetDesiredUpdateRate(0.001)
+                        rw.Render()
+                except Exception:
+                    pass
+
+                try:
+                    if obj is not None and hasattr(obj, "AbortFlagOn"):
+                        obj.AbortFlagOn()
+                except Exception:
+                    pass
+
+                return
+
+            if not self.middle_down:
+
+================ NEW / REPLACE BLOCK ================
+
+        # ── PANNING takes absolute priority — never block middle-mouse pan ──────
+        if self._is_panning:
+            # Trust the matched VTK press/release pair. QApplication.mouseButtons()
+            # is not reliable inside a VTK MouseMoveEvent on Windows and was
+            # falsely reporting NoButton immediately after a valid press.
+            if not self.middle_down:

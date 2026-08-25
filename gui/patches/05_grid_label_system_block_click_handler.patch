@@ -1,0 +1,74 @@
+============================================================
+PATCH 5: grid_label_system.py - Block click handler (CASE A.5)
+File: grid_label_system.py
+Function: on_right_click() - CASE A.5 block polygon handling
+Lines: ~1947-1997
+Purpose: Collect ALL overlapping polygons' names, merge alt_names,
+         file existence check, pass merged alts to load_grid_las
+============================================================
+
+--- OLD BLOCK (before) ---
+                hit_block = None
+                for blk in block_polygons:
+                    pts = blk.get("points_2d", [])
+                    if len(pts) >= 3 and _pip(wx, wy, pts):
+                        hit_block = blk
+                        break
+
+                if hit_block is None:
+                    print(f"[block-click] no BL polygon contains ({wx:.2f}, {wy:.2f})")
+                if hit_block is not None:
+                    grid_name = hit_block.get("grid_name")
+                    file_path = hit_block.get("file_path")
+                    snt_filename = hit_block.get("snt_filename")
+                    print(f"[block-click] HIT block from '{hit_block.get('snt_filename')}', "
+                          f"grid_name='{grid_name}', file_path='{file_path}'")
+
+                        def _load_block_file(_=False, gn=grid_name, fp=file_path):
+                            if fp:
+                                self._load_las_file(Path(fp), gn or Path(fp).stem)
+                                return
+                            self.load_grid_las(gn, snt_filename=snt_filename)
+
++++ NEW BLOCK (after) +++
+                hit_block = None
+                all_hit_alt_names = []
+                for blk in block_polygons:
+                    pts = blk.get("points_2d", [])
+                    if len(pts) >= 3 and _pip(wx, wy, pts):
+                        if hit_block is None:
+                            hit_block = blk
+                        # Collect alt_names from ALL overlapping polygons
+                        for an in blk.get("alt_names", []):
+                            if an not in all_hit_alt_names:
+                                all_hit_alt_names.append(an)
+                        # Also add grid_names from other overlapping polygons as alternatives
+                        other_gn = blk.get("grid_name")
+                        if other_gn and other_gn != hit_block.get("grid_name"):
+                            if other_gn not in all_hit_alt_names:
+                                all_hit_alt_names.append(other_gn)
+
+                if hit_block is None:
+                    print(f"[block-click] no BL polygon contains ({wx:.2f}, {wy:.2f})")
+                if hit_block is not None:
+                    grid_name = hit_block.get("grid_name")
+                    file_path = hit_block.get("file_path")
+                    snt_filename = hit_block.get("snt_filename")
+                    # Merge hit_block's own alt_names with collected ones
+                    merged_alt = list(all_hit_alt_names)
+                    for an in (hit_block.get("alt_names") or []):
+                        if an not in merged_alt:
+                            merged_alt.append(an)
+                    print(f"[block-click] HIT block from '{hit_block.get('snt_filename')}', "
+                          f"grid_name='{grid_name}', file_path='{file_path}'")
+                    if merged_alt:
+                        print(f"[block-click] All candidate names: {[grid_name] + merged_alt}")
+
+                        def _load_block_file(_=False, gn=grid_name, fp=file_path,
+                                              an=None):
+                            if an is None:
+                                an = merged_alt
+                            if fp and Path(fp).exists():
+                                self._load_las_file(Path(fp), gn or Path(fp).stem)
+                                return
+                            self.load_grid_las(gn, snt_filename=snt_filename, alt_names=an)
