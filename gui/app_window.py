@@ -4162,7 +4162,19 @@ class NakshaApp(QMainWindow):
 
         # Deactivate any active digitize tool before enabling cross-section
         self._deactivate_digitize_tool()
- 
+
+        # ✅ Stand down the temp fence tool — its main-view VTK observers
+        # would otherwise keep capturing clicks during cross-section drawing.
+        try:
+            _tft = getattr(self, "temp_fence_tool", None)
+            if _tft is not None and getattr(_tft, "active", False):
+                _tft.deactivate()
+                if getattr(self, "active_classify_tool", None) == "temp_fence":
+                    self.active_classify_tool = None
+                print("🚧 Temp fence stood down for cross-section mode")
+        except Exception as _e:
+            print(f"⚠️ Temp fence stand-down failed: {_e}")
+
 
         # ✅ Create NON-BLOCKING view selector (only once)
         if not hasattr(self, '_view_selector_dialog') or self._view_selector_dialog is None:

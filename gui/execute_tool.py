@@ -267,6 +267,34 @@ def _deactivate_measurement_tool_safely(app_window, reason="switching tools"):
         mt.is_drawing = False
 
 
+def _deactivate_temp_fence_safely(app_window, reason="switching tools"):
+    """
+    Safely stand down the temp fence tool.
+    Called when switching to cross-section / cut-section (or any tool that
+    bypasses set_classify_tool and would otherwise leave the fence's VTK
+    observers capturing clicks).
+    """
+    tft = getattr(app_window, 'temp_fence_tool', None)
+    if tft is None:
+        return
+
+    if not getattr(tft, 'active', False):
+        return
+
+    print(f"   🚧 Deactivating temp fence tool ({reason})")
+
+    if hasattr(tft, 'deactivate'):
+        try:
+            tft.deactivate()
+        except Exception as e:
+            print(f"      ⚠️ Temp fence deactivate failed: {e}")
+
+    # Force flags even if deactivate() didn't clear them
+    tft.active = False
+    if getattr(app_window, 'active_classify_tool', None) == 'temp_fence':
+        app_window.active_classify_tool = None
+
+
 def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_label=""):
     """
     Execute a classification or cross-section tool.
@@ -970,6 +998,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         # ✅ Deactivate measurement tool
         _deactivate_measurement_tool_safely(app_window, "switching to cross-section")
 
+        # ✅ Stand down temp fence tool (its VTK observers would fight the
+        # cross-section line drawing)
+        _deactivate_temp_fence_safely(app_window, "switching to cross-section")
+
         # Element/rectangle selection tools install their own VTK observers;
         # clear them before the cross-section interactor takes over.
         deactivate_selection = getattr(app_window, "_deactivate_selection_tools", None)
@@ -1029,6 +1061,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         
         # ✅ Deactivate measurement tool
         _deactivate_measurement_tool_safely(app_window, "switching to cut-section")
+
+        # ✅ Stand down temp fence tool (its VTK observers would fight the
+        # cut-section rectangle drawing)
+        _deactivate_temp_fence_safely(app_window, "switching to cut-section")
         
         try:
             app_window.active_classify_tool = None
@@ -1049,6 +1085,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     if tool_name == "CutFromCross":
         # ✅ Deactivate curve tool
         _deactivate_curve_tool_safely(app_window, "switching to CutFromCross")
+
+        # ✅ Stand down temp fence tool
+        _deactivate_temp_fence_safely(app_window, "switching to CutFromCross")
         
         if hasattr(app_window, "cut_section_controller"):
             app_window.cut_section_controller.activate_from_cross_shortcut()
@@ -1057,6 +1096,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     if tool_name == "CutFromCut":
         # ✅ Deactivate curve tool
         _deactivate_curve_tool_safely(app_window, "switching to CutFromCut")
+
+        # ✅ Stand down temp fence tool
+        _deactivate_temp_fence_safely(app_window, "switching to CutFromCut")
         
         if hasattr(app_window, "cut_section_controller"):
             app_window.cut_section_controller.activate_from_cut_shortcut()
