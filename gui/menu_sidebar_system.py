@@ -305,6 +305,11 @@ RIBBON_TOOLTIP_META = {
         "description": "Open the display mode dialog and manage saved display presets.",
         "shortcut_tools": ("DisplayMode",),
     },
+    ("DisplayRibbon", "Config", "Fields"): {
+        "title": "Fields",
+        "description": "View and manage point cloud attribute fields.",
+        "shortcut_tools": ("Fields",),
+    },
     ("MeasurementRibbon", "Distance", "Line"): {
         "title": "Measure Line",
         "description": "Measure straight-line distance between two points.",
@@ -1765,25 +1770,27 @@ class DisplayRibbon(QWidget):
     """Ribbon for Display menu"""
     
     display_mode_clicked = Signal()
+    fields_clicked = Signal()
     border_width_changed = Signal(int)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Display Mode (Ctrl+D to Apply)")
-       
+
         self.resize(850, 600)
         self.current_ptc_path = None
         self.current_border_value = 0
         self.build_ribbon()
-        
+
     def build_ribbon(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        
+
         # Config
         config = RibbonSection("Config", self)
         config.add_button("Display", "🎛️", self.display_mode_clicked.emit)
+        config.add_button("Fields", "📋", self.fields_clicked.emit)
         layout.addWidget(config)
         layout.addStretch()
     
@@ -3761,28 +3768,37 @@ class IdentificationRibbon(QWidget):
             self._deactivate_zoom_rectangle()
             self._reset_status_label()
    
-    def update_info(self, class_code, class_name, xyz, color=None, lvl=None):
+    def update_info(self, class_code, class_name, xyz, color=None, lvl=None, fields=None):
         """
         Update the displayed information with class color background.
-        
+
         Args:
             class_code: Classification code (e.g., 2 for Ground)
             class_name: Human-readable name (e.g., "Ground")
             xyz: Tuple of (x, y, z) coordinates
             color: Optional RGB tuple (r, g, b) for background color
             lvl: Optional level/priority string (e.g., "5")
+            fields: Optional ordered dict of {field_label: display_value},
+                already filtered to what the user checked in the View Fields
+                dialog (Display ▸ Fields). When provided, this drives the
+                displayed text instead of the fixed Class/Lvl/XYZ layout.
         """
-        # ✅ NEW: Build info text with Level
-        x, y, z = xyz
-        info_text = f"Class {class_code}: {class_name}"
-        
-        # ✅ ADD: Show Level if available
-        if lvl:
-            info_text += f" | Lvl: {lvl}"
-        
-        # Add coordinates on second line
-        info_text += f"\nXYZ: ({x:.2f}, {y:.2f}, {z:.2f})"
-        
+        if fields:
+            pairs = [f"{label}: {value}" for label, value in fields.items()]
+            lines = ["  |  ".join(pairs[i:i + 2]) for i in range(0, len(pairs), 2)]
+            info_text = "\n".join(lines)
+        else:
+            # ✅ NEW: Build info text with Level
+            x, y, z = xyz
+            info_text = f"Class {class_code}: {class_name}"
+
+            # ✅ ADD: Show Level if available
+            if lvl:
+                info_text += f" | Lvl: {lvl}"
+
+            # Add coordinates on second line
+            info_text += f"\nXYZ: ({x:.2f}, {y:.2f}, {z:.2f})"
+
         self.status_label.setText(info_text)
         
         # ✅ Apply class color as background if provided

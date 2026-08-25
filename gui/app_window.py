@@ -6202,8 +6202,6 @@ class NakshaApp(QMainWindow):
         self.data = {"xyz": result["xyz"], "classification": result["classification"]}
         if "rgb"       in result: self.data["rgb"]       = result["rgb"]
         if "intensity" in result: self.data["intensity"] = result["intensity"]
-        if result.get("point_source_id") is not None:
-            self.data["point_source_id"] = result["point_source_id"]
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
         # Track whether this load was class-filtered so auto-save skips the file.
@@ -7394,7 +7392,6 @@ class NakshaApp(QMainWindow):
 
         import time as _time
         mode = str(mode or "").lower().strip()
-        previous_mode = str(getattr(self, "display_mode", "") or "").lower().strip()
         t0 = _time.perf_counter()
         print(f"\n🎨 Display mode → {mode}")
 
@@ -7481,17 +7478,6 @@ class NakshaApp(QMainWindow):
                 }
         except Exception:
             pass
-
-        # Line mode is rendered as a filtered PyVista point actor.  Remove it
-        # before returning to the unified-actor modes; otherwise it remains on
-        # top and hides class/depth/intensity/RGB/elevation color changes.
-        if previous_mode == "line" and mode != "line":
-            try:
-                from gui.pointcloud_display import _remove_pyvista_point_actors
-                _remove_pyvista_point_actors(self)
-                print(f"  🧹 Detached Line-mode point actor before {mode}")
-            except Exception as _line_cleanup_err:
-                print(f"  ⚠️ Line-mode cleanup before {mode} failed: {_line_cleanup_err}")
 
         # Close control docks
         for dock_name in ('shading_dock', 'class_dock'):
@@ -7582,24 +7568,6 @@ class NakshaApp(QMainWindow):
                 mode = "elevation"
                 self.display_mode = "elevation"
 
-        # Flight-line mode changes geometry visibility (selected Point Source
-        # IDs only), so use the filtering renderer rather than merely rewriting
-        # the unified actor's RGB buffer.
-        if mode == "line":
-            from .pointcloud_display import update_pointcloud
-            update_pointcloud(self, "line")
-            try:
-                if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:
-                    dlg = self.display_mode_dialog
-                    if dlg.color_mode.currentIndex() != 7:
-                        dlg.color_mode.blockSignals(True)
-                        dlg.color_mode.setCurrentIndex(7)
-                        dlg.color_mode.blockSignals(False)
-            except Exception:
-                pass
-            self._restore_camera_safe(saved_camera)
-            return
-
         # ═══════════════════════════════════════════════════════════════
         # ALL OTHER MODES: Write colors into unified actor RGB buffer
         # Zero rebuild. MicroStation instant switch.
@@ -7644,17 +7612,6 @@ class NakshaApp(QMainWindow):
 
         # Make unified actor visible (it may have been hidden by shading mode)
         actor.SetVisibility(True)
-
-        # vtk_widget.clear() in Line mode removes the unified actor from the
-        # renderer but deliberately keeps its cached Python reference for fast
-        # reuse.  Reattach that actor before writing its RGB buffer.
-        try:
-            renderer = self.vtk_widget.renderer
-            if renderer is not None and not renderer.HasViewProp(actor):
-                renderer.AddActor(actor)
-                print("  ♻️ Unified actor reattached after filtered display mode")
-        except Exception as _reattach_err:
-            print(f"  ⚠️ Unified actor reattach failed: {_reattach_err}")
 
         rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
         vtk_ca = getattr(actor, '_naksha_vtk_array', None)
@@ -13125,6 +13082,7 @@ class NakshaApp(QMainWindow):
         # =========================
         display_ribbon = self.ribbon_manager.ribbons["display"]
         display_ribbon.display_mode_clicked.connect(self.open_display_mode)
+        display_ribbon.fields_clicked.connect(self.open_fields_panel)
         display_ribbon.border_width_changed.connect(self.on_border_changed)
         print("✅ Border slider connected to on_border_changed")
 
@@ -15005,7 +14963,50 @@ class NakshaApp(QMainWindow):
                 pass
         
             print("✅ Display Mode dialog FORCED visible")
-    
+
+    def open_fields_panel(self):
+        """Open the MicroStation-style point data table for the loaded cloud."""
+        from PySide6.QtWidgets import QMessageBox
+        from gui.dialogs.view_fields_table import ViewFieldsTableDialog
+
+        if not getattr(self, "loaded_file", None):
+            QMessageBox.information(
+                self,
+                "View Fields",
+                "Load a point cloud file first to view its fields.",
+            )
+            return
+
+        if not self.data or "xyz" not in self.data:
+            QMessageBox.information(
+                self,
+                "View Fields",
+                "No point data loaded.",
+            )
+            return
+
+        # Only one table window at a time — if one is already open, just
+        # bring it to the front instead of creating a duplicate.
+        existing = getattr(self, "_view_fields_table_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.setWindowState(
+                existing.windowState() & ~Qt.WindowMinimized
+                | Qt.WindowActive)
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        dialog = ViewFieldsTableDialog(
+            filename=self.loaded_file,
+            app_data=self.data,
+            parent=self,
+        )
+        # Keep a reference so the Identification tool can highlight rows here.
+        self._view_fields_table_dialog = dialog
+        dialog.finished.connect(
+            lambda _r: setattr(self, "_view_fields_table_dialog", None))
+        dialog.show()  # non-modal so the user can still interact with the 3D view
+
     def load_las_for_grid(self, grid_name):
         """
         Load LAZ/LAS file matching the clicked grid name - AUTO-DETECT folder
@@ -15408,8 +15409,6 @@ class NakshaApp(QMainWindow):
                     self.data["rgb"] = tile_data["rgb"]
                 if tile_data.get("intensity") is not None:
                     self.data["intensity"] = tile_data["intensity"]
-                if tile_data.get("point_source_id") is not None:
-                    self.data["point_source_id"] = tile_data["point_source_id"]
                 
                 # Set CRS
                 if tile_data.get("crs_epsg"):
