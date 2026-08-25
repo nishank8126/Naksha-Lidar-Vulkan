@@ -158,8 +158,8 @@ class IdentificationTool(QObject):
                             self.highlight_class(class_code)
                             
                             # Update ribbon display
-                            self._update_ribbon_info(class_code, class_name, actual_pos)
-                            
+                            self._update_ribbon_info(class_code, class_name, actual_pos, point_index=closest_idx)
+
                             # Emit signal
                             self.point_identified.emit(class_code, class_name, actual_pos)
                         else:
@@ -176,13 +176,61 @@ class IdentificationTool(QObject):
             import traceback
             traceback.print_exc()
     
-    def _update_ribbon_info(self, class_code, class_name, xyz):
+    def _collect_field_values(self, class_code, class_name, xyz, point_index=None):
+        """
+        Build an ordered {field_label: display_value} dict for the picked point,
+        restricted to the fields checked in the View Fields dialog (Display ▸
+        Fields) and to data actually kept in memory for the loaded cloud.
+        """
+        from gui.dialogs.view_fields_dialog import FIELD_SPECS, DEFAULT_CHECKED
+
+        selected = getattr(self.app, "selected_view_fields", None)
+        selected = set(selected) if selected is not None else set(DEFAULT_CHECKED)
+
+        x, y, z = xyz
+        class_lvl = self.get_class_lvl(class_code)
+        raw_values = {
+            "Class": str(class_code),
+            "Description": class_lvl if class_lvl else class_name,
+            "Easting": f"{x:.2f}",
+            "Northing": f"{y:.2f}",
+            "Elevation": f"{z:.2f}",
+        }
+
+        data = getattr(self.app, "data", None) or {}
+        if point_index is not None:
+            intensity = data.get("intensity")
+            if intensity is not None and 0 <= point_index < len(intensity):
+                raw_values["Intensity"] = f"{float(intensity[point_index]):.1f}"
+
+            rgb = data.get("rgb")
+            if rgb is not None and 0 <= point_index < len(rgb):
+                r, g, b = (int(v) for v in rgb[point_index])
+                raw_values["Color RGB"] = f"{r}, {g}, {b}"
+
+        return {
+            label: raw_values[label]
+            for label, _dims, _always in FIELD_SPECS
+            if label in selected and label in raw_values
+        }
+
+    def _update_ribbon_info(self, class_code, class_name, xyz, point_index=None):
         """Update the identification ribbon with point info"""
         try:
+            # Sync the View Fields table (if open) with the identified point.
+            if point_index is not None:
+                table_dlg = getattr(self.app, "_view_fields_table_dialog", None)
+                if table_dlg is not None and table_dlg.isVisible():
+                    try:
+                        print(f"   🔗 Syncing View Fields table (point {point_index})")
+                        table_dlg.highlight_point(point_index)
+                    except Exception as exc:
+                        print(f"   ⚠️ View Fields table highlight failed: {exc}")
             # Get color and level regardless of ribbon availability
             class_color = self.get_class_color(class_code)
             class_lvl = self.get_class_lvl(class_code)
             display_name = class_lvl if class_lvl else class_name
+            fields = self._collect_field_values(class_code, class_name, xyz, point_index)
 
             if hasattr(self.app, 'ribbon_manager'):
                 identify_ribbon = self.app.ribbon_manager.ribbons.get('identify')
@@ -192,7 +240,8 @@ class IdentificationTool(QObject):
                         class_name,
                         xyz,
                         color=class_color,
-                        lvl=class_lvl
+                        lvl=class_lvl,
+                        fields=fields,
                     )
 
             # Update footer label with color dot + "Class: code : name"
@@ -557,10 +606,10 @@ class IdentificationTool(QObject):
                         
                         # ✅ Highlight in Point Statistics widget
                         self.highlight_class(class_code)
-                        
+
                         # Update ribbon display
-                        self._update_ribbon_info(class_code, class_name, actual_pos)
-                        
+                        self._update_ribbon_info(class_code, class_name, actual_pos, point_index=original_idx)
+
                         # Emit signal
                         self.point_identified.emit(class_code, class_name, actual_pos)
                     else:

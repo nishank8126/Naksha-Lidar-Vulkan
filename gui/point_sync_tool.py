@@ -573,7 +573,7 @@ class PointSyncTool(QObject):
                 # Delegate to identification_tool — it handles ribbon + footer
                 class_name = identification_tool.get_class_name(class_code)
                 identification_tool.highlight_class(class_code)
-                identification_tool._update_ribbon_info(class_code, class_name, world_xyz)
+                identification_tool._update_ribbon_info(class_code, class_name, world_xyz, point_index=global_index)
             else:
                 # Fallback: update footer directly with "Class: code : name" format
                 if hasattr(self.app, "snt_layer_pick_footer_label"):
