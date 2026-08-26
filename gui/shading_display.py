@@ -12859,7 +12859,20 @@ _MAX_STORED_SHADING_CACHES = 4
 _MAX_STORED_REPRESENTATIVE_CACHES = 4
 _ADAPTIVE_SHADING_VERSION = 1
 _ADAPTIVE_DEFAULT_TARGET = 3_000_000
+_SHADING_FAST_TARGET = 1_000_000
 _FEATURE_AWARE_VERSION = 1
+
+# Multi-class classification refresh must keep the enormous base shaded mesh
+# immutable.  Local class edits are displayed through one tiny exact-face
+# overlay, just like the existing single-class live-add path.
+_MULTICLASS_COLOR_OVERLAY_NAME = "shaded_mesh_live_multiclass_color"
+_INCIDENT_FACE_CACHE_MAX_NEW_VERTICES = 4096
+
+
+def normalize_shading_quality(value):
+    """Return the persisted shading quality key used by UI and caches."""
+    quality = str(value or "normal").strip().lower()
+    return quality if quality in ("fast", "normal", "slow") else "normal"
 _rebuild_timer = None
 _rebuild_reason = ""
 _rebuild_changed_indices = None
@@ -13030,7 +13043,15 @@ def _schedule_fast_shaded_present(
         try:
             widget = getattr(app, 'vtk_widget', None)
             if widget is not None:
+                reason = getattr(app, '_shading_present_reason', None)
+                pt0 = time.perf_counter()
                 widget.render()
+                if reason:
+                    print(
+                        "SHADING_PRESENT "
+                        f"reason={reason} render={(time.perf_counter()-pt0)*1000:.1f}ms"
+                    )
+                    app._shading_present_reason = None
         except Exception as exc:
             print(f"SHADING_PRESENT failed={exc}")
         try:
@@ -13056,7 +13077,7 @@ class _ShadingComputationWorker(QThread):
     finished_signal = Signal(dict)
     error_signal = Signal(str)
 
-    def __init__(self, xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None):
+    def __init__(self, xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None, quality_mode="normal"):
         super().__init__()
         self.xyz_raw = xyz_raw
         self.classes_raw = classes_raw
@@ -13069,6 +13090,7 @@ class _ShadingComputationWorker(QThread):
         self.data_hash = data_hash
         self.representative_seed = representative_seed
         self.boundary_flags = boundary_flags
+        self.quality_mode = quality_mode
 
     def run(self):
         try:
@@ -13077,7 +13099,8 @@ class _ShadingComputationWorker(QThread):
                 self.azimuth, self.angle, self.ambient,
                 self.max_edge_factor, self.single_class_max_edge, self.data_hash,
                 representative_seed=self.representative_seed,
-                boundary_flags=self.boundary_flags
+                boundary_flags=self.boundary_flags,
+                quality_mode=self.quality_mode
             )
             self.finished_signal.emit(res)
         except Exception:
@@ -13244,7 +13267,7 @@ def _feature_aware_filter_faces(faces, xyz_unique, representative_boundary, spac
     )
     return filtered, meta
 
-def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None):
+def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None, quality_mode="normal"):
     profile_start = time.perf_counter()
     stage_start = profile_start
     timings = OrderedDict()
@@ -13349,74 +13372,107 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
         natural_spacing = np.sqrt(area / n_pts)
         checkpoint("normalize_extent")
 
-        TARGET_MAX = 1_500_000 if HAS_TRIANGLE else 500_000
+        quality_mode = str(quality_mode or "normal").strip().lower()
+        if quality_mode not in ("fast", "normal", "slow"):
+            quality_mode = "normal"
+        adaptive_enabled = os.environ.get("NAKSHA_SHADING_ADAPTIVE", "1").strip().lower() not in ("0", "false", "off", "no")
+        use_count_first = False
         precision = max(natural_spacing * 0.3, 0.005)
         lod_factor = 1.0
 
-        # PATCH 3 count-first deduplication.
-        use_count_first = n_pts > int(TARGET_MAX * 1.30)
-        if use_count_first:
-            n_unique = _grid_unique_count_fast_at_precision(xyz, precision)
-            unique_local = None
-        else:
-            unique_local = _grid_dedup_at_precision(xyz, precision)
-            n_unique = len(unique_local)
-        base_grid_unique_count = int(n_unique)
-        checkpoint("dedup_pass1")
-
-        if n_unique > TARGET_MAX:
-            lod_factor = np.sqrt(n_unique / TARGET_MAX)
-            lod_factor = min(max(lod_factor, 1.0), 5.0)
-            precision2 = precision * lod_factor
-
-            # PATCH 7: do not materialize representatives at an intermediate
-            # precision that may immediately be discarded. Count its exact
-            # occupied cells first, apply the same legacy correction formula,
-            # and invoke the highest-Z selector only once at the final precision.
-            n_unique2 = _grid_unique_count_fast_at_precision(xyz, precision2)
-            if n_unique2 > TARGET_MAX * 1.3:
-                lod_factor2 = np.sqrt(n_unique2 / TARGET_MAX)
-                precision3 = precision2 * lod_factor2
-                unique_local = _grid_dedup_at_precision(xyz, precision3)
-                n_unique = len(unique_local)
-                lod_factor *= lod_factor2
-                precision = precision3
-            else:
-                unique_local = _grid_dedup_at_precision(xyz, precision2)
-                n_unique = len(unique_local)
-                precision = precision2
-        elif unique_local is None:
-            unique_local = _grid_dedup_at_precision(xyz, precision)
-            n_unique = len(unique_local)
-        checkpoint("dedup_lod_extra")
-
-        adaptive_enabled = os.environ.get("NAKSHA_SHADING_ADAPTIVE", "1").strip().lower() not in ("0", "false", "off", "no")
-        adaptive_target = int(os.environ.get("NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)))
-        if adaptive_enabled and HAS_TRIANGLE and visible_boundary is not None:
-            unique_local, adaptive_meta = _adaptive_boundary_representatives(
-                xyz, unique_local, visible_boundary, precision, adaptive_target
-            )
-            print(
-                "SHADING_ADAPTIVE "
-                f"status={'enabled' if adaptive_meta.get('enabled') else 'fallback'} "
-                f"reason={adaptive_meta.get('reason')} "
-                f"base={adaptive_meta.get('base', len(unique_local))} "
-                f"boundary_points={adaptive_meta.get('boundary_points', 0)} "
-                f"fine_candidates={adaptive_meta.get('fine_candidates', 0)} "
-                f"extra={adaptive_meta.get('extra', 0)} "
-                f"final={len(unique_local)} target={adaptive_meta.get('target', adaptive_target)} "
-                f"elapsed={adaptive_meta.get('elapsed', 0.0)*1000.0:.1f}ms"
-            )
-        else:
+        if quality_mode == "slow":
+            # MicroStation-style Slow: retain every eligible finite point.
+            # The confirmation and memory warning live in Display Mode before
+            # this deliberately expensive background operation starts.
+            unique_local = np.arange(n_pts, dtype=np.int64)
+            n_unique = n_pts
+            base_grid_unique_count = n_pts
+            checkpoint("dedup_pass1")
+            checkpoint("dedup_lod_extra")
+            adaptive_target = n_pts
             adaptive_meta = {
-                "enabled": False,
-                "reason": "disabled" if not adaptive_enabled else ("triangle_unavailable" if not HAS_TRIANGLE else "boundary_unavailable"),
-                "base": len(unique_local), "extra": 0, "target": adaptive_target,
+                "enabled": False, "reason": "slow_all_points",
+                "base": n_pts, "extra": 0, "target": n_pts,
             }
             print(
-                "SHADING_ADAPTIVE status=fallback "
-                f"reason={adaptive_meta['reason']} base={len(unique_local)} final={len(unique_local)}"
+                "SHADING_ADAPTIVE status=disabled reason=slow_all_points "
+                f"base={n_pts} final={n_pts} target={n_pts}"
             )
+        else:
+            final_target = (
+                _SHADING_FAST_TARGET if quality_mode == "fast"
+                else int(os.environ.get(
+                    "NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)
+                ))
+            )
+            TARGET_MAX = (
+                max(3, final_target // 2) if HAS_TRIANGLE
+                else min(final_target, 500_000)
+            )
+
+            # Count-first grid deduplication avoids materializing an oversized
+            # representative array before the final precision is known.
+            use_count_first = n_pts > int(TARGET_MAX * 1.30)
+            if use_count_first:
+                n_unique = _grid_unique_count_fast_at_precision(xyz, precision)
+                unique_local = None
+            else:
+                unique_local = _grid_dedup_at_precision(xyz, precision)
+                n_unique = len(unique_local)
+            base_grid_unique_count = int(n_unique)
+            checkpoint("dedup_pass1")
+
+            if n_unique > TARGET_MAX:
+                lod_factor = np.sqrt(n_unique / TARGET_MAX)
+                lod_factor = min(max(lod_factor, 1.0), 5.0)
+                precision2 = precision * lod_factor
+                n_unique2 = _grid_unique_count_fast_at_precision(xyz, precision2)
+                if n_unique2 > TARGET_MAX * 1.3:
+                    lod_factor2 = np.sqrt(n_unique2 / TARGET_MAX)
+                    precision3 = precision2 * lod_factor2
+                    unique_local = _grid_dedup_at_precision(xyz, precision3)
+                    n_unique = len(unique_local)
+                    lod_factor *= lod_factor2
+                    precision = precision3
+                else:
+                    unique_local = _grid_dedup_at_precision(xyz, precision2)
+                    n_unique = len(unique_local)
+                    precision = precision2
+            elif unique_local is None:
+                unique_local = _grid_dedup_at_precision(xyz, precision)
+                n_unique = len(unique_local)
+            checkpoint("dedup_lod_extra")
+
+            adaptive_target = final_target
+            if adaptive_enabled and HAS_TRIANGLE and visible_boundary is not None:
+                unique_local, adaptive_meta = _adaptive_boundary_representatives(
+                    xyz, unique_local, visible_boundary, precision, adaptive_target
+                )
+                print(
+                    "SHADING_ADAPTIVE "
+                    f"status={'enabled' if adaptive_meta.get('enabled') else 'fallback'} "
+                    f"reason={adaptive_meta.get('reason')} "
+                    f"base={adaptive_meta.get('base', len(unique_local))} "
+                    f"boundary_points={adaptive_meta.get('boundary_points', 0)} "
+                    f"fine_candidates={adaptive_meta.get('fine_candidates', 0)} "
+                    f"extra={adaptive_meta.get('extra', 0)} "
+                    f"final={len(unique_local)} target={adaptive_meta.get('target', adaptive_target)} "
+                    f"elapsed={adaptive_meta.get('elapsed', 0.0)*1000.0:.1f}ms"
+                )
+            else:
+                adaptive_meta = {
+                    "enabled": False,
+                    "reason": "disabled" if not adaptive_enabled else (
+                        "triangle_unavailable" if not HAS_TRIANGLE else "boundary_unavailable"
+                    ),
+                    "base": len(unique_local), "extra": 0,
+                    "target": adaptive_target,
+                }
+                print(
+                    "SHADING_ADAPTIVE status=fallback "
+                    f"reason={adaptive_meta['reason']} "
+                    f"base={len(unique_local)} final={len(unique_local)}"
+                )
         checkpoint("adaptive_refinement")
 
         xyz_unique = xyz[unique_local]
@@ -13738,6 +13794,17 @@ if HAS_NUMBA:
             )
         return affected
 
+    @njit(parallel=True, cache=True)
+    def _numba_fill_affected_face_mask(faces, changed_vertex, affected):
+        """Fill a caller-owned mask to avoid a 26M bool allocation per edit."""
+        n = faces.shape[0]
+        for i in prange(n):
+            affected[i] = (
+                changed_vertex[faces[i, 0]]
+                or changed_vertex[faces[i, 1]]
+                or changed_vertex[faces[i, 2]]
+            )
+
     @njit(parallel=True, fastmath=True)
     def _numba_edge_filter(faces, xy, max_edge_sq):
         n = faces.shape[0]
@@ -13880,7 +13947,10 @@ if HAS_NUMBA:
             _gf = np.array([[0,1,2]], dtype=np.int32)
             _numba_edge_filter(_gf, _xy, 100.)
             _numba_degenerate_filter(_gf, _xy, 1e-6, 0.001)
-            _numba_affected_face_mask(_gf, np.array([True, False, False]))
+            _cv = np.array([True, False, False])
+            _numba_affected_face_mask(_gf, _cv)
+            _af = np.empty(len(_gf), dtype=np.bool_)
+            _numba_fill_affected_face_mask(_gf, _cv, _af)
             _numba_dense_grid_highest_z(_xyz, 0.5, 0, 0, 3, 3)
             _numba_dense_grid_unique_count(_xyz, 0.5, 0, 0, 3, 3)
         except Exception:
@@ -14050,21 +14120,75 @@ def _remove_shaded_edge_overlay(app):
     app._shaded_mesh_edge_actor = None; app._shaded_mesh_edge_polydata = None
 
 
+def _remove_multiclass_color_overlay(app, cache=None, clear_dirty=True):
+    """Remove the tiny multi-class color overlay without touching base shading.
+
+    A full shading render/recolor already bakes the current canonical
+    classification into the base mesh, so any live color overlay is then
+    redundant and must be discarded.
+    """
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is not None:
+        try:
+            plotter.remove_actor(_MULTICLASS_COLOR_OVERLAY_NAME, render=False)
+        except Exception:
+            pass
+    app._shading_multiclass_color_overlay_actor = None
+
+    if clear_dirty:
+        caches = []
+        if cache is not None:
+            caches = [cache]
+        else:
+            try:
+                caches = list(_cache_store.values())
+            except Exception:
+                caches = []
+        for item in caches:
+            try:
+                item._multiclass_dirty_faces.clear()
+                item._multiclass_dirty_faces_faces_id = id(item.faces) if item.faces is not None else None
+            except Exception:
+                pass
+
+
 def _remove_fast_shading_overlays(app):
     """Remove only temporary shading-owned actors; never touch class actors."""
     plotter = getattr(app, 'vtk_widget', None)
     if plotter is None:
         app._shading_add_overlays = []
+        app._shading_remove_overlays = []
+        app._shading_multiclass_color_overlay_actor = None
+        try:
+            for item in _cache_store.values():
+                item._multiclass_dirty_faces.clear()
+        except Exception:
+            pass
         return 0
     names = {
         str(entry.get('name'))
         for entry in (getattr(app, '_shading_add_overlays', None) or [])
         if entry.get('name')
     }
+    # Single-class visible -> hidden edits use tiny local eraser/fill actors
+    # so the 50M+ cell base mesh stays immutable on the GPU during active
+    # classification.  They are shading-owned and must be removed together
+    # with the existing add overlays on mode switches/full rebuilds.
+    for entry in (getattr(app, '_shading_remove_overlays', None) or []):
+        if not isinstance(entry, dict):
+            continue
+        for key in ('erase_name', 'fill_name'):
+            value = entry.get(key)
+            if value:
+                names.add(str(value))
     try:
         names.update(
             str(name) for name in list(plotter.actors.keys())
-            if str(name).startswith('shaded_mesh_live_add_')
+            if (
+                str(name).startswith('shaded_mesh_live_add_')
+                or str(name).startswith('shaded_mesh_live_remove_erase_')
+                or str(name).startswith('shaded_mesh_live_remove_fill_')
+            )
         )
     except Exception:
         pass
@@ -14076,6 +14200,22 @@ def _remove_fast_shading_overlays(app):
         except Exception:
             pass
     app._shading_add_overlays = []
+    app._shading_remove_overlays = []
+    # Multi-class uses a separate exact-face color overlay.  It is shading-owned
+    # too, but deliberately not mixed with the single-class add-overlay journal.
+    try:
+        if _MULTICLASS_COLOR_OVERLAY_NAME in plotter.actors:
+            plotter.remove_actor(_MULTICLASS_COLOR_OVERLAY_NAME, render=False)
+            removed += 1
+    except Exception:
+        pass
+    app._shading_multiclass_color_overlay_actor = None
+    try:
+        for item in _cache_store.values():
+            item._multiclass_dirty_faces.clear()
+            item._multiclass_dirty_faces_faces_id = id(item.faces) if item.faces is not None else None
+    except Exception:
+        pass
     if removed:
         print(f"SHADING_OVERLAY_CLEANUP actors={removed}")
     return removed
@@ -14178,6 +14318,18 @@ class ShadingGeometryCache:
         self.data_hash = None; self._vtk_colors_ptr = None
         self._hidden_face_mask = None; self._global_to_unique = None
         self._cached_face_class = None; self._tri_lod_factor = 1.0
+        # Reusable masks for local shading classification edits.
+        self._changed_vertex_scratch = None
+        self._affected_face_scratch = None
+        # Sparse point->incident-face cache.  It is populated only for vertices
+        # the user actually edits, so we avoid a 1GB+ global CSR adjacency for
+        # 30M+ point meshes while making repeat edits/undo essentially O(k).
+        self._incident_face_cache = {}
+        self._incident_face_cache_faces_id = None
+        # Faces whose displayed class color differs from the immutable base
+        # mesh.  A tiny overlay is rebuilt from this sparse set only.
+        self._multiclass_dirty_faces = set()
+        self._multiclass_dirty_faces_faces_id = None
         self._xy_tree = None; self._xy_tree_size = 0
         self._xy_tree_xyz_id = None
         # Keep NumPy buffers alive when VTK uses zero-copy local updates.
@@ -14263,9 +14415,15 @@ def _compute_xyz_hash(xyz):
 def _normalize_visible_classes(vc):
     return tuple(sorted(int(c) for c in vc)) if vc else tuple()
 
-def _build_cache_key(xyz, visible_classes, single_class_max_edge=None):
+def _build_cache_key(xyz, visible_classes, single_class_max_edge=None, quality_mode="normal"):
+    quality_mode = normalize_shading_quality(quality_mode)
     adaptive_enabled = os.environ.get("NAKSHA_SHADING_ADAPTIVE", "1").strip().lower() not in ("0", "false", "off", "no")
-    adaptive_target = int(os.environ.get("NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)))
+    if quality_mode == "fast":
+        adaptive_target = _SHADING_FAST_TARGET
+    elif quality_mode == "slow":
+        adaptive_target = "all"
+    else:
+        adaptive_target = int(os.environ.get("NAKSHA_SHADING_ADAPTIVE_TARGET", str(_ADAPTIVE_DEFAULT_TARGET)))
     adaptive_ratio = round(float(os.environ.get("NAKSHA_SHADING_ADAPTIVE_FINE_RATIO", "0.55")), 4)
     feature_enabled = os.environ.get("NAKSHA_SHADING_FEATURE_AWARE", "1").strip().lower() not in ("0", "false", "off", "no")
     feature_key = (
@@ -14276,7 +14434,7 @@ def _build_cache_key(xyz, visible_classes, single_class_max_edge=None):
         round(float(os.environ.get("NAKSHA_SHADING_FEATURE_MIN_Z_JUMP", "0.35")), 4),
         round(float(os.environ.get("NAKSHA_SHADING_FEATURE_MIN_SLOPE", "0.75")), 4),
     )
-    quality_key = (_ADAPTIVE_SHADING_VERSION, int(adaptive_enabled), adaptive_target, adaptive_ratio, feature_key)
+    quality_key = (quality_mode, _ADAPTIVE_SHADING_VERSION, int(adaptive_enabled), adaptive_target, adaptive_ratio, feature_key)
     if len(visible_classes) == 1:
         edge_key = "auto" if single_class_max_edge is None else round(float(single_class_max_edge), 6)
         mode_key = ("single", edge_key, quality_key)
@@ -14324,8 +14482,8 @@ def _set_rendered_cache_key(app, cache=None, cache_key=None):
         cache_key = getattr(cache, 'cache_key', None)
     setattr(app, '_rendered_shading_cache_key', cache_key)
 
-def has_cached_geometry(xyz, visible_classes, single_class_max_edge=None):
-    cache = _cache_store.get(_build_cache_key(xyz, visible_classes, single_class_max_edge))
+def has_cached_geometry(xyz, visible_classes, single_class_max_edge=None, quality_mode="normal"):
+    cache = _cache_store.get(_build_cache_key(xyz, visible_classes, single_class_max_edge, quality_mode))
     return bool(cache and cache.is_geometry_valid(xyz, visible_classes))
 
 def clear_shading_cache(reason="", all_entries=True):
@@ -14504,7 +14662,11 @@ def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
     angle = getattr(app, 'last_shade_angle', angle)
     ambient = getattr(app, 'shade_ambient', ambient)
     vc = _get_shading_visibility(app)
-    requested_cache_key = _build_cache_key(xyz_raw, vc, single_class_max_edge) if vc else None
+    quality_mode = normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
+    app.shading_quality = quality_mode
+    requested_cache_key = _build_cache_key(
+        xyz_raw, vc, single_class_max_edge, quality_mode
+    ) if vc else None
     cache = get_cache(requested_cache_key) if vc else get_cache()
     rendered_cache_key = _get_rendered_cache_key(app)
 
@@ -14681,7 +14843,8 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
     nv = len(visible_classes)
     is_sc = (nv == 1)
     print(f"\n{'='*60}")
-    print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode)")
+    quality_mode = normalize_shading_quality(getattr(app, "shading_quality", "normal"))
+    print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode, {quality_mode})")
     print(f"{'='*60}")
     t_total = time.time()
 
@@ -14721,7 +14884,8 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
             xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
             max_edge_factor, single_class_max_edge, _compute_xyz_hash(xyz_raw),
             representative_seed=representative_seed,
-            boundary_flags=boundary_flags
+            boundary_flags=boundary_flags,
+            quality_mode=normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
         )
         
         loop = QEventLoop()
@@ -14757,6 +14921,7 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
         if backend_profile:
             _emit_shading_profile(
                 "geometry_backend", backend_profile,
+                quality=normalize_shading_quality(getattr(app, "shading_quality", "normal")),
                 raw_points=len(xyz_raw),
                 unique_points=len(res.get("xyz_unique", [])),
                 faces=len(res.get("faces", [])),
@@ -15036,6 +15201,9 @@ def _face_class_ids(vertex_classes, faces):
 
 def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     if cache.faces is None or len(cache.faces) == 0: return
+    # A full render/recolor bakes canonical classes into the base mesh.  Drop
+    # any temporary multi-class color overlay before touching that base actor.
+    _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
     profile_start = time.perf_counter()
     stage_start = profile_start
     render_timings = OrderedDict()
@@ -15238,8 +15406,9 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
             elif any(ns.startswith(p) for p in ["border_", "shaded_mesh", "__lod_overlay_"]):
                 plotter.remove_actor(name, render=False)
     checkpoint("actor_scan_cleanup")
-    # A normal shading build supersedes every temporary local-add overlay.
+    # A normal shading build supersedes every temporary single-class delta.
     app._shading_add_overlays = []
+    app._shading_remove_overlays = []
 
     app._shaded_mesh_actor = plotter.add_mesh(
         mesh, scalars="RGB", rgb=True, show_edges=False, lighting=False,
@@ -15413,7 +15582,9 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
     xyz_raw = data.get("xyz")
     if cls_raw is None or xyz_raw is None:
         return False
-    cls = cls_raw.astype(np.int32)
+    # LAS classification is already integer data; do not copy 13M+ entries
+    # to int32 just to inspect a few hundred changed points.
+    cls = np.asarray(cls_raw)
     ci = np.flatnonzero(changed_mask)
     cc = cls[ci]
     nh = ~np.isin(cc, va)  # Points now hidden (classified away from visible class)
@@ -15487,6 +15658,76 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
             update_shaded_class(app, force_rebuild=True)
             return True
     
+    # Multi-class fast membership path.
+    #
+    # If every edited point stays on the same visibility side of the shaded
+    # subset, geometry is unchanged. In the common all-classes-visible case
+    # this is always true, so skip the expensive orphan checks that call
+    # np.unique(cache.faces.ravel()) across tens of millions of face indices.
+    if not isc or sci is None:
+        try:
+            membership_unchanged = False
+            visible_after = True
+
+            if delta is not None:
+                mdci = np.asarray(delta.changed_indices, dtype=np.int64).ravel()
+                mdold = np.asarray(delta.old_classes).ravel()
+                mdnew = np.asarray(delta.new_classes).ravel()
+                if mdci.size == mdold.size == mdnew.size:
+                    old_vis = np.isin(mdold, va)
+                    new_vis = np.isin(mdnew, va)
+                    membership_unchanged = not np.any(old_vis != new_vis)
+                    visible_after = bool(np.any(new_vis))
+                    if membership_unchanged:
+                        if not visible_after:
+                            return True
+                        if _fast_multiclass_color_overlay(
+                            app,
+                            cache,
+                            changed_mask=changed_mask,
+                            changed_indices=mdci,
+                            visible_classes=vc,
+                        ):
+                            return True
+                        return _update_colors_gpu_fast(
+                            app,
+                            cache,
+                            changed_mask=changed_mask,
+                            _visible_classes=vc,
+                            _defer_render=True,
+                            _changed_indices=mdci,
+                        )
+
+            # Safe fallback when explicit old/new classes are unavailable:
+            # if every known palette class is visible, no classification can
+            # change shading membership.
+            known_classes = set(int(c) for c in app.class_palette.keys())
+            if known_classes and known_classes.issubset(set(int(c) for c in vc)):
+                if _fast_multiclass_color_overlay(
+                    app,
+                    cache,
+                    changed_mask=changed_mask,
+                    changed_indices=ci,
+                    visible_classes=vc,
+                ):
+                    return True
+                return _update_colors_gpu_fast(
+                    app,
+                    cache,
+                    changed_mask=changed_mask,
+                    _visible_classes=vc,
+                    _defer_render=True,
+                    _changed_indices=ci,
+                )
+        except Exception as exc:
+            print(f"SHADING_MULTI_FAST_PATH fallback={exc}")
+
+        # We are leaving the topology-stable overlay regime (for example a
+        # visible class becomes hidden or vice versa).  Commit prior sparse
+        # color edits before the existing topology-aware path mutates faces.
+        if getattr(cache, '_multiclass_dirty_faces', None):
+            _bake_multiclass_color_overlay_into_base(app, cache, vc)
+
     # ✅ FAST PATH for single-class: blacken affected faces immediately, queue rebuild
     if isc and sci is not None:
         mesh = getattr(app, '_shaded_mesh_polydata', None)
@@ -15987,15 +16228,38 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
     xyz = app.data.get("xyz")
     if cls is None or xyz is None:
         return False
-    cls = cls.astype(np.int32)
+    # Classification is already integer LAS data.  Do not copy 34M entries on
+    # every Ctrl+Z merely to inspect the changed subset.
+    cls = np.asarray(cls)
     ci = np.flatnonzero(changed_mask)
     if len(ci) == 0:
         return True
     
     va = np.array(sorted(vc), dtype=np.int32) if vc else np.array([], dtype=np.int32)
     nv = np.isin(cls[ci], va) if len(va) > 0 else np.zeros(len(ci), dtype=bool)
+
+    # Multi-class topology-stable undo must mirror the classification fast
+    # path.  Do this BEFORE np.unique(cache.faces.ravel()), which is catastrophic
+    # on a 68M-face mesh and is unnecessary when both old/new classes are visible.
+    if not isc or sci is None:
+        try:
+            if np.all(nv) and _check_previous_classes_visible(app, ci, va):
+                if _fast_multiclass_color_overlay(
+                    app,
+                    cache,
+                    changed_mask=changed_mask,
+                    changed_indices=ci,
+                    visible_classes=vc,
+                ):
+                    return True
+        except Exception as exc:
+            print(f"SHADING_MULTI_UNDO_FAST_PATH fallback={exc}")
     
-    # Fast path: all changed points still visible
+    # Existing topology-aware path remains unchanged for visibility membership
+    # changes (visible<->hidden classes).  Bake any earlier sparse color overlay
+    # before that path changes topology.
+    if (not isc or sci is None) and getattr(cache, '_multiclass_dirty_faces', None):
+        _bake_multiclass_color_overlay_into_base(app, cache, vc)
     g2u = cache.build_global_to_unique(len(xyz))
     cu = g2u[ci]
     ic = cu >= 0
@@ -16070,11 +16334,21 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
         return True
     return True
 
-def _affected_faceted_faces(cache, changed_mask, total_points):
-    """Return representative vertices and incident facets for a class edit."""
-    changed_indices = np.flatnonzero(changed_mask)
+def _affected_faceted_faces(cache, changed_mask, total_points, changed_indices=None):
+    """Return representative vertices and their exact incident facets.
+
+    First touch of new vertices uses the existing Numba full-face scan, which is
+    exact and already costs only ~35-55 ms even on a 68M-face mesh.  The result
+    is then cached sparsely per edited representative vertex.  Undo/re-edit of
+    those same points no longer scans the complete mesh.
+    """
+    if changed_indices is None:
+        changed_indices = np.flatnonzero(changed_mask)
+    else:
+        changed_indices = np.asarray(changed_indices, dtype=np.int64).ravel()
     if changed_indices.size == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
     g2u = cache.build_global_to_unique(total_points)
     changed_unique = g2u[changed_indices]
     changed_unique = np.unique(
@@ -16085,129 +16359,545 @@ def _affected_faceted_faces(cache, changed_mask, total_points):
     )
     if changed_unique.size == 0:
         return changed_unique, np.empty(0, dtype=np.int64)
-    changed_vertex = np.zeros(len(cache.unique_indices), dtype=bool)
-    changed_vertex[changed_unique] = True
-    if HAS_NUMBA:
-        affected_faces = np.flatnonzero(
-            _numba_affected_face_mask(cache.faces, changed_vertex)
+
+    faces_id = id(cache.faces)
+    incident_cache = getattr(cache, '_incident_face_cache', None)
+    if not isinstance(incident_cache, dict):
+        incident_cache = {}
+        cache._incident_face_cache = incident_cache
+    if getattr(cache, '_incident_face_cache_faces_id', None) != faces_id:
+        incident_cache.clear()
+        cache._incident_face_cache_faces_id = faces_id
+
+    cached_parts = []
+    missing = []
+    for vertex_id in changed_unique.tolist():
+        hit = incident_cache.get(int(vertex_id))
+        if hit is None:
+            missing.append(int(vertex_id))
+        elif len(hit):
+            cached_parts.append(np.asarray(hit, dtype=np.int64))
+
+    # Pure cache hit: no 68M-face scan at all.  This is particularly important
+    # for Ctrl+Z, which edits exactly the same representatives in reverse.
+    if not missing:
+        if not cached_parts:
+            return changed_unique, np.empty(0, dtype=np.int64)
+        affected_faces = np.unique(np.concatenate(cached_parts))
+        print(
+            'SHADING_FACE_LOOKUP cache=hit '
+            f'vertices={len(changed_unique)} faces={len(affected_faces)}'
+        )
+        return changed_unique, affected_faces
+
+    missing_arr = np.asarray(missing, dtype=np.int64)
+    changed_vertex = getattr(cache, '_changed_vertex_scratch', None)
+    if (
+        changed_vertex is None
+        or changed_vertex.dtype != np.bool_
+        or len(changed_vertex) != len(cache.unique_indices)
+    ):
+        changed_vertex = np.zeros(len(cache.unique_indices), dtype=np.bool_)
+        cache._changed_vertex_scratch = changed_vertex
+
+    changed_vertex[missing_arr] = True
+    try:
+        if HAS_NUMBA:
+            affected_mask = getattr(cache, '_affected_face_scratch', None)
+            if (
+                affected_mask is None
+                or affected_mask.dtype != np.bool_
+                or len(affected_mask) != len(cache.faces)
+            ):
+                affected_mask = np.empty(len(cache.faces), dtype=np.bool_)
+                cache._affected_face_scratch = affected_mask
+            _numba_fill_affected_face_mask(
+                cache.faces, changed_vertex, affected_mask
+            )
+            newly_affected = np.flatnonzero(affected_mask)
+        else:
+            newly_affected = np.flatnonzero(
+                changed_vertex[cache.faces[:, 0]]
+                | changed_vertex[cache.faces[:, 1]]
+                | changed_vertex[cache.faces[:, 2]]
+            )
+    finally:
+        changed_vertex[missing_arr] = False
+
+    # Cache only normal interactive-sized batches.  For huge bulk edits, the
+    # Python dict bookkeeping would cost more than it saves; exact behaviour is
+    # unchanged because the scan result is still returned.
+    if (
+        len(missing_arr) <= _INCIDENT_FACE_CACHE_MAX_NEW_VERTICES
+        and len(newly_affected) > 0
+    ):
+        local_faces = cache.faces[newly_affected]
+        for vertex_id in missing_arr.tolist():
+            member = np.any(local_faces == int(vertex_id), axis=1)
+            incident_cache[int(vertex_id)] = np.asarray(
+                newly_affected[member], dtype=np.int32
+            )
+
+    if cached_parts:
+        affected_faces = np.unique(
+            np.concatenate(cached_parts + [np.asarray(newly_affected, dtype=np.int64)])
         )
     else:
-        affected_faces = np.flatnonzero(
-            changed_vertex[cache.faces[:, 0]]
-            | changed_vertex[cache.faces[:, 1]]
-            | changed_vertex[cache.faces[:, 2]]
-        )
+        affected_faces = np.asarray(newly_affected, dtype=np.int64)
+
     return changed_unique, affected_faces
 
 
-def _update_colors_gpu_fast(app, cache, changed_mask=None, _visible_classes=None, _defer_render=False):
+def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
+    """Commit sparse overlay colours to base before a topology-changing edit.
+
+    This is intentionally NOT used for normal all-class classification.  It is
+    only a correctness bridge when an edit crosses the visible/hidden boundary
+    and the topology-aware legacy path must take over.  VTK may upload the large
+    base color buffer once here, which is acceptable for that rare case.
+    """
+    dirty = getattr(cache, '_multiclass_dirty_faces', None)
+    if not dirty:
+        _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+        return True
+
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    if mesh is None or cache.faces is None or cache.unique_indices is None:
+        return False
+    cell_colors = mesh.GetCellData().GetScalars()
+    if cell_colors is None or cell_colors.GetNumberOfTuples() != len(cache.faces):
+        return False
+
+    data = getattr(app, 'data', None)
+    classes = data.get('classification') if isinstance(data, dict) else None
+    if classes is None:
+        return False
+    classes = np.asarray(classes)
+
+    dirty_faces = np.fromiter(dirty, dtype=np.int64, count=len(dirty))
+    dirty_faces = dirty_faces[(dirty_faces >= 0) & (dirty_faces < len(cache.faces))]
+    if dirty_faces.size == 0:
+        _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+        return True
+
+    base_faces = cache.faces[dirty_faces]
+    fvc = classes[cache.unique_indices[base_faces]]
+    c0, c1, c2 = fvc[:, 0], fvc[:, 1], fvc[:, 2]
+    face_classes = np.where(
+        c0 == c1,
+        c0,
+        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+    ).astype(np.int64, copy=False)
+
+    vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
+    vc = set(int(c) for c in (vc or ()))
+    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+    local_max = int(face_classes.max()) if face_classes.size else 0
+    mc = max([255, local_max] + palette_codes) + 1
+    lut = np.zeros((mc, 3), dtype=np.float32)
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        ci = int(code)
+        if 0 <= ci < mc and ci in vc:
+            lut[ci] = entry.get('color', (128, 128, 128))
+
+    shade = (
+        cache.shade[dirty_faces]
+        if cache.shade is not None and len(cache.shade) == len(cache.faces)
+        else np.ones(len(dirty_faces), dtype=np.float32)
+    )
+    colors_np = numpy_support.vtk_to_numpy(cell_colors)
+    colors_np[dirty_faces] = np.clip(
+        lut[np.clip(face_classes, 0, mc - 1)] * shade[:, None], 0, 255
+    ).astype(np.uint8)
+
+    cell_colors.Modified()
+    mesh.GetCellData().Modified()
+    mesh.Modified()
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    if actor is not None and actor.GetMapper() is not None:
+        actor.GetMapper().Modified()
+
+    print(
+        'SHADING_MULTI_COLOR_BAKE '
+        f'faces={len(dirty_faces)} reason=topology_membership_change'
+    )
+    _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+    return True
+
+
+def _fast_multiclass_color_overlay(
+        app, cache, changed_mask=None, changed_indices=None,
+        visible_classes=None, schedule_render=True):
+    """Refresh topology-stable multi-class shading without touching base RGB.
+
+    The base all-class mesh can contain tens of millions of cells.  Calling
+    ``cell_colors.Modified()`` on that mesh after a 50-point classification
+    makes VTK/OpenGL treat the complete cell-color buffer as dirty.  The CPU
+    patch is small, but the subsequent GPU upload/presentation is not.
+
+    This path keeps the base mesh and its 68M-cell RGB array completely static.
+    It builds one tiny exact-face overlay from only faces ever touched during
+    the current shading session.  Current canonical classifications are used on
+    every rebuild, so classification, undo and redo all display correctly.
+    """
+    t0 = time.perf_counter()
+    if getattr(cache, 'n_visible_classes', 0) <= 1:
+        return False
+    if (
+        cache.faces is None
+        or cache.xyz_final is None
+        or cache.unique_indices is None
+        or cache.shade is None
+    ):
+        return False
+
+    data = getattr(app, 'data', None)
+    if not isinstance(data, dict):
+        return False
+    classes = data.get('classification')
+    xyz_raw = data.get('xyz')
+    if classes is None or xyz_raw is None:
+        return False
+    classes = np.asarray(classes)
+
+    lookup_t0 = time.perf_counter()
+    changed_unique, affected_faces = _affected_faceted_faces(
+        cache,
+        changed_mask,
+        len(xyz_raw),
+        changed_indices=changed_indices,
+    )
+    lookup_ms = (time.perf_counter() - lookup_t0) * 1000.0
+    if changed_unique.size == 0 or affected_faces.size == 0:
+        return True
+
+    faces_id = id(cache.faces)
+    dirty = getattr(cache, '_multiclass_dirty_faces', None)
+    if not isinstance(dirty, set):
+        dirty = set()
+        cache._multiclass_dirty_faces = dirty
+    if getattr(cache, '_multiclass_dirty_faces_faces_id', None) != faces_id:
+        dirty.clear()
+        cache._multiclass_dirty_faces_faces_id = faces_id
+
+    dirty.update(int(v) for v in np.asarray(affected_faces, dtype=np.int64))
+    if not dirty:
+        return True
+
+    # Deterministic ordering makes debugging and VTK replacement stable.
+    dirty_faces = np.fromiter(dirty, dtype=np.int64, count=len(dirty))
+    dirty_faces.sort()
+
+    base_faces = np.asarray(cache.faces[dirty_faces], dtype=np.int32)
+    flat_vertices = base_faces.reshape(-1)
+    local_vertex_ids, inverse = np.unique(flat_vertices, return_inverse=True)
+    local_faces = inverse.reshape(-1, 3).astype(np.int32, copy=False)
+    local_xyz = np.ascontiguousarray(cache.xyz_final[local_vertex_ids])
+
+    # Compute exactly the same flat/faceted majority-class colour as the base
+    # renderer, but only for the sparse dirty faces.
+    global_face_indices = cache.unique_indices[base_faces]
+    fvc = classes[global_face_indices]
+    c0 = fvc[:, 0]
+    c1 = fvc[:, 1]
+    c2 = fvc[:, 2]
+    face_classes = np.where(
+        c0 == c1,
+        c0,
+        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+    ).astype(np.int64, copy=False)
+
+    vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
+    vc = set(int(c) for c in (vc or ()))
+    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+    local_max = int(face_classes.max()) if face_classes.size else 0
+    mc = max([255, local_max] + palette_codes) + 1
+    lut = np.zeros((mc, 3), dtype=np.float32)
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        code_int = int(code)
+        if 0 <= code_int < mc and code_int in vc:
+            lut[code_int] = entry.get('color', (128, 128, 128))
+
+    local_shade = np.asarray(cache.shade[dirty_faces], dtype=np.float32)
+    rgb = np.clip(
+        lut[np.clip(face_classes, 0, mc - 1)] * local_shade[:, None],
+        0,
+        255,
+    ).astype(np.uint8)
+
+    packed = np.empty(len(local_faces) * 4, dtype=np.int32)
+    packed[0::4] = 3
+    packed[1::4] = local_faces[:, 0]
+    packed[2::4] = local_faces[:, 1]
+    packed[3::4] = local_faces[:, 2]
+    patch = pv.PolyData(local_xyz, packed)
+    patch.cell_data['RGB'] = rgb
+
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is None:
+        return False
     try:
-        mesh = getattr(app, '_shaded_mesh_polydata', None)
-        if mesh is None: return False
+        plotter.remove_actor(_MULTICLASS_COLOR_OVERLAY_NAME, render=False)
+    except Exception:
+        pass
+
+    actor = plotter.add_mesh(
+        patch,
+        scalars='RGB',
+        rgb=True,
+        show_edges=False,
+        lighting=False,
+        smooth_shading=False,
+        preference='cell',
+        name=_MULTICLASS_COLOR_OVERLAY_NAME,
+        render=False,
+    )
+    if actor is None:
+        return False
+
+    try:
+        setattr(actor, '_is_shading_mesh', True)
+        setattr(actor, '_is_shading_color_overlay', True)
+        actor.PickableOff()
+        prop = actor.GetProperty()
+        prop.SetInterpolationToFlat()
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.EdgeVisibilityOff()
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-4.0, -4.0)
+            mapper.InterpolateScalarsBeforeMappingOff()
+    except Exception:
+        pass
+
+    app._shading_multiclass_color_overlay_actor = actor
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    print(
+        'SHADING_MULTI_COLOR_OVERLAY '
+        f'changed_vertices={len(changed_unique)} '
+        f'new_faces={len(affected_faces)} dirty_faces={len(dirty_faces)} '
+        f'local_vertices={len(local_vertex_ids)} lookup={lookup_ms:.1f}ms '
+        f'total={total_ms:.1f}ms base_rgb_untouched=True'
+    )
+
+    if schedule_render:
+        app._shading_present_reason = 'multiclass_color_overlay'
+        _schedule_fast_shaded_present(
+            app, delay_ms=0, restart=True, wait_while_preview=True
+        )
+    return True
+
+def _update_colors_gpu_fast(
+        app, cache, changed_mask=None, _visible_classes=None, _defer_render=False,
+        _changed_indices=None):
+    """Patch shaded RGB without rebuilding geometry.
+
+    For local classification edits, only the affected triangle vertices are
+    mapped back to the canonical LAS classification array. The old path copied
+    the complete classification array and materialized classes for every
+    representative vertex even when only a few hundred points changed.
+    """
+    try:
+        t0 = time.perf_counter()
+        mesh = getattr(app, "_shaded_mesh_polydata", None)
+        if mesh is None:
+            return False
+
         vc = _visible_classes or _get_shading_visibility(app)
         data = getattr(app, "data", None)
         cls_raw = data.get("classification") if isinstance(data, dict) else None
         xyz_raw = data.get("xyz") if isinstance(data, dict) else None
 
-        # Current shading actors use one RGB tuple per triangle. Recompute the
-        # cell colors after classification changes so class boundaries stay
-        # sharp and no legacy point-color interpolation is reintroduced.
         cell_colors = mesh.GetCellData().GetScalars()
-        if (cell_colors is not None
-                and cell_colors.GetNumberOfTuples() == len(cache.faces)
-                and cls_raw is not None):
-            cls = cls_raw.astype(np.int32)
-            cm = cls[cache.unique_indices]
-            mc = max(int(cm.max()) + 1, 256)
-            lut = np.zeros((mc, 3), dtype=np.float32)
-            for code, entry in app.class_palette.items():
-                code_int = int(code)
-                if code_int < mc and code_int in vc:
-                    lut[code_int] = entry.get("color", (128, 128, 128))
+        if (
+            cell_colors is not None
+            and cell_colors.GetNumberOfTuples() == len(cache.faces)
+            and cls_raw is not None
+            and cache.unique_indices is not None
+        ):
+            classes = np.asarray(cls_raw)
+            colors_np = numpy_support.vtk_to_numpy(cell_colors)
             shade = (
                 cache.shade
                 if cache.shade is not None and len(cache.shade) == len(cache.faces)
                 else np.ones(len(cache.faces), dtype=np.float32)
             )
-            colors_np = numpy_support.vtk_to_numpy(cell_colors)
 
             affected_faces = None
+            changed_unique = np.empty(0, dtype=np.int64)
+            lookup_ms = 0.0
+
             if changed_mask is not None and np.any(changed_mask) and xyz_raw is not None:
+                ta = time.perf_counter()
                 changed_unique, affected_faces = _affected_faceted_faces(
-                    cache, changed_mask, len(xyz_raw)
+                    cache, changed_mask, len(xyz_raw), changed_indices=_changed_indices
                 )
-                if changed_unique.size == 0:
-                    return True
-                if affected_faces.size == 0:
+                lookup_ms = (time.perf_counter() - ta) * 1000.0
+                if changed_unique.size == 0 or affected_faces.size == 0:
                     return True
 
-            if affected_faces is None:
-                target_faces = cache.faces
-                target_shade = shade
-                face_classes = _face_class_ids(cm, target_faces)
-                colors_np[:] = np.clip(
-                    lut[np.clip(face_classes, 0, mc - 1)] * target_shade[:, None],
-                    0,
-                    255,
-                ).astype(np.uint8)
-            else:
+            palette_codes = []
+            try:
+                palette_codes = [int(c) for c in app.class_palette.keys()]
+            except Exception:
+                palette_codes = []
+            palette_max = max([255] + palette_codes)
+
+            if affected_faces is not None:
+                # True local path: gather classes only for vertices belonging to
+                # the affected triangles. No O(all-points) class materialization.
                 target_faces = cache.faces[affected_faces]
+                global_face_indices = cache.unique_indices[target_faces]
+                fvc = classes[global_face_indices]
+                c0 = fvc[:, 0]
+                c1 = fvc[:, 1]
+                c2 = fvc[:, 2]
+                face_classes = np.where(
+                    c0 == c1,
+                    c0,
+                    np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+                ).astype(np.int64, copy=False)
+
+                local_max = int(face_classes.max()) if face_classes.size else 0
+                mc = max(palette_max, local_max) + 1
+                lut = np.zeros((mc, 3), dtype=np.float32)
+                for code, entry in app.class_palette.items():
+                    code_int = int(code)
+                    if 0 <= code_int < mc and code_int in vc:
+                        lut[code_int] = entry.get("color", (128, 128, 128))
+
                 target_shade = shade[affected_faces]
-                face_classes = _face_class_ids(cm, target_faces)
                 colors_np[affected_faces] = np.clip(
-                    lut[np.clip(face_classes, 0, mc - 1)] * target_shade[:, None],
+                    lut[np.clip(face_classes, 0, mc - 1)]
+                    * target_shade[:, None],
                     0,
                     255,
                 ).astype(np.uint8)
+
+                cell_colors.Modified()
+                mesh.GetCellData().Modified()
+                mesh.Modified()
+                actor = getattr(app, "_shaded_mesh_actor", None)
+                if actor is not None:
+                    mapper = actor.GetMapper()
+                    if mapper is not None:
+                        mapper.Modified()
+
+                total_ms = (time.perf_counter() - t0) * 1000.0
                 print(
                     "SHADING_LOCAL_COLOR_PATCH "
                     f"changed_vertices={len(changed_unique)} "
                     f"affected_faces={len(affected_faces)} "
-                    f"total_faces={len(cache.faces)}"
+                    f"total_faces={len(cache.faces)} "
+                    f"lookup={lookup_ms:.1f}ms total={total_ms:.1f}ms"
                 )
+
+                if _defer_render:
+                    _schedule_fast_shaded_present(app, delay_ms=0)
+                else:
+                    app.vtk_widget.render()
+                return True
+
+            # Full recolor remains available for palette/visibility changes.
+            # It bakes current canonical classes into the base RGB buffer, so
+            # the sparse live overlay is no longer needed.
+            _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+            cm = classes[cache.unique_indices]
+            class_max = int(cm.max()) if cm.size else 0
+            mc = max(palette_max, class_max) + 1
+            lut = np.zeros((mc, 3), dtype=np.float32)
+            for code, entry in app.class_palette.items():
+                code_int = int(code)
+                if 0 <= code_int < mc and code_int in vc:
+                    lut[code_int] = entry.get("color", (128, 128, 128))
+
+            face_classes = _face_class_ids(cm, cache.faces)
+            colors_np[:] = np.clip(
+                lut[np.clip(face_classes, 0, mc - 1)] * shade[:, None],
+                0,
+                255,
+            ).astype(np.uint8)
+
             cell_colors.Modified()
+            mesh.GetCellData().Modified()
             mesh.Modified()
-            actor = getattr(app, '_shaded_mesh_actor', None)
-            if actor:
-                actor.GetMapper().Modified()
+            actor = getattr(app, "_shaded_mesh_actor", None)
+            if actor is not None:
+                mapper = actor.GetMapper()
+                if mapper is not None:
+                    mapper.Modified()
+
             if _defer_render:
-                QTimer.singleShot(0, lambda: app.vtk_widget.render() if not getattr(app, 'is_dragging', False) else None)
+                _schedule_fast_shaded_present(app, delay_ms=0)
             else:
                 app.vtk_widget.render()
             return True
 
-        # Compatibility fallback for an actor created by an older smooth cache.
+        # Compatibility fallback for a legacy smooth/point-colored shaded mesh.
         pc = mesh.GetPointData().GetScalars()
-        if pc is None or pc.GetNumberOfTuples() != len(cache.unique_indices): return False
+        if pc is None or pc.GetNumberOfTuples() != len(cache.unique_indices):
+            return False
         if cls_raw is None or xyz_raw is None:
             return False
-        vp = numpy_support.vtk_to_numpy(pc); cls = cls_raw.astype(np.int32)
-        cm = cls[cache.unique_indices]; nv2 = len(cm)
-        sh = cache.vertex_shade if cache.vertex_shade is not None and len(cache.vertex_shade) == nv2 else np.ones(nv2, dtype=np.float32)
-        mc = max(int(cm.max())+1, 256); lut = np.zeros((mc, 3), dtype=np.float32)
+
+        vp = numpy_support.vtk_to_numpy(pc)
+        classes = np.asarray(cls_raw)
+        cm = classes[cache.unique_indices]
+        nv2 = len(cm)
+        sh = (
+            cache.vertex_shade
+            if cache.vertex_shade is not None and len(cache.vertex_shade) == nv2
+            else np.ones(nv2, dtype=np.float32)
+        )
+        class_max = int(cm.max()) if cm.size else 0
+        palette_max = max(
+            [255] + [int(c) for c in getattr(app, "class_palette", {}).keys()]
+        )
+        mc = max(class_max, palette_max) + 1
+        lut = np.zeros((mc, 3), dtype=np.float32)
         for c, e in app.class_palette.items():
             ci = int(c)
-            if ci < mc and ci in vc: lut[ci] = e.get("color", (128,128,128))
-        vcl = np.clip(cm, 0, mc-1)
+            if 0 <= ci < mc and ci in vc:
+                lut[ci] = e.get("color", (128, 128, 128))
+        vcl = np.clip(cm.astype(np.int64, copy=False), 0, mc - 1)
+
         if changed_mask is not None and np.any(changed_mask):
             g2u = cache.build_global_to_unique(len(xyz_raw))
-            cu = g2u[np.flatnonzero(changed_mask)]; cu = cu[(cu >= 0) & (cu < nv2)]
+            cu = g2u[np.flatnonzero(changed_mask)]
+            cu = cu[(cu >= 0) & (cu < nv2)]
             if len(cu) > 0:
-                vp[cu] = np.clip(lut[vcl[cu]] * sh[cu, None], 0, 255).astype(np.uint8); pc.Modified()
+                vp[cu] = np.clip(
+                    lut[vcl[cu]] * sh[cu, None], 0, 255
+                ).astype(np.uint8)
+                pc.Modified()
+                mesh.Modified()
+                actor = getattr(app, "_shaded_mesh_actor", None)
+                if actor is not None and actor.GetMapper() is not None:
+                    actor.GetMapper().Modified()
                 if _defer_render or len(cu) < 500:
-                    mesh.Modified(); a = getattr(app, '_shaded_mesh_actor', None)
-                    if a: a.GetMapper().Modified()
-                    QTimer.singleShot(0, lambda: app.vtk_widget.render() if not getattr(app, 'is_dragging', False) else None)
-                else: app.vtk_widget.render()
+                    _schedule_fast_shaded_present(app, delay_ms=0)
+                else:
+                    app.vtk_widget.render()
                 return True
-        vp[:] = np.clip(lut[vcl] * sh[:, None], 0, 255).astype(np.uint8); pc.Modified()
+
+        vp[:] = np.clip(lut[vcl] * sh[:, None], 0, 255).astype(np.uint8)
+        pc.Modified()
+        mesh.Modified()
+        actor = getattr(app, "_shaded_mesh_actor", None)
+        if actor is not None and actor.GetMapper() is not None:
+            actor.GetMapper().Modified()
         if _defer_render:
-            mesh.Modified(); a = getattr(app, '_shaded_mesh_actor', None)
-            if a: a.GetMapper().Modified()
-            QTimer.singleShot(0, lambda: app.vtk_widget.render() if not getattr(app, 'is_dragging', False) else None)
-        else: app.vtk_widget.render()
+            _schedule_fast_shaded_present(app, delay_ms=0)
+        else:
+            app.vtk_widget.render()
         return True
-    except: return False
+    except Exception as exc:
+        print(f"SHADING_LOCAL_COLOR_PATCH fallback_error={exc}")
+        return False
 
 def _rebuild_single_class_for_undo(app, sci, changed_mask):
     """Optimized single-class undo - only update affected region faces."""
@@ -16627,6 +17317,360 @@ def _face_membership_mask(candidate_faces, target_faces):
     return np.isin(cv, tv, assume_unique=False)
 
 
+
+def _build_single_class_delta_actor(
+    app,
+    cache,
+    faces,
+    rgb,
+    name,
+    polygon_offset,
+):
+    """Build one tiny flat-shaded local delta actor from cache face indices.
+
+    The base single-class mesh remains completely immutable.  Only vertices
+    referenced by ``faces`` are materialized into this small PolyData.
+    """
+    faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+    if len(faces) == 0:
+        return None
+    if cache.xyz_final is None:
+        return None
+    if np.any(faces < 0) or int(np.max(faces)) >= len(cache.xyz_final):
+        return None
+
+    vertex_ids = np.unique(faces.ravel())
+    if vertex_ids.size < 3:
+        return None
+    local_xyz = np.asarray(cache.xyz_final[vertex_ids], dtype=np.float64)
+    local_faces = np.searchsorted(vertex_ids, faces).astype(np.int32, copy=False)
+
+    packed = np.empty(len(local_faces) * 4, dtype=np.int32)
+    packed[0::4] = 3
+    packed[1::4] = local_faces[:, 0]
+    packed[2::4] = local_faces[:, 1]
+    packed[3::4] = local_faces[:, 2]
+
+    rgb = np.asarray(rgb, dtype=np.uint8).reshape(-1, 3)
+    if len(rgb) != len(local_faces):
+        return None
+
+    patch = pv.PolyData(local_xyz, packed)
+    patch.cell_data['RGB'] = np.ascontiguousarray(rgb, dtype=np.uint8)
+
+    actor = app.vtk_widget.add_mesh(
+        patch,
+        scalars='RGB',
+        rgb=True,
+        show_edges=False,
+        lighting=False,
+        smooth_shading=False,
+        preference='cell',
+        name=name,
+        render=False,
+    )
+    if actor is None:
+        return None
+
+    try:
+        setattr(actor, '_is_shading_mesh', True)
+        setattr(actor, '_is_single_class_delta_overlay', True)
+        actor.PickableOff()
+        if hasattr(actor, 'UseBoundsOff'):
+            actor.UseBoundsOff()
+        prop = actor.GetProperty()
+        prop.SetInterpolationToFlat()
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.EdgeVisibilityOff()
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
+                float(polygon_offset), float(polygon_offset)
+            )
+            mapper.InterpolateScalarsBeforeMappingOff()
+    except Exception:
+        pass
+    return actor
+
+
+def _apply_single_class_remove_delta_overlay(
+    app,
+    cache,
+    slot_indices,
+    original_faces,
+    replacement_faces,
+    replacement_shade,
+    new_faces,
+    new_shade,
+    replacement_normals=None,
+):
+    """Apply visible->hidden single-class topology as a replacement skin.
+
+    IMPORTANT CORRECTNESS RULE:
+      Do NOT paint the old triangles black.  A black erase actor sits at the
+      original surface depth and can occlude the replacement triangulation,
+      which produces the large black voids seen after Ground -> other-class
+      classification.
+
+    Instead the huge base mesh stays immutable and only the newly triangulated
+    local replacement surface is drawn on top with a strong, but bounded,
+    polygon-depth priority.  The CPU topology is still updated exactly, so
+    subsequent classification/undo uses the current mesh rather than the old
+    one.  SNT/DXF overlays keep a much stronger (-50000) priority, therefore
+    vector overlays remain above this local shading skin.
+
+    If no valid replacement surface can be produced, return None so the caller
+    falls back to the existing exact fixed-slot VTK path.
+    """
+    t0 = time.perf_counter()
+    slots = np.asarray(slot_indices, dtype=np.int64).ravel()
+    old_faces = np.asarray(original_faces, dtype=np.int32).reshape(-1, 3)
+    repl_faces = np.asarray(replacement_faces, dtype=np.int32).reshape(-1, 3)
+    repl_shade = np.asarray(replacement_shade, dtype=np.float32).ravel()
+    fill_faces = np.asarray(new_faces, dtype=np.int32).reshape(-1, 3)
+    fill_shade = np.asarray(new_shade, dtype=np.float32).ravel()
+
+    if (
+        slots.size == 0
+        or len(old_faces) != len(slots)
+        or len(repl_faces) != len(slots)
+        or len(repl_shade) != len(slots)
+        or cache.faces is None
+        or cache.shade is None
+        or len(cache.shade) != len(cache.faces)
+        or int(slots.min()) < 0
+        or int(slots.max()) >= len(cache.faces)
+    ):
+        return None
+
+    # A replacement-only visual skin cannot represent a true no-fill case.
+    # Use the exact VTK slot mutation fallback in that rare situation.
+    if len(fill_faces) == 0 or len(fill_shade) != len(fill_faces):
+        return None
+
+    plotter = getattr(app, 'vtk_widget', None)
+    base_actor = getattr(app, '_shaded_mesh_actor', None)
+    base_mesh = getattr(app, '_shaded_mesh_polydata', None)
+    if plotter is None or base_actor is None or base_mesh is None:
+        return None
+
+    # This path is intentionally limited to the current flat/faceted renderer.
+    if bool(getattr(cache, 'smooth_all_classes', False)):
+        return None
+
+    generation = int(getattr(app, '_shading_remove_overlay_generation', 0)) + 1
+    app._shading_remove_overlay_generation = generation
+    fill_name = f'shaded_mesh_live_remove_fill_{generation}'
+
+    fill_actor = None
+    try:
+        class_color = np.asarray(
+            app.class_palette.get(cache.single_class_id, {}).get(
+                'color', (128, 128, 128)
+            ),
+            dtype=np.float32,
+        )
+        fill_rgb = np.clip(
+            class_color[None, :] * fill_shade[:, None], 0, 255
+        ).astype(np.uint8)
+
+        # The base shading mesh uses no strong relative polygon priority.
+        # Multi-class live colour overlays use about -4, while SNT/DXF
+        # overlays are restored with about -50000.  -5000 is therefore
+        # deliberately strong enough to keep the local replacement surface
+        # above the stale base facets without stealing priority from vectors.
+        fill_actor = _build_single_class_delta_actor(
+            app, cache, fill_faces, fill_rgb, fill_name, -5000.0
+        )
+        if fill_actor is None:
+            return None
+
+        # Only after the replacement actor is ready do we advance the CPU
+        # topology.  The giant base VTK connectivity/RGB arrays stay immutable.
+        cache.faces[slots] = repl_faces
+        cache.shade[slots] = repl_shade
+        if (
+            replacement_normals is not None
+            and cache.face_normals is not None
+            and len(cache.face_normals) == len(cache.faces)
+        ):
+            rn = np.asarray(
+                replacement_normals, dtype=cache.face_normals.dtype
+            ).reshape(-1, 3)
+            if len(rn) == len(slots):
+                cache.face_normals[slots] = rn
+
+        cache._needs_compaction = False
+
+        entry = {
+            'erase_name': None,
+            'fill_name': fill_name,
+            'slot_indices': slots.copy(),
+        }
+        overlays = getattr(app, '_shading_remove_overlays', None)
+        if not isinstance(overlays, list):
+            overlays = []
+            app._shading_remove_overlays = overlays
+        overlays.append(entry)
+
+        app._shading_present_reason = 'singleclass_remove_replacement_overlay'
+        _schedule_fast_shaded_present(
+            app, delay_ms=0, restart=True, wait_while_preview=True
+        )
+
+        print(
+            'SHADING_REMOVE_REPLACEMENT_OVERLAY '
+            f'old_faces={len(old_faces)} fill_faces={len(fill_faces)} '
+            f'local_actors=1 elapsed={(time.perf_counter()-t0)*1000.0:.1f}ms '
+            'black_eraser=False base_vbo_untouched=True'
+        )
+        return entry
+
+    except Exception as exc:
+        try:
+            if fill_name:
+                plotter.remove_actor(fill_name, render=False)
+        except Exception:
+            pass
+        print(
+            f'SHADING_REMOVE_REPLACEMENT_OVERLAY '
+            f'fallback={type(exc).__name__}: {exc}'
+        )
+        return None
+
+def _remove_single_class_delta_overlay_entry(app, record):
+    """Remove the two tiny actors owned by one remove-delta journal record."""
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is None:
+        return
+    for key in ('erase_name', 'fill_name'):
+        name = record.get(key)
+        if not name:
+            continue
+        try:
+            plotter.remove_actor(str(name), render=False)
+        except Exception:
+            pass
+
+    overlays = getattr(app, '_shading_remove_overlays', None)
+    if isinstance(overlays, list):
+        erase_name = record.get('erase_name')
+        fill_name = record.get('fill_name')
+        app._shading_remove_overlays = [
+            e for e in overlays
+            if not (
+                isinstance(e, dict)
+                and e.get('erase_name') == erase_name
+                and e.get('fill_name') == fill_name
+            )
+        ]
+
+def _patch_shaded_face_slots_in_place(
+    app,
+    cache,
+    slot_indices,
+    replacement_faces,
+    replacement_shade,
+    replacement_rgb,
+):
+    """Patch a fixed set of facet slots without copying the complete mesh.
+
+    Used only by the flat/faceted single-class local-remove path. Cell count
+    stays constant; unused removed slots become degenerate triangles. If the
+    live VTK cell layout is not the expected modern connectivity layout, return
+    False so the existing full-array fallback runs unchanged.
+    """
+    slots = np.asarray(slot_indices, dtype=np.int64).ravel()
+    faces = np.asarray(replacement_faces, dtype=np.int32).reshape(-1, 3)
+    shades = np.asarray(replacement_shade, dtype=np.float32).ravel()
+    rgbs = np.asarray(replacement_rgb, dtype=np.uint8).reshape(-1, 3)
+
+    if (
+        slots.size == 0
+        or len(faces) != len(slots)
+        or len(shades) != len(slots)
+        or len(rgbs) != len(slots)
+        or cache.faces is None
+        or cache.shade is None
+        or len(cache.shade) != len(cache.faces)
+        or int(slots.min()) < 0
+        or int(slots.max()) >= len(cache.faces)
+    ):
+        return False
+
+    mesh = getattr(app, "_shaded_mesh_polydata", None)
+    actor = getattr(app, "_shaded_mesh_actor", None)
+    if (
+        mesh is None
+        or actor is None
+        or mesh.GetNumberOfCells() != len(cache.faces)
+    ):
+        return False
+
+    try:
+        polys = mesh.GetPolys()
+        conn_arr = polys.GetConnectivityArray() if polys is not None else None
+        cell_colors = mesh.GetCellData().GetScalars()
+        if conn_arr is None or cell_colors is None:
+            return False
+        if conn_arr.GetNumberOfTuples() != len(cache.faces) * 3:
+            return False
+        if cell_colors.GetNumberOfTuples() != len(cache.faces):
+            return False
+
+        conn_np = numpy_support.vtk_to_numpy(conn_arr).reshape(-1, 3)
+        rgb_np = numpy_support.vtk_to_numpy(cell_colors)
+        if rgb_np.ndim != 2 or rgb_np.shape[1] < 3:
+            return False
+
+        old_faces = cache.faces[slots].copy()
+        old_shade = cache.shade[slots].copy()
+        old_conn = conn_np[slots].copy()
+        old_rgb = rgb_np[slots, :3].copy()
+
+        try:
+            cache.faces[slots] = faces
+            cache.shade[slots] = shades
+            conn_np[slots] = faces
+            rgb_np[slots, :3] = rgbs
+
+            conn_arr.Modified()
+            polys.Modified()
+            cell_colors.Modified()
+            mesh.GetCellData().Modified()
+            mesh.Modified()
+            mapper = actor.GetMapper()
+            if mapper is not None:
+                mapper.Modified()
+            actor.Modified()
+
+            cache._vtk_colors_ptr = None
+            cache._needs_compaction = False
+            app._shading_present_reason = 'singleclass_remove_vtk_slots'
+            _schedule_fast_shaded_present(app, delay_ms=0)
+            return True
+        except Exception:
+            # Restore local state before allowing the safe legacy fallback.
+            cache.faces[slots] = old_faces
+            cache.shade[slots] = old_shade
+            conn_np[slots] = old_conn
+            rgb_np[slots, :3] = old_rgb
+            try:
+                conn_arr.Modified()
+                polys.Modified()
+                cell_colors.Modified()
+                mesh.Modified()
+            except Exception:
+                pass
+            return False
+    except Exception:
+        return False
+
+
 def _undo_last_local_remove_patch(app, added_global_indices):
     """Restore the exact topology removed by the latest LOCAL_REMOVE.
 
@@ -16665,6 +17709,128 @@ def _undo_last_local_remove_patch(app, added_global_indices):
     if np.any(original_faces < 0) or int(np.max(original_faces)) >= len(cache.xyz_unique):
         print("SHADING_UNDO_LOCAL_RESTORE status=stale reason=original_vertex_out_of_range")
         return False
+
+    # Fastest journal format: the base GPU mesh was never touched.  Restore
+    # CPU slots and remove only the tiny eraser/fill actors.  This is the exact
+    # counterpart of SHADING_REMOVE_OVERLAY and therefore avoids any giant VTK
+    # connectivity/color buffer invalidation on Ctrl+Z.
+    if record.get('visual_delta_overlay'):
+        slots = np.asarray(record.get('slot_indices', []), dtype=np.int64).ravel()
+        slot_replacement = np.asarray(
+            record.get('slot_replacement_faces', []), dtype=np.int32
+        ).reshape(-1, 3)
+        original_shade = np.asarray(
+            record.get('original_shade', []), dtype=np.float32
+        ).reshape(-1)
+        original_normals = record.get('original_normals')
+        if (
+            len(slots) == len(original_faces)
+            and len(slot_replacement) == len(slots)
+            and len(original_shade) == len(slots)
+            and len(slots) > 0
+            and int(slots.min()) >= 0
+            and int(slots.max()) < len(cache.faces)
+            and np.array_equal(cache.faces[slots], slot_replacement)
+        ):
+            cache.faces[slots] = original_faces
+            cache.shade[slots] = original_shade
+            if (
+                original_normals is not None
+                and cache.face_normals is not None
+                and len(cache.face_normals) == len(cache.faces)
+            ):
+                on = np.asarray(
+                    original_normals, dtype=cache.face_normals.dtype
+                ).reshape(-1, 3)
+                if len(on) == len(slots):
+                    cache.face_normals[slots] = on
+
+            _remove_single_class_delta_overlay_entry(app, record)
+            stack.pop()
+            app._shading_present_reason = 'singleclass_remove_replacement_undo'
+            _schedule_fast_shaded_present(
+                app, delay_ms=0, restart=True, wait_while_preview=False
+            )
+            print(
+                'SHADING_UNDO_LOCAL_RESTORE status=restored_replacement_overlay '
+                f'changed_points={len(added)} slots={len(slots)} '
+                f'elapsed={(time.perf_counter()-t0)*1000.0:.1f}ms '
+                'base_vbo_untouched=True'
+            )
+            return True
+        print(
+            'SHADING_UNDO_LOCAL_RESTORE status=delta_overlay_miss '
+            'fallback=slot_or_legacy_restore'
+        )
+
+    # Fast journal format: the local remove kept cell count fixed and rewrote
+    # only these exact slots. Undo can therefore restore them directly without
+    # scanning/copying the complete 11M+ face mesh.
+    slot_indices_raw = record.get("slot_indices")
+    slot_replacement_raw = record.get("slot_replacement_faces")
+    if slot_indices_raw is not None and slot_replacement_raw is not None:
+        slots = np.asarray(slot_indices_raw, dtype=np.int64).ravel()
+        slot_replacement = np.asarray(
+            slot_replacement_raw, dtype=np.int32
+        ).reshape(-1, 3)
+        if (
+            len(slots) == len(original_faces)
+            and len(slot_replacement) == len(slots)
+            and len(slots) > 0
+            and int(slots.min()) >= 0
+            and int(slots.max()) < len(cache.faces)
+            and int(record.get("face_count", len(cache.faces))) == len(cache.faces)
+            and np.array_equal(cache.faces[slots], slot_replacement)
+        ):
+            original_shade = record.get("original_shade")
+            if original_shade is None:
+                original_normals = _compute_face_normals(
+                    cache.xyz_unique, original_faces
+                )
+                original_shade = _compute_face_shade_global_z(
+                    cache.xyz_unique,
+                    original_faces,
+                    getattr(app, "last_shade_azimuth", 45.0),
+                    getattr(app, "last_shade_angle", 45.0),
+                    getattr(app, "shade_ambient", 0.25),
+                    face_normals=original_normals,
+                )
+            original_shade = np.asarray(
+                original_shade, dtype=np.float32
+            ).reshape(-1)
+            if len(original_shade) == len(original_faces):
+                class_color = np.asarray(
+                    app.class_palette.get(int(current_single_class), {}).get(
+                        "color", (128, 128, 128)
+                    ),
+                    dtype=np.float32,
+                ).reshape(3)
+                restored_rgb = np.clip(
+                    class_color[None, :] * original_shade[:, None],
+                    0,
+                    255,
+                ).astype(np.uint8)
+                if _patch_shaded_face_slots_in_place(
+                    app,
+                    cache,
+                    slots,
+                    original_faces,
+                    original_shade,
+                    restored_rgb,
+                ):
+                    stack.pop()
+                    print(
+                        "SHADING_UNDO_LOCAL_RESTORE status=restored_fast_slots "
+                        f"changed_points={len(added)} slots={len(slots)} "
+                        f"elapsed={(time.perf_counter()-t0)*1000.0:.1f}ms "
+                        "full_mesh_copy_avoided=True"
+                    )
+                    return True
+
+        print(
+            "SHADING_UNDO_LOCAL_RESTORE status=slot_fast_path_miss "
+            "fallback=legacy_exact_restore"
+        )
 
     if len(fill_faces):
         if np.any(fill_faces < 0) or int(np.max(fill_faces)) >= len(cache.xyz_unique):
@@ -16814,10 +17980,10 @@ def _undo_last_local_remove_patch(app, added_global_indices):
 
 
 def _local_remove_single_class_points(app, removed_global_indices):
-    """Remove a bounded set of visible vertices and retriangulate its ring.
+    """Remove visible-class points with a bounded local topology patch.
 
-    The exact original faces, shades and normals are journaled so undo can
-    restore the previous surface. Live VTK RGB is not authoritative undo data.
+    Preferred path rewrites only the affected triangle slots in place. The
+    previous full-array path is retained as a fallback for unsupported layouts.
     """
     t0 = time.perf_counter()
     cache = get_cache()
@@ -16836,47 +18002,54 @@ def _local_remove_single_class_points(app, removed_global_indices):
     if valid_gi.size == 0:
         return True
 
-    removed_ui = np.unique(g2u[valid_gi][g2u[valid_gi] >= 0]).astype(np.int32)
+    removed_ui = np.unique(
+        g2u[valid_gi][g2u[valid_gi] >= 0]
+    ).astype(np.int32)
     if removed_ui.size == 0:
         return True
 
     old_face_count = len(cache.faces)
     removed_vertex = np.zeros(len(cache.unique_indices), dtype=bool)
     removed_vertex[removed_ui] = True
-    affected = (
-        removed_vertex[cache.faces[:, 0]]
-        | removed_vertex[cache.faces[:, 1]]
-        | removed_vertex[cache.faces[:, 2]]
-    )
-    n_removed = int(np.count_nonzero(affected))
+
+    if HAS_NUMBA:
+        affected = getattr(cache, "_affected_face_scratch", None)
+        if (
+            affected is None
+            or affected.dtype != np.bool_
+            or len(affected) != old_face_count
+        ):
+            affected = np.empty(old_face_count, dtype=np.bool_)
+            cache._affected_face_scratch = affected
+        _numba_fill_affected_face_mask(cache.faces, removed_vertex, affected)
+    else:
+        affected = (
+            removed_vertex[cache.faces[:, 0]]
+            | removed_vertex[cache.faces[:, 1]]
+            | removed_vertex[cache.faces[:, 2]]
+        )
+
+    affected_idx = np.flatnonzero(affected).astype(np.int64, copy=False)
+    n_removed = len(affected_idx)
     if n_removed == 0:
         print(
             "SHADING_LOCAL_PATCH operation=LOCAL_REMOVE "
-            f"overlay_points={overlay_removed} base_faces=0 full_mesh_upload_avoided=True"
+            f"overlay_points={overlay_removed} base_faces=0 "
+            "full_mesh_upload_avoided=True"
         )
         return True
 
-    original_faces = np.asarray(cache.faces[affected], dtype=np.int32).copy()
-    keep_faces = cache.faces[~affected]
-    flat_mode = not getattr(cache, "smooth_all_classes", False)
-    keep_normals = (
-        cache.face_normals[~affected]
-        if cache.face_normals is not None and not flat_mode
-        else None
-    )
-    keep_shade = (
-        cache.shade[~affected]
-        if cache.shade is not None and len(cache.shade) == old_face_count
-        else None
-    )
-
+    original_faces = np.asarray(
+        cache.faces[affected_idx], dtype=np.int32
+    ).copy()
     original_normals = (
-        np.asarray(cache.face_normals[affected]).copy()
-        if cache.face_normals is not None and len(cache.face_normals) == old_face_count
+        np.asarray(cache.face_normals[affected_idx]).copy()
+        if cache.face_normals is not None
+        and len(cache.face_normals) == old_face_count
         else _compute_face_normals(cache.xyz_unique, original_faces)
     )
     original_shade = (
-        np.asarray(cache.shade[affected], dtype=np.float32).copy()
+        np.asarray(cache.shade[affected_idx], dtype=np.float32).copy()
         if cache.shade is not None and len(cache.shade) == old_face_count
         else _compute_face_shade_global_z(
             cache.xyz_unique,
@@ -16887,17 +18060,6 @@ def _local_remove_single_class_points(app, removed_global_indices):
             face_normals=original_normals,
         )
     )
-
-    if keep_shade is None:
-        keep_face_normals = _compute_face_normals(cache.xyz_unique, keep_faces)
-        keep_shade = _compute_face_shade_global_z(
-            cache.xyz_unique,
-            keep_faces,
-            getattr(app, "last_shade_azimuth", 45.0),
-            getattr(app, "last_shade_angle", 45.0),
-            getattr(app, "shade_ambient", 0.25),
-            face_normals=keep_face_normals,
-        )
 
     ring = np.unique(original_faces.ravel())
     ring = ring[~removed_vertex[ring]].astype(np.int32, copy=False)
@@ -16928,6 +18090,170 @@ def _local_remove_single_class_points(app, removed_global_indices):
         face_normals=new_normals,
     )
 
+    flat_mode = not getattr(cache, "smooth_all_classes", False)
+
+    # Fast fixed-slot path. Removing points normally reduces local triangle
+    # count, so the replacement fill fits inside the invalidated slots.
+    if flat_mode and len(new_faces) <= n_removed:
+        anchor = None
+        if ring.size:
+            anchor = int(ring[0])
+        else:
+            for candidate in original_faces.ravel():
+                if not removed_vertex[int(candidate)]:
+                    anchor = int(candidate)
+                    break
+
+        if anchor is not None:
+            replacement_faces = np.empty((n_removed, 3), dtype=np.int32)
+            n_new = len(new_faces)
+            if n_new:
+                replacement_faces[:n_new] = new_faces
+            if n_new < n_removed:
+                replacement_faces[n_new:] = anchor
+
+            replacement_shade = np.zeros(n_removed, dtype=np.float32)
+            if n_new:
+                replacement_shade[:n_new] = new_shade
+
+            base_color = np.asarray(
+                app.class_palette.get(cache.single_class_id, {}).get(
+                    "color", (128, 128, 128)
+                ),
+                dtype=np.float32,
+            )
+            replacement_rgb = np.zeros((n_removed, 3), dtype=np.uint8)
+            if n_new:
+                replacement_rgb[:n_new] = np.clip(
+                    base_color * new_shade[:, None], 0, 255
+                ).astype(np.uint8)
+
+            replacement_normals = np.zeros((n_removed, 3), dtype=np.float64)
+            replacement_normals[:, 2] = 1.0
+            if n_new:
+                replacement_normals[:n_new] = new_normals
+
+            # --------------------------------------------------------------
+            # Preferred single-class visible -> hidden path:
+            # keep the gigantic VTK base actor immutable and render only a
+            # tiny local erase/fill delta.  This mirrors the already-smooth
+            # any-class -> visible-class overlay architecture.
+            # --------------------------------------------------------------
+            delta_entry = _apply_single_class_remove_delta_overlay(
+                app,
+                cache,
+                affected_idx,
+                original_faces,
+                replacement_faces,
+                replacement_shade,
+                new_faces,
+                new_shade,
+                replacement_normals=replacement_normals,
+            )
+            if delta_entry is not None:
+                journal = getattr(app, "_shading_local_remove_journal", None)
+                if not isinstance(journal, list):
+                    journal = []
+                    app._shading_local_remove_journal = journal
+                journal.append(
+                    {
+                        "single_class_id": int(cache.single_class_id),
+                        "changed_global_indices": valid_gi.copy(),
+                        "original_faces": original_faces,
+                        "fill_faces": new_faces.copy(),
+                        "original_shade": np.asarray(
+                            original_shade, dtype=np.float32
+                        ).copy(),
+                        "original_normals": np.asarray(original_normals).copy(),
+                        "slot_indices": affected_idx.copy(),
+                        "slot_replacement_faces": replacement_faces.copy(),
+                        "face_count": int(old_face_count),
+                        "visual_delta_overlay": True,
+                        "erase_name": delta_entry.get("erase_name"),
+                        "fill_name": delta_entry.get("fill_name"),
+                    }
+                )
+                if len(journal) > 128:
+                    del journal[:-128]
+
+                print(
+                    "SHADING_LOCAL_PATCH operation=LOCAL_REMOVE_REPLACEMENT_OVERLAY "
+                    f"removed_points={len(removed_ui)} slots={n_removed} "
+                    f"new_faces={len(new_faces)} "
+                    f"elapsed={(time.perf_counter()-t0)*1000:.1f}ms "
+                    "base_vbo_untouched=True"
+                )
+                return True
+
+            # Safety fallback: original exact fixed-slot VTK patch.  This is
+            # preserved unchanged for any renderer/layout where delta-overlay
+            # creation is unavailable.
+            if _patch_shaded_face_slots_in_place(
+                app,
+                cache,
+                affected_idx,
+                replacement_faces,
+                replacement_shade,
+                replacement_rgb,
+            ):
+                journal = getattr(app, "_shading_local_remove_journal", None)
+                if not isinstance(journal, list):
+                    journal = []
+                    app._shading_local_remove_journal = journal
+                journal.append(
+                    {
+                        "single_class_id": int(cache.single_class_id),
+                        "changed_global_indices": valid_gi.copy(),
+                        "original_faces": original_faces,
+                        "fill_faces": new_faces.copy(),
+                        "original_shade": np.asarray(
+                            original_shade, dtype=np.float32
+                        ).copy(),
+                        "original_normals": np.asarray(original_normals).copy(),
+                        "slot_indices": affected_idx.copy(),
+                        "slot_replacement_faces": replacement_faces.copy(),
+                        "face_count": int(old_face_count),
+                    }
+                )
+                if len(journal) > 128:
+                    del journal[:-128]
+
+                print(
+                    "SHADING_LOCAL_PATCH operation=LOCAL_REMOVE_FAST_SLOTS "
+                    f"removed_points={len(removed_ui)} slots={n_removed} "
+                    f"new_faces={len(new_faces)} "
+                    f"elapsed={(time.perf_counter()-t0)*1000:.1f}ms "
+                    "full_mesh_copy_avoided=True"
+                )
+                return True
+
+    # ------------------------------------------------------------------
+    # Existing exact fallback. Only reached if the in-place layout is not
+    # supported or the replacement unexpectedly needs more cell slots.
+    # ------------------------------------------------------------------
+    keep_faces = cache.faces[~affected]
+    keep_normals = (
+        cache.face_normals[~affected]
+        if cache.face_normals is not None and not flat_mode
+        else None
+    )
+    keep_shade = (
+        cache.shade[~affected]
+        if cache.shade is not None and len(cache.shade) == old_face_count
+        else None
+    )
+
+    if keep_shade is None:
+        keep_face_normals = _compute_face_normals(cache.xyz_unique, keep_faces)
+        keep_shade = _compute_face_shade_global_z(
+            cache.xyz_unique,
+            keep_faces,
+            getattr(app, "last_shade_azimuth", 45.0),
+            getattr(app, "last_shade_angle", 45.0),
+            getattr(app, "shade_ambient", 0.25),
+            face_normals=keep_face_normals,
+        )
+
     journal = getattr(app, "_shading_local_remove_journal", None)
     if not isinstance(journal, list):
         journal = []
@@ -16938,7 +18264,9 @@ def _local_remove_single_class_points(app, removed_global_indices):
             "changed_global_indices": valid_gi.copy(),
             "original_faces": original_faces,
             "fill_faces": new_faces.copy(),
-            "original_shade": np.asarray(original_shade, dtype=np.float32).copy(),
+            "original_shade": np.asarray(
+                original_shade, dtype=np.float32
+            ).copy(),
             "original_normals": np.asarray(original_normals).copy(),
         }
     )
@@ -16949,21 +18277,29 @@ def _local_remove_single_class_points(app, removed_global_indices):
     try:
         scalars = app._shaded_mesh_polydata.GetCellData().GetScalars()
         if scalars is not None and scalars.GetNumberOfTuples() == old_face_count:
-            current_rgb = np.asarray(numpy_support.vtk_to_numpy(scalars), dtype=np.uint8)
+            current_rgb = np.asarray(
+                numpy_support.vtk_to_numpy(scalars), dtype=np.uint8
+            )
     except Exception:
         current_rgb = None
 
-    bc = np.asarray(
+    base_color = np.asarray(
         app.class_palette.get(cache.single_class_id, {}).get(
             "color", (128, 128, 128)
         ),
         dtype=np.float32,
     )
     if current_rgb is not None and len(current_rgb) == old_face_count:
-        kept_rgb = np.ascontiguousarray(current_rgb[~affected], dtype=np.uint8)
+        kept_rgb = np.ascontiguousarray(
+            current_rgb[~affected], dtype=np.uint8
+        )
     else:
-        kept_rgb = np.clip(bc * keep_shade[:, None], 0, 255).astype(np.uint8)
-    new_rgb = np.clip(bc * new_shade[:, None], 0, 255).astype(np.uint8)
+        kept_rgb = np.clip(
+            base_color * keep_shade[:, None], 0, 255
+        ).astype(np.uint8)
+    new_rgb = np.clip(
+        base_color * new_shade[:, None], 0, 255
+    ).astype(np.uint8)
     cache._pending_fast_rgb = np.ascontiguousarray(
         np.vstack((kept_rgb, new_rgb)), dtype=np.uint8
     )
@@ -16978,19 +18314,23 @@ def _local_remove_single_class_points(app, removed_global_indices):
             else np.vstack([keep_normals, new_normals])
         )
     )
-    cache.shade = np.concatenate([keep_shade, new_shade]).astype(np.float32, copy=False)
+    cache.shade = np.concatenate(
+        [keep_shade, new_shade]
+    ).astype(np.float32, copy=False)
     cache._vtk_colors_ptr = None
     cache._needs_compaction = False
+    cache._changed_vertex_scratch = None
+    cache._affected_face_scratch = None
 
     _render_mesh_fast_update(app, cache, n_removed, len(new_faces))
     print(
         "SHADING_LOCAL_PATCH operation=LOCAL_REMOVE "
         f"removed_points={len(removed_ui)} removed_faces={n_removed} "
-        f"new_faces={len(new_faces)} elapsed={(time.perf_counter()-t0)*1000:.1f}ms "
+        f"new_faces={len(new_faces)} "
+        f"elapsed={(time.perf_counter()-t0)*1000:.1f}ms "
         "full_rebuild_avoided=True"
     )
     return True
-
 
 def _fast_incremental_add_points(app, ngi):
     t0 = time.perf_counter()

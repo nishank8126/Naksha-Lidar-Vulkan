@@ -1073,6 +1073,29 @@ class DisplayModeDialog(QDialog):
             "Line",                   # idx 7 - LAS flight lines / Point Source ID
         ])
         controls_layout.addWidget(self.color_mode, stretch=2)
+        self.shading_quality_label = QLabel("Speed")
+        self.shading_quality_label.setToolTip(
+            "Shading density: Fast uses 1M representatives, Normal uses 3M, "
+            "and Slow triangulates every eligible point."
+        )
+        controls_layout.addWidget(self.shading_quality_label)
+        self.shading_quality = QComboBox()
+        self.shading_quality.setObjectName("displayShadingQuality")
+        self.shading_quality.addItem("Fast", "fast")
+        self.shading_quality.addItem("Normal", "normal")
+        self.shading_quality.addItem("Slow – all points", "slow")
+        self.shading_quality.setMinimumWidth(135)
+        saved_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
+        quality_index = self.shading_quality.findData(saved_quality)
+        self.shading_quality.setCurrentIndex(quality_index if quality_index >= 0 else 1)
+        if parent is not None:
+            parent.shading_quality = self.shading_quality.currentData()
+        self.shading_quality.setToolTip(
+            "Fast: up to 1,000,000 shading points. Normal: up to 3,000,000. "
+            "Slow: every eligible finite point; may require very large RAM and several minutes."
+        )
+        controls_layout.addWidget(self.shading_quality)
+        self.color_mode.currentIndexChanged.connect(self._sync_color_mode_state)
 
         # MicroStation-style persistent flight-line selector.  A QMenu closes
         # after every click, so this button opens a proper dialog instead.
@@ -1483,6 +1506,14 @@ class DisplayModeDialog(QDialog):
                 return
             self.color_mode.setVisible(True)
             self.color_mode.setEnabled(self.current_slot == 0)
+            shading_controls_visible = (
+                self.current_slot == 0 and self.color_mode.currentIndex() == 1
+            )
+            if hasattr(self, "shading_quality_label"):
+                self.shading_quality_label.setVisible(shading_controls_visible)
+            if hasattr(self, "shading_quality"):
+                self.shading_quality.setVisible(shading_controls_visible)
+                self.shading_quality.setEnabled(shading_controls_visible)
             if self.current_slot != 0 and self.color_mode.currentIndex() != 0:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
@@ -2075,7 +2106,15 @@ class DisplayModeDialog(QDialog):
             source_ids = app.data.get("point_source_id")
             if source_ids is None:
                 source_ids = self._recover_flight_line_ids(app)
-        existing = dict(getattr(app, "flight_line_visibility", {}) or {}) if app else {}
+        slot = int(getattr(self, "current_slot", 0))
+        by_slot = getattr(app, "flight_line_visibility_by_slot", None) if app else None
+        if not isinstance(by_slot, dict):
+            by_slot = {}
+        existing = by_slot.get(slot)
+        if not isinstance(existing, dict):
+            # Migrate the former global selection into every slot once, then
+            # each slot becomes independent.
+            existing = dict(getattr(app, "flight_line_visibility", {}) or {}) if app else {}
         if source_ids is None:
             self._line_ids = []
             self.lines_button.setEnabled(True)
@@ -2085,9 +2124,13 @@ class DisplayModeDialog(QDialog):
         self._line_ids = unique_ids
         self.lines_button.setEnabled(bool(unique_ids))
         if app is not None:
-            app.flight_line_visibility = {
+            slot_visibility = {
                 lid: bool(existing.get(lid, True)) for lid in unique_ids
             }
+            by_slot[slot] = slot_visibility
+            app.flight_line_visibility_by_slot = by_slot
+            if slot == 0:
+                app.flight_line_visibility = dict(slot_visibility)
             colors = dict(getattr(app, "flight_line_colors", {}) or {})
             for lid in unique_ids:
                 colors.setdefault(lid, self._flight_line_color(lid))
@@ -2135,7 +2178,10 @@ class DisplayModeDialog(QDialog):
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
 
-        visibility = dict(getattr(app, "flight_line_visibility", {}) or {})
+        slot = int(getattr(self, "current_slot", 0))
+        visibility = dict(
+            getattr(app, "flight_line_visibility_by_slot", {}).get(slot, {}) or {}
+        )
         colors = dict(getattr(app, "flight_line_colors", {}) or {})
         checks = {}
         for row, lid in enumerate(line_ids):
@@ -2183,24 +2229,50 @@ class DisplayModeDialog(QDialog):
         root.addLayout(footer)
 
         if popup.exec() == QDialog.Accepted:
-            app.flight_line_visibility = {
+            slot_visibility = {
                 int(lid): check.isChecked() for lid, check in checks.items()
             }
-            self._line_visibility = dict(app.flight_line_visibility)
-            # Flight lines are a global point filter. Rebuild the currently
-            # active pipeline immediately so OK has the same effect in every
-            # Display Mode, not only in the dedicated Line colour mode.
+            by_slot = getattr(app, "flight_line_visibility_by_slot", None)
+            if not isinstance(by_slot, dict):
+                by_slot = {}
+            by_slot[slot] = slot_visibility
+            app.flight_line_visibility_by_slot = by_slot
+            if slot == 0:
+                app.flight_line_visibility = dict(slot_visibility)
+            self._line_visibility = dict(slot_visibility)
+            # Refresh only the selected view. Other slots retain their own
+            # independent flight-line selection.
             try:
-                from gui.unified_actor_manager import invalidate_unified_actor
-                invalidate_unified_actor(app)
-                current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-                if current_mode == "shaded_class":
-                    from gui.shading_display import clear_shading_cache
-                    clear_shading_cache("flight-line visibility changed")
-                elif current_mode == "surface":
-                    app._surface_visible_class_signature = None
-                if hasattr(app, "set_display_mode"):
-                    app.set_display_mode(current_mode)
+                if slot == 0:
+                    current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+                    from gui.unified_actor_manager import (
+                        fast_main_flight_line_visibility_update,
+                        invalidate_unified_actor,
+                    )
+                    fast_done = (
+                        current_mode == "class"
+                        and fast_main_flight_line_visibility_update(app)
+                    )
+                    if not fast_done:
+                        invalidate_unified_actor(app)
+                        if current_mode == "shaded_class":
+                            from gui.shading_display import clear_shading_cache
+                            clear_shading_cache("Main View flight-line visibility changed")
+                        elif current_mode == "surface":
+                            app._surface_visible_class_signature = None
+                        if hasattr(app, "set_display_mode"):
+                            app.set_display_mode(current_mode)
+                elif 1 <= slot <= 4:
+                    from gui.unified_actor_manager import build_section_unified_actor
+                    view_idx = slot - 1
+                    if view_idx in (getattr(app, "section_vtks", {}) or {}):
+                        build_section_unified_actor(
+                            app,
+                            view_idx,
+                            border_percent=float(
+                                getattr(app, "view_borders", {}).get(slot, 0.0)
+                            ),
+                        )
             except Exception as exc:
                 print(f"⚠️ Flight-line filter refresh failed: {exc}")
 
@@ -2441,6 +2513,22 @@ class DisplayModeDialog(QDialog):
         if not app:
             return
 
+        quality_mode = str(self.shading_quality.currentData() or "normal")
+        if self.current_slot == 0 and idx == 1 and quality_mode == "slow":
+            total_points = len(app.data.get("xyz", [])) if isinstance(getattr(app, "data", None), dict) else 0
+            if total_points > 5_000_000:
+                answer = QMessageBox.question(
+                    self,
+                    "Slow Shading – All Points",
+                    f"Slow shading can triangulate up to {total_points:,} loaded points.\n\n"
+                    "This may require very large RAM, take several minutes, or fail if "
+                    "the GPU/system memory is insufficient. Continue?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+        app.shading_quality = quality_mode
         if not hasattr(self, 'view_palettes'):
             self.view_palettes = {i: {} for i in range(6)}
         self.view_palettes[self.current_slot] = clone_palette(class_map)
@@ -2495,7 +2583,7 @@ class DisplayModeDialog(QDialog):
                 _xyz = (app.data.get("xyz")
                         if hasattr(app, 'data') and app.data else None)
 
-                if _xyz is not None and has_cached_geometry(_xyz, new_vis):
+                if _xyz is not None and has_cached_geometry(_xyz, new_vis, quality_mode=quality_mode):
                     print("   âš¡ Geometry cached â€” skipping rebuild")
                     update_shaded_class(app, azimuth, angle, ambient,
                                         force_rebuild=False)
@@ -2847,6 +2935,7 @@ class DisplayModeDialog(QDialog):
 
             # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
+            settings.setValue("global_shading_quality", self.shading_quality.currentData())
             
             if self.border_logic_hybrid.isChecked():
                 mode_val = 2

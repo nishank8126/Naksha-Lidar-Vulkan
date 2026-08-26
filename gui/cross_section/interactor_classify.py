@@ -3684,6 +3684,15 @@ class ClassificationInteractor:
                                     fresh = fresh[np.isin(classes[fresh], visible_classes_arr)]
 
                                 if len(fresh) > 0:
+                                    from gui.flight_line_filter import filter_visible_flight_line_indices
+                                    fresh = filter_visible_flight_line_indices(
+                                        self.app,
+                                        fresh,
+                                        len(classes),
+                                        slot=self._active_flight_line_slot(),
+                                    )
+
+                                if len(fresh) > 0:
                                     # 1. Unique and capture for undo
                                     fresh = np.unique(fresh)
                                     if not hasattr(self, "_brush_old_classes_arrays"):
@@ -3946,6 +3955,18 @@ class ClassificationInteractor:
                                                 # Apply filters
                                                 fresh_local = fresh_local[keep_mask]
                                                 global_indices = global_indices[keep_mask]
+
+                                                from gui.flight_line_filter import flight_line_visibility_mask
+                                                line_mask = flight_line_visibility_mask(
+                                                    self.app,
+                                                    len(classes),
+                                                    slot=self._active_flight_line_slot(),
+                                                )
+                                                line_keep = line_mask[global_indices]
+                                                fresh_local = fresh_local[line_keep]
+                                                global_indices = global_indices[line_keep]
+                                                if len(global_indices) == 0:
+                                                    return
                                                 
                                                 # 1. Unique and capture for undo
                                                 fresh_local = np.unique(fresh_local)
@@ -4117,6 +4138,13 @@ class ClassificationInteractor:
                 fresh = fresh[vis_mask]
                 if len(fresh) == 0:
                     return
+
+            from gui.flight_line_filter import filter_visible_flight_line_indices
+            fresh = filter_visible_flight_line_indices(
+                self.app, fresh, len(classes), slot=0
+            )
+            if len(fresh) == 0:
+                return
 
             # Save old classes for undo (Unified array-based)
             old_cls = classes[fresh].copy()
@@ -6323,6 +6351,20 @@ class ClassificationInteractor:
         print(f"🎯 Point cursor drawn (filled circle, radius={radius:.2f})")
 
      # ======== MAIN-VIEW CLASSIFIERS (Plan View: XY) ========
+
+    def _active_flight_line_slot(self):
+        """Map the active classification interactor to its Display Mode slot."""
+        if self._is_main_view():
+            return 0
+        try:
+            active = self._get_active_vtk_widget()
+            ctrl = getattr(self.app, "cut_section_controller", None)
+            if ctrl is not None and active == getattr(ctrl, "cut_vtk", None):
+                return 5
+        except Exception:
+            pass
+        view_idx = self._get_view_index_from_interactor()
+        return int(view_idx) + 1 if view_idx is not None else 0
  
     def _apply_mask_and_record(self, mask, to_class):
         """
@@ -6412,6 +6454,12 @@ class ClassificationInteractor:
         # np.flatnonzero, classes[mask] = to_class). Working in index-space
         # below saves ~3 full-array scans (~300-400 ms per classify on 300M pts).
         changed_indices = np.flatnonzero(mask).astype(np.int64, copy=False)
+        # Disabled LAS flight lines are protected for every tool and view,
+        # independent of the active display colour mode.
+        from gui.flight_line_filter import filter_visible_flight_line_indices
+        changed_indices = filter_visible_flight_line_indices(
+            self.app, changed_indices, len(classes), slot=self._active_flight_line_slot()
+        )
         if changed_indices.size == 0:
             if hasattr(self.app, 'statusBar'):
                 self.app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
@@ -6431,6 +6479,9 @@ class ClassificationInteractor:
         self.app.redo_stack.clear()
 
         classes[changed_indices] = to_class
+        # Downstream partial refreshes must use the final protected set.
+        mask = np.zeros_like(mask, dtype=bool)
+        mask[changed_indices] = True
         self.app._last_changed_mask = mask
         self.app._last_changed_indices = changed_indices.copy()
 
@@ -9449,14 +9500,23 @@ class ClassificationInteractor:
         import numpy as np
 
         classification = self.app.data["classification"]
-        old_classes = classification[mask].copy()
+        from gui.flight_line_filter import filter_visible_flight_line_indices
+        changed_indices = filter_visible_flight_line_indices(
+            self.app, np.flatnonzero(mask), len(classification),
+            slot=self._active_flight_line_slot(),
+        )
+        if changed_indices.size == 0:
+            return False
+        mask = np.zeros_like(mask, dtype=bool)
+        mask[changed_indices] = True
+        old_classes = classification[changed_indices].copy()
 
         # Apply to ground truth
-        classification[mask] = to_class
+        classification[changed_indices] = to_class
 
         # Push undo step
         step = {
-            "indices": np.flatnonzero(mask).astype(np.int64, copy=False),
+            "indices": changed_indices,
             "old_classes": old_classes,
             "new_classes": np.full(mask.sum(), to_class, dtype=classification.dtype),
         }

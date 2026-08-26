@@ -4251,6 +4251,30 @@ class _BaseClassifyDialog(QDialog):
         kwargs["xyz"] = self.app.data["xyz"]
         kwargs["classification"] = self.app.data["classification"]
 
+        # The fence mask is the writable candidate region for every LiDAR
+        # algorithm. Hidden Main View flight lines remain usable as spatial
+        # context, but their points cannot be changed.
+        from gui.flight_line_filter import flight_line_visibility_mask
+        line_mask = flight_line_visibility_mask(
+            self.app, len(old_cls_full), slot=0
+        )
+        user_fence = kwargs.get("fence_mask")
+        if user_fence is None:
+            kwargs["fence_mask"] = line_mask
+        else:
+            user_fence = np.asarray(user_fence, dtype=bool).ravel()
+            if len(user_fence) != len(line_mask):
+                self._active_old_cls = None
+                self.app._lidar_classification_active_dialog = None
+                self._restore_after_algorithm()
+                QMessageBox.warning(
+                    self,
+                    "Invalid Fence",
+                    "Fence mask does not match the loaded point cloud.",
+                )
+                return
+            kwargs["fence_mask"] = user_fence & line_mask
+
         self._prog = QProgressDialog(f"Running {name}…", "Cancel", 0, 100, self.app)
         self._prog.setWindowModality(Qt.NonModal)
         self._prog.setWindowTitle(name)
@@ -4504,6 +4528,37 @@ class _BaseClassifyDialog(QDialog):
             self._rollback_classification_snapshot(old_cls)
             result["changed"] = 0
             result["indices"] = np.array([], dtype=np.intp)
+
+        # Defensive postcondition: no LiDAR worker may commit a reported
+        # change outside Main View's enabled flight lines, even if a future
+        # algorithm implementation forgets to honor fence_mask internally.
+        reported_indices = np.asarray(
+            result.get("indices", np.array([], dtype=np.intp)),
+            dtype=np.intp,
+        )
+        if not cancelled and reported_indices.size:
+            from gui.flight_line_filter import filter_visible_flight_line_indices
+            allowed_indices = filter_visible_flight_line_indices(
+                self.app,
+                reported_indices,
+                len(old_cls),
+                slot=0,
+            )
+            allowed_set_mask = np.zeros(reported_indices.size, dtype=bool)
+            if allowed_indices.size:
+                allowed_set_mask = np.isin(
+                    reported_indices, allowed_indices, assume_unique=False
+                )
+            rejected_indices = reported_indices[~allowed_set_mask]
+            current_cls = self.app.data["classification"]
+            if rejected_indices.size:
+                current_cls[rejected_indices] = old_cls[rejected_indices]
+            if allowed_indices.size:
+                allowed_indices = allowed_indices[
+                    current_cls[allowed_indices] != old_cls[allowed_indices]
+                ]
+            result["indices"] = allowed_indices.astype(np.intp, copy=False)
+            result["changed"] = int(allowed_indices.size)
 
         changed = int(result.get("changed", 0))
         indices = np.asarray(

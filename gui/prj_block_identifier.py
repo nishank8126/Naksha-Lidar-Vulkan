@@ -8248,19 +8248,51 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 else:
                     i += 1
             
-            # ── Collect LAZ search directories from loaded SNT attachments ──────
-            # The LAZ files live in the same folder as the .snt file, NOT in the
-            # PRJ file's own directory.  We gather every unique parent folder from
-            # all currently loaded SNT attachments so cross-area PRJs correctly
-            # show "No file in path" for blocks that aren't in the active dataset.
-            laz_search_dirs = self._get_snt_laz_directories()
+            # ── PRJ-authoritative LAZ/LAS discovery ───────────────────────────
+            # PRJ Block Identifier is intentionally independent from SNT attachment
+            # paths.  The currently loaded PRJ file owns the point-cloud lookup.
+            #
+            # Priority inside the PRJ tree:
+            #   1) file beside the PRJ (direct child)
+            #   2) same-stem file in a PRJ subfolder
+            #
+            # Loaded SNT folders are NEVER consulted here.  SNT remains useful for
+            # viewport geometry/highlighting, but cannot change which point-cloud
+            # files the PRJ table reports as available.
+            prj_lidar_index = {}
+            prj_root = None
+            if self.current_directory:
+                try:
+                    prj_root = Path(self.current_directory).resolve()
+                    print(f"  📁 PRJ-authoritative point-cloud root: {prj_root}")
 
-            # Fallback: if no SNT loaded at all, use the PRJ's own directory
-            if not laz_search_dirs:
-                laz_search_dirs = [self.current_directory]
-                print("  ℹ️ No SNT loaded — falling back to PRJ directory for LAZ lookup")
+                    # Direct children first so they always win over a duplicate
+                    # filename found deeper in the PRJ directory tree.
+                    try:
+                        for fp in prj_root.iterdir():
+                            if fp.is_file() and fp.suffix.lower() in ('.laz', '.las'):
+                                prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                    except OSError as exc:
+                        print(f"  ⚠️ Could not scan PRJ directory directly: {exc}")
+
+                    # Then allow project-local subfolders without ever escaping to
+                    # an SNT directory or a previously loaded project directory.
+                    try:
+                        for fp in prj_root.rglob('*'):
+                            if not fp.is_file() or fp.suffix.lower() not in ('.laz', '.las'):
+                                continue
+                            prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                    except OSError as exc:
+                        print(f"  ⚠️ Could not recursively scan PRJ directory: {exc}")
+
+                    print(
+                        f"  ✅ PRJ-local point-cloud index: "
+                        f"{len(prj_lidar_index)} unique LAZ/LAS stem(s)"
+                    )
+                except Exception as exc:
+                    print(f"  ⚠️ PRJ point-cloud discovery failed: {exc}")
             else:
-                print(f"  🗂️ LAZ search dirs from SNT: {laz_search_dirs}")
+                print("  ⚠️ PRJ directory unavailable; point-cloud lookup disabled")
 
             # Populate table
             # Populate table + master sort list
@@ -8272,17 +8304,10 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
             for row, data in enumerate(self.prj_data):
                 block_label = data['label']
-                candidate_filenames = [f"{block_label}.laz", f"{block_label}.las"]
-
-                found_laz_path = None
-                for search_dir in laz_search_dirs:
-                    for candidate_name in candidate_filenames:
-                        candidate = os.path.join(search_dir, candidate_name)
-                        if os.path.exists(candidate):
-                            found_laz_path = candidate
-                            break
-                    if found_laz_path:
-                        break
+                # Resolve strictly from the currently loaded PRJ's own
+                # directory tree.  This deliberately ignores loaded SNT folders.
+                block_stem = os.path.splitext(os.path.basename(block_label))[0].upper()
+                found_laz_path = prj_lidar_index.get(block_stem)
 
                 # Column 0: Block Label  — store original prj_data index in UserRole
                 label_item = QTableWidgetItem(block_label)
@@ -12850,8 +12875,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         except Exception as e:
             print(f"  ❌ Error getting point count: {e}")
             return 0        
-            
-            
+                        
     def calculate_grid_area(self, block_name):
         """
         Calculate approximate area of a grid block from DXF geometry.
@@ -12892,6 +12916,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         except Exception as e:
             print(f"  ⚠️ Error calculating area: {e}")
             return 0        
+        
     def calculate_grid_area_from_prj(self, block_data):
         """
         Calculate exact polygon area from PRJ boundary coordinates using the

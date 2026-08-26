@@ -3613,6 +3613,18 @@ def _build_vtk_actor_from_arrays(vtk_widget, actor_name, arrays, actual_pt_size,
     rgb_vtk.SetName("RGB")
     cloud.GetPointData().SetScalars(rgb_vtk)
 
+    # Optional per-point flight-line visibility. Keeping this as a shader
+    # attribute lets the main actor stay allocated while line selections are
+    # changed; interaction LOD actors use the same attribute so hidden lines
+    # do not reappear during pan/zoom.
+    flight_values = arrays.get("flight_visible")
+    if flight_values is not None:
+        flight_vtk = numpy_support.numpy_to_vtk(
+            np.ascontiguousarray(flight_values, dtype=np.uint8), deep=True
+        )
+        flight_vtk.SetName("FlightVisible")
+        cloud.GetPointData().AddArray(flight_vtk)
+
     actor = vtk_widget.add_points(
         cloud, scalars="RGB", rgb=True,
         point_size=actual_pt_size,
@@ -4458,6 +4470,15 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "boundary_flag", "BoundaryFlag",
             vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1
         )
+        has_flight_visibility = bool(
+            mesh is not None
+            and mesh.GetPointData().GetArray("FlightVisible") is not None
+        )
+        if has_flight_visibility:
+            raw_m.MapDataArrayToVertexAttribute(
+                "flight_visible", "FlightVisible",
+                vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, -1
+            )
         vertex_attr_wired = True
         print(f"      🔗 Linked 'Classification' + 'BoundaryFlag' to shader")
     except Exception as e:
@@ -4473,11 +4494,22 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
         sp.ClearAllFragmentShaderReplacements()
 
         # ── Vertex declarations ──────────────────────────────────────────────
+        flight_decl = "in float flight_visible;\n" if has_flight_visibility else ""
+        flight_hide = (
+            "  if (flight_visible < 0.5) {\n"
+            "    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+            "    gl_PointSize = 0.0;\n"
+            "    v_point_size = 0.0;\n"
+            "    v_core_size = 0.0;\n"
+            "  } else \n"
+            if has_flight_visibility else ""
+        )
         sp.AddVertexShaderReplacement(
             "//VTK::PositionVC::Dec", True,
             "//VTK::PositionVC::Dec\n"
             "in  float class_code;\n"
             "in  float boundary_flag;\n"
+            + flight_decl +
             "out float v_point_size;\n"
             "out float v_core_size;\n"
             "out float v_boundary;\n",
@@ -4493,6 +4525,7 @@ def _attach_view_shader_context(actor, ctx, actor_name, use_sphere_shaders=True)
             "//VTK::PositionVC::Impl\n"
             "  int c_idx = clamp(int(class_code + 0.5), 0, 255);\n"
             "  v_boundary = boundary_flag;\n"
+            + flight_hide +
             "  if (visibility_lut[c_idx] <= 0.0) {\n"
             "    gl_Position  = vec4(2.0, 2.0, 2.0, 1.0);\n"
             "    gl_PointSize = 0.0;\n"
@@ -5303,8 +5336,6 @@ def build_unified_actor(
     N_total = len(xyz)
     from gui.flight_line_filter import flight_line_visibility_mask
     _flight_mask = flight_line_visibility_mask(app, N_total)
-    _flight_filtered = not bool(np.all(_flight_mask))
-    _flight_indices = np.flatnonzero(_flight_mask) if _flight_filtered else None
     try:
         from gui.optimization_config import MAIN_VIEW_RENDER_ALL_POINTS
     except Exception:
@@ -5314,9 +5345,9 @@ def build_unified_actor(
         # None is the established identity-map convention in refresh code.
         # It avoids a 32M-entry arange and advanced-index copies of full XYZ.
         step = 1
-        global_indices = _flight_indices
-        vis_xyz = xyz if global_indices is None else xyz[global_indices]
-        vis_class = classification if global_indices is None else classification[global_indices]
+        global_indices = None
+        vis_xyz = xyz
+        vis_class = classification
     else:
         target_points = 10_000_000
         if N_total > target_points:
@@ -5325,8 +5356,6 @@ def build_unified_actor(
         else:
             step = 1
             global_indices = None
-        if _flight_indices is not None:
-            global_indices = _flight_indices[::step]
         vis_xyz = xyz if global_indices is None else xyz[global_indices]
         vis_class = classification if global_indices is None else classification[global_indices]
 
@@ -5334,7 +5363,7 @@ def build_unified_actor(
     # Store LOD step for O(M) brush index mapping (avoids intersect1d on 10M array).
     # gi = arange(0, N, step), so global_idx is in LOD iff global_idx % step == 0
     # and its local index is global_idx // step.
-    app._main_lod_step = None if _flight_indices is not None else step
+    app._main_lod_step = step
 
     # "All off" is a valid MicroStation-style state. Keep overlays/camera but
     # remove the point-cloud actor instead of running min/max on empty arrays.
@@ -5363,6 +5392,14 @@ def build_unified_actor(
                                             deep=True)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
+
+    flight_values = np.asarray(
+        _flight_mask if global_indices is None else _flight_mask[global_indices],
+        dtype=np.uint8,
+    )
+    flight_vtk = numpy_support.numpy_to_vtk(flight_values, deep=False)
+    flight_vtk.SetName("FlightVisible")
+    cloud.GetPointData().AddArray(flight_vtk)
 
     _bf = _compute_boundary_flags(vis_xyz, vis_class)
     _bf_vtk = numpy_support.numpy_to_vtk(_bf, deep=False)
@@ -5461,6 +5498,8 @@ def build_unified_actor(
         actor._naksha_mesh            = mesh
         actor._naksha_base_point_size = actual_point_size
         actor._naksha_boundary_vtk    = _bf_vtk
+        actor._naksha_flight_np_ref   = flight_values
+        actor._naksha_flight_vtk      = mesh.GetPointData().GetArray("FlightVisible")
         actor._naksha_data_id         = id(xyz)
         from gui.flight_line_filter import flight_line_visibility_signature
         actor._naksha_flight_line_signature = flight_line_visibility_signature(app)
@@ -5598,6 +5637,12 @@ def _build_main_interaction_actor(
         "bf": np.ascontiguousarray(full_boundary[lod_indices], dtype=np.float32),
         "rgb": np.ascontiguousarray(full_rgb[lod_indices], dtype=np.uint8),
     }
+    full_flight_vtk = getattr(full_actor, "_naksha_flight_vtk", None)
+    if full_flight_vtk is not None:
+        full_flight = numpy_support.vtk_to_numpy(full_flight_vtk)
+        arrays["flight_visible"] = np.ascontiguousarray(
+            full_flight[lod_indices], dtype=np.uint8
+        )
     result = _build_vtk_actor_from_arrays(
         plotter,
         MAIN_INTERACTION_ACTOR_NAME,
@@ -5636,6 +5681,7 @@ def _build_main_interaction_actor(
     lod_actor._naksha_point_count = int(lod_indices.size)
     # Keep the point source alive even with VTK builds that wrap NumPy memory.
     lod_actor._naksha_points_np_ref = arrays["pts"]
+    lod_actor._naksha_flight_vtk = mesh.GetPointData().GetArray("FlightVisible")
     if lod_ctx is not None:
         full_ctx = getattr(full_actor, "_naksha_shader_ctx", None)
         if full_ctx is not None:
@@ -5678,7 +5724,7 @@ def _sync_interaction_actor_subset(full_actor, lod_actor) -> bool:
 
         full_pd = full_mesh.GetPointData()
         lod_pd = lod_mesh.GetPointData()
-        for array_name in ("Classification", "BoundaryFlag"):
+        for array_name in ("Classification", "BoundaryFlag", "FlightVisible"):
             source_vtk = full_pd.GetArray(array_name)
             target_vtk = lod_pd.GetArray(array_name)
             if source_vtk is None or target_vtk is None:
@@ -6280,6 +6326,18 @@ def build_section_unified_actor(
     buf_pts_use = buf_pts if has_buffer else None
     buf_idx_use = buf_global_idx if has_buffer else np.empty((0,), dtype=np.int64)
 
+    # Flight-line visibility is global: section actors obey the same Point
+    # Source ID filter as the main view in every display/colour mode.
+    from gui.flight_line_filter import flight_line_visibility_mask
+    line_mask = flight_line_visibility_mask(app, n_class, slot=slot_idx)
+    core_line_keep = line_mask[core_idx_use]
+    core_pts_use = np.asarray(core_pts_use)[core_line_keep]
+    core_idx_use = core_idx_use[core_line_keep]
+    if buf_pts_use is not None:
+        buf_line_keep = line_mask[buf_idx_use]
+        buf_pts_use = np.asarray(buf_pts_use)[buf_line_keep]
+        buf_idx_use = buf_idx_use[buf_line_keep]
+
     total_raw_points = int(len(core_pts_use) + (len(buf_pts_use) if buf_pts_use is not None else 0))
     section_cap = _section_render_point_cap(app)
     downsampled = False
@@ -6319,6 +6377,8 @@ def build_section_unified_actor(
     if buf_pts_use is not None and len(buf_pts_use) > 0:
         if (
             not downsampled
+            and bool(np.all(core_line_keep))
+            and (buf_pts_use is None or bool(np.all(buf_line_keep)))
             and all_pts_prebuilt is not None
             and len(all_pts_prebuilt) == (len(core_pts) + len(buf_pts))
         ):
@@ -6339,6 +6399,13 @@ def build_section_unified_actor(
     ):
         combined_global_mask = core_mask if (buf_pts_use is None or len(buf_pts_use) == 0) else None
     if len(all_pts) == 0:
+        actor_name = f"_section_{view_idx}_unified"
+        interaction_actor_name = f"_section_{view_idx}_interaction_lod"
+        for name in (actor_name, interaction_actor_name):
+            if name in vtk_widget.actors:
+                vtk_widget.remove_actor(name, render=False)
+        setattr(app, f"_section_{view_idx}_global_indices", np.empty(0, dtype=np.int64))
+        vtk_widget.render()
         return None
 
     setattr(app, f"_section_{view_idx}_global_indices", all_global_indices)
@@ -7120,12 +7187,6 @@ def _expected_main_actor_point_count(current_n: int, app=None) -> int:
         MAIN_VIEW_RENDER_ALL_POINTS = True
     current_n = max(0, int(current_n))
     effective_n = current_n
-    if app is not None:
-        try:
-            from gui.flight_line_filter import flight_line_visible_count
-            effective_n = flight_line_visible_count(app, current_n)
-        except Exception:
-            effective_n = current_n
     if MAIN_VIEW_RENDER_ALL_POINTS:
         return effective_n
     target_pts = 10_000_000
@@ -7137,7 +7198,18 @@ def _get_unified_actor(app) -> Optional[object]:
     # Block all callers while build_unified_actor is running
     if getattr(app, '_unified_actor_building', False):
         return None
+    plotter = getattr(app, "vtk_widget", None)
     actor = getattr(app, "_unified_actor", None)
+    # A renderer clear can detach the VTK actor while its Python reference
+    # remains alive. Do not write palette data into that orphan actor.
+    if actor is not None:
+        registered = (
+            getattr(plotter, "actors", {}).get(UNIFIED_ACTOR_NAME)
+            if plotter is not None else None
+        )
+        if registered is not actor:
+            actor = None
+            app._unified_actor = None
     if actor is not None:
         try:
             actor.GetVisibility()
@@ -7159,8 +7231,16 @@ def _get_unified_actor(app) -> Optional[object]:
                         current_line_sig = flight_line_visibility_signature(app)
                         actor_line_sig = getattr(actor, '_naksha_flight_line_signature', ())
                         if actor_line_sig != current_line_sig:
-                            print("   DEBUG: _get_unified_actor STALE - flight-line selection changed")
-                            return None
+                            # FAST LINE MODE: flight-line selection is shader visibility,
+                            # not a geometry change. Patch the existing FlightVisible
+                            # VTK array in place instead of rebuilding millions of points.
+                            if not fast_main_flight_line_visibility_update(app, render=False):
+                                print(
+                                    "   DEBUG: _get_unified_actor STALE - "
+                                    "flight-line selection changed and in-place patch failed"
+                                )
+                                return None
+                            print("   ⚡ _get_unified_actor: flight-line visibility patched in place")
 
                         actor_n = getattr(actor, '_naksha_point_count', 0)
                         if actor_n > 0 and actor_n != expected_actor_n:
@@ -7178,7 +7258,6 @@ def _get_unified_actor(app) -> Optional[object]:
             except AttributeError:
                 pass
 
-    plotter = getattr(app, "vtk_widget", None)
     if plotter is None:
         return None
 
@@ -7195,7 +7274,11 @@ def _get_unified_actor(app) -> Optional[object]:
                         expected_actor_n = _expected_main_actor_point_count(current_n, app)
                         from gui.flight_line_filter import flight_line_visibility_signature
                         if getattr(actor, '_naksha_flight_line_signature', ()) != flight_line_visibility_signature(app):
-                            return None
+                            # Same rule as the cached app actor above: line selection
+                            # changes only FlightVisible, so keep the geometry alive.
+                            app._unified_actor = actor
+                            if not fast_main_flight_line_visibility_update(app, render=False):
+                                return None
                         actor_n = getattr(actor, '_naksha_point_count', 0)
                         if actor_n > 0 and actor_n != expected_actor_n:
                             return None
@@ -7355,6 +7438,65 @@ def invalidate_unified_actor(app):
             except Exception:
                 pass
     print("   🧹 Unified actor references invalidated")
+
+def fast_main_flight_line_visibility_update(app, render: bool = True) -> bool:
+    """
+    Patch Main View flight visibility in place without rebuilding geometry.
+
+    ``render=False`` is used by mode-switch code to batch FlightVisible,
+    palette/uniform, and RGB changes into one final render. Existing callers
+    retain the old immediate-render behavior because the default is True.
+    """
+    t0 = time.perf_counter()
+    actor = getattr(app, "_unified_actor", None)
+    plotter = getattr(app, "vtk_widget", None)
+    if actor is None and plotter is not None:
+        actor = getattr(plotter, "actors", {}).get(UNIFIED_ACTOR_NAME)
+    if actor is None:
+        return False
+
+    mesh = getattr(actor, "_naksha_mesh", None)
+    if mesh is None:
+        try:
+            mesh = actor.GetMapper().GetInput()
+        except Exception:
+            return False
+    arr = mesh.GetPointData().GetArray("FlightVisible") if mesh is not None else None
+    if arr is None:
+        return False
+
+    data = getattr(app, "data", None)
+    xyz = data.get("xyz") if isinstance(data, dict) else None
+    if xyz is None:
+        return False
+
+    from gui.flight_line_filter import (
+        flight_line_visibility_mask,
+        flight_line_visibility_signature,
+    )
+    full_mask = flight_line_visibility_mask(app, len(xyz), slot=0)
+    global_indices = getattr(app, "_main_global_indices", None)
+    local_mask = full_mask if global_indices is None else full_mask[global_indices]
+    vtk_values = numpy_support.vtk_to_numpy(arr)
+    if len(vtk_values) != len(local_mask):
+        return False
+
+    np.copyto(vtk_values, local_mask, casting="unsafe")
+    arr.Modified()
+    mesh.Modified()
+    actor._naksha_flight_line_signature = flight_line_visibility_signature(app, 0)
+    actor._naksha_flight_np_ref = vtk_values
+    actor._naksha_flight_vtk = arr
+    actor.SetVisibility(1)
+    if render and plotter is not None:
+        plotter.render()
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    print(
+        f"   Main flight-line GPU visibility: "
+        f"{int(np.count_nonzero(local_mask)):,}/{len(local_mask):,} pts [{elapsed:.1f} ms]"
+    )
+    return True
+
 
 def reset_uam(app):
     """

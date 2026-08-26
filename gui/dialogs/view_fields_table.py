@@ -144,19 +144,22 @@ def _points_in_polygon(points, polygon_coords):
 _GPS_EPOCH = datetime.datetime(1980, 1, 6)
 
 
-def _gps_to_date_string(value):
+def _gps_to_date_string(value, adjusted_standard=False):
     try:
         v = float(value)
     except (TypeError, ValueError):
         return ""
+    # LAS Global Encoding bit 0 means Adjusted Standard GPS Time: the stored
+    # value has 1,000,000,000 subtracted from standard GPS seconds.
+    if adjusted_standard:
+        v += 1_000_000_000.0
     dt = _GPS_EPOCH + datetime.timedelta(seconds=v)
-    # Some writers store "adjusted" GPS time (large values); fall back to unix.
     if dt.year > 2100 or dt.year < 1980:
         try:
             dt = datetime.datetime.utcfromtimestamp(v)
         except (OverflowError, OSError, ValueError):
             return "%.6f" % v
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%d/%m/%Y")
 
 
 # Column kinds understood by the model.
@@ -290,7 +293,9 @@ class PointTableModel(QAbstractTableModel):
             return _class_name(code)
         if kind == K_DATE:
             val = self._raw_value(header, K_TIME, "gps_time", row)
-            return _gps_to_date_string(val) if val is not None else ""
+            return _gps_to_date_string(
+                val, bool(self._data.get("_gps_time_adjusted", False))
+            ) if val is not None else ""
         if kind == K_RGB:
             rgb = self._raw_value(header, K_RGB, "rgb", row)
             if rgb is None:
@@ -404,6 +409,9 @@ class _ExtraFieldLoader(QThread):
                 self.finished_loading.emit(result)
                 return
             with laspy.open(self._filename) as las:
+                global_encoding = getattr(las.header, "global_encoding", 0)
+                encoding_value = int(getattr(global_encoding, "value", global_encoding) or 0)
+                result["_gps_time_adjusted"] = bool(encoding_value & 1)
                 dims = {str(d).lower() for d in las.header.point_format.dimension_names}
                 needed = [w for w in self._wanted if w in dims]
                 if needed:
@@ -829,12 +837,12 @@ class ViewFieldsTableDialog(QDialog):
         wanted = [k for (_h, _kind, k) in COLUMN_DEFS
                   if k not in self.app_data or self.app_data.get(k) is None]
         wanted = [w for w in wanted if w not in ("x", "y", "z")]
-        if not wanted or not self.filename:
+        if not self.filename:
             return
         n_points = len(self.app_data.get("xyz", []))
-        if n_points > self.EXTRA_FIELD_LIMIT:
-            print("[ViewFieldsTable] skipping extra field read (%d points)" % n_points)
-            return
+        if wanted and n_points > self.EXTRA_FIELD_LIMIT:
+            print("[ViewFieldsTable] loading LAS header only (%d points)" % n_points)
+            wanted = []
         self._loader = _ExtraFieldLoader(self.filename, wanted, self)
         self._loader.finished_loading.connect(self._on_extra_fields_loaded)
         self._loader.start()

@@ -7960,6 +7960,22 @@ def _apply_classification(app, update_mask: np.ndarray, from_classes, to_class: 
     if update_idx.size == 0:
         return False
 
+    # Authoritative line guard for every shared geometry classifier.
+    from gui.flight_line_filter import (
+        active_classification_flight_line_slot,
+        filter_visible_flight_line_indices,
+    )
+    flight_slot = active_classification_flight_line_slot(app)
+    update_idx = filter_visible_flight_line_indices(
+        app, update_idx, len(classes), slot=flight_slot
+    )
+    if update_idx.size == 0:
+        if hasattr(app, "statusBar"):
+            app.statusBar().showMessage(
+                "No points from enabled flight lines in selection.", 2500
+            )
+        return False
+
     # ── 2. Visibility filter — O(k) vectorized isin, no Python loop ──────
     visible_classes = _get_visible_classes_for_current_view(app)
     if visible_classes is not None:
