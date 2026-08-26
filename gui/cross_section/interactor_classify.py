@@ -9859,6 +9859,25 @@ class ClassificationDoubleClickFilter(QObject):
                 if getattr(app, "active_classify_tool", None) in (
                     "above_line", "below_line", "parallel_line"
                 ):
+                    # This filter exists only to normalize rapid LEFT-button
+                    # tap/tap input. Never translate middle-button pan (or
+                    # right-button navigation) into a synthetic left click.
+                    try:
+                        event_button = event.button()
+                        held_buttons = event.buttons()
+                        if (
+                            event_button == Qt.MiddleButton
+                            or bool(held_buttons & Qt.MiddleButton)
+                        ):
+                            return False
+                        if (
+                            event_button not in (Qt.LeftButton, Qt.NoButton)
+                            and not bool(held_buttons & Qt.LeftButton)
+                        ):
+                            return False
+                    except Exception:
+                        return False
+
                     # ROOT CAUSE of "classification silently stops responding
                     # mid-session" — two distinct bugs, both bypassed here by
                     # driving VTK's interactor directly instead of going
@@ -11159,21 +11178,6 @@ class ClassificationInteractor:
             if self.interactor is None:
                 return
             
-            # ═══════════════════════════════════════════════════════════════
-            # ✅ CRITICAL: Verify middle button is actually pressed via Qt
-            # VTK sends phantom MiddleButtonPressEvent after classification
-            # ═══════════════════════════════════════════════════════════════
-            try:
-                from PySide6.QtWidgets import QApplication
-                from PySide6.QtCore import Qt
-                buttons = QApplication.mouseButtons()
-                is_valid_press = bool(buttons & Qt.MiddleButton)
-                if not is_valid_press:
-                    # Phantom event - ignore completely
-                    return
-            except Exception:
-                pass
-            
             self._is_panning = True
             self._last_pan_pos = self.interactor.GetEventPosition()
 
@@ -11240,31 +11244,12 @@ class ClassificationInteractor:
 
     def _do_safe_pan(self):
         """
-        Execute pan: move camera by mouse delta.
-        ✅ CRITICAL FIX: Verify middle button is ACTUALLY pressed before panning.
-        This prevents phantom pan from corrupted VTK interactor state.
+        Execute pan from the VTK middle-button press/release state.
+
+        Qt's global mouse-button state is intentionally not consulted here:
+        QVTK delivery can clear it before this callback even though the
+        physical middle-button gesture is still active.
         """
-        # ═══════════════════════════════════════════════════════════════════
-        # ✅ CRITICAL: Check Qt button state, not just our flag
-        # VTK can send phantom MiddleButtonPressEvent after classification
-        # tools complete, setting _is_panning=True incorrectly.
-        # ═══════════════════════════════════════════════════════════════════
-        try:
-            from PySide6.QtWidgets import QApplication
-            from PySide6.QtCore import Qt
-            buttons = QApplication.mouseButtons()
-            middle_actually_pressed = bool(buttons & Qt.MiddleButton)
-            
-            if not middle_actually_pressed:
-                # Middle button not pressed - reset our flag if it was set
-                if self._is_panning:
-                    self._is_panning = False
-                return
-        except Exception:
-            # Fallback: use our flag only
-            if not getattr(self, '_is_panning', False):
-                return
-        
         if not getattr(self, '_is_panning', False):
             return
         
