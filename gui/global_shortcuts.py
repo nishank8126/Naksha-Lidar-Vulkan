@@ -1253,6 +1253,90 @@ class GlobalShortcutFilter(QObject):
                 return True
 
             # ====================================================================
+            # Dedicated flight-line shortcut. This intentionally bypasses the
+            # class-preset rebase used by DisplayMode.
+            if tool == "LineMode":
+                preset = shortcut.get("preset") or {}
+                lines = {
+                    int(line_id): bool(shown)
+                    for line_id, shown in dict(
+                        preset.get("lines", {}) or {}
+                    ).items()
+                }
+                if not lines:
+                    print("LineMode shortcut has no flight-line preset")
+                    return True
+                if not self._shortcut_guard.try_acquire("DisplayMode"):
+                    return True
+                try:
+                    app = self.app_window
+                    by_slot = getattr(
+                        app, "flight_line_visibility_by_slot", None
+                    )
+                    if not isinstance(by_slot, dict):
+                        by_slot = {}
+                    by_slot[0] = dict(lines)
+                    app.flight_line_visibility_by_slot = by_slot
+                    app.flight_line_visibility = dict(lines)
+
+                    cache = getattr(
+                        app, "_flight_line_mask_cache_by_slot", None
+                    )
+                    if isinstance(cache, dict):
+                        cache.pop(0, None)
+                    app._flight_line_mask_cache_key = None
+                    app._flight_line_mask_cache = None
+
+                    from gui.unified_actor_manager import (
+                        fast_main_flight_line_visibility_update,
+                    )
+                    fast_done = fast_main_flight_line_visibility_update(app)
+                    if fast_done:
+                        app.set_display_mode("line")
+                    else:
+                        # Do not block a first Line shortcut on constructing a
+                        # new 13M-point unified actor. The established Line
+                        # pipeline is substantially faster when no actor exists.
+                        from gui.pointcloud_display import update_pointcloud
+                        app.display_mode = "line"
+                        update_pointcloud(app, "line")
+
+                    dlg = self._get_live_qt_attr("display_mode_dialog")
+                    if dlg is not None:
+                        dlg.current_slot = 0
+                        if hasattr(dlg, "slot_box"):
+                            dlg.slot_box.blockSignals(True)
+                            dlg.slot_box.setCurrentIndex(0)
+                            dlg.slot_box.blockSignals(False)
+                        if hasattr(dlg, "color_mode"):
+                            dlg.color_mode.blockSignals(True)
+                            dlg.color_mode.setCurrentIndex(7)
+                            dlg.color_mode.blockSignals(False)
+                        if hasattr(dlg, "_line_visibility"):
+                            dlg._line_visibility = dict(lines)
+
+                    visible = sum(1 for shown in lines.values() if shown)
+                    if hasattr(app, "statusBar"):
+                        app.statusBar().showMessage(
+                            f"[{key_label}] Line Mode: "
+                            f"{visible}/{len(lines)} flight lines",
+                            2500,
+                        )
+                    print(
+                        f"Line shortcut applied: "
+                        f"{visible}/{len(lines)} flight lines"
+                    )
+                except Exception as exc:
+                    print(f"Line shortcut failed: {exc}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    _QTimer.singleShot(
+                        ShortcutExecutionGuard.COOLDOWN_DISPLAY,
+                        self._shortcut_guard.force_unlock,
+                    )
+                return True
+
             # DisplayMode shortcut handler
             # ====================================================================
             if tool == "DisplayMode":
@@ -1313,6 +1397,9 @@ class GlobalShortcutFilter(QObject):
 
                     views = preset.get("views", {})
                     border_percent = preset.get("border_percent", 0.0)
+                    target_display_mode = str(
+                        preset.get("display_mode", "class") or "class"
+                    ).lower()
                     
                     target_view = int(list(views.keys())[0]) if views else 0
                     print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
@@ -1330,8 +1417,9 @@ class GlobalShortcutFilter(QObject):
                     if _last_applied_id == _current_shortcut_id:
                         _state_ok = True
                         try:
-                            if target_view == 0 and \
-                                    getattr(self.app_window, 'display_mode', None) != 'class':
+                            if target_view == 0 and str(
+                                    getattr(self.app_window, 'display_mode', None) or ""
+                            ).lower() != target_display_mode:
                                 _state_ok = False
                             if _state_ok and target_view == 0:
                                 _cp = getattr(self.app_window, 'class_palette', None)
@@ -1411,14 +1499,14 @@ class GlobalShortcutFilter(QObject):
                         print(f"   🔍 Previous display mode: '{previous_display_mode}' "
                             f"| was_shading={was_shading} | was_surface={was_surface}")
 
-                        # Surface → ByClass/Class shortcut must behave same as manual Display Mode.
+                        # Surface transitions must behave like manual Display Mode.
                         # Remove Surface mesh before class actor/GPU sync is made visible.
                         if was_surface:
                             try:
                                 from gui.surface_mode import detach_surface_before_non_surface_mode
                                 detach_surface_before_non_surface_mode(
                                     self.app_window,
-                                    requested_mode="class",
+                                    requested_mode=target_display_mode,
                                 )
                                 print("      ✅ Surface actor removed before DisplayMode shortcut class view")
                             except Exception as _surface_cleanup_err:
@@ -1472,11 +1560,10 @@ class GlobalShortcutFilter(QObject):
                         # ✅ FIX STEP 4: Clear shading override flag
                         self.app_window._shading_visibility_override = None
 
-                        # ✅ FIX STEP 5: Set display mode to classification
-                        self.app_window.display_mode = 'class'
-                        if hasattr(self.app_window, 'current_display_mode'):
-                            self.app_window.current_display_mode = 'class'
-                        print(f"      ✅ display_mode set to 'class'")
+                        print(
+                            f"      Target display mode from shortcut: "
+                            f"'{target_display_mode}'"
+                        )
 
                         # ✅ FIX STEP 6: Restore class_ actor visibility
                         # CRITICAL — ShadingMode hides all class_ actors via
@@ -1746,12 +1833,21 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     if hasattr(dlg, 'color_mode'):
                         if target_view == 0:
-                            _combo_idx = 0  # Main View preset → always 'class'
+                            _MODE_TO_IDX_LOCAL = {
+                                'class': 0, 'shaded_class': 1,
+                                'depth': 2, 'intensity': 3,
+                                'rgb': 4, 'elevation': 5,
+                                'surface': 6, 'line': 7,
+                            }
+                            _combo_idx = _MODE_TO_IDX_LOCAL.get(
+                                target_display_mode, 0
+                            )
                         else:
                             _MODE_TO_IDX_LOCAL = {
                                 'class': 0, 'shaded_class': 1,
                                 'depth': 2, 'intensity': 3,
                                 'rgb': 4, 'elevation': 5,
+                                'surface': 6, 'line': 7,
                             }
                             _cur_mode = getattr(
                                 self.app_window, 'display_mode', 'class'
@@ -1782,8 +1878,9 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     # STEP 5: Check current display mode / adjust borders
                     # ============================================================
-                    current_display_mode = getattr(
-                        self.app_window, 'display_mode', 'class'
+                    current_display_mode = (
+                        target_display_mode if target_view == 0 else
+                        getattr(self.app_window, 'display_mode', 'class')
                     )
                     print(f"\n   🎨 DISPLAY MODE NOW: {current_display_mode}")
 
@@ -1814,26 +1911,40 @@ class GlobalShortcutFilter(QObject):
                     if target_view == 0 and 0 in views:
                         dlg.view_borders[0] = border_percent
                         try:
-                            from gui.unified_actor_manager import (
-                                sync_palette_to_gpu, _get_unified_actor
-                            )
-                            _actor = _get_unified_actor(self.app_window)
-                            if _actor is not None:
-                                # ✅ FIX: Always ensure actor visible before sync
-                                _actor.SetVisibility(True)
+                            if target_display_mode != "class":
                                 self.app_window._preserve_view = True
-                                sync_palette_to_gpu(
-                                    self.app_window, 0,
-                                    self.app_window.class_palette,
-                                    border_percent, render=True
+                                self.app_window.set_display_mode(target_display_mode)
+                                print(
+                                    f"   STEP 6: Main view switched live to "
+                                    f"{target_display_mode}"
                                 )
-                                print(f"   ⚡ STEP 6: Main view GPU sync "
-                                    f"(border={border_percent}%)")
                             else:
-                                from gui.class_display import update_class_mode
-                                self.app_window._preserve_view = True
-                                update_class_mode(self.app_window, force_refresh=True)
-                                print(f"   ✅ STEP 6: Main view rebuilt (no actor)")
+                                # Palette sync alone does not leave Line mode.
+                                if str(getattr(
+                                    self.app_window, "display_mode", "class"
+                                ) or "class").lower() != "class":
+                                    self.app_window._preserve_view = True
+                                    self.app_window.set_display_mode("class")
+                                    print("   STEP 6: Main view switched live to class")
+                                from gui.unified_actor_manager import (
+                                    sync_palette_to_gpu, _get_unified_actor
+                                )
+                                _actor = _get_unified_actor(self.app_window)
+                                if _actor is not None:
+                                    _actor.SetVisibility(True)
+                                    self.app_window._preserve_view = True
+                                    sync_palette_to_gpu(
+                                        self.app_window, 0,
+                                        self.app_window.class_palette,
+                                        border_percent, render=True
+                                    )
+                                    print(f"   STEP 6: Main view GPU sync "
+                                        f"(border={border_percent}%)")
+                                else:
+                                    from gui.class_display import update_class_mode
+                                    self.app_window._preserve_view = True
+                                    update_class_mode(self.app_window, force_refresh=True)
+                                    print(f"   STEP 6: Main view rebuilt (no actor)")
                         except Exception as _sync_err:
                             print(f"   ⚠️ STEP 6 GPU sync failed: {_sync_err}")
                             import traceback
@@ -1936,7 +2047,8 @@ class GlobalShortcutFilter(QObject):
                                 view_names_short.append(f"V{v}")
 
                         self.app_window.statusBar().showMessage(
-                            f"[{key_label}] ✅ DisplayMode: {view_names_short[0]} active, "
+                            f"[{key_label}] ✅ DisplayMode: "
+                            f"{target_display_mode}, {view_names_short[0]} active, "
                             f"{total_visible} classes visible",
                             2500
                         )
@@ -2193,12 +2305,19 @@ class GlobalShortcutFilter(QObject):
                             single_class_max_edge = panel.max_edge.value()
                     except Exception:
                         single_class_max_edge = None
+                    # Do not discard valid shaded geometry on every shortcut
+                    # press. Classification commits update the live mesh
+                    # incrementally; forcing Delaunay for all 13M points here
+                    # caused the 10–15 second refresh seen in the audit log.
+                    _shading_force_rebuild = str(
+                        getattr(self.app_window, "display_mode", "")
+                    ).lower() != "shaded_class"
                     update_shaded_class(
                         self.app_window,
                         azimuth=azimuth,
                         angle=angle,
                         ambient=ambient,
-                        force_rebuild=True,
+                        force_rebuild=_shading_force_rebuild,
                         single_class_max_edge=single_class_max_edge
                     )
 

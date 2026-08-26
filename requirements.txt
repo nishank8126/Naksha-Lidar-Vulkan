@@ -52,3 +52,20 @@ pyinstaller>=6.0
 
 ####\\\\\\\\\---------  python -m PyInstaller --clean --noconfirm naksha.spec ---------------//////////########
 #                       pyinstaller --clean -y naksha.spec                     #
+
+
+
+# for git push 
+
+# cd E:\NAKSHA-LIDAR
+
+# git status
+# git add .
+# git commit -m "Describe your changes"
+# git push origin MAIN
+# To download the latest version on another computer:
+# git clone --branch MAIN https://github.com/Chiragkj/NakshaAI_Lidar.git
+# If the repository is already cloned:
+# cd NakshaAI_Lidar
+# git switch MAIN
+# git pull origin MAIN

@@ -7825,6 +7825,88 @@ class NakshaApp(QMainWindow):
             gamma_val = getattr(self, "depth_gamma", 1.0)
             print(f"  ✅ Depth mode applied: clip={clip_lo:.1f}-{clip_hi:.1f}%, scheme={scheme}, gamma={gamma_val:.2f}")
 
+        elif mode == "line":
+            # Line is only a color presentation of the SAME point geometry.
+            # Never rebuild/slice the actor for flight-line visibility: the
+            # FlightVisible shader array handles show/hide independently.
+            source_ids = self.data.get("point_source_id")
+            if source_ids is None or len(source_ids) != len(xyz):
+                print("  No usable Point Source ID data for Line mode")
+            else:
+                vis_lines = source_ids[gi] if gi is not None else source_ids
+                vis_lines = np.asarray(vis_lines)
+                line_colors = dict(getattr(self, "flight_line_colors", {}) or {})
+
+                # LAS Point Source ID is uint16. A fixed 65,536-row RGB LUT
+                # (~192 KiB) lets NumPy write directly into the persistent VTK
+                # RGB buffer. The previous np.unique(..., return_inverse=True)
+                # allocated a huge inverse array (100+ MB for ~13M points) on
+                # every Line switch and added roughly a second of CPU time.
+                try:
+                    line_color_sig = tuple(sorted(
+                        (int(raw_id), tuple(int(c) for c in color[:3]))
+                        for raw_id, color in line_colors.items()
+                    ))
+                except Exception:
+                    line_color_sig = tuple()
+
+                line_lut = getattr(self, "_line_mode_rgb_lut", None)
+                if (
+                    not isinstance(line_lut, np.ndarray)
+                    or line_lut.shape != (65536, 3)
+                    or line_lut.dtype != np.uint8
+                    or getattr(self, "_line_mode_rgb_lut_sig", None) != line_color_sig
+                ):
+                    ids = np.arange(65536, dtype=np.uint32)
+                    line_lut = np.empty((65536, 3), dtype=np.uint8)
+                    line_lut[:, 0] = ((ids * 67 + 53) & 255).astype(np.uint8)
+                    line_lut[:, 1] = ((ids * 131 + 97) & 255).astype(np.uint8)
+                    line_lut[:, 2] = ((ids * 193 + 181) & 255).astype(np.uint8)
+                    for raw_line_id, color in line_colors.items():
+                        try:
+                            line_id = int(raw_line_id)
+                            if 0 <= line_id <= 65535:
+                                line_lut[line_id] = tuple(int(c) for c in color[:3])
+                        except Exception:
+                            continue
+                    self._line_mode_rgb_lut = line_lut
+                    self._line_mode_rgb_lut_sig = line_color_sig
+
+                line_ids = np.asarray(vis_lines, dtype=np.intp)
+                if (
+                    line_ids.size == len(rgb_ptr)
+                    and (line_ids.size == 0 or (line_ids.min() >= 0 and line_ids.max() <= 65535))
+                ):
+                    # Direct indexed write: no compact RGB temporary, no inverse array.
+                    np.take(line_lut, line_ids, axis=0, out=rgb_ptr)
+                else:
+                    # Defensive fallback for malformed/non-LAS source IDs.
+                    unique_lines, inverse = np.unique(vis_lines, return_inverse=True)
+                    compact_lut = np.empty((len(unique_lines), 3), dtype=np.uint8)
+                    for lut_idx, raw_line_id in enumerate(unique_lines):
+                        line_id = int(raw_line_id)
+                        compact_lut[lut_idx] = line_colors.get(
+                            line_id,
+                            (
+                                (line_id * 67 + 53) % 256,
+                                (line_id * 131 + 97) % 256,
+                                (line_id * 193 + 181) % 256,
+                            ),
+                        )
+                    np.copyto(rgb_ptr, compact_lut[inverse])
+
+                vtk_ca.Modified()
+                _mark_actor_dirty(actor)
+                self.vtk_widget.render()
+                configured_lines = max(
+                    len(line_colors),
+                    len(dict(getattr(self, "flight_line_visibility", {}) or {})),
+                )
+                print(
+                    f"  ⚡ Line mode: existing unified actor recolored via LUT "
+                    f"({configured_lines} configured flight lines)"
+                )
+
         else:
             # Unknown mode — fallback to pointcloud_display
             try:
@@ -7859,6 +7941,7 @@ class NakshaApp(QMainWindow):
             "rgb":          4,
             "elevation":    5,
             "surface":      6,
+            "line":         7,
         }
         try:
             if hasattr(self, 'display_mode_dialog') and self.display_mode_dialog:

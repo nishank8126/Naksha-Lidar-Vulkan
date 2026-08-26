@@ -5825,7 +5825,12 @@ class ByClassDialog(QDialog):
                 converted_count = len(classification)
             else:
                 mask = np.isin(classification, from_classes)
-                converted_count = np.sum(mask)
+
+            from gui.flight_line_filter import intersect_with_visible_flight_lines
+            mask = intersect_with_visible_flight_lines(
+                self.app, mask, len(classification), slot=0
+            )
+            converted_count = int(np.count_nonzero(mask))
             
             if converted_count == 0:
                 QMessageBox.information(self, "No Points", "No points found to convert")
@@ -7264,6 +7269,10 @@ class ClosedByClassDialog(QDialog):
         
         # Work with entire dataset
         section_mask = np.ones(len(classification), dtype=bool)
+        from gui.flight_line_filter import intersect_with_visible_flight_lines
+        section_mask = intersect_with_visible_flight_lines(
+            self.app, section_mask, len(classification), slot=0
+        )
 
         if self.selected_fences:
             combined_inside_mask = np.zeros(len(classification), dtype=bool)
@@ -9410,6 +9419,11 @@ class ByClassHeightDialog(QDialog):
             from_class_mask = (classification != to_class)
         else:
             from_class_mask = np.isin(classification, from_classes)
+
+        from gui.flight_line_filter import intersect_with_visible_flight_lines
+        from_class_mask = intersect_with_visible_flight_lines(
+            self.app, from_class_mask, len(classification), slot=0
+        )
 
         from_class_count = np.sum(from_class_mask)
         
@@ -11579,6 +11593,18 @@ class InsideFenceDialog(QDialog):
             final_convert_indices = inside_indices[height_mask]
         else:
             final_convert_indices = inside_indices
+
+        # Fence conversion has its own direct classification commit path, so
+        # enforce the Main View's per-view flight-line selection here as the
+        # final eligibility boundary. This also keeps preview/undo/GPU masks
+        # identical to the points that are actually allowed to change.
+        from gui.flight_line_filter import filter_visible_flight_line_indices
+        final_convert_indices = filter_visible_flight_line_indices(
+            self.app,
+            final_convert_indices,
+            len(classification),
+            slot=0,
+        )
             
         converted_count = len(final_convert_indices)
         if converted_count == 0:

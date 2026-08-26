@@ -137,7 +137,9 @@ def _apply_display_visibility_preset(app_window, preset) -> int:
     return sum(1 for value in visibility.values() if value)
 
 
-def _sync_display_visibility_to_renderer(app_window, preset) -> bool:
+def _sync_display_visibility_to_renderer(
+    app_window, preset, border_percent=0.0, render=True
+) -> bool:
     """Push shortcut visibility to the unified actor without replacing mode colors."""
     if not isinstance(preset, dict) or not (preset.get("classes") or {}):
         return False
@@ -153,8 +155,8 @@ def _sync_display_visibility_to_renderer(app_window, preset) -> bool:
             app_window,
             slot_idx=0,
             palette=palette,
-            border=0.0,
-            render=True,
+            border=float(border_percent),
+            render=bool(render),
             rewrite_rgb=False,
         ))
     except Exception as exc:
@@ -868,7 +870,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     
     # ✅ DISPLAY MODE SHORTCUTS (Non-classification)
     # ========================================================================
-    if tool in ("Depth", "RGB", "Intensity", "Elevation", "Class", "Surface"):
+    if tool in ("Depth", "RGB", "Intensity", "Elevation", "Line", "Class", "Surface"):
         
         print(f"🎨 Switching to {tool} display mode")
         
@@ -891,16 +893,88 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             "RGB": "rgb",
             "Intensity": "intensity",
             "Elevation": "elevation",
+            "Line": "line",
             "Class": "class",
             "Surface": "surface",
         }
         
         mode = mode_map[tool]
 
-        if tool in ("Depth", "RGB", "Intensity", "Elevation"):
+        # Line shortcut can change three independent GPU states: flight-line
+        # visibility, class visibility, and RGB presentation. Batch the first
+        # two without rendering so set_display_mode("line") performs the one
+        # final repaint. This avoids a 13M+ point actor rebuild and duplicate
+        # renders while preserving all existing preset semantics.
+        _line_flight_prepatched = False
+        _line_visibility_presynced = False
+
+        if tool in ("Depth", "RGB", "Intensity", "Elevation", "Line"):
             visible_count = _apply_display_visibility_preset(app_window, preset)
             if isinstance(preset, dict) and preset.get("classes"):
                 print(f"   Applied {tool} visibility preset: {visible_count} classes visible")
+
+        if tool == "Line" and isinstance(preset, dict):
+            saved_lines = preset.get("flight_lines", {}) or {}
+            if saved_lines:
+                line_visibility = {
+                    int(line_id): bool(shown)
+                    for line_id, shown in saved_lines.items()
+                }
+                by_slot = getattr(
+                    app_window, "flight_line_visibility_by_slot", None
+                )
+                if not isinstance(by_slot, dict):
+                    by_slot = {}
+                    app_window.flight_line_visibility_by_slot = by_slot
+                by_slot[0] = dict(line_visibility)
+                app_window.flight_line_visibility = dict(line_visibility)
+                cache = getattr(
+                    app_window, "_flight_line_mask_cache_by_slot", None
+                )
+                if isinstance(cache, dict):
+                    cache.pop(0, None)
+                app_window._flight_line_mask_cache_key = None
+                app_window._flight_line_mask_cache = None
+                print(
+                    "   Applied Line flight-line preset: "
+                    f"{sum(line_visibility.values())}/{len(line_visibility)} visible"
+                )
+
+                # IMPORTANT: do this BEFORE set_display_mode(). The old order
+                # made _get_unified_actor() see a new flight-line signature and
+                # incorrectly rebuild the entire point-cloud actor.
+                try:
+                    from gui.unified_actor_manager import (
+                        fast_main_flight_line_visibility_update,
+                    )
+                    _line_flight_prepatched = bool(
+                        fast_main_flight_line_visibility_update(
+                            app_window, render=False
+                        )
+                    )
+                    if _line_flight_prepatched:
+                        print("   ⚡ Line flight visibility prepatched (no render)")
+                except Exception as _line_patch_exc:
+                    print(f"   ⚠️ Line prepatch skipped: {_line_patch_exc}")
+            app_window._last_display_shortcut_id = None
+
+            # Push class visibility/border uniforms before the RGB mode switch,
+            # also without rendering. set_display_mode('line') will repaint once.
+            try:
+                _line_visibility_presynced = bool(
+                    _sync_display_visibility_to_renderer(
+                        app_window,
+                        preset,
+                        border_percent=float(
+                            getattr(app_window, "point_border_percent", 0.0) or 0.0
+                        ),
+                        render=False,
+                    )
+                )
+                if _line_visibility_presynced:
+                    print("   ⚡ Line class visibility pre-synced (no render)")
+            except Exception as _line_vis_exc:
+                print(f"   ⚠️ Line visibility pre-sync skipped: {_line_vis_exc}")
         
         if mode in ['depth', 'rgb', 'intensity', 'elevation', 'surface']:
             print(f"   🔳 Clearing borders for {mode} mode")
@@ -962,14 +1036,32 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                     print(f"   ⚠️ No display mode handler found!")
                     return
 
-            if tool in ("Depth", "RGB", "Intensity", "Elevation"):
-                if _sync_display_visibility_to_renderer(app_window, preset):
+            if tool in ("Depth", "RGB", "Intensity", "Elevation", "Line"):
+                sync_border = (
+                    float(getattr(app_window, "point_border_percent", 0.0) or 0.0)
+                    if tool == "Line" else 0.0
+                )
+                if tool == "Line" and _line_visibility_presynced:
+                    print("   ⚡ Line visibility already synchronized before final render")
+                elif _sync_display_visibility_to_renderer(
+                    app_window, preset, border_percent=sync_border
+                ):
                     print(f"   ✅ Synced {tool} class visibility to renderer")
             
             app_window.active_classify_tool = None
+            if tool == "Line" and isinstance(preset, dict) and preset.get(
+                "flight_lines"
+            ):
+                if _line_flight_prepatched:
+                    print("   ⚡ Line flight visibility already patched before mode switch")
+                else:
+                    from gui.unified_actor_manager import (
+                        fast_main_flight_line_visibility_update,
+                    )
+                    fast_main_flight_line_visibility_update(app_window)
             _return_focus_to_main_view(app_window)
             
-            icon_map = {"depth": "🧱", "rgb": "🌈", "intensity": "💡", "elevation": "📊", "class": "🏷️", "surface": "🏔️"}
+            icon_map = {"depth": "🧱", "rgb": "🌈", "intensity": "💡", "elevation": "📊", "line": "✈", "class": "🏷️", "surface": "🏔️"}
             icon = icon_map.get(mode, "🎨")
             
             if hasattr(app_window, "statusBar"):

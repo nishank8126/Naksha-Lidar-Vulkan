@@ -16,11 +16,12 @@ from .theme_manager import get_dialog_stylesheet
 
 TOOLS = [
     "AboveLine", "BelowLine", "ParallelLine", "Rectangle", "Circle",
-    "Polygon", "Freehand", "Brush", "Point", "TempFence",
+    "Polygon", "Freehand", "Brush", "Point",
     "CrossSectionRect", "CutSectionRect",
     "CutFromCross", "CutFromCut",
     "TopView",
     "DisplayMode",
+    "Line",
     "ShadingMode", "Depth",
     "RGB",
     "Intensity",
@@ -36,15 +37,15 @@ TOOLS = [
 
 SIMPLE_SHORTCUT_TOOLS = (
     "CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut",
-    "TopView","TempFence", "Depth", "RGB", "Intensity", "Elevation", "Class", "Surface",
+    "TopView", "Depth", "RGB", "Intensity", "Elevation", "Line", "Class", "Surface",
     "MeasureLine", "MeasurePath", "ClearMeasurements",
     "Pan",
     "Save", "SaveAs",
 )
 
-DISPLAY_VISIBILITY_TOOLS = ("Depth", "RGB", "Intensity", "Elevation")
+DISPLAY_VISIBILITY_TOOLS = ("Depth", "RGB", "Intensity", "Elevation", "Line")
 CLASS_VISIBILITY_PICKER_MODES = (
-    "shading", "surface", "depth", "rgb", "intensity", "elevation",
+    "shading", "surface", "depth", "rgb", "intensity", "elevation", "line",
 )
 
 import json
@@ -60,6 +61,42 @@ def decode_classes(text):
         return data.get("from"), data.get("to")
     except Exception:
         return None, None
+
+
+def encode_line_mode_preset(payload: dict) -> str:
+    lines = {
+        str(int(line_id)): bool(shown)
+        for line_id, shown in dict(payload.get("lines", {}) or {}).items()
+    }
+    return json.dumps({
+        "__type__": "line_mode_preset",
+        "target_view": 0,
+        "lines": lines,
+    })
+
+
+def decode_line_mode_preset(value):
+    try:
+        data = value if isinstance(value, dict) else json.loads(value)
+        if not isinstance(data, dict):
+            return None
+        if data.get("__type__") not in (None, "line_mode_preset"):
+            return None
+        return {
+            "target_view": 0,
+            "lines": {
+                int(line_id): bool(shown)
+                for line_id, shown in dict(data.get("lines", {}) or {}).items()
+            },
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def summarize_line_mode_preset(preset: dict) -> str:
+    lines = dict((preset or {}).get("lines", {}) or {})
+    visible = sum(1 for shown in lines.values() if shown)
+    return f"Line Mode: {visible}/{len(lines)} flight lines"
 
 def encode_display_preset(payload: dict) -> str:
     try:
@@ -84,6 +121,7 @@ def encode_display_preset(payload: dict) -> str:
 
         preset = {
             "__type__": "display_mode_preset_v3",
+            "display_mode": str(payload.get("display_mode", "class") or "class"),
             "border_percent": float(payload.get("border_percent", 0)),
             "border_type": int(payload.get("border_type", 0)),
             "force_refresh": bool(payload.get("force_refresh", True)),
@@ -123,6 +161,7 @@ def decode_display_preset(text):
                     for code_str, v in classes.items()
                 }
             return {
+                "display_mode": str(data.get("display_mode", "class") or "class"),
                 "border_percent": float(data.get("border_percent", 0)),
                 "border_type": int(data.get("border_type", 0)),
                 "force_refresh": bool(data.get("force_refresh", True)),
@@ -150,6 +189,7 @@ def decode_display_preset(text):
                 views[view_idx] = classes_dict
 
             return {
+                "display_mode": str(data.get("display_mode", "class") or "class"),
                 "border_percent": float(data.get("border_percent", 0)),
                 "border_type": int(data.get("border_type", 0)),
                 "force_refresh": bool(data.get("force_refresh", True)),
@@ -173,6 +213,7 @@ def decode_display_preset(text):
             # Convert to new format
             target_view = data.get("target_view", data.get("slot", 0))
             return {
+                "display_mode": str(data.get("display_mode", "class") or "class"),
                 "border_percent": float(data.get("border_percent", 0)),
                 "border_type": int(data.get("border_type", 0)),
                 "force_refresh": bool(data.get("force_refresh", True)),
@@ -197,6 +238,7 @@ def decode_display_preset(text):
                     }
                 views[view_idx] = classes_dict
             return {
+                "display_mode": str(data.get("display_mode", "class") or "class"),
                 "border_percent": float(data.get("border_percent", 0)),
                 "border_type": int(data.get("border_type", 0)),
                 "force_refresh": bool(data.get("force_refresh", True)),
@@ -245,6 +287,7 @@ def rebase_display_preset_to_current_ptc(preset: dict, app_window) -> dict:
         rebased_views[view_idx] = rebased
 
     return {
+        "display_mode":   str(preset.get("display_mode", "class") or "class"),
         "border_percent": float(preset.get("border_percent", 0.0)),
         "border_type":    int(preset.get("border_type", 0)),
         "force_refresh":  bool(preset.get("force_refresh", True)),
@@ -265,6 +308,17 @@ def summarize_display_like_preset(preset: dict, prefix: str = "Preset") -> str:
 
     parts = []
     border_pct = float(preset.get("border_percent", 0.0))
+    mode_key = str(preset.get("display_mode", "class") or "class")
+    mode_label = {
+        "class": "By Classification",
+        "shaded_class": "Shaded Classification",
+        "depth": "Depth",
+        "intensity": "Intensity",
+        "rgb": "RGB",
+        "elevation": "Elevation",
+        "surface": "Surface",
+        "line": "Line",
+    }.get(mode_key, mode_key)
     for view_idx in sorted(int(k) for k in views.keys()):
         view_classes = views.get(view_idx, views.get(str(view_idx), {}))
         if not isinstance(view_classes, dict):
@@ -279,7 +333,10 @@ def summarize_display_like_preset(preset: dict, prefix: str = "Preset") -> str:
                            else f"W={min(weights):.1f}-{max(weights):.1f}")
         else:
             weight_info = "W=1.0"
-        parts.append(f"{view_name}: {visible}vis, B={border_pct:.1f}%, {weight_info}")
+        parts.append(
+            f"{view_name}: {mode_label}, {visible}vis, "
+            f"B={border_pct:.1f}%, {weight_info}"
+        )
     return "; ".join(parts) if parts else f"{prefix}: Not configured yet"
 
 
@@ -678,9 +735,16 @@ def encode_display_visibility_preset(payload: dict) -> str:
         return json.dumps({
             "__type__": "display_visibility_preset",
             "mode": str(payload.get("mode", "")),
+            "target_view": int(payload.get("target_view", 0) or 0),
             "classes": {
                 str(int(code)): {"show": bool(info.get("show", True))}
                 for code, info in classes.items()
+            },
+            "flight_lines": {
+                str(int(line_id)): bool(shown)
+                for line_id, shown in dict(
+                    payload.get("flight_lines", {}) or {}
+                ).items()
             },
         })
     except Exception:
@@ -704,7 +768,17 @@ def decode_display_visibility_preset(value):
             for code, info in (data.get("classes", {}) or {}).items()
             if isinstance(info, dict)
         }
-        return {"mode": str(data.get("mode", "")), "classes": classes}
+        return {
+            "mode": str(data.get("mode", "")),
+            "target_view": int(data.get("target_view", 0) or 0),
+            "classes": classes,
+            "flight_lines": {
+                int(line_id): bool(shown)
+                for line_id, shown in dict(
+                    data.get("flight_lines", {}) or {}
+                ).items()
+            },
+        }
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -712,6 +786,13 @@ def decode_display_visibility_preset(value):
 def summarize_display_visibility_preset(preset: dict, tool: str) -> str:
     classes = (preset or {}).get("classes", {}) or {}
     visible = sum(1 for info in classes.values() if info.get("show", True))
+    if tool == "Line":
+        lines = dict((preset or {}).get("flight_lines", {}) or {})
+        line_visible = sum(1 for shown in lines.values() if shown)
+        return (
+            f"Line: {visible}/{len(classes)} classes, "
+            f"{line_visible}/{len(lines)} flight lines"
+        )
     return f"{tool}: {visible} of {len(classes)} classes visible"
 
 
@@ -1074,6 +1155,123 @@ _GEOMETRY_KEY   = "display_preset_picker/geometry"
 _DEFAULT_WIDTHS = [57, 79, 122, 147, 112, 213]
 
 
+class LineModePresetDialog(QDialog):
+    """Shortcut preset editor containing only Main View flight-line settings."""
+
+    def __init__(self, app_window, preset=None, parent=None):
+        super().__init__(parent)
+        self.app_window = app_window
+        self.setProperty("themeStyledDialog", True)
+        self.setWindowTitle("Configure Line Mode Shortcut")
+        self.setModal(False)
+        self.setWindowFlags(Qt.Window)
+        self.resize(390, 470)
+
+        root = QVBoxLayout(self)
+        note = QLabel(
+            "Select the flight lines that this shortcut should display. "
+            "Pressing the shortcut always switches Main View to Line mode."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("dialogInlineNote")
+        root.addWidget(note)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Show", "Flight line / Color"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.Stretch
+        )
+        root.addWidget(self.table, stretch=1)
+
+        source_ids = None
+        data = getattr(app_window, "data", None)
+        if isinstance(data, dict):
+            source_ids = data.get("point_source_id")
+        line_ids = []
+        if source_ids is not None:
+            import numpy as np
+            line_ids = [int(value) for value in np.unique(source_ids)]
+
+        saved = dict((preset or {}).get("lines", {}) or {})
+        if not saved:
+            saved = dict(getattr(app_window, "flight_line_visibility", {}) or {})
+        colors = dict(getattr(app_window, "flight_line_colors", {}) or {})
+        self.checks = {}
+        for row, line_id in enumerate(line_ids):
+            self.table.insertRow(row)
+            check = QCheckBox()
+            check.setChecked(bool(saved.get(line_id, True)))
+            holder = QWidget()
+            holder_layout = QHBoxLayout(holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            holder_layout.setAlignment(Qt.AlignCenter)
+            holder_layout.addWidget(check)
+            self.table.setCellWidget(row, 0, holder)
+            self.checks[line_id] = check
+
+            rgb = colors.get(
+                line_id,
+                (
+                    (line_id * 67 + 53) % 256,
+                    (line_id * 131 + 97) % 256,
+                    (line_id * 193 + 181) % 256,
+                ),
+            )
+            item = QTableWidgetItem(f"Line {line_id}")
+            item.setBackground(QColor(*rgb))
+            item.setForeground(
+                QColor(0, 0, 0) if sum(rgb) > 390 else QColor(255, 255, 255)
+            )
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, item)
+
+        actions = QHBoxLayout()
+        all_on = QPushButton("All on")
+        invert = QPushButton("Invert")
+        all_off = QPushButton("All off")
+        actions.addWidget(all_on)
+        actions.addWidget(invert)
+        actions.addWidget(all_off)
+        root.addLayout(actions)
+        all_on.clicked.connect(
+            lambda: [check.setChecked(True) for check in self.checks.values()]
+        )
+        invert.clicked.connect(
+            lambda: [
+                check.setChecked(not check.isChecked())
+                for check in self.checks.values()
+            ]
+        )
+        all_off.clicked.connect(
+            lambda: [check.setChecked(False) for check in self.checks.values()]
+        )
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        ok_button = QPushButton("OK")
+        close_button = QPushButton("Close")
+        footer.addWidget(ok_button)
+        footer.addWidget(close_button)
+        root.addLayout(footer)
+        ok_button.clicked.connect(self.accept)
+        close_button.clicked.connect(self.reject)
+
+    def get_preset(self):
+        return {
+            "target_view": 0,
+            "lines": {
+                int(line_id): check.isChecked()
+                for line_id, check in self.checks.items()
+            },
+        }
+
+
 class ClassVisibilityPicker(QDialog):
     """Lightweight dialog — Display/Shading Mode preset configurator"""
 
@@ -1253,6 +1451,36 @@ class ClassVisibilityPicker(QDialog):
 
         layout = QVBoxLayout(self)
 
+        # A Line shortcut saves Main View class and flight-line filters together.
+        self.line_visibility = {}
+        if mode == "line":
+            by_slot = getattr(app_window, "flight_line_visibility_by_slot", {})
+            if isinstance(by_slot, dict):
+                self.line_visibility = dict(
+                    by_slot.get(0, by_slot.get("0", {})) or {}
+                )
+            if not self.line_visibility:
+                self.line_visibility = dict(
+                    getattr(app_window, "flight_line_visibility", {}) or {}
+                )
+            line_header = QHBoxLayout()
+            line_header.setSpacing(10)
+            line_header.addWidget(QLabel("Target View:"))
+            self.view_selector = QComboBox()
+            self.view_selector.addItem("Main View", 0)
+            self.view_selector.setMinimumWidth(130)
+            line_header.addWidget(self.view_selector)
+            line_header.addWidget(QLabel("Display Mode:"))
+            self.display_mode_selector = QComboBox()
+            self.display_mode_selector.addItem("Line", "line")
+            self.display_mode_selector.setMinimumWidth(150)
+            line_header.addWidget(self.display_mode_selector)
+            self.lines_button = QPushButton("Lines")
+            self.lines_button.clicked.connect(self._open_line_selection)
+            line_header.addWidget(self.lines_button)
+            line_header.addStretch()
+            layout.addLayout(line_header)
+
         # ── shading parameters (shading mode only) ───────────────────
         if mode in ("shading", "surface"):
             shading_group = QGroupBox(
@@ -1399,6 +1627,25 @@ class ClassVisibilityPicker(QDialog):
             # Display mode — full table UI
             self._rebuild_display_mode_ui(layout)
 
+    def _open_line_selection(self):
+        """Edit the local flight-line portion of this Line shortcut preset."""
+        dialog = LineModePresetDialog(
+            self.app_window,
+            preset={"target_view": 0, "lines": self.line_visibility},
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self.line_visibility = dict(dialog.get_preset().get("lines", {}))
+
+    def set_line_visibility(self, visibility):
+        self.line_visibility = {
+            int(line_id): bool(shown)
+            for line_id, shown in dict(visibility or {}).items()
+        }
+
+    def get_line_visibility(self):
+        return dict(self.line_visibility)
+
     # ─────────────────────────────────────────────────────────────────
     # EVENT FILTER — hide when another top-level window is activated
     # ─────────────────────────────────────────────────────────────────
@@ -1521,6 +1768,29 @@ class ClassVisibilityPicker(QDialog):
         self.view_selector.setCurrentIndex(0)
         self.view_selector.currentIndexChanged.connect(self._on_view_selector_changed)
         controls_row.addWidget(self.view_selector)
+
+        controls_row.addSpacing(12)
+        controls_row.addWidget(QLabel("Display Mode:"))
+        self.display_mode_selector = QComboBox()
+        self.display_mode_selector.setMinimumWidth(165)
+        for label, mode_key in (
+            ("By Classification", "class"),
+            ("Shaded Classification", "shaded_class"),
+            ("Depth", "depth"),
+            ("Intensity", "intensity"),
+            ("RGB", "rgb"),
+            ("Elevation", "elevation"),
+            ("Surface", "surface"),
+        ):
+            self.display_mode_selector.addItem(label, mode_key)
+        live_mode = str(
+            getattr(self.app_window, "display_mode", "class") or "class"
+        ).lower()
+        live_mode_idx = self.display_mode_selector.findData(live_mode)
+        self.display_mode_selector.setCurrentIndex(
+            live_mode_idx if live_mode_idx >= 0 else 0
+        )
+        controls_row.addWidget(self.display_mode_selector)
 
         controls_row.addSpacing(12)
         controls_row.addWidget(QLabel("Border %:"))
@@ -2083,6 +2353,10 @@ class ClassVisibilityPicker(QDialog):
             selected_view_idx = self.view_selector.currentIndex()
 
         result = {
+            "display_mode": (
+                str(self.display_mode_selector.currentData() or "class")
+                if hasattr(self, "display_mode_selector") else "class"
+            ),
             "border_percent": self.border_spin.value() if hasattr(self, 'border_spin') else 0,
             "border_type": self.get_border_logic_mode(),
             "views": {}
@@ -2546,40 +2820,115 @@ class ShortcutManager(QWidget):
             pass
 
     def _on_table_border_changed(self, slot_idx: int, border_percent: float, logic_mode: int):
-        """Update Classes column text for all DisplayMode rows targeting slot_idx."""
+        """Update DisplayMode shortcut summaries when a live view border changes.
+
+        This callback is connected directly to DisplayModeDialog.border_changed,
+        so it must not depend on ClassVisibilityPicker-local variables.  The
+        shortcut preset stored in the table cell is the authoritative source for
+        the saved display-mode label and per-view class configuration.
+        """
         _VIEW_NAMES = ["Main", "View 1", "View 2", "View 3", "View 4", "Cut"]
+        _MODE_LABELS = {
+            "class": "By Classification",
+            "shaded_class": "Shaded Classification",
+            "depth": "Depth",
+            "intensity": "Intensity",
+            "rgb": "RGB",
+            "elevation": "Elevation",
+            "surface": "Surface",
+            "line": "Line",
+        }
+
+        try:
+            slot_idx = int(slot_idx)
+            border_percent = float(border_percent)
+            logic_mode = int(logic_mode)
+        except (TypeError, ValueError):
+            return
+
         for row in range(self.table.rowCount()):
-            tool_w = self.table.cellWidget(row, self.COL_TOOL)
-            if tool_w is None:
-                continue
-            tool = tool_w.currentText() if hasattr(tool_w, "currentText") else ""
-            if tool != "DisplayMode":
-                continue
-            cell = self.table.item(row, self.COL_CLASSES)
-            if cell is None:
-                continue
-            preset = decode_display_preset(cell.data(Qt.UserRole))
-            if preset is None:
-                continue
-            views = preset.get("views", {})
-            # Find the view index stored in the preset
-            if not views:
-                continue
-            view_idx = list(views.keys())[0]
-            if int(view_idx) != slot_idx:
-                continue
-            # Update border in preset and refresh label
-            preset["border_percent"] = border_percent
-            preset["border_type"]    = logic_mode
-            view_classes = views[view_idx]
-            visible = sum(1 for c in view_classes.values() if c.get("show"))
-            view_name = _VIEW_NAMES[slot_idx] if slot_idx < 6 else f"View {slot_idx}"
-            weights = [c.get("weight", 1.0) for c in view_classes.values()]
-            weight_info = (f"W={weights[0]:.1f}" if len(set(weights)) == 1
-                           else f"W={min(weights):.1f}-{max(weights):.1f}")
-            summary = f"{view_name}: {visible}vis, B={border_percent:.1f}%, {weight_info}"
-            cell.setText(summary)
-            cell.setData(Qt.UserRole, encode_display_preset(preset))
+            try:
+                tool_w = self.table.cellWidget(row, self.COL_TOOL)
+                if tool_w is None:
+                    continue
+
+                tool = tool_w.currentText() if hasattr(tool_w, "currentText") else ""
+                if tool != "DisplayMode":
+                    continue
+
+                cell = self.table.item(row, self.COL_CLASSES)
+                if cell is None:
+                    continue
+
+                preset = decode_display_preset(cell.data(Qt.UserRole))
+                if preset is None:
+                    continue
+
+                views = preset.get("views", {}) or {}
+                if not views:
+                    continue
+
+                # Current DisplayMode shortcuts are single-view presets.  Keep
+                # compatibility with either integer or JSON-string view keys.
+                view_idx = next(iter(views.keys()))
+                try:
+                    view_idx_int = int(view_idx)
+                except (TypeError, ValueError):
+                    continue
+
+                if view_idx_int != slot_idx:
+                    continue
+
+                view_classes = views.get(view_idx)
+                if view_classes is None:
+                    view_classes = views.get(view_idx_int, views.get(str(view_idx_int), {}))
+                if not isinstance(view_classes, dict):
+                    continue
+
+                # Update only the border fields.  Visibility, weights, target
+                # view and saved display mode remain untouched.
+                preset["border_percent"] = border_percent
+                preset["border_type"] = logic_mode
+
+                visible = sum(
+                    1 for class_info in view_classes.values()
+                    if isinstance(class_info, dict) and class_info.get("show")
+                )
+
+                weights = [
+                    float(class_info.get("weight", 1.0))
+                    for class_info in view_classes.values()
+                    if isinstance(class_info, dict)
+                ]
+                if not weights:
+                    weight_info = "W=1.0"
+                elif len(set(weights)) == 1:
+                    weight_info = f"W={weights[0]:.1f}"
+                else:
+                    weight_info = f"W={min(weights):.1f}-{max(weights):.1f}"
+
+                view_name = (
+                    _VIEW_NAMES[slot_idx]
+                    if 0 <= slot_idx < len(_VIEW_NAMES)
+                    else f"View {slot_idx}"
+                )
+
+                mode_key = str(preset.get("display_mode", "class") or "class")
+                mode_label = _MODE_LABELS.get(mode_key, mode_key)
+
+                summary = (
+                    f"{view_name}: {mode_label}, {visible}vis, "
+                    f"B={border_percent:.1f}%, {weight_info}"
+                )
+                cell.setText(summary)
+                cell.setData(Qt.UserRole, encode_display_preset(preset))
+
+            except Exception as exc:
+                # A malformed/stale shortcut row must never crash the entire
+                # application when the Display Mode border changes.
+                print(
+                    f"⚠️ DisplayMode shortcut border sync skipped for row {row}: {exc}"
+                )
 
     def _restore_app_focus(self):
         """Return keyboard focus to the main app/view after closing this manager."""
@@ -3053,6 +3402,16 @@ class ShortcutManager(QWidget):
                 mod       = modifier.lower()
                 key_upper = key.upper()
 
+                if tool in ("Line", "LineMode"):
+                    preset_payload = entry.get("line_mode_preset") or {
+                        "target_view": 0, "lines": {}
+                    }
+                    shortcuts[(mod, key_upper)] = {
+                        "tool": "Line",
+                        "preset": preset_payload,
+                    }
+                    continue
+
                 if tool == "DisplayMode":
                     preset_payload = entry.get("display_preset")
                     if preset_payload:
@@ -3202,6 +3561,20 @@ class ShortcutManager(QWidget):
             self.table.setItem(row, self.COL_CLASSES, item)
             if not self._is_loading_shortcuts:
                 self._open_display_visibility_for_row(row, tool_text)
+            return
+
+        if tool_text == "LineMode":
+            item = QTableWidgetItem(
+                "Click/Double-click to configure flight lines"
+            )
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setData(
+                Qt.UserRole,
+                encode_line_mode_preset({"lines": {}}),
+            )
+            self.table.setItem(row, self.COL_CLASSES, item)
+            if not self._is_loading_shortcuts:
+                self._open_line_mode_for_row(row)
             return
 
         if tool_text == "DisplayMode":
@@ -3517,6 +3890,11 @@ class ShortcutManager(QWidget):
                 border_type = existing_preset.get("border_type", 0)
 
                 picker.border_spin.setValue(border_percent)
+                preset_mode = str(existing_preset.get("display_mode", "class") or "class")
+                mode_idx = picker.display_mode_selector.findData(preset_mode)
+                picker.display_mode_selector.setCurrentIndex(
+                    mode_idx if mode_idx >= 0 else 0
+                )
                 picker.set_border_logic_mode(border_type)
                 picker.view_selector.blockSignals(True)
                 picker.view_selector.setCurrentIndex(first_view_idx)
@@ -3540,6 +3918,11 @@ class ShortcutManager(QWidget):
             else:
                 border_type = existing_preset.get("border_type", 0)
                 picker.border_spin.setValue(border_percent)
+                preset_mode = str(existing_preset.get("display_mode", "class") or "class")
+                mode_idx = picker.display_mode_selector.findData(preset_mode)
+                picker.display_mode_selector.setCurrentIndex(
+                    mode_idx if mode_idx >= 0 else 0
+                )
                 picker.set_border_logic_mode(border_type)
                 print(f"📋 Preset has no views configured")
                 picker._populate_classes()
@@ -3667,6 +4050,10 @@ class ShortcutManager(QWidget):
         setattr(self, attr_name, picker)
         if existing_classes:
             picker.set_selected_classes(existing_classes)
+        if tool == "Line" and existing_preset:
+            picker.set_line_visibility(
+                existing_preset.get("flight_lines", {})
+            )
 
         def cleanup_picker():
             picker.hide()
@@ -3676,7 +4063,13 @@ class ShortcutManager(QWidget):
 
         def on_accepted():
             selected_classes = picker.get_selected_classes()
-            preset = {"mode": tool, "classes": selected_classes}
+            preset = {
+                "mode": tool,
+                "target_view": 0,
+                "classes": selected_classes,
+            }
+            if tool == "Line":
+                preset["flight_lines"] = picker.get_line_visibility()
 
             item = QTableWidgetItem(
                 summarize_display_visibility_preset(preset, tool)
@@ -3863,6 +4256,7 @@ class ShortcutManager(QWidget):
                 return
             view_idx = list(view_configs.keys())[0]
             preset = {
+                "display_mode": all_configs.get("display_mode", "class"),
                 "border_percent": border_percent,
                 "border_type": border_type,
                 "views": {view_idx: view_configs[view_idx]},
@@ -3897,6 +4291,47 @@ class ShortcutManager(QWidget):
         picker.raise_()
         picker.activateWindow()
 
+    def _open_line_mode_for_row(self, row):
+        cell = self.table.item(row, self.COL_CLASSES)
+        preset = (
+            decode_line_mode_preset(cell.data(Qt.UserRole))
+            if cell is not None else None
+        )
+        picker = LineModePresetDialog(
+            self.app_window, preset=preset, parent=self
+        )
+        self._line_mode_picker = picker
+
+        def on_accepted():
+            line_preset = picker.get_preset()
+            item = QTableWidgetItem(summarize_line_mode_preset(line_preset))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setData(Qt.UserRole, encode_line_mode_preset(line_preset))
+            self.table.setItem(row, self.COL_CLASSES, item)
+
+            mod_widget = self.table.cellWidget(row, self.COL_MODIFIER)
+            key_widget = self.table.cellWidget(row, self.COL_KEY)
+            if mod_widget is not None and key_widget is not None:
+                combo = (
+                    mod_widget.currentText().lower(),
+                    key_widget.currentText().upper(),
+                )
+                shortcuts = getattr(self.app_window, "shortcuts", {})
+                if combo in shortcuts:
+                    shortcuts[combo] = {
+                        "tool": "Line",
+                        "preset": line_preset,
+                    }
+            try:
+                self.auto_save_shortcuts()
+            except Exception as exc:
+                print(f"LineMode shortcut auto-save failed: {exc}")
+
+        picker.accepted.connect(on_accepted)
+        picker.show()
+        picker.raise_()
+        picker.activateWindow()
+
     def on_class_edit(self, row, col):
         """Only opens on DOUBLE-CLICK."""
         if col != self.COL_CLASSES:
@@ -3911,6 +4346,9 @@ class ShortcutManager(QWidget):
             return
         if tool == "DisplayMode":
             self._open_display_mode_for_row(row)
+            return
+        if tool == "LineMode":
+            self._open_line_mode_for_row(row)
             return
         if tool == "Surface":
             self._open_surface_for_row(row)
@@ -4314,6 +4752,15 @@ class ShortcutManager(QWidget):
                     f.write(f"{mod}\t{key}\t{tool}\t{preset_json}\t{display_text}\n")
                     continue
 
+                if tool == "LineMode":
+                    preset_json = cell.data(Qt.UserRole) if cell else ""
+                    display_text = cell.text() if cell else ""
+                    f.write(
+                        f"{mod}\t{key}\t{tool}\t"
+                        f"{preset_json}\t{display_text}\n"
+                    )
+                    continue
+
                 if tool == "Surface":
                     preset_json  = cell.data(Qt.UserRole) if cell else ""
                     surface_text = cell.text() if cell else ""
@@ -4434,7 +4881,7 @@ class ShortcutManager(QWidget):
                         row,
                         modifier=parts[0],
                         key=parts[1],
-                        tool=parts[2]
+                        tool="Line" if parts[2] == "LineMode" else parts[2]
                     )
 
                     if parts[2] == "DisplayMode":
@@ -4482,6 +4929,28 @@ class ShortcutManager(QWidget):
                                 "classes": {}, "slot": 0, "target_view": 0,
                                 "color_mode": 0, "border_percent": 0, "force_refresh": True
                             }))
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        self.table.setItem(row, self.COL_CLASSES, item)
+                        continue
+
+                    if parts[2] in ("Line", "LineMode"):
+                        preset_payload = (
+                            decode_line_mode_preset(parts[3])
+                            if len(parts) > 3 and parts[3].strip()
+                            else {"target_view": 0, "lines": {}}
+                        )
+                        saved_text = parts[4] if len(parts) > 4 else ""
+                        item = QTableWidgetItem(
+                            saved_text or summarize_line_mode_preset(
+                                preset_payload or {"lines": {}}
+                            )
+                        )
+                        item.setData(
+                            Qt.UserRole,
+                            encode_line_mode_preset(
+                                preset_payload or {"lines": {}}
+                            ),
+                        )
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         self.table.setItem(row, self.COL_CLASSES, item)
                         continue
@@ -4719,6 +5188,18 @@ class ShortcutManager(QWidget):
                     shortcuts[(mod, key)] = {"tool": "DisplayMode", "preset": preset_payload}
                     continue
 
+                if tool == "LineMode":
+                    cell = self.table.item(row, self.COL_CLASSES)
+                    preset_payload = (
+                        decode_line_mode_preset(cell.data(Qt.UserRole))
+                        if cell else None
+                    )
+                    shortcuts[(mod, key)] = {
+                        "tool": "Line",
+                        "preset": preset_payload or {"target_view": 0, "lines": {}},
+                    }
+                    continue
+
                 if tool == "Surface":
                     cell = self.table.item(row, self.COL_CLASSES)
                     preset_payload = decode_surface_preset(cell.data(Qt.UserRole)) if cell else None
@@ -4944,6 +5425,8 @@ class ShortcutManager(QWidget):
                     modifier  = entry.get("modifier", "alt")
                     key       = entry.get("key", "F1")
                     tool      = entry.get("tool", "AboveLine")
+                    if tool == "LineMode":
+                        tool = "Line"
                     mod       = modifier.lower()
                     key_upper = key.upper()
 
@@ -4956,6 +5439,16 @@ class ShortcutManager(QWidget):
                             views = preset_payload.get("views", {})
                             print(f"   ✅ {mod}+{key_upper} → DisplayMode "
                                   f"(views: {list(views.keys())}) [stored, NOT applied]")
+                        continue
+
+                    if tool == "LineMode":
+                        preset_payload = entry.get("line_mode_preset") or {
+                            "target_view": 0, "lines": {}
+                        }
+                        shortcuts[(mod, key_upper)] = {
+                            "tool": "Line",
+                            "preset": preset_payload,
+                        }
                         continue
 
                     if tool == "Surface":
@@ -5027,15 +5520,18 @@ class ShortcutManager(QWidget):
             try:
                 self.table.setRowCount(0)
                 for entry in shortcuts_list:
+                    row_tool = entry.get("tool", "AboveLine")
+                    if row_tool == "LineMode":
+                        row_tool = "Line"
                     row = self.table.rowCount()
                     self.table.insertRow(row)
                     self._install_row_widgets(
                         row,
                         modifier=entry.get("modifier", "alt"),
                         key=entry.get("key", "F1"),
-                        tool=entry.get("tool", "AboveLine")
+                        tool=row_tool
                     )
-                    tool = entry.get("tool", "AboveLine")
+                    tool = row_tool
 
                     if tool == "DisplayMode":
                         preset_payload = entry.get("display_preset")
@@ -5113,6 +5609,20 @@ class ShortcutManager(QWidget):
                         item.setData(Qt.UserRole, encode_sync_preset(preset_payload or {"rows": []}))
                         self.table.setItem(row, self.COL_CLASSES, item)
 
+                    elif tool == "LineMode":
+                        preset_payload = entry.get("line_mode_preset") or {
+                            "target_view": 0, "lines": {}
+                        }
+                        item = QTableWidgetItem(
+                            summarize_line_mode_preset(preset_payload)
+                        )
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                        item.setData(
+                            Qt.UserRole,
+                            encode_line_mode_preset(preset_payload),
+                        )
+                        self.table.setItem(row, self.COL_CLASSES, item)
+
                     elif tool in DISPLAY_VISIBILITY_TOOLS:
                         preset_payload = entry.get("visibility_preset") or {
                             "mode": tool, "classes": {}
@@ -5181,6 +5691,11 @@ class ShortcutManager(QWidget):
                     preset = decode_display_preset(cell.data(Qt.UserRole))
                     if preset:
                         entry["display_preset"] = preset
+                elif tool == "LineMode" and cell:
+                    preset = decode_line_mode_preset(cell.data(Qt.UserRole))
+                    entry["line_mode_preset"] = (
+                        preset or {"target_view": 0, "lines": {}}
+                    )
                 elif tool == "Surface" and cell:
                     preset = decode_surface_preset(cell.data(Qt.UserRole))
                     entry["surface_preset"] = preset

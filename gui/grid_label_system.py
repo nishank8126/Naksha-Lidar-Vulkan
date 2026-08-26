@@ -7253,35 +7253,59 @@ class GridLabelManager:
         from PySide6.QtWidgets import QMenu, QMessageBox
         from PySide6.QtGui import QAction, QCursor
 
-        # Gather SNT-derived block polygons first (these take priority for
-        # blocks that exist in both sources, because existing grid labels /
-        # SNT file paths are authoritative there).
+        # Start with the normal SNT-derived block set.  This remains the
+        # authority when the user is working from SNT only.
         block_polygons = list(getattr(self.app, 'snt_block_polygons', None) or [])
         if not block_polygons:
             block_polygons = list(self._ensure_snt_block_index())
 
-        # ALWAYS also include PRJ Block Identifier polygons. A block the user
-        # identified directly from a .prj file (with or without an SNT loaded)
-        # is drawn at its PRJ geometry, so right-click must hit-test against
-        # that exact polygon. This fixes the case where the SNT polygon set is
-        # empty, stale (left over after an SNT was removed), or located at
-        # different coordinates than the PRJ geometry, which previously caused
-        # every right-click to fall through with "no BL polygon contains".
+        # If the user explicitly identified block(s) through PRJ Block Identifier,
+        # those PRJ records become authoritative for SAME-NAME block loading.
+        # This is intentionally narrower than a global PRJ override: SNT-only
+        # workflows are unchanged, while an identified PRJ block always resolves
+        # its LAZ/LAS from the currently loaded PRJ directory instead of an SNT
+        # attachment directory from another location.
         prj_polygons = self._get_prj_block_polygons()
         if prj_polygons:
-            existing = {blk.get("grid_name") for blk in block_polygons}
-            added = 0
+            prj_keys = {
+                str(p.get("grid_name") or "").strip().casefold()
+                for p in prj_polygons
+                if str(p.get("grid_name") or "").strip()
+            }
+
+            snt_aliases = {}
+            kept = []
+            replaced = 0
+            for blk in block_polygons:
+                key = str(blk.get("grid_name") or "").strip().casefold()
+                if key and key in prj_keys:
+                    replaced += 1
+                    aliases = snt_aliases.setdefault(key, [])
+                    for name in [blk.get("grid_name"), blk.get("block_file"), *(blk.get("alt_names") or [])]:
+                        name = str(name or "").strip()
+                        if name and name not in aliases:
+                            aliases.append(name)
+                    continue
+                kept.append(blk)
+
+            authoritative_prj = []
             for p in prj_polygons:
-                gn = p.get("grid_name")
-                if gn not in existing:
-                    block_polygons.append(p)
-                    existing.add(gn)
-                    added += 1
-            if added:
-                print(
-                    f"[block-click] Added {added} PRJ block polygon(s) "
-                    f"({len(block_polygons)} total) to hit-test set"
-                )
+                item = dict(p)
+                key = str(item.get("grid_name") or "").strip().casefold()
+                merged_alt = list(item.get("alt_names") or [])
+                for name in snt_aliases.get(key, []):
+                    if name and name != item.get("grid_name") and name not in merged_alt:
+                        merged_alt.append(name)
+                item["alt_names"] = merged_alt
+                item["source"] = "prj_boundary"
+                authoritative_prj.append(item)
+
+            block_polygons = kept + authoritative_prj
+            print(
+                f"[block-click] PRJ authority active: {len(authoritative_prj)} "
+                f"identified PRJ block(s), replaced {replaced} same-name "
+                f"SNT block source(s)"
+            )
 
         if not block_polygons:
             return False
@@ -7361,6 +7385,7 @@ class GridLabelManager:
             grid_name = hit_block.get("grid_name")
             file_path = hit_block.get("file_path")
             snt_filename = hit_block.get("snt_filename")
+            block_source = str(hit_block.get("source") or "").strip().lower()
             merged_alt = list(all_hit_alt_names)
             for an in (hit_block.get("alt_names") or []):
                 if an not in merged_alt:
@@ -7401,13 +7426,50 @@ class GridLabelManager:
                 clear_action.setEnabled(False)
                 clear_action.setText("🧹 (Grid not loaded)")
 
-            def _load_block_file(_=False, gn=grid_name, fp=file_path, an=None):
+            def _load_block_file(
+                _=False,
+                gn=grid_name,
+                fp=file_path,
+                an=None,
+                source=block_source,
+                owner_ref=snt_filename,
+            ):
                 if an is None:
                     an = merged_alt
+
                 if fp and Path(fp).exists():
+                    print(f"[block-click] Loading authoritative file: {fp}")
                     self._load_las_file(Path(fp), gn or Path(fp).stem)
                     return
-                self.load_grid_las(gn, snt_filename=snt_filename, alt_names=an)
+
+                # An explicitly identified PRJ block must never silently fall
+                # back to a loaded SNT folder.  If its file is absent from the
+                # PRJ directory tree, keep the lookup scoped to the PRJ root and
+                # let the user choose there (or cancel).
+                if source == "prj_boundary":
+                    prj_dir = None
+                    try:
+                        if owner_ref:
+                            owner_path = Path(str(owner_ref))
+                            prj_dir = owner_path.parent if owner_path.suffix.lower() == ".prj" else owner_path
+                    except Exception:
+                        prj_dir = None
+
+                    if prj_dir is None:
+                        prj_dialog = getattr(self.app, "block_identifier_dialog", None)
+                        current_prj = getattr(prj_dialog, "current_prj_path", None) if prj_dialog else None
+                        if current_prj:
+                            prj_dir = Path(str(current_prj)).parent
+
+                    print(
+                        f"[block-click] PRJ block '{gn}' has no resolved file; "
+                        f"SNT fallback disabled; PRJ root={prj_dir}"
+                    )
+                    self._show_file_selection_dialog(prj_dir, gn)
+                    return
+
+                # SNT-only workflow: preserve the existing owner-aware search.
+                self.load_grid_las(gn, snt_filename=owner_ref, alt_names=an)
 
             load_action.triggered.connect(_load_block_file)
 

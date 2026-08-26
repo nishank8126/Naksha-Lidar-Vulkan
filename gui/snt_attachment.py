@@ -13141,6 +13141,119 @@ def _snt_point_in_polygon_2d(px: float, py: float, polygon: list) -> bool:
     return inside
 
 
+def _snt_polygon_bbox_2d(polygon) -> Optional[Tuple[float, float, float, float]]:
+    """Return finite XY bounds for a polygon without allocating a NumPy array."""
+    if not polygon:
+        return None
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
+    found = False
+    for point in polygon:
+        try:
+            x = float(point[0])
+            y = float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
+        found = True
+        if x < min_x:
+            min_x = x
+        if x > max_x:
+            max_x = x
+        if y < min_y:
+            min_y = y
+        if y > max_y:
+            max_y = y
+    if not found:
+        return None
+    return (min_x, min_y, max_x, max_y)
+
+
+def _choose_snt_spatial_cell_size(polygon_records, default: float = 1000.0) -> float:
+    """Choose a stable grid size from the median block extent."""
+    spans = []
+    for record in polygon_records or []:
+        try:
+            polygon = record[0]
+        except Exception:
+            polygon = record
+        bounds = _snt_polygon_bbox_2d(polygon)
+        if bounds is None:
+            continue
+        min_x, min_y, max_x, max_y = bounds
+        span = max(max_x - min_x, max_y - min_y)
+        if math.isfinite(span) and span > 0.0:
+            spans.append(float(span))
+    if not spans:
+        return max(1.0, float(default))
+    try:
+        value = float(np.median(np.asarray(spans, dtype=np.float64)))
+    except Exception:
+        value = float(default)
+    if not math.isfinite(value) or value <= 0.0:
+        value = float(default)
+    return max(1.0, value)
+
+
+def _build_snt_point_spatial_index(entries, cell_size: float):
+    """Build an order-preserving point grid for tuples beginning with X/Y."""
+    cell_size = max(1e-9, float(cell_size))
+    buckets = defaultdict(list)
+    valid_count = 0
+    source_entries = entries or []
+    for order, entry in enumerate(source_entries):
+        try:
+            x = float(entry[0])
+            y = float(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
+        key = (math.floor(x / cell_size), math.floor(y / cell_size))
+        buckets[key].append((order, entry))
+        valid_count += 1
+    return {
+        "cell_size": cell_size,
+        "buckets": buckets,
+        "entries": source_entries,
+        "valid_count": valid_count,
+    }
+
+
+def _query_snt_point_spatial_index(index, polygon):
+    """Return bbox-local point entries in the exact original source order."""
+    if not index:
+        return []
+    entries = index.get("entries") or []
+    if not entries:
+        return []
+    bounds = _snt_polygon_bbox_2d(polygon)
+    if bounds is None:
+        return entries
+    min_x, min_y, max_x, max_y = bounds
+    cell_size = float(index.get("cell_size") or 1.0)
+    ix0 = math.floor(min_x / cell_size)
+    ix1 = math.floor(max_x / cell_size)
+    iy0 = math.floor(min_y / cell_size)
+    iy1 = math.floor(max_y / cell_size)
+    nx = ix1 - ix0 + 1
+    ny = iy1 - iy0 + 1
+    if nx <= 0 or ny <= 0 or nx * ny > 16384:
+        return entries
+    candidates = []
+    buckets = index.get("buckets") or {}
+    for ix in range(ix0, ix1 + 1):
+        for iy in range(iy0, iy1 + 1):
+            candidates.extend(buckets.get((ix, iy), ()))
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: item[0])
+    return [entry for _order, entry in candidates]
+
+
 def _snt_polygon_centroid_2d(polygon: list) -> Tuple[float, float]:
     if not polygon:
         return (0.0, 0.0)
@@ -13698,7 +13811,19 @@ def _apply_prj_precision_to_block_entities(
                 quantization_applied = True
 
         if not use_exact_prj and not quantization_applied:
-            corrected.append(entity)
+            # Preserve the PRJ match as metadata so the later block-index pass
+            # can reuse this exact result instead of matching the same polygon
+            # a second time. Geometry remains unchanged.
+            if block is not None:
+                entity_copy = dict(entity)
+                entity_copy["_prj_block_label"] = str(block.get("label") or "")
+                entity_copy["_prj_alignment_error_m"] = float(error)
+                corrected.append(entity_copy)
+                label = str(block.get("label") or "")
+                if label:
+                    used_labels.add(label)
+            else:
+                corrected.append(entity)
             continue
 
         entity_copy = dict(entity)
@@ -13754,6 +13879,10 @@ def build_snt_block_polygons(
     Text labels that are file names reside on the 'FileNames' layer (promoted from FeatureAttribs).
     We prefer those over generic text so the block click uses the correct LAZ file name.
     """
+    import time as _time
+    _perf_t0 = _time.perf_counter()
+    _perf_stage_t0 = _perf_t0
+
     if not hasattr(app, 'snt_block_polygons'):
         app.snt_block_polygons = []
         
@@ -13984,6 +14113,45 @@ def build_snt_block_polygons(
                 other_text.append(entry)
 
     # ------------------------------------------------------------------
+    # Build spatial indices once. Previously every block scanned every text
+    # label with a Python point-in-polygon test. On large SNTs this becomes
+    # O(blocks * labels * vertices) and dominates attachment time. The index
+    # only narrows candidates by bbox; the exact containment test is unchanged.
+    # ------------------------------------------------------------------
+    _all_closed_records = (
+        explicit_block_polys
+        + placeholder_polys
+        + bbox_index_polys
+        + unrouted_closed_polys
+    )
+    _text_cell_size = _choose_snt_spatial_cell_size(
+        _all_closed_records,
+        1000.0,
+    )
+    _filename_text_index = _build_snt_point_spatial_index(
+        filename_text,
+        _text_cell_size,
+    )
+    _other_text_index = _build_snt_point_spatial_index(
+        other_text,
+        _text_cell_size,
+    )
+    _text_layer_indexes: Dict[str, object] = {}
+
+    def _text_candidates_for_layer(layer_name: str, polygon):
+        entries = text_by_layer.get(layer_name, [])
+        if not entries:
+            return []
+        index = _text_layer_indexes.get(layer_name)
+        if index is None:
+            index = _build_snt_point_spatial_index(entries, _text_cell_size)
+            _text_layer_indexes[layer_name] = index
+        return _query_snt_point_spatial_index(index, polygon)
+
+    _perf_entity_scan_ms = (_time.perf_counter() - _perf_stage_t0) * 1000.0
+    _perf_stage_t0 = _time.perf_counter()
+
+    # ------------------------------------------------------------------
     # Resolve only those default-level polygons that contain a text label
     # corresponding to a real physical LAZ/LAS file.
     # ------------------------------------------------------------------
@@ -14000,13 +14168,21 @@ def build_snt_block_polygons(
                 resolved_path,
             ))
 
+    _resolved_file_label_index = _build_snt_point_spatial_index(
+        resolved_file_labels,
+        _text_cell_size,
+    )
+
     qualified_placeholder_polys: list = []
 
     for points_2d, layer, entity in placeholder_polys:
         resolved_text = None
         resolved_path = None
 
-        for tx, ty, text_value, file_path in resolved_file_labels:
+        for tx, ty, text_value, file_path in _query_snt_point_spatial_index(
+            _resolved_file_label_index,
+            points_2d,
+        ):
             if _snt_point_in_polygon_2d(
                 tx,
                 ty,
@@ -14045,6 +14221,14 @@ def build_snt_block_polygons(
     if prj_blocks is None:
         prj_blocks = _parse_snt_adjacent_prj_blocks(snt_filename)
     prj_spatial_index = _build_prj_spatial_index(prj_blocks)
+    _prj_by_label = {
+        str(block.get("label") or "").strip().casefold(): block
+        for block in (prj_blocks or [])
+        if str(block.get("label") or "").strip()
+    }
+
+    _perf_preindex_ms = (_time.perf_counter() - _perf_stage_t0) * 1000.0
+    _perf_stage_t0 = _time.perf_counter()
 
     if not explicit_block_polys and unrouted_closed_polys and prj_blocks:
         _layer_match: Dict[str, int] = {}
@@ -14122,6 +14306,12 @@ def build_snt_block_polygons(
 
     used_prj_labels: Set[str] = set()
     used_precision_labels: Set[str] = set()
+    _prj_match_count = 0
+    _prj_direct_metadata_hits = 0
+    _verbose_prj_matches = os.getenv(
+        "NAKSHA_SNT_VERBOSE_BLOCK_MATCH",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     for poly_pts, poly_layer, poly_entity in bl_polys:
         grid_name = None
@@ -14162,7 +14352,22 @@ def build_snt_block_polygons(
             )
             and "BBOX" not in poly_layer_u
         )
-        if prj_blocks and is_precision_block_poly:
+
+        _pre_matched_label = str(
+            poly_entity.get("_prj_block_label") or ""
+        ).strip()
+        if _pre_matched_label:
+            _candidate = _prj_by_label.get(_pre_matched_label.casefold())
+            if _candidate is not None:
+                prj_block = _candidate
+                precision_prj_block = _candidate
+                _prj_direct_metadata_hits += 1
+
+        if (
+            prj_blocks
+            and is_precision_block_poly
+            and precision_prj_block is None
+        ):
             precision_prj_block, _ = _find_precision_prj_block(
                 poly_pts,
                 prj_blocks,
@@ -14175,40 +14380,54 @@ def build_snt_block_polygons(
                     used_precision_labels.add(precision_label)
 
         if prj_blocks:
-            cx, cy = _snt_polygon_interior_point(poly_pts)
-            nearby_blocks = _nearby_prj_blocks(
-                poly_pts, prj_blocks, prj_spatial_index
-            )
-            for block in nearby_blocks:
-                label = str(block.get("label") or "")
-                if label in used_prj_labels:
-                    continue
-                prj_poly = block.get("points_2d") or []
-                if len(prj_poly) >= 3 and _snt_point_in_polygon_2d(cx, cy, prj_poly):
-                    prj_block = block
-                    break
             if prj_block is None:
-                best_score = None
+                cx, cy = _snt_polygon_interior_point(poly_pts)
+                nearby_blocks = _nearby_prj_blocks(
+                    poly_pts, prj_blocks, prj_spatial_index
+                )
                 for block in nearby_blocks:
                     label = str(block.get("label") or "")
                     if label in used_prj_labels:
                         continue
                     prj_poly = block.get("points_2d") or []
-                    if len(prj_poly) < 3:
-                        continue
-                    pcx, pcy = _snt_polygon_interior_point(prj_poly)
-                    if not _snt_point_in_polygon_2d(pcx, pcy, poly_pts):
-                        continue
-                    score = (pcx - cx) * (pcx - cx) + (pcy - cy) * (pcy - cy)
-                    if best_score is None or score < best_score:
-                        best_score = score
+                    if len(prj_poly) >= 3 and _snt_point_in_polygon_2d(cx, cy, prj_poly):
                         prj_block = block
+                        break
+                if prj_block is None:
+                    best_score = None
+                    for block in nearby_blocks:
+                        label = str(block.get("label") or "")
+                        if label in used_prj_labels:
+                            continue
+                        prj_poly = block.get("points_2d") or []
+                        if len(prj_poly) < 3:
+                            continue
+                        pcx, pcy = _snt_polygon_interior_point(prj_poly)
+                        if not _snt_point_in_polygon_2d(pcx, pcy, poly_pts):
+                            continue
+                        score = (pcx - cx) * (pcx - cx) + (pcy - cy) * (pcy - cy)
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            prj_block = block
             if prj_block is not None:
                 grid_name = str(prj_block.get("label") or "").strip() or None
                 file_path = prj_block.get("file_path")
                 if grid_name:
-                    used_prj_labels.add(grid_name)
-                    print(f"[SNT block polygons] PRJ matched BL polygon -> {grid_name}")
+                    if grid_name in used_prj_labels and _pre_matched_label:
+                        # Defensive duplicate guard; preserve the old one-label
+                        # per polygon behavior rather than accepting a stale tag.
+                        prj_block = None
+                        precision_prj_block = None
+                        grid_name = None
+                        file_path = None
+                    else:
+                        used_prj_labels.add(grid_name)
+                        _prj_match_count += 1
+                        if _verbose_prj_matches:
+                            print(
+                                f"[SNT block polygons] PRJ matched BL polygon -> "
+                                f"{grid_name}"
+                            )
         # For a validated default-level boundary, the local physical file
         # is authoritative. Do not allow an unrelated DV-style tile label
         # or PRJ alias to replace LAVARONE000002.
@@ -14238,8 +14457,13 @@ def build_snt_block_polygons(
             grid_name = physical_grid_name
             file_path = fallback_file_path
 
-        # Collect ALL text labels inside polygon as alternative names for fallback matching
-        for tx, ty, tval in filename_text:
+        # Collect ALL text labels inside polygon as alternative names for
+        # fallback matching, but only test bbox-local candidates. The point-in-
+        # polygon test and source ordering remain identical to the old path.
+        for tx, ty, tval in _query_snt_point_spatial_index(
+            _filename_text_index,
+            poly_pts,
+        ):
             if _snt_point_in_polygon_2d(tx, ty, poly_pts):
                 if grid_name is None:
                     grid_name = tval
@@ -14248,7 +14472,10 @@ def build_snt_block_polygons(
 
         # IMPORTANT: exclude raw .laz/.las tile-reference text strings for normal blocks
         if grid_name is None:
-            for tx, ty, tval in other_text:
+            for tx, ty, tval in _query_snt_point_spatial_index(
+                _other_text_index,
+                poly_pts,
+            ):
                 tval_lo = tval.strip().lower()
                 if (tval_lo.endswith(".laz") or tval_lo.endswith(".las")) and not is_grid_poly:
                     continue
@@ -14256,7 +14483,10 @@ def build_snt_block_polygons(
                     grid_name = tval
                     break
         else:
-            for tx, ty, tval in other_text:
+            for tx, ty, tval in _query_snt_point_spatial_index(
+                _other_text_index,
+                poly_pts,
+            ):
                 tval_lo = tval.strip().lower()
                 if (tval_lo.endswith(".laz") or tval_lo.endswith(".las")) and not is_grid_poly:
                     continue
@@ -14324,7 +14554,10 @@ def build_snt_block_polygons(
     for poly_pts, poly_layer, _poly_entity in unrouted_closed_polys:
         contained_labels = [
             text_value
-            for tx, ty, text_value in text_by_layer.get(poly_layer, [])
+            for tx, ty, text_value in _text_candidates_for_layer(
+                poly_layer,
+                poly_pts,
+            )
             if _snt_point_in_polygon_2d(tx, ty, poly_pts)
         ]
         if len(contained_labels) == 1 and contained_labels[0].strip():
@@ -14422,9 +14655,24 @@ def build_snt_block_polygons(
         block for block in app.snt_block_polygons
         if block.get("snt_filename") == snt_filename
     ]
+
+    _perf_match_ms = (_time.perf_counter() - _perf_stage_t0) * 1000.0
+    _perf_total_ms = (_time.perf_counter() - _perf_t0) * 1000.0
+    if _prj_match_count:
+        print(
+            f"[SNT block polygons] PRJ matched {_prj_match_count} SNT polygon(s) "
+            f"(metadata fast-path={_prj_direct_metadata_hits})"
+        )
     print(
         f"[SNT block polygons] stored {len(stored_for_owner)} block entries "
         f"({sum(1 for block in stored_for_owner if block.get('grid_name'))} with grid_name)"
+    )
+    print(
+        f"[SNT block polygons] PERF entity/index={_perf_entity_scan_ms:.1f}ms "
+        f"preindex/placeholder={_perf_preindex_ms:.1f}ms "
+        f"match/store={_perf_match_ms:.1f}ms "
+        f"total={_perf_total_ms:.1f}ms "
+        f"text_cell={_text_cell_size:.1f}m"
     )
 
 def _aci_to_rgb(aci: int, cycle_idx: int = 0) -> Tuple[int, int, int]:
