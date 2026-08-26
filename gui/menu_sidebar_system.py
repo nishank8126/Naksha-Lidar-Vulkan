@@ -521,7 +521,7 @@ class RibbonSection(QWidget):
     _POINT_SYNC_EXCLUSIVE_BUTTONS = {
         "ToolsRibbon": {"Cross", "Cut"},
         "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Vertex", "AccuDraw", "Select", "Parallel", "Centerline", "Curve"},
-        "ClassifyRibbon": {"Above", "Below", "Parallel", "Rect", "Circle", "Polygon", "Free", "Brush", "Point"},
+        "ClassifyRibbon": {"Above", "Below", "Parallel", "Rect", "Circle", "Polygon", "Free", "Brush", "Point", "Fence"},
         "MeasurementRibbon": {"Line", "Path", "Block", "Grid"},
         "IdentificationRibbon": {"Identify", "Zoom", "Select"},
         "CurveRibbon": {"Curve"},
@@ -1762,6 +1762,9 @@ class ClassifyRibbon(QWidget):
         points = RibbonSection("Points", self)
         points.add_button("Brush", "🖌️", lambda: self._try_activate_tool("brush"))
         points.add_button("Point", "📍", lambda: self._try_activate_tool("point"))
+        # ✅ NEW: Temporary Fence — draw a throwaway polygon, then pick a By
+        # Class tool from the popup that appears (fence is pre-applied there).
+        points.add_button("Fence", "🔲", lambda: self._try_activate_tool("temp_fence"))
         layout.addWidget(points)
 
         layout.addStretch()
@@ -5042,6 +5045,15 @@ class ByClassRibbon(QWidget):
         
         
     def perform_classification_undo(self):
+        # ✅ Temp Fence drawing: Ctrl+Z removes the last fence vertex
+        try:
+            _tft = getattr(self.app, "temp_fence_tool", None)
+            if _tft is not None and getattr(_tft, "active", False):
+                if _tft.undo_vertex():
+                    return
+        except Exception:
+            pass
+
         # ✅ If digitizer tool is active, let it handle undo
         # BUT: if InsideFenceDialog is open, classification undo takes priority
         fence_dialog_open = False
@@ -5089,6 +5101,15 @@ class ByClassRibbon(QWidget):
         ✅ Application-level CLASSIFICATION redo
         Works even when dialogs are closed
         """
+        # ✅ Temp Fence drawing: Ctrl+Y re-adds the last undone vertex
+        try:
+            _tft = getattr(self.app, "temp_fence_tool", None)
+            if _tft is not None and getattr(_tft, "active", False):
+                if _tft.redo_vertex():
+                    return
+        except Exception:
+            pass
+
         print("🔄 ByClassRibbon: Classification redo triggered")
         
         if not hasattr(self.app, 'redo_classification'):

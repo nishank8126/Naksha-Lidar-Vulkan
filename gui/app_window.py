@@ -1,4 +1,4 @@
-import os
+﻿import os
 import random
 import vtk
 import time
@@ -2252,6 +2252,12 @@ class NakshaApp(QMainWindow):
             print("🧹 CLEARING PROJECT")
             print("="*60)
 
+            # --- Hide the classification count label in the top bar ---
+            if hasattr(app, "_classify_count_label"):
+                app._classify_count_label.hide()
+            if hasattr(app, "_classify_count_timer"):
+                app._classify_count_timer.stop()
+
             # --- Clear main viewer ---
             if hasattr(app, "vtk_widget") and app.vtk_widget:
                 app.vtk_widget.clear()
@@ -2937,6 +2943,25 @@ class NakshaApp(QMainWindow):
         add_menu_button("AI", "ai")
         add_menu_button("Block", "block")
         add_menu_button("Plugins", "plugins")
+
+        # --- Centered classification count label (exact middle of top bar) ---
+        from PySide6.QtWidgets import QLabel
+        from PySide6.QtCore import QTimer
+
+        self._classify_count_label = QLabel("")
+        self._classify_count_label.setObjectName("ClassifyCountLabel")
+        self._classify_count_label.setAlignment(Qt.AlignCenter)
+        self._classify_count_label.setStyleSheet(
+            "color: #FFD54F; font-weight: bold; font-size: 11px; "
+            "background: transparent; padding: 0 8px;"
+        )
+        self._classify_count_label.hide()
+        self._classify_count_timer = QTimer(self)
+        self._classify_count_timer.setSingleShot(True)
+        self._classify_count_timer.setInterval(3000)
+        self._classify_count_timer.timeout.connect(self._classify_count_label.hide)
+        # stretch=1 makes this label occupy the free middle space -> centered
+        top_layout.addWidget(self._classify_count_label, 1)
 
         top_layout.addStretch()
 
@@ -4137,7 +4162,19 @@ class NakshaApp(QMainWindow):
 
         # Deactivate any active digitize tool before enabling cross-section
         self._deactivate_digitize_tool()
- 
+
+        # ✅ Stand down the temp fence tool — its main-view VTK observers
+        # would otherwise keep capturing clicks during cross-section drawing.
+        try:
+            _tft = getattr(self, "temp_fence_tool", None)
+            if _tft is not None and getattr(_tft, "active", False):
+                _tft.deactivate()
+                if getattr(self, "active_classify_tool", None) == "temp_fence":
+                    self.active_classify_tool = None
+                print("🚧 Temp fence stood down for cross-section mode")
+        except Exception as _e:
+            print(f"⚠️ Temp fence stand-down failed: {_e}")
+
 
         # ✅ Create NON-BLOCKING view selector (only once)
         if not hasattr(self, '_view_selector_dialog') or self._view_selector_dialog is None:
@@ -8826,6 +8863,17 @@ class NakshaApp(QMainWindow):
                     self.digitizer.enabled = True
                     print("✅ Digitizer re-enabled")
                 return
+
+            # ✅ Temp Fence tool lifecycle: switching to any other tool stands
+            # down the vertex capture. A finalized fence + popup intentionally
+            # stay alive until replaced / used / Esc'd (handled inside the tool).
+            if tool_name != "temp_fence":
+                try:
+                    _tft = getattr(self, "temp_fence_tool", None)
+                    if _tft is not None:
+                        _tft.deactivate()
+                except Exception as _e:
+                    print(f"⚠️ Temp fence stand-down failed: {_e}")
    
             # Brush size dialog — skip during right-click reactivation to avoid blocking
             if tool_name == "brush" and not getattr(self, "_right_click_reactivating", False):
@@ -8868,7 +8916,38 @@ class NakshaApp(QMainWindow):
                     }.get(tool_name, lambda a: None)(self)
                 except Exception as e:
                     print(f"⚠️ Algorithm dialog failed ({tool_name}): {e}")
-                return  ###    
+                return  ###
+
+            # ✅ NEW: Temporary Fence tool — draw a throwaway polygon fence on
+            # the main view, then pick a By Class tool from the popup that
+            # appears (the fence is pre-applied in that dialog). Fully
+            # standalone: never touches the digitizer or classification
+            # interactors.
+            if tool_name == "temp_fence":
+                if self.data is None:
+                    QMessageBox.warning(self, "No Data", "Please load a LiDAR file first.")
+                    return
+                # Stand down any active classification tool first so its
+                # interactor doesn't fight the fence drawing.
+                try:
+                    if getattr(self, "active_classify_tool", None):
+                        self.set_classify_tool(None)
+                except Exception as _e:
+                    print(f"⚠️ Temp Fence: failed to stand down classify tool: {_e}")
+                try:
+                    if hasattr(self, 'digitizer'):
+                        self.digitizer.enabled = False
+                    from gui.temp_fence_tool import TempFenceTool
+                    tft = getattr(self, "temp_fence_tool", None)
+                    if tft is None:
+                        tft = TempFenceTool(self)
+                        self.temp_fence_tool = tft
+                    tft.activate()
+                    self.active_classify_tool = "temp_fence"
+                except Exception as e:
+                    print(f"⚠️ Temp Fence activation failed: {e}")
+                    import traceback; traceback.print_exc()
+                return
            
             # Stand down conflicting tools so their VTK observers don't fight the
             # classification interactor — same direction the element-select tool
@@ -9350,6 +9429,28 @@ class NakshaApp(QMainWindow):
         total = len(classification)
         self._classified_count_cache = max(0, min(total, self._classified_point_count() + delta))
         return True
+
+    def _update_classify_count_display(self, count):
+        """Show the exact count of points being classified in the top bar center.
+
+        The label appears at the exact middle of the tab bar while a
+        classification operation runs, then auto-hides after 3 seconds.
+        """
+        label = getattr(self, "_classify_count_label", None)
+        if label is None:
+            return
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            label.setText(f"Classifying: {count:,} points")
+            label.show()
+            timer = getattr(self, "_classify_count_timer", None)
+            if timer is not None:
+                timer.start()  # restart the 3s auto-hide countdown
+        else:
+            label.hide()
 
     def _refresh_window_title_classification_count(self):
         """Refresh the title from the cached count without scanning the dataset."""
@@ -12414,6 +12515,14 @@ class NakshaApp(QMainWindow):
 
         self._shutdown_in_progress = True
         print("🧹 Main window closing - cleaning up child dialogs")
+
+        # ✅ Temp Fence tool: full teardown (actors + popup + timer)
+        try:
+            _tft = getattr(self, "temp_fence_tool", None)
+            if _tft is not None:
+                _tft.shutdown()
+        except Exception as _e:
+            print(f"⚠️ Temp fence shutdown failed: {_e}")
 
         # Classifiers cooperatively mutate the shared class array in QThreads.
         # Join them before deleting dialogs, point data, or VTK resources.

@@ -330,7 +330,11 @@ class OptimizedRefreshPipeline:
                 print(f"   ⚠️ fast_classify_update failed: {e}")
 
         if display_mode == "class":
-            self._refresh_main_view_class_mode(to_class, state)
+            # NOTE: `state` was deleted above; _refresh_main_view_class_mode
+            # discards it anyway (`del to_class, state`), so pass None to
+            # avoid UnboundLocalError on the first classification (before the
+            # unified actor exists and the fast path returns early).
+            self._refresh_main_view_class_mode(to_class, None)
         elif display_mode == "shaded_class":
             self._refresh_shaded_mode()
         else:
