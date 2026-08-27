@@ -19,8 +19,12 @@ from PySide6.QtCore import (
     QObject,
     QThread,
     Signal,
+    QItemSelection,
+    QItemSelectionModel,
 )
 from PySide6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
     QDialog,
     QDialogButtonBox,
     QVBoxLayout,
@@ -140,25 +144,81 @@ def _points_in_polygon(points, polygon_coords):
     return inside
 
 
-# GPS epoch (seconds since 1980-01-06 00:00:00 UTC) used by LAS gps_time.
+# ---------------------------------------------------------------------------
+# LAS GPS-time handling
+# ---------------------------------------------------------------------------
+# LAS Global Encoding bit 0 defines how the point-record GPS time is stored:
+#   0 -> GPS Week Time (seconds into a GPS week; calendar week number absent)
+#   1 -> Adjusted Standard GPS Time (standard GPS seconds - 1,000,000,000)
+#
+# A GPS Week Time value such as 307789 is NOT a date in January 1980.  Without
+# a trustworthy GPS week number, converting it from the GPS epoch invents a
+# calendar date.  TerraScan/MicroStation correctly shows '-' in this case.
 _GPS_EPOCH = datetime.datetime(1980, 1, 6)
+_GPS_WEEK_SECONDS = 7.0 * 24.0 * 60.0 * 60.0
+
+# UTC dates at which GPS-UTC increased by one second.  GPS time itself has no
+# leap seconds, so an absolute GPS timestamp is converted to UTC by subtracting
+# the accumulated offset.  This matters only around midnight for the Date
+# column, but using the real conversion avoids a second subtle false date.
+_GPS_UTC_LEAP_EFFECTIVE_DATES = (
+    datetime.datetime(1981, 7, 1),
+    datetime.datetime(1982, 7, 1),
+    datetime.datetime(1983, 7, 1),
+    datetime.datetime(1985, 7, 1),
+    datetime.datetime(1988, 1, 1),
+    datetime.datetime(1990, 1, 1),
+    datetime.datetime(1991, 1, 1),
+    datetime.datetime(1992, 7, 1),
+    datetime.datetime(1993, 7, 1),
+    datetime.datetime(1994, 7, 1),
+    datetime.datetime(1996, 1, 1),
+    datetime.datetime(1997, 7, 1),
+    datetime.datetime(1999, 1, 1),
+    datetime.datetime(2006, 1, 1),
+    datetime.datetime(2009, 1, 1),
+    datetime.datetime(2012, 7, 1),
+    datetime.datetime(2015, 7, 1),
+    datetime.datetime(2017, 1, 1),
+)
 
 
-def _gps_to_date_string(value, adjusted_standard=False):
+def _gps_standard_to_utc_datetime(standard_gps_seconds):
+    """Convert absolute GPS seconds since 1980-01-06 to a UTC datetime."""
+    try:
+        seconds = float(standard_gps_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(seconds) or seconds < 0.0:
+        return None
+
+    gps_dt = _GPS_EPOCH + datetime.timedelta(seconds=seconds)
+    utc_dt = gps_dt
+    # Two passes are enough because the correction is at most a few seconds
+    # and only changes the selected leap-second count at a boundary.
+    for _ in range(2):
+        leap_count = sum(utc_dt >= d for d in _GPS_UTC_LEAP_EFFECTIVE_DATES)
+        utc_dt = gps_dt - datetime.timedelta(seconds=leap_count)
+    return utc_dt
+
+
+def _gps_to_date_string(value, gps_time_mode="gps_week"):
+    """Return a trustworthy per-point date, or '-' when LAS cannot provide it."""
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return ""
-    # LAS Global Encoding bit 0 means Adjusted Standard GPS Time: the stored
-    # value has 1,000,000,000 subtracted from standard GPS seconds.
-    if adjusted_standard:
-        v += 1_000_000_000.0
-    dt = _GPS_EPOCH + datetime.timedelta(seconds=v)
-    if dt.year > 2100 or dt.year < 1980:
-        try:
-            dt = datetime.datetime.utcfromtimestamp(v)
-        except (OverflowError, OSError, ValueError):
-            return "%.6f" % v
+        return "-"
+    if not np.isfinite(v):
+        return "-"
+
+    if gps_time_mode != "adjusted_standard":
+        # GPS Week Time has only seconds-within-week.  The LAS point record does
+        # not carry the GPS week number, so the calendar date is unknowable.
+        return "-"
+
+    dt = _gps_standard_to_utc_datetime(v + 1_000_000_000.0)
+    if dt is None or dt.year < 1980 or dt.year > 2100:
+        return "-"
     return dt.strftime("%d/%m/%Y")
 
 
@@ -283,19 +343,41 @@ class PointTableModel(QAbstractTableModel):
         return arr[r]
 
     def data(self, index, role=Qt.DisplayRole):
-        if role != Qt.DisplayRole or not index.isValid():
+        if not index.isValid():
             return None
         row, col = index.row(), index.column()
         header, kind, key = self._columns[col]
+
+        if role == Qt.ToolTipRole and kind == K_DATE:
+            mode = self._data.get("_gps_time_mode")
+            if mode is None:
+                mode = "adjusted_standard" if self._data.get("_gps_time_adjusted", False) else "gps_week"
+            if mode == "adjusted_standard":
+                return (
+                    "Date derived from LAS Adjusted Standard GPS Time "
+                    "(Global Encoding bit 0 = 1)."
+                )
+            creation = self._data.get("_las_creation_date")
+            extra = (" Header creation date: %s." % creation) if creation else ""
+            return (
+                "Calendar date unavailable: this file stores GPS Week Time. "
+                "LAS does not store the GPS week number in each point, so "
+                "NakshaAI does not invent a date." + extra +
+                " The header date is file metadata, not a per-point acquisition date."
+            )
+
+        if role != Qt.DisplayRole:
+            return None
 
         if kind == K_DESC:
             code = self._raw_value(header, K_CODE, "classification", row)
             return _class_name(code)
         if kind == K_DATE:
             val = self._raw_value(header, K_TIME, "gps_time", row)
-            return _gps_to_date_string(
-                val, bool(self._data.get("_gps_time_adjusted", False))
-            ) if val is not None else ""
+            mode = self._data.get("_gps_time_mode")
+            if mode is None:
+                mode = "adjusted_standard" if self._data.get("_gps_time_adjusted", False) else "gps_week"
+            return _gps_to_date_string(val, mode) if val is not None else "-"
         if kind == K_RGB:
             rgb = self._raw_value(header, K_RGB, "rgb", row)
             if rgb is None:
@@ -390,6 +472,44 @@ class PointTableModel(QAbstractTableModel):
             return None
         return xyz[r]
 
+    def class_code_for_row(self, row):
+        """Return classification code for a visible row, or None."""
+        try:
+            point_index = int(self._order[row])
+        except (IndexError, TypeError, ValueError):
+            return None
+        classification = self._data.get("classification")
+        if classification is None or point_index < 0 or point_index >= len(classification):
+            return None
+        try:
+            return int(classification[point_index])
+        except (TypeError, ValueError):
+            return None
+
+    def rows_for_class(self, class_code):
+        """Return visible table rows belonging to class_code as an int64 array."""
+        classification = self._data.get("classification")
+        if classification is None or self._order.size == 0:
+            return np.empty(0, dtype=np.int64)
+        try:
+            ordered_codes = np.asarray(classification)[self._order]
+            return np.flatnonzero(ordered_codes == int(class_code)).astype(np.int64, copy=False)
+        except Exception:
+            return np.empty(0, dtype=np.int64)
+
+    def sort_by_class_code(self):
+        """Stable class sort used only when a huge class selection is fragmented."""
+        classification = self._data.get("classification")
+        if classification is None:
+            return False
+        try:
+            self.layoutAboutToBeChanged.emit()
+            self._order = np.argsort(np.asarray(classification), kind="stable")
+            self.layoutChanged.emit()
+            return True
+        except Exception:
+            return False
+
 
 class _ExtraFieldLoader(QThread):
     """Read optional LAS dimensions from the file in the background."""
@@ -411,7 +531,23 @@ class _ExtraFieldLoader(QThread):
             with laspy.open(self._filename) as las:
                 global_encoding = getattr(las.header, "global_encoding", 0)
                 encoding_value = int(getattr(global_encoding, "value", global_encoding) or 0)
-                result["_gps_time_adjusted"] = bool(encoding_value & 1)
+                adjusted = bool(encoding_value & 1)
+                result["_gps_time_adjusted"] = adjusted  # backward compatibility
+                result["_gps_time_mode"] = "adjusted_standard" if adjusted else "gps_week"
+
+                creation_date = getattr(las.header, "creation_date", None)
+                if creation_date:
+                    try:
+                        result["_las_creation_date"] = creation_date.isoformat()
+                    except Exception:
+                        result["_las_creation_date"] = str(creation_date)
+                result["_las_system_identifier"] = str(
+                    getattr(las.header, "system_identifier", "") or ""
+                ).strip()
+                result["_las_generating_software"] = str(
+                    getattr(las.header, "generating_software", "") or ""
+                ).strip()
+
                 dims = {str(d).lower() for d in las.header.point_format.dimension_names}
                 needed = [w for w in self._wanted if w in dims]
                 if needed:
@@ -437,6 +573,9 @@ class ViewFieldsTableDialog(QDialog):
         self.filename = filename
         self.app_data = app_data if isinstance(app_data, dict) else {}
         self._highlight_actor = None
+        self._class_selected_rows = None
+        self._programmatic_class_selection = False
+        self._context_row = None
 
         # QDialogs suppress min/max buttons by default — re-add them so the
         # window can be maximized (button + double-click title bar).
@@ -788,8 +927,8 @@ class ViewFieldsTableDialog(QDialog):
         self.table.setObjectName("fieldsTable")
         self.model = PointTableModel(self.app_data, self.filename)
         self.table.setModel(self.model)
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.SingleSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSortIndicatorShown(True)
@@ -797,6 +936,7 @@ class ViewFieldsTableDialog(QDialog):
         self.table.clicked.connect(self._on_row_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._build_context_menu)
+        self.table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
         layout.addWidget(self.table, 1)
 
     # -- identification link ----------------------------------------------
@@ -878,6 +1018,9 @@ class ViewFieldsTableDialog(QDialog):
 
         self.filename = filename
         self.app_data = app_data
+        self._class_selected_rows = None
+        self._context_row = None
+        self._cached_point_radius = None
         self.model._data = app_data
         self.model.refresh_columns()
 
@@ -888,6 +1031,19 @@ class ViewFieldsTableDialog(QDialog):
         self._load_extra_fields()
 
     # -- row interactions -------------------------------------------------
+    def _on_table_selection_changed(self, _selected, _deselected):
+        if not self._programmatic_class_selection:
+            self._class_selected_rows = None
+
+    def _selected_rows(self):
+        """Return selected visible row numbers without forcing Qt to expand a class selection."""
+        if self._class_selected_rows is not None:
+            return self._class_selected_rows
+        sel = self.table.selectionModel()
+        if sel is None or not sel.hasSelection():
+            return np.empty(0, dtype=np.int64)
+        return np.asarray(sorted({idx.row() for idx in sel.selectedRows()}), dtype=np.int64)
+
     def _on_row_clicked(self, index):
         if not index.isValid():
             return
@@ -908,12 +1064,15 @@ class ViewFieldsTableDialog(QDialog):
             sphere = vtk.vtkSphereSource()
             sphere.SetCenter(float(xyz[0]), float(xyz[1]), float(xyz[2]))
             sphere.SetRadius(self._point_radius())
+            sphere.SetThetaResolution(16)
+            sphere.SetPhiResolution(12)
             mapper = vtk.vtkPolyDataMapper()
             mapper.SetInputConnection(sphere.GetOutputPort())
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
-            actor.GetProperty().SetColor(1.0, 0.2, 0.2)
+            actor.GetProperty().SetColor(1.0, 0.15, 0.15)
             actor.GetProperty().SetRepresentationToWireframe()
+            actor.GetProperty().SetLineWidth(3.0)
             renderer.AddActor(actor)
             self._highlight_actor = actor
             app.vtk_widget.render()
@@ -925,70 +1084,225 @@ class ViewFieldsTableDialog(QDialog):
         if xyz is None or xyz.shape[0] < 2:
             return 1.0
         try:
-            mn = xyz.min(axis=0)
-            mx = xyz.max(axis=0)
+            # Do not scan the whole array for every click.  Cache a dataset-size
+            # marker radius; refresh_data clears it for a new cloud.
+            cached = getattr(self, "_cached_point_radius", None)
+            if cached is not None:
+                return cached
+            mn = np.nanmin(xyz, axis=0)
+            mx = np.nanmax(xyz, axis=0)
             diag = float(np.linalg.norm(mx - mn))
-            return max(diag / 5000.0, 1e-6)
+            self._cached_point_radius = max(diag / 5000.0, 1e-4)
+            return self._cached_point_radius
         except Exception:
             return 1.0
 
+    def _primary_action_row(self):
+        if self._context_row is not None and 0 <= int(self._context_row) < self.model.rowCount():
+            return int(self._context_row)
+        rows = self._selected_rows()
+        return int(rows[0]) if rows.size else None
+
     def _go_to_selected(self):
-        sel = self.table.selectionModel()
-        if sel is None or not sel.hasSelection():
+        row = self._primary_action_row()
+        if row is None:
             return
-        row = sel.selectedRows()[0].row()
         xyz = self.model.xyz_for_row(row)
-        if self._center_camera(xyz):
+        if self._zoom_camera_to_point(xyz):
             self._highlight_point(xyz)
 
-    def _center_camera(self, xyz):
+    def _zoom_camera_to_point(self, xyz):
+        """Center the main camera and actually zoom in to the chosen point."""
+        if xyz is None:
+            return False
         app = self.parent()
         if app is None or not hasattr(app, "vtk_widget"):
             return False
         try:
-            import vtk
             renderer = app.vtk_widget.renderer
             camera = renderer.GetActiveCamera()
-            focus = camera.GetFocalPoint()
-            pos = camera.GetPosition()
-            delta = (xyz[0] - focus[0], xyz[1] - focus[1], xyz[2] - focus[2])
-            camera.SetFocalPoint(xyz[0], xyz[1], xyz[2])
-            camera.SetPosition(pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2])
+            if camera is None:
+                return False
+
+            xyz = np.asarray(xyz, dtype=float)
+            focus = np.asarray(camera.GetFocalPoint(), dtype=float)
+            pos = np.asarray(camera.GetPosition(), dtype=float)
+            view_vec = pos - focus
+            distance = float(np.linalg.norm(view_vec))
+            if not np.isfinite(distance) or distance <= 1e-9:
+                view_vec = np.array([0.0, 0.0, 1.0], dtype=float)
+                distance = 1.0
+            else:
+                view_vec /= distance
+
+            radius = max(float(self._point_radius()), 1e-4)
+            camera.SetFocalPoint(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+            if camera.GetParallelProjection():
+                # Target roughly a few dozen marker radii across the viewport;
+                # never zoom out if the user is already closer than that.
+                current_scale = max(float(camera.GetParallelScale()), 1e-9)
+                target_scale = max(radius * 20.0, 0.25)
+                camera.SetParallelScale(min(current_scale, target_scale))
+                new_pos = xyz + view_vec * distance
+                camera.SetPosition(float(new_pos[0]), float(new_pos[1]), float(new_pos[2]))
+            else:
+                # Perspective: place the camera at a deterministic distance that
+                # frames the marker while preserving the current view direction.
+                angle = max(float(camera.GetViewAngle()), 1.0)
+                half_angle = np.deg2rad(angle * 0.5)
+                target_half_size = max(radius * 20.0, 0.25)
+                target_distance = target_half_size / max(np.tan(half_angle), 1e-6)
+                new_pos = xyz + view_vec * target_distance
+                camera.SetPosition(float(new_pos[0]), float(new_pos[1]), float(new_pos[2]))
+
             renderer.ResetCameraClippingRange()
             app.vtk_widget.render()
+
+            schedule_history = getattr(app, "_schedule_main_view_history_commit", None)
+            if callable(schedule_history):
+                schedule_history("fields_zoom_to_point", delay_ms=0)
+            print(
+                "[ViewFieldsTable] zoomed to point "
+                "(%.3f, %.3f, %.3f)" % (xyz[0], xyz[1], xyz[2])
+            )
             return True
         except Exception as exc:
-            print("[ViewFieldsTable] camera move failed: %s" % exc)
+            print("[ViewFieldsTable] camera zoom failed: %s" % exc)
             return False
 
     # -- actions ----------------------------------------------------------
+    def _show_status(self, message, timeout_ms=3000):
+        app = self.parent()
+        try:
+            status_bar = app.statusBar() if app is not None and hasattr(app, "statusBar") else None
+            if status_bar is not None:
+                status_bar.showMessage(message, timeout_ms)
+                return
+        except Exception:
+            pass
+        print("[ViewFieldsTable] %s" % message)
+
     def _copy_selected_row(self):
-        sel = self.table.selectionModel()
-        if sel is None or not sel.hasSelection():
+        rows = self._selected_rows()
+        if rows.size == 0:
             return
-        row = sel.selectedRows()[0].row()
-        cells = []
-        for col in range(self.model.columnCount()):
-            cells.append(str(self.model.data(self.model.index(row, col))))
-        QMessageBox.information(self, "Row %d" % row, "\t".join(cells))
+
+        if rows.size > 100_000:
+            reply = QMessageBox.question(
+                self,
+                "Copy Selected Rows",
+                "Copy %s rows to the clipboard?\n\n"
+                "This can use a large amount of memory. For very large selections, "
+                "Export Selection to CSV is recommended." % format(int(rows.size), ","),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        lines = []
+        for row in rows:
+            row = int(row)
+            cells = [
+                str(self.model.data(self.model.index(row, col), Qt.DisplayRole) or "")
+                for col in range(self.model.columnCount())
+            ]
+            lines.append("\t".join(cells))
+
+        QApplication.clipboard().setText("\n".join(lines))
+        self._show_status("Copied %s row(s) to clipboard" % format(int(rows.size), ","))
 
     def _identify_selected(self):
-        sel = self.table.selectionModel()
-        if sel is None or not sel.hasSelection():
+        row = self._primary_action_row()
+        if row is None:
             return
-        row = sel.selectedRows()[0].row()
         pidx = self.model.point_index(row)
+        xyz = self.model.xyz_for_row(row)
         app = self.parent()
-        identify = getattr(app, "activate_identification_at_point", None)
-        if callable(identify):
+
+        identify_tool = getattr(app, "identification_tool", None) if app is not None else None
+        identify_by_index = getattr(identify_tool, "identify_point_index", None)
+        if callable(identify_by_index):
             try:
-                identify(pidx)
-                return
+                result = identify_by_index(pidx)
+                if result:
+                    self._highlight_point(xyz)
+                    self._show_status(
+                        "Identified point %d — class %s" % (pidx, result.get("class_code", "?"))
+                    )
+                    return
             except Exception as exc:
                 print("[ViewFieldsTable] identify failed: %s" % exc)
+
         QMessageBox.information(
-            self, "Identify",
-            "Selected point index: %d\n(row %d in the current view)" % (pidx, row))
+            self,
+            "Identify",
+            "Unable to run the Identification backend for point index %d." % pidx,
+        )
+
+    def _select_by_class(self):
+        row = self._context_row
+        if row is None:
+            current = self.table.currentIndex()
+            row = current.row() if current.isValid() else None
+        if row is None or row < 0:
+            return
+
+        class_code = self.model.class_code_for_row(row)
+        if class_code is None:
+            QMessageBox.information(self, "Select by Class", "Classification is not available.")
+            return
+
+        rows = self.model.rows_for_class(class_code)
+        if rows.size == 0:
+            return
+
+        # Convert row numbers to contiguous QItemSelection ranges.  If the
+        # current table order makes one class extremely fragmented, stable-sort
+        # by Class first so millions of selected rows do not become millions of
+        # tiny Qt selection objects.
+        def _runs(values):
+            if values.size == 0:
+                return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+            breaks = np.flatnonzero(np.diff(values) != 1)
+            starts = np.r_[0, breaks + 1]
+            ends = np.r_[breaks, values.size - 1]
+            return values[starts], values[ends]
+
+        run_starts, run_ends = _runs(rows)
+        if run_starts.size > 5000 and self.model.sort_by_class_code():
+            rows = self.model.rows_for_class(class_code)
+            run_starts, run_ends = _runs(rows)
+            self._show_status("Table sorted by Class for efficient class selection")
+
+        last_col = max(self.model.columnCount() - 1, 0)
+        selection = QItemSelection()
+        for start_row, end_row in zip(run_starts, run_ends):
+            selection.select(
+                self.model.index(int(start_row), 0),
+                self.model.index(int(end_row), last_col),
+            )
+
+        sel_model = self.table.selectionModel()
+        self._programmatic_class_selection = True
+        try:
+            sel_model.select(
+                selection,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            first = self.model.index(int(rows[0]), 0)
+            self.table.setCurrentIndex(first)
+            self.table.scrollTo(first, QTableView.PositionAtCenter)
+            self._class_selected_rows = rows
+        finally:
+            self._programmatic_class_selection = False
+
+        self._show_status(
+            "Selected %s row(s) in class %d (%s)" % (
+                format(int(rows.size), ","), class_code, _class_name(class_code)
+            )
+        )
 
     def _sort_selected(self, order):
         sel = self.table.selectionModel()
@@ -999,11 +1313,10 @@ class ViewFieldsTableDialog(QDialog):
         self.table.sortByColumn(col, order)
 
     def _export_csv(self):
-        sel = self.table.selectionModel()
-        has_selection = sel is not None and sel.hasSelection()
+        selected_rows = self._selected_rows()
         n_rows = self.model.rowCount()
-        if has_selection:
-            rows = sorted(idx.row() for idx in sel.selectedRows())
+        if selected_rows.size:
+            rows = selected_rows
             default_name = "selected_points.csv"
         else:
             if n_rows > 1_000_000:
@@ -1026,22 +1339,52 @@ class ViewFieldsTableDialog(QDialog):
             with open(path, "w", encoding="utf-8", newline="") as fh:
                 fh.write(",".join('"%s"' % h.replace('"', '""') for h in headers) + "\n")
                 for row in rows:
-                    cells = [str(self.model.data(self.model.index(row, c)))
+                    row = int(row)
+                    cells = [str(self.model.data(self.model.index(row, c), Qt.DisplayRole) or "")
                              for c in range(self.model.columnCount())]
                     fh.write(",".join('"%s"' % c.replace('"', '""') for c in cells) + "\n")
-            QMessageBox.information(self, "Export CSV",
-                                    "Exported %s rows to %s" % (format(len(rows), ","), path))
+            QMessageBox.information(
+                self, "Export CSV",
+                "Exported %s rows to %s" % (format(len(rows), ","), path)
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Export CSV", "Export failed: %s" % exc)
 
     # -- context menu -----------------------------------------------------
     def _build_context_menu(self, pos):
-        sel = self.table.selectionModel()
-        if sel is None or not sel.hasSelection():
+        index = self.table.indexAt(pos)
+        if not index.isValid():
             return
+
+        self._context_row = index.row()
+        sel_model = self.table.selectionModel()
+
+        # A right-click must operate on the row under the cursor, not an old
+        # selection from somewhere else.  Preserve an existing multi-selection
+        # when the user right-clicks inside it.
+        row_is_selected = sel_model.isRowSelected(index.row(), QModelIndex())
+        if not row_is_selected:
+            self._class_selected_rows = None
+            sel_model.select(
+                self.model.index(index.row(), 0),
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            self.table.setCurrentIndex(self.model.index(index.row(), 0))
+
+        class_code = self.model.class_code_for_row(index.row())
+
         menu = QMenu(self)
-        menu.addAction("Copy Row", self._copy_selected_row)
+        copy_label = "Copy Row" if self._selected_rows().size <= 1 else "Copy Selected Rows"
+        menu.addAction(copy_label, self._copy_selected_row)
         menu.addAction("Export Selection to CSV", self._export_csv)
+
+        if class_code is not None:
+            menu.addSeparator()
+            menu.addAction(
+                "Select by Class — %d (%s)" % (class_code, _class_name(class_code)),
+                self._select_by_class,
+            )
+
         menu.addSeparator()
         menu.addAction("Zoom to Point in 3D", self._go_to_selected)
         menu.addAction("Identify Point", self._identify_selected)

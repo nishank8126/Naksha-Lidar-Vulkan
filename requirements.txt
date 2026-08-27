@@ -69,3 +69,12 @@ pyinstaller>=6.0
 # cd NakshaAI_Lidar
 # git switch MAIN
 # git pull origin MAIN
+
+
+
+# FOR git commit changes 
+
+# git switch MAIN
+# git add gui/cross_section/interactor_classify.py
+# git commit -m "SURFACE CLASSIFICATION: Added new feature to classify point cloud surfaces based on user-defined criteria., CLASSIFICATION TOOLS DEACTIVATION , FREEHAND , FEILD OPTIOND FOR IDENTIFIACATION , CONFLCIT BETWEEN TOOLS AND IDENTIFY TOOL  "
+# git push origin MAIN

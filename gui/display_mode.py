@@ -1085,13 +1085,20 @@ class DisplayModeDialog(QDialog):
         self.shading_quality.addItem("Normal", "normal")
         self.shading_quality.addItem("Slow – all points", "slow")
         self.shading_quality.setMinimumWidth(135)
-        saved_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
-        quality_index = self.shading_quality.findData(saved_quality)
+        self._shading_quality_value = str(
+            settings.value("global_shading_quality", "normal") or "normal"
+        ).lower()
+        self._surface_quality_value = str(
+            settings.value("global_surface_quality", "normal") or "normal"
+        ).lower()
+        self._quality_mode_context = int(self.color_mode.currentIndex())
+        quality_index = self.shading_quality.findData(self._shading_quality_value)
         self.shading_quality.setCurrentIndex(quality_index if quality_index >= 0 else 1)
         if parent is not None:
-            parent.shading_quality = self.shading_quality.currentData()
+            parent.shading_quality = self._shading_quality_value
+            parent.surface_quality = self._surface_quality_value
         self.shading_quality.setToolTip(
-            "Fast: up to 1,000,000 shading points. Normal: up to 3,000,000. "
+            "Fast: up to 1,000,000 mesh points. Normal: up to 3,000,000. "
             "Slow: every eligible finite point; may require very large RAM and several minutes."
         )
         controls_layout.addWidget(self.shading_quality)
@@ -1500,20 +1507,53 @@ class DisplayModeDialog(QDialog):
         self._sync_color_mode_state()
 
     def _sync_color_mode_state(self) -> None:
-        """Keep the color-mode combo consistently visible and correctly enabled."""
+        """Keep mode controls visible and bind Speed independently to Shading/Surface."""
         try:
             if not hasattr(self, "color_mode") or self.color_mode is None:
                 return
+
+            # Save the outgoing mesh-quality choice before changing context.
+            previous = int(getattr(self, "_quality_mode_context", self.color_mode.currentIndex()))
+            if hasattr(self, "shading_quality"):
+                current_value = str(self.shading_quality.currentData() or "normal")
+                if previous == 1:
+                    self._shading_quality_value = current_value
+                elif previous == 6:
+                    self._surface_quality_value = current_value
+
             self.color_mode.setVisible(True)
             self.color_mode.setEnabled(self.current_slot == 0)
-            shading_controls_visible = (
-                self.current_slot == 0 and self.color_mode.currentIndex() == 1
-            )
+            mode_idx = int(self.color_mode.currentIndex())
+            mesh_speed_visible = self.current_slot == 0 and mode_idx in (1, 6)
+
             if hasattr(self, "shading_quality_label"):
-                self.shading_quality_label.setVisible(shading_controls_visible)
+                self.shading_quality_label.setVisible(mesh_speed_visible)
             if hasattr(self, "shading_quality"):
-                self.shading_quality.setVisible(shading_controls_visible)
-                self.shading_quality.setEnabled(shading_controls_visible)
+                self.shading_quality.setVisible(mesh_speed_visible)
+                self.shading_quality.setEnabled(mesh_speed_visible)
+                if mesh_speed_visible:
+                    wanted = (
+                        getattr(self, "_shading_quality_value", "normal")
+                        if mode_idx == 1
+                        else getattr(self, "_surface_quality_value", "normal")
+                    )
+                    qidx = self.shading_quality.findData(str(wanted).lower())
+                    if qidx < 0:
+                        qidx = self.shading_quality.findData("normal")
+                    self.shading_quality.blockSignals(True)
+                    self.shading_quality.setCurrentIndex(qidx if qidx >= 0 else 1)
+                    self.shading_quality.blockSignals(False)
+                    if mode_idx == 1:
+                        self.shading_quality.setToolTip(
+                            "Shading — Fast: 1M representatives; Normal: 3M; Slow: all eligible points."
+                        )
+                    else:
+                        self.shading_quality.setToolTip(
+                            "Surface — Fast: 1M representatives; Normal: 3M; Slow: all eligible points."
+                        )
+
+            self._quality_mode_context = mode_idx
+
             if self.current_slot != 0 and self.color_mode.currentIndex() != 0:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
@@ -2513,14 +2553,15 @@ class DisplayModeDialog(QDialog):
         if not app:
             return
 
-        quality_mode = str(self.shading_quality.currentData() or "normal")
-        if self.current_slot == 0 and idx == 1 and quality_mode == "slow":
+        quality_mode = str(self.shading_quality.currentData() or "normal").lower()
+        if self.current_slot == 0 and idx in (1, 6) and quality_mode == "slow":
             total_points = len(app.data.get("xyz", [])) if isinstance(getattr(app, "data", None), dict) else 0
             if total_points > 5_000_000:
+                mode_name = "Shading" if idx == 1 else "Surface"
                 answer = QMessageBox.question(
                     self,
-                    "Slow Shading – All Points",
-                    f"Slow shading can triangulate up to {total_points:,} loaded points.\n\n"
+                    f"Slow {mode_name} – All Points",
+                    f"Slow {mode_name.lower()} can triangulate up to {total_points:,} loaded points.\n\n"
                     "This may require very large RAM, take several minutes, or fail if "
                     "the GPU/system memory is insufficient. Continue?",
                     QMessageBox.Yes | QMessageBox.Cancel,
@@ -2528,7 +2569,12 @@ class DisplayModeDialog(QDialog):
                 )
                 if answer != QMessageBox.Yes:
                     return
-        app.shading_quality = quality_mode
+        if idx == 1:
+            self._shading_quality_value = quality_mode
+            app.shading_quality = quality_mode
+        elif idx == 6:
+            self._surface_quality_value = quality_mode
+            app.surface_quality = quality_mode
         if not hasattr(self, 'view_palettes'):
             self.view_palettes = {i: {} for i in range(6)}
         self.view_palettes[self.current_slot] = clone_palette(class_map)
@@ -2600,7 +2646,9 @@ class DisplayModeDialog(QDialog):
             app.point_border_percent = 0
             if hasattr(app, '_shading_visibility_override'):
                 del app._shading_visibility_override
-            print("🎨 Display mode → surface")
+            app.surface_quality = quality_mode
+            self._surface_quality_value = quality_mode
+            print(f"🎨 Display mode → surface ({quality_mode})")
             if hasattr(app, 'set_display_mode'):
                 app.set_display_mode(target_mode)
                 QApplication.processEvents()
@@ -2935,7 +2983,15 @@ class DisplayModeDialog(QDialog):
 
             # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())
-            settings.setValue("global_shading_quality", self.shading_quality.currentData())
+            # Persist Shading and Surface Speed independently even though they share one UI combo.
+            mode_idx = int(self.color_mode.currentIndex())
+            current_quality = str(self.shading_quality.currentData() or "normal")
+            if mode_idx == 1:
+                self._shading_quality_value = current_quality
+            elif mode_idx == 6:
+                self._surface_quality_value = current_quality
+            settings.setValue("global_shading_quality", getattr(self, "_shading_quality_value", "normal"))
+            settings.setValue("global_surface_quality", getattr(self, "_surface_quality_value", "normal"))
             
             if self.border_logic_hybrid.isChecked():
                 mode_val = 2

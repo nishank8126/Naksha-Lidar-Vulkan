@@ -3740,6 +3740,27 @@ class IdentificationRibbon(QWidget):
                 if hasattr(self.app, '_cancel_cross_section_tool_only'):
                     self.app._cancel_cross_section_tool_only()
 
+            # Cancel any active Cut Section — it also collides on the section
+            # views. Identify must dominate so no other tool "works" while it
+            # is enabled. Detect a finalized cut OR one mid-placement.
+            if self.app and getattr(self.app, 'cut_section_controller', None) is not None:
+                cut = self.app.cut_section_controller
+                cut_busy = (
+                    getattr(cut, 'is_cut_view_active', False)
+                    or getattr(cut, 'cut_points', None) is not None
+                    or getattr(cut, '_state', 0) in (1, 2)  # WAITING_CENTER / WAITING_DEPTH
+                )
+                if cut_busy:
+                    try:
+                        cut.cancel_cut_section()
+                    except Exception:
+                        try:
+                            cut.clear()
+                        except Exception:
+                            pass
+                    if hasattr(self.app, 'cut_section_mode_on'):
+                        self.app.cut_section_mode_on = False
+
         if self.identify_active:
             self.status_label.setText("Active")
 

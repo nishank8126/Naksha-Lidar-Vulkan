@@ -4146,11 +4146,51 @@ class NakshaApp(QMainWindow):
             3000
         )
 
+    def _deactivate_point_pick_tools(self):
+        """
+        Turn OFF every click-to-pick point tool (Identify / Point Sync / SNT
+        layer pick) so none of them collide with Cross/Cut Section on the
+        shared section/cut views. Also resets the Identify ribbon toggle
+        button so the UI stays consistent.
+        Returns True if any tool was active and got disabled.
+        """
+        disabled = False
+        for tool_name in ("identification_tool", "point_sync_tool", "snt_layer_pick_tool"):
+            tool = getattr(self, tool_name, None)
+            if tool is None or not getattr(tool, "active", False):
+                continue
+            try:
+                tool.deactivate()
+            except Exception:
+                pass
+            disabled = True
+
+        # Reset the Identify ribbon toggle button if present.
+        try:
+            ribbon_manager = getattr(self, "ribbon_manager", None)
+            identify_ribbon = (
+                getattr(ribbon_manager, "ribbons", {}).get("identify")
+                if ribbon_manager is not None else None
+            )
+            if identify_ribbon is not None and hasattr(identify_ribbon, "_deactivate_identify"):
+                identify_ribbon._deactivate_identify()
+        except Exception:
+            pass
+
+        if disabled:
+            print("🚫 Point-pick tools auto-disabled (Cross/Cut Section activated)")
+        return disabled
+
     def enable_cross_section_mode(self):   #Added by bala
         # Check if we're in top view (for main viewer)
         if getattr(self, "current_view", None) != "top":
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
             return
+
+        # ✅ MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
+        # pick) collide with Cross Section on the same views, so disable them
+        # automatically when Cross Section is activated (no popup needed).
+        self._deactivate_point_pick_tools()
 
         # Cross-section and Curve are mutually exclusive canvas tools. Keep
         # any unfinished curve available for a later manual Curve activation,
@@ -5608,6 +5648,11 @@ class NakshaApp(QMainWindow):
         if getattr(self, "current_view", None) != "top":
             QMessageBox.warning(self, "Cut Section", "Main view must be in Top View")
             return
+
+        # ✅ MUTUAL EXCLUSION: Point-pick tools (Identify / Point Sync / SNT
+        # pick) collide with Cut Section on the same views, so disable them
+        # automatically when Cut Section is activated (it just yields).
+        self._deactivate_point_pick_tools()
 
         # ✅ Do NOT touch the main interactor - cut section works on cross-section window!
         # Just activate the cut section controller
@@ -7472,12 +7517,23 @@ class NakshaApp(QMainWindow):
 
                     current_sig = _surface_signature_from_open_dialog()
                     previous_sig = getattr(self, "_surface_visible_class_signature", None)
+                    try:
+                        from gui.surface_mode import normalize_surface_quality
+                        current_quality = normalize_surface_quality(getattr(self, "surface_quality", "normal"))
+                    except Exception:
+                        current_quality = str(getattr(self, "surface_quality", "normal") or "normal").lower()
+                    previous_quality = getattr(self, "_surface_quality_signature", None)
 
-                    if previous_sig is None or current_sig != previous_sig:
+                    if (
+                        previous_sig is None
+                        or current_sig != previous_sig
+                        or previous_quality != current_quality
+                    ):
                         force_surface_rebuild = True
-                        print("🔁 Surface Display Mode class filter changed — rebuilding Surface mesh")
-                        print(f"   old={previous_sig}")
-                        print(f"   new={current_sig}")
+                        print("🔁 Surface Display Mode signature changed — switching/rebuilding Surface mesh")
+                        print(f"   classes old={previous_sig}")
+                        print(f"   classes new={current_sig}")
+                        print(f"   quality old={previous_quality} new={current_quality}")
 
                 except Exception as _surface_sig_err:
                     print(f"⚠️ Surface signature check failed: {_surface_sig_err}")
@@ -10158,7 +10214,10 @@ class NakshaApp(QMainWindow):
         self._last_changed_mask = None
         self._last_changed_indices = None
         self._gpu_sync_done = False
-        self.vtk_widget.render()
+        # Surface refresh owns its own presentation.  A metadata-only Surface
+        # undo needs no 12M/50M-face redraw, while a true rebuild already rendered.
+        if str(getattr(self, "display_mode", "") or "").lower() != "surface":
+            self.vtk_widget.render()
 
     def redo_classification(self):
         """🚀 MICROSTATION REDO: Instant GPU Forward-Patch"""
@@ -10253,7 +10312,9 @@ class NakshaApp(QMainWindow):
         self._last_changed_indices = None
         self._gpu_sync_done = False
 
-        self.vtk_widget.render()
+        # Surface refresh owns presentation for both no-op and exact topology paths.
+        if str(getattr(self, "display_mode", "") or "").lower() != "surface":
+            self.vtk_widget.render()
 
 
     def _refresh_main_view_after_undo(self, affected_classes, changed_mask):
@@ -12039,6 +12100,13 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"⚠️ Failed to load elevation ramp: {e}")
                     self.elevation_color_ramp = None
+            self.shading_quality = str(settings.value("global_shading_quality", "normal") or "normal").lower()
+            if self.shading_quality not in ("fast", "normal", "slow"):
+                self.shading_quality = "normal"
+            self.surface_quality = str(settings.value("global_surface_quality", "normal") or "normal").lower()
+            if self.surface_quality not in ("fast", "normal", "slow"):
+                self.surface_quality = "normal"
+
             saved_surface_ramp = settings.value("surface_color_ramp", None)
             if saved_surface_ramp:
                 try:
@@ -13948,6 +14016,22 @@ class NakshaApp(QMainWindow):
         import numpy as np
 
         # 1. Update Core CPU Memory
+        # Preserve the exact transition for Surface before mutating ground truth.
+        # This is O(K) and lets Surface decide whether geometry actually changed.
+        try:
+            _surface_changed_idx = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
+            _surface_old = self.data["classification"][_surface_changed_idx].copy()
+            _surface_new = np.full(
+                _surface_changed_idx.size, to_class, dtype=self.data["classification"].dtype
+            )
+            self._pending_surface_delta = {
+                "indices": _surface_changed_idx.copy(),
+                "old_classes": _surface_old,
+                "new_classes": _surface_new,
+            }
+        except Exception:
+            self._pending_surface_delta = None
+
         self.data["classification"][changed_mask] = to_class
         self.classification_revision = int(getattr(self, "classification_revision", 0) or 0) + 1
 

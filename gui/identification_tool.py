@@ -91,9 +91,28 @@ class IdentificationTool(QObject):
         # ✅ NEW: Clear highlight when deactivating
         self.clear_highlight()
     
+    def _cut_section_is_taking(self):
+        """
+        Return True if a cut section is currently being placed/taken (consuming
+        left-click input). While in this state the IdentificationTool must NOT
+        identify points, otherwise it visibly interferes with cut placement.
+
+        CutSectionState: IDLE=0, WAITING_CENTER=1, WAITING_DEPTH=2, FINALIZED=3.
+        We compare integer values to avoid importing the enum (keeps this tool
+        free of a circular dependency on the cross_section package).
+        """
+        cut = getattr(self.app, "cut_section_controller", None)
+        if cut is None:
+            return False
+        state = getattr(cut, "_state", 0)
+        if state in (1, 2):  # WAITING_CENTER / WAITING_DEPTH
+            return True
+        return False
+
     def _on_left_click(self, obj, event):
         """
         Handle left click to identify point.
+
         ✅ FIX: Check if Cross Section tool is active and skip if it is
         """
         if not self.active:
@@ -106,6 +125,11 @@ class IdentificationTool(QObject):
                 if self.app.cross_action.isChecked():
                     print("🚫 Cross Section active - skipping identification")
                     return
+
+        # ✅ CRITICAL FIX: Don't interfere while a Cut Section is being taken
+        if self._cut_section_is_taking():
+            print("🚫 Cut Section being taken - skipping identification")
+            return
         
         try:
             # Get click position
@@ -176,6 +200,62 @@ class IdentificationTool(QObject):
             import traceback
             traceback.print_exc()
     
+    def identify_point_index(self, point_index):
+        """
+        Identify an already-known global point index using the same backend as
+        an interactive 3D click.
+
+        This is intentionally a public, index-based entry point so dialogs such
+        as View Fields do not have to fake a VTK pick or duplicate identify
+        ribbon/statistics logic.
+
+        Returns a small result dict on success, otherwise None.
+        """
+        try:
+            data = getattr(self.app, "data", None) or {}
+            xyz = data.get("xyz")
+            classification = data.get("classification")
+            if xyz is None or classification is None:
+                print("   ⚠️ identify_point_index: xyz/classification unavailable")
+                return None
+
+            idx = int(point_index)
+            if idx < 0 or idx >= len(xyz) or idx >= len(classification):
+                print(f"   ⚠️ identify_point_index: index out of range: {idx}")
+                return None
+
+            class_code = int(classification[idx])
+            class_name = self.get_class_name(class_code)
+            actual_pos = tuple(float(v) for v in xyz[idx])
+
+            self.highlight_class(class_code)
+            self._update_ribbon_info(
+                class_code,
+                class_name,
+                actual_pos,
+                point_index=idx,
+            )
+            self.point_identified.emit(class_code, class_name, actual_pos)
+
+            print(
+                "   ✅ Identified point index %d: class %d (%s) at "
+                "(%.3f, %.3f, %.3f)" % (
+                    idx, class_code, class_name,
+                    actual_pos[0], actual_pos[1], actual_pos[2],
+                )
+            )
+            return {
+                "point_index": idx,
+                "class_code": class_code,
+                "class_name": class_name,
+                "xyz": actual_pos,
+            }
+        except Exception as exc:
+            print(f"   ❌ identify_point_index failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _collect_field_values(self, class_code, class_name, xyz, point_index=None):
         """
         Build an ordered {field_label: display_value} dict for the picked point,
@@ -524,8 +604,25 @@ class IdentificationTool(QObject):
         """Handle left click in cross-section view to identify point"""
         if not self.active:
             return
-        
+
+        # ✅ CRITICAL FIX: Don't interfere while a Cut Section is being taken.
+        # The cut placement observer is attached to the very same cross-section
+        # view, so both handlers otherwise run on every click and the point
+        # target "glitches" / fights with the cut tool during placement.
+        if self._cut_section_is_taking():
+            print(f"🚫 Cut Section being taken (view {view_index + 1}) - skipping identification")
+            return
+
+        # ✅ CRITICAL FIX: Don't interfere with the active Cross Section tool
+        # (e.g. section-locate clicks) in the section view either.
+        if hasattr(self.app, 'cross_interactor') and self.app.cross_interactor:
+            if hasattr(self.app, 'cross_action') and self.app.cross_action:
+                if self.app.cross_action.isChecked():
+                    print(f"🚫 Cross Section active (view {view_index + 1}) - skipping identification")
+                    return
+
         try:
+
             # Get click position
             vtk_interactor = section_vtk_widget.interactor
             click_pos = vtk_interactor.GetEventPosition()

@@ -1,4 +1,5 @@
 import numpy as np
+import time
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QDoubleSpinBox, QAbstractSpinBox, QMessageBox, QDockWidget, QPushButton, QHBoxLayout
@@ -449,6 +450,25 @@ class CutSectionController:
         self._old_classify_interactor = None
         self._cut_preview_render_pending = False
         self._cut_preview_render_interval_ms = 16
+        # Cut-in-Cut hot-path state.  Reuse one picker and invalidate stale
+        # preview timers instead of allocating/finishing VTK work per mouse event.
+        self._cut_world_picker = vtk.vtkWorldPointPicker()
+        self._cut_preview_render_generation = 0
+        self._cut_fast_rearm_count = 0
+
+        # Cut-in-Cut drag hot path.
+        #
+        # Exact vtkWorldPointPicker picking is retained for mouse CLICKS so
+        # finalized cut coordinates/mapping remain unchanged. Mouse MOVE
+        # previews use camera projection only, avoiding synchronous picker /
+        # Z-buffer work in the high-frequency drag path.
+        self._cut_preview_pending_depth_ui = None
+        self._cut_preview_base_signature = None
+        self._cut_preview_motion_events = 0
+        self._cut_preview_render_frames = 0
+        self._cut_preview_render_ms_total = 0.0
+        self._cut_preview_map_ms_total = 0.0
+        self._cut_preview_profile_last_print = time.perf_counter()
 
         # Dedicated cut section widgets (with INLINE DEPTH)
         self.cut_vtk = None
@@ -480,7 +500,17 @@ class CutSectionController:
         self._depth_adjustment_started = False
 
     def _adaptive_cut_preview_interval_ms(self) -> int:
-        """Use the same adaptive preview cadence as the Cross tool."""
+        """
+        Preview cadence.
+
+        Cut-in-Cut uses zero-delay event-loop coalescing. The VTK render itself
+        provides back-pressure; adding a fixed 16 ms timer after a 16 ms mouse
+        throttle creates visible drag latency. Cross->Cut keeps the historical
+        adaptive cadence.
+        """
+        if getattr(self, "_cut_source", None) == "cut":
+            return 0
+
         try:
             section_controller = getattr(self.app, "section_controller", None)
             adaptive_interval = getattr(
@@ -503,24 +533,187 @@ class CutSectionController:
             return 22
         return 16
 
+    def _cut_cursor_world_on_focal_plane(self, pos):
+        """
+        Convert a cut-dock display position to the camera focal plane without
+        vtkWorldPointPicker.
+
+        This is preview-only. Exact left clicks still use vtkWorldPointPicker,
+        preserving the existing finalized cut position and nested index logic.
+        """
+        if self.cut_vtk is None:
+            return None
+
+        ren = getattr(self.cut_vtk, "renderer", None)
+        if ren is None:
+            return None
+
+        try:
+            cam = ren.GetActiveCamera()
+            if cam is None:
+                return None
+
+            if cam.GetParallelProjection():
+                size = ren.GetSize()
+                origin = ren.GetOrigin()
+                width = max(int(size[0]), 1)
+                height = max(int(size[1]), 1)
+
+                x = float(pos[0]) - float(origin[0])
+                y = float(pos[1]) - float(origin[1])
+                nx = (x / float(width) - 0.5) * 2.0
+                ny = (y / float(height) - 0.5) * 2.0
+
+                focal = np.asarray(cam.GetFocalPoint(), dtype=float)
+                up = np.asarray(cam.GetViewUp(), dtype=float)
+                dop = np.asarray(cam.GetDirectionOfProjection(), dtype=float)
+
+                up_norm = float(np.linalg.norm(up))
+                dop_norm = float(np.linalg.norm(dop))
+                if up_norm <= 1e-12 or dop_norm <= 1e-12:
+                    return None
+                up /= up_norm
+                dop /= dop_norm
+
+                right = np.cross(dop, up)
+                right_norm = float(np.linalg.norm(right))
+                if right_norm <= 1e-12:
+                    return None
+                right /= right_norm
+
+                half_h = float(cam.GetParallelScale())
+                half_w = half_h * (float(width) / float(height))
+
+                return (
+                    focal
+                    + right * (nx * half_w)
+                    + up * (ny * half_h)
+                )
+
+            # Unexpected perspective-camera fallback. Matrix projection only;
+            # still no picker/Z-buffer readback.
+            focal = cam.GetFocalPoint()
+            ren.SetWorldPoint(
+                float(focal[0]),
+                float(focal[1]),
+                float(focal[2]),
+                1.0,
+            )
+            ren.WorldToDisplay()
+            display_z = float(ren.GetDisplayPoint()[2])
+            ren.SetDisplayPoint(
+                float(pos[0]),
+                float(pos[1]),
+                display_z,
+            )
+            ren.DisplayToWorld()
+            world = ren.GetWorldPoint()
+            w = float(world[3])
+            if abs(w) <= 1e-12:
+                return None
+            return np.asarray(
+                (world[0] / w, world[1] / w, world[2] / w),
+                dtype=float,
+            )
+        except Exception:
+            return None
+
     def _schedule_cut_preview_render(self) -> None:
-        """Coalesce Cut-in-Cut preview renders to avoid mouse-event stalls."""
+        """
+        Coalesce Cut-in-Cut preview frames with minimum latency.
+
+        Nested cut:
+            every mouse event updates the latest line transform
+            -> one zero-delay Qt render is queued
+            -> intermediate cursor positions are automatically collapsed
+
+        This removes the previous double throttle:
+            16 ms mouse throttle + 16 ms render timer.
+        """
         if self._cut_preview_render_pending:
             return
 
-        self._cut_preview_render_interval_ms = self._adaptive_cut_preview_interval_ms()
+        delay_ms = int(self._adaptive_cut_preview_interval_ms())
+        self._cut_preview_render_interval_ms = delay_ms
         self._cut_preview_render_pending = True
         scheduled_widget = self.cut_vtk
+        scheduled_generation = int(
+            getattr(self, "_cut_preview_render_generation", 0)
+        )
 
         def _flush():
+            # Always clear first. A stale generation must not permanently
+            # leave the scheduler marked pending.
             self._cut_preview_render_pending = False
+
+            if scheduled_generation != int(
+                getattr(self, "_cut_preview_render_generation", 0)
+            ):
+                return
             if getattr(self, "_is_destroying", False):
                 return
             if scheduled_widget is None or scheduled_widget is not self.cut_vtk:
                 return
-            _safe_vtk_render(scheduled_widget)
 
-        QTimer.singleShot(self._cut_preview_render_interval_ms, _flush)
+            pending_depth = getattr(
+                self,
+                "_cut_preview_pending_depth_ui",
+                None,
+            )
+            self._cut_preview_pending_depth_ui = None
+            if pending_depth is not None and self.depth_spin is not None:
+                try:
+                    self.depth_spin.blockSignals(True)
+                    self.depth_spin.setValue(float(pending_depth))
+                    self.depth_spin.blockSignals(False)
+                except Exception:
+                    pass
+
+            t0 = time.perf_counter()
+            rendered = _safe_vtk_render(scheduled_widget)
+            render_ms = (time.perf_counter() - t0) * 1000.0
+
+            if getattr(self, "_cut_source", None) == "cut" and rendered:
+                self._cut_preview_render_frames = int(
+                    getattr(self, "_cut_preview_render_frames", 0)
+                ) + 1
+                self._cut_preview_render_ms_total = float(
+                    getattr(self, "_cut_preview_render_ms_total", 0.0)
+                ) + render_ms
+
+                # Low-noise profiler: at most about once every two seconds.
+                now = time.perf_counter()
+                last_print = float(
+                    getattr(self, "_cut_preview_profile_last_print", now)
+                )
+                if now - last_print >= 2.0:
+                    frames = max(
+                        int(getattr(self, "_cut_preview_render_frames", 0)),
+                        1,
+                    )
+                    events = int(
+                        getattr(self, "_cut_preview_motion_events", 0)
+                    )
+                    avg_render = float(
+                        getattr(self, "_cut_preview_render_ms_total", 0.0)
+                    ) / frames
+                    avg_map = float(
+                        getattr(self, "_cut_preview_map_ms_total", 0.0)
+                    ) / max(events, 1)
+                    print(
+                        "CUT_PREVIEW_PROFILE "
+                        f"events={events} frames={frames} "
+                        f"map_avg={avg_map:.3f}ms "
+                        f"render_avg={avg_render:.2f}ms "
+                        "picker_on_move=0 fixed_timer_delay=0ms"
+                    )
+                    self._cut_preview_motion_events = 0
+                    self._cut_preview_render_frames = 0
+                    self._cut_preview_render_ms_total = 0.0
+                    self._cut_preview_map_ms_total = 0.0
+                    self._cut_preview_profile_last_print = now
+
+        QTimer.singleShot(max(delay_ms, 0), _flush)
 
     def _reset_depth_adjustment_guard(self):
         """Require an actual depth adjustment before accepting finalize click."""
@@ -1015,6 +1208,10 @@ class CutSectionController:
 
     def _activate_from_cut_dock(self):
         """Activate cut section INSIDE the existing cut view (nested cut)."""
+        # ✅ MUTUAL EXCLUSION: disable Identify (Point Target) so it cannot
+        # collide with the nested cut placement handlers.
+        if getattr(self.app, "_deactivate_point_pick_tools", None) is not None:
+            self.app._deactivate_point_pick_tools()
         print(f"📐 Nested cut: taking cut from existing cut view")
         purged = self._purge_stale_cut_preview_actors(include_cut_dock=True)
         if purged > 0:
@@ -1085,6 +1282,13 @@ class CutSectionController:
         # ✅ CRITICAL: Store last mouse position to prevent redundant updates
         self._last_mouse_pos = None
         self._last_update_time = 0
+        self._cut_preview_pending_depth_ui = None
+        self._cut_preview_base_signature = None
+        self._cut_preview_motion_events = 0
+        self._cut_preview_render_frames = 0
+        self._cut_preview_render_ms_total = 0.0
+        self._cut_preview_map_ms_total = 0.0
+        self._cut_preview_profile_last_print = time.perf_counter()
         
         # ✅ BUG #2 FIX: Clean slate before attaching new observers
         if self.cut_vtk is not None:
@@ -1107,9 +1311,9 @@ class CutSectionController:
                 print(f"🖱️ Left click in cut dock (state={self._state})")
                 
                 pos = self.cut_vtk.interactor.GetEventPosition()
-                picker = vtk.vtkWorldPointPicker()
+                picker = self._cut_world_picker
                 picker.Pick(pos[0], pos[1], 0, self.cut_vtk.renderer)
-                pt = np.array(picker.GetPickPosition())
+                pt = np.asarray(picker.GetPickPosition(), dtype=float)
                 
                 if np.allclose(pt, (0, 0, 0), atol=1e-6):
                     print("  ⚠️ Invalid pick position")
@@ -1134,60 +1338,69 @@ class CutSectionController:
             def on_mouse_move(obj, evt):
                 if self._cut_source != 'cut':
                     return
-                if self._state not in (CutSectionState.WAITING_CENTER, CutSectionState.WAITING_DEPTH):
+                if self._state not in (
+                    CutSectionState.WAITING_CENTER,
+                    CutSectionState.WAITING_DEPTH,
+                ):
                     return
-                
-                # ✅ THROTTLING: Prevent excessive updates
-                import time
-                current_time = time.time()
-                if current_time - self._last_update_time < 0.016:  # Max 60 FPS
-                    return
-                self._last_update_time = current_time
-                
+
+                # Do not throttle cursor state. Rendering is already coalesced,
+                # so every event can cheaply update the latest desired preview
+                # position without scheduling an extra frame.
                 pos = self.cut_vtk.interactor.GetEventPosition()
-                
-                # ✅ CRITICAL: Check if mouse actually moved
+
+                # One-pixel dead zone only. The previous 2px + 16ms throttle
+                # created visible stepping during precise slow drags.
                 if self._last_mouse_pos is not None:
                     dx = abs(pos[0] - self._last_mouse_pos[0])
                     dy = abs(pos[1] - self._last_mouse_pos[1])
-                    if dx < 2 and dy < 2:  # Ignore tiny movements
+                    if dx < 1 and dy < 1:
                         return
                 self._last_mouse_pos = pos
-                
-                picker = vtk.vtkWorldPointPicker()
-                picker.Pick(pos[0], pos[1], 0, self.cut_vtk.renderer)
-                curr = np.array(picker.GetPickPosition())
-                
-                if np.allclose(curr, (0, 0, 0), atol=1e-6):
+
+                map_t0 = time.perf_counter()
+                curr = self._cut_cursor_world_on_focal_plane(pos)
+                map_ms = (time.perf_counter() - map_t0) * 1000.0
+                if curr is None:
                     return
-                
+
+                self._cut_preview_motion_events = int(
+                    getattr(self, "_cut_preview_motion_events", 0)
+                ) + 1
+                self._cut_preview_map_ms_total = float(
+                    getattr(self, "_cut_preview_map_ms_total", 0.0)
+                ) + map_ms
+
                 if self._state == CutSectionState.WAITING_CENTER:
-                    # ✅ Update line while moving to center
+                    # Preview only. The actual click still uses the exact
+                    # vtkWorldPointPicker path below.
                     self._draw_dynamic_center_line_in_cut(curr)
                     return
-                
-                if self._state == CutSectionState.WAITING_DEPTH and self.center_point is not None:
-                    # ✅ FIX: ALWAYS use X-axis (0) for cut section interaction
-                    # Camera ALWAYS looks along Y-axis, so mouse movement affects X primarily
-                    # Using Y-axis causes issues because mouse movement doesn't change Y position
-                    axis = 0  # ← FIXED! Was: ((self.accumulated_rotation + 90) // 90) % 2
-                    
-                    new_depth = abs(curr[axis] - self.center_point[axis])
-                    
-                    # ✅ Skip tiny movements (prevents snapping to 0.01m)
+
+                if (
+                    self._state == CutSectionState.WAITING_DEPTH
+                    and self.center_point is not None
+                ):
+                    # Visually the cut dock horizontal axis is world X.
+                    # Nested rotation/filter semantics are unchanged at finalize.
+                    new_depth = abs(
+                        float(curr[0]) - float(self.center_point[0])
+                    )
+
                     if new_depth < 0.01:
-                        return  # Ignore movement near center line
-                    
+                        return
+
                     self.dynamic_depth = new_depth
-                    self._draw_cut_section_preview(self.center_point, self.dynamic_depth)
-                    
-                    # Update spinbox
-                    if self.depth_spin:
-                        self.depth_spin.blockSignals(True)
-                        self.depth_spin.setValue(self.dynamic_depth)
-                        self.depth_spin.blockSignals(False)
+                    self._mark_depth_adjustment_started()
+                    self._draw_cut_section_preview(
+                        self.center_point,
+                        self.dynamic_depth,
+                    )
+
+                    # QWidget update is coalesced with the next preview frame.
+                    self._cut_preview_pending_depth_ui = self.dynamic_depth
                     return
-            
+
             try:
                 lid = iren.AddObserver("LeftButtonPressEvent", on_left_click)
                 mid = iren.AddObserver("MouseMoveEvent", on_mouse_move)
@@ -1205,6 +1418,106 @@ class CutSectionController:
         
         self.app.statusBar().showMessage("✂️ Nested Cut: click center, adjust depth, click to finalize", 0)
 
+
+    def _fast_rearm_persistent_cut_in_cut(self) -> bool:
+        """
+        Re-arm the next Cut-in-Cut placement without rebuilding interaction state.
+
+        During a persistent nested-cut session the cut-dock observers are already
+        installed and classification is already suspended.  The old path restored
+        every cross-section/classification interactor after each cut and then
+        immediately tore all of it down again via _activate_from_cut_dock().
+        Keeping the existing observers/style alive removes that redundant Qt/VTK
+        churn while preserving the same cut geometry, palette and index mapping.
+
+        Returns True when the hot path was used.  False lets the caller fall back
+        to the original defensive re-arm path.
+        """
+        if self.cut_vtk is None or not self._has_valid_cut_dock():
+            return False
+
+        observer_ids = self._view_observer_ids.get("cut_dock")
+        if not observer_ids:
+            return False
+
+        # Remove references to preview props that were removed by
+        # _plot_cut_to_dedicated_widget().  Do NOT touch the completed cut actor.
+        self.line_actor = None
+        self.buffer_actor_upper = None
+        self.buffer_actor_lower = None
+        self.cut_preview_upper = None
+        self.cut_preview_lower = None
+
+        for attr in (
+            "_line_actor_points", "_line_actor_poly", "_line_actor_mapper",
+            "_cut_preview_upper_points", "_cut_preview_upper_lines",
+            "_cut_preview_upper_poly", "_cut_preview_upper_mapper",
+            "_cut_preview_lower_points", "_cut_preview_lower_lines",
+            "_cut_preview_lower_poly", "_cut_preview_lower_mapper",
+        ):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+
+        # Cancel any preview frame queued for the just-finished placement.
+        self._cut_preview_render_generation = int(
+            getattr(self, "_cut_preview_render_generation", 0)
+        ) + 1
+        self._cut_preview_render_pending = False
+
+        self._cut_source = "cut"
+        self._state = CutSectionState.WAITING_CENTER
+        self.cut_phase = 0
+        self.center_point = None
+        self.dynamic_depth = max(
+            float(getattr(self.app, "default_cut_width", 1.0)), 0.5
+        )
+        self._reset_depth_adjustment_guard()
+        self._last_mouse_pos = None
+        self._last_update_time = 0.0
+        self._cut_preview_pending_depth_ui = None
+        self._cut_preview_base_signature = None
+        self._cut_preview_motion_events = 0
+        self._cut_preview_render_frames = 0
+        self._cut_preview_render_ms_total = 0.0
+        self._cut_preview_map_ms_total = 0.0
+        self._cut_preview_profile_last_print = time.perf_counter()
+
+        if self.depth_spin is not None:
+            try:
+                self.depth_spin.blockSignals(True)
+                self.depth_spin.setValue(self.dynamic_depth)
+                self.depth_spin.blockSignals(False)
+            except Exception:
+                pass
+
+        # A persistent nested-cut session owns the cut-dock left click, so keep
+        # locate/classification interaction suspended until the user exits the
+        # tool or explicitly activates a classification tool.
+        try:
+            sc = getattr(self.app, "section_controller", None)
+            if sc is not None and hasattr(sc, "set_section_locate_enabled"):
+                sc.set_section_locate_enabled(False, clear_state=True)
+        except Exception:
+            pass
+
+        self._cut_fast_rearm_count = int(getattr(self, "_cut_fast_rearm_count", 0)) + 1
+        try:
+            self.app.statusBar().showMessage(
+                "✂️ Cut-in-Cut ready: click next center, adjust depth, click to finalize",
+                0,
+            )
+        except Exception:
+            pass
+
+        print(
+            "⚡ CUT_IN_CUT_FAST_REARM "
+            f"count={self._cut_fast_rearm_count} observers=reused "
+            "classification_rebuild=skipped cross_view_restore=skipped"
+        )
+        return True
 
 
     def _draw_dynamic_center_line_in_cut(self, center):
@@ -1292,13 +1605,27 @@ class CutSectionController:
         # Preserve how this operation was started before the cut widget and its
         # interactor are rebuilt. Cut-in-Cut stays armed after every valid cut.
         persistent_nested_cut = self._cut_source == 'cut'
-        
-        try:
-            sc = getattr(self.app, 'section_controller', None)
-            if sc is not None and hasattr(sc, 'set_section_locate_enabled'):
-                sc.set_section_locate_enabled(True, clear_state=True)
-        except Exception:
-            pass
+        _nested_total_t0 = time.perf_counter() if persistent_nested_cut else None
+        _nested_input_count = int(len(self.cut_points)) if (persistent_nested_cut and self.cut_points is not None) else 0
+        _nested_filter_rotate_ms = 0.0
+        _nested_plot_ms = 0.0
+
+        # Cross-section locate should stay suspended throughout a persistent
+        # Cut-in-Cut session.  Toggling it on here only to disable it again on
+        # re-arm caused unnecessary observer/UI churn.
+        if not persistent_nested_cut:
+            try:
+                sc = getattr(self.app, 'section_controller', None)
+                if sc is not None and hasattr(sc, 'set_section_locate_enabled'):
+                    sc.set_section_locate_enabled(True, clear_state=True)
+            except Exception:
+                pass
+
+        # Invalidate a preview render queued just before the final click.
+        self._cut_preview_render_generation = int(
+            getattr(self, "_cut_preview_render_generation", 0)
+        ) + 1
+        self._cut_preview_render_pending = False
 
         if self.center_point is None:
             print("⚠️ finalize: invalid center")
@@ -1346,9 +1673,19 @@ class CutSectionController:
 
         # Nested cut logic (cut-from-cut)
         if self.is_cut_view_active and self.cut_points is not None:
+            _nested_filter_t0 = time.perf_counter()
             print(f"🔄 Creating nested cut from {len(self.cut_points)} existing cut points")
-            xyz = self.cut_points.copy()
-            parent_index_map = self._cut_index_map.copy()
+
+            # Read the existing cut arrays without cloning them first.  The old
+            # path copied the full XYZ + index map, then created two more arrays
+            # during filtering/rotation.  Only the filtered/rotated output needs
+            # to be materialized.
+            source_xyz = np.asarray(self.cut_points)
+            source_index_map = (
+                np.asarray(self._cut_index_map)
+                if self._cut_index_map is not None
+                else None
+            )
             
             # ✅ BUG #4 FIX: Use correct axis based on rotation (alternates 0→1→0→1)
             # After each 90° rotation, the filtering axis switches
@@ -1365,16 +1702,15 @@ class CutSectionController:
             
             print(f"✅ Filtering nested cut: axis={axis}, center={center_val:.2f}, depth=±{self.dynamic_depth:.2f}")
             
-            depth_mask = (
-                (xyz[:, axis] >= cut_lower) &
-                (xyz[:, axis] <= cut_upper)
-            )
+            axis_values = source_xyz[:, axis]
+            depth_mask = (axis_values >= cut_lower) & (axis_values <= cut_upper)
+            kept_count = int(np.count_nonzero(depth_mask))
+
+            print(f"✅ Depth filter: {kept_count}/{len(source_xyz)} points")
             
-            print(f"✅ Depth filter: {np.sum(depth_mask)}/{len(xyz)} points")
-            
-            if not np.any(depth_mask):
+            if kept_count == 0:
                 print(f"❌ No points in depth range [{cut_lower:.2f}, {cut_upper:.2f}] on axis {axis}")
-                print(f"   Data range on axis {axis}: [{xyz[:, axis].min():.2f}, {xyz[:, axis].max():.2f}]")
+                print(f"   Data range on axis {axis}: [{axis_values.min():.2f}, {axis_values.max():.2f}]")
                 
                 # ✅ BUG #11 FIX: Reset state before returning
                 self._state = CutSectionState.IDLE
@@ -1386,18 +1722,27 @@ class CutSectionController:
                 print("✅ State reset to IDLE")
                 return
 
-            # Transform to new coordinate system (rotate 90°)
-            xyz_filtered = xyz[depth_mask]
-            
-            # ✅ Rotate coordinates 90° for next cut
-            xyz_rotated = xyz_filtered.copy()
-            xyz_rotated[:, 0] = xyz_filtered[:, 1]   # New X = old Y
-            xyz_rotated[:, 1] = -xyz_filtered[:, 0]  # New Y = -old X (90° rotation)
-            # Z unchanged
-            
-            xyz = xyz_rotated
-            parent_index_map = parent_index_map[depth_mask]
-            
+            # Transform to the next orthogonal coordinate system.  Allocate one
+            # output array only; avoid the old full-copy -> filtered-copy ->
+            # rotated-copy chain.
+            if kept_count == len(source_xyz):
+                xyz_filtered = source_xyz
+                parent_index_map = source_index_map
+            else:
+                xyz_filtered = source_xyz[depth_mask]
+                parent_index_map = (
+                    source_index_map[depth_mask]
+                    if source_index_map is not None
+                    else None
+                )
+
+            xyz = np.empty_like(xyz_filtered)
+            xyz[:, 0] = xyz_filtered[:, 1]   # New X = old Y
+            xyz[:, 1] = -xyz_filtered[:, 0]  # New Y = -old X (90° rotation)
+            xyz[:, 2] = xyz_filtered[:, 2]   # Z unchanged
+
+            _nested_filter_rotate_ms = (time.perf_counter() - _nested_filter_t0) * 1000.0
+
             # Increment rotation
             self.accumulated_rotation = (self.accumulated_rotation + 90) % 360
             print(f"✅ Rotation incremented: now at {self.accumulated_rotation}°")
@@ -1727,7 +2072,10 @@ class CutSectionController:
             pass
         
         # Plot to cut section widget
+        _plot_t0 = time.perf_counter()
         self._plot_cut_to_dedicated_widget(self.cut_points)
+        if persistent_nested_cut:
+            _nested_plot_ms = (time.perf_counter() - _plot_t0) * 1000.0
         
         # ✅ RESTORE DOCK FROM MINIMIZED STATE (NEW CODE)
         print("   🔄 Ensuring cut dock is visible and active...")
@@ -1741,17 +2089,22 @@ class CutSectionController:
         else:
             self.cut_dock.setVisible(True)  # Ensure visible
         
-        # Bring to front and activate
-        self.cut_dock.raise_()
-        self.cut_dock.activateWindow()
-        
-        # Explicitly set window state to active (removes minimize flag)
-        from PySide6.QtCore import Qt
-        self.cut_dock.setWindowState(
-            self.cut_dock.windowState() & ~Qt.WindowMinimized | Qt.WindowActive
-        )
-        
-        print("   ✅ Cut dock shown and activated")
+        # Bringing an already-active Windows/Qt dock to the front on every
+        # nested cut causes avoidable focus/layout work.  It is only needed for
+        # first/non-persistent activation; a Cut-in-Cut final click already came
+        # from this dock.
+        if not persistent_nested_cut:
+            self.cut_dock.raise_()
+            self.cut_dock.activateWindow()
+
+            # Explicitly set window state to active (removes minimize flag)
+            from PySide6.QtCore import Qt
+            self.cut_dock.setWindowState(
+                self.cut_dock.windowState() & ~Qt.WindowMinimized | Qt.WindowActive
+            )
+            print("   ✅ Cut dock shown and activated")
+        else:
+            print("   ⚡ Cut dock already active - focus churn skipped")
         
         self.is_cut_view_active = True
         
@@ -1761,6 +2114,31 @@ class CutSectionController:
             pass
         
         self._set_camera_along_tangent(self.cut_vtk, self.cut_points, self.section_tangent)
+
+        # ------------------------------------------------------------
+        # FAST PERSISTENT CUT-IN-CUT PATH
+        # ------------------------------------------------------------
+        # The completed nested cut is already plotted.  While Cut-in-Cut stays
+        # armed there is no reason to restore every cross-section interactor,
+        # create a new cut ClassificationInteractor, restore classification, and
+        # immediately tear all of that down again.  Reuse the existing cut-dock
+        # observers/style and reset only the lightweight placement state.
+        if persistent_nested_cut:
+            _rearm_t0 = time.perf_counter()
+            if self._fast_rearm_persistent_cut_in_cut():
+                _rearm_ms = (time.perf_counter() - _rearm_t0) * 1000.0
+                _total_ms = (time.perf_counter() - _nested_total_t0) * 1000.0
+                print(
+                    "CUT_IN_CUT_PROFILE "
+                    f"input={_nested_input_count} output={len(self.cut_points)} "
+                    f"filter_rotate={_nested_filter_rotate_ms:.2f}ms "
+                    f"plot={_nested_plot_ms:.2f}ms "
+                    f"rearm={_rearm_ms:.2f}ms total={_total_ms:.2f}ms "
+                    "interactor_rebuild=0 classification_toggle=0"
+                )
+                return
+
+            print("⚠️ CUT_IN_CUT_FAST_REARM unavailable - using original safe re-arm path")
 
         # ✅ CRITICAL FIX: Re-attach ClassificationInteractor to ALL cross-section views
         # This ensures proper camera controls (rotation/pan/zoom) are restored
@@ -1924,7 +2302,7 @@ class CutSectionController:
 
         if persistent_nested_cut:
             try:
-                print("Cut-in-Cut remains active - ready for the next nested cut")
+                print("Cut-in-Cut fallback re-arm - restoring original defensive path")
                 self._activate_from_cut_dock()
                 return
             except Exception as e:
@@ -1938,6 +2316,10 @@ class CutSectionController:
             
     def _reuse_cut_dock_for_new_cross_cut(self):
         """Reuse existing cut dock for NEW cut from cross-section (without closing)."""
+        # ✅ MUTUAL EXCLUSION: disable Identify (Point Target) so it cannot
+        # collide with the cut placement handlers (shortcut path reuses this).
+        if getattr(self.app, "_deactivate_point_pick_tools", None) is not None:
+            self.app._deactivate_point_pick_tools()
         print("📐 NEW FEATURE: Reusing cut dock for fresh cross-section cut...")
         purged = self._purge_stale_cut_preview_actors(include_cut_dock=True)
         if purged > 0:
@@ -2935,6 +3317,12 @@ class CutSectionController:
     def activate(self, show_source_dialog: bool = True, shortcut_preference: str | None = None):
         """Enable CutSection in all open cross-section panes."""
         try:
+            # ✅ MUTUAL EXCLUSION: Identify (Point Target) must never be active
+            # while a cut is taken — their click handlers collide on the same
+            # cross-section views. Auto-disable Identify (it just yields).
+            # Covers both ribbon and shortcut entry points.
+            if getattr(self.app, "_deactivate_point_pick_tools", None) is not None:
+                self.app._deactivate_point_pick_tools()
 
             print("🔥 Starting cut tool activation with nuclear cleanup...")
             purged = self._purge_stale_cut_preview_actors(include_cut_dock=True)
@@ -4301,111 +4689,179 @@ class CutSectionController:
             print(f"⚠️ Render failed in _draw_dynamic_band_preview: {e}")
 
     def _draw_cut_section_preview(self, center, depth):
-        """Draw preview inside cut dock with robust actor management."""
+        """
+        Draw Cut-in-Cut depth preview lines with transform-only drag updates.
 
+        For nested cuts the two vertical line geometries are created once at
+        the selected centre. During drag only vtkActor.SetPosition() changes,
+        avoiding vtkPoints/vtkPolyData uploads every mouse event.
+
+        Non-nested behavior is preserved.
+        """
         if self._state != CutSectionState.WAITING_DEPTH:
             return
-        if getattr(self, '_is_destroying', False):
+        if getattr(self, "_is_destroying", False):
             return
-        if self.cut_vtk is None or not hasattr(self.cut_vtk, "renderer") or self.cut_vtk.renderer is None:
+        if (
+            self.cut_vtk is None
+            or not hasattr(self.cut_vtk, "renderer")
+            or self.cut_vtk.renderer is None
+        ):
             return
-        
-        ren = self.cut_vtk.renderer
-
         if center is None:
             return
 
-        # Always use X-axis for cut section preview
-        axis = 0
-        
-        # Use valid depth
-        preview_depth = depth if (depth is not None and abs(depth) > 1e-6) else max(0.5, getattr(self, "dynamic_depth", 1.0))
+        ren = self.cut_vtk.renderer
+        preview_depth = (
+            float(depth)
+            if depth is not None and abs(float(depth)) > 1e-6
+            else max(0.5, float(getattr(self, "dynamic_depth", 1.0)))
+        )
 
-        # Both lines share the same viewport bounds. Computing this once avoids
-        # duplicate camera queries on every preview frame.
-        base_p0, base_p1 = self._get_vertical_segment(center, self.cut_vtk)
-        for sign, attr in [(-1.0, "cut_preview_lower"), (+1.0, "cut_preview_upper")]:
-            # Calculate offset points
-            p0 = base_p0.copy()
-            p1 = base_p1.copy()
-            p0[axis] += sign * preview_depth
-            p1[axis] += sign * preview_depth
-            
+        fast_nested = getattr(self, "_cut_source", None) == "cut"
+
+        try:
+            cam = ren.GetActiveCamera()
+            cam_scale = float(cam.GetParallelScale()) if cam is not None else 0.0
+        except Exception:
+            cam_scale = 0.0
+
+        base_signature = (
+            round(float(center[0]), 9),
+            round(float(center[1]), 9),
+            round(float(center[2]), 9),
+            round(cam_scale, 9),
+        )
+        base_changed = (
+            getattr(self, "_cut_preview_base_signature", None)
+            != base_signature
+        )
+
+        if base_changed or not fast_nested:
+            base_p0, base_p1 = self._get_vertical_segment(
+                center,
+                self.cut_vtk,
+            )
+        else:
+            base_p0 = None
+            base_p1 = None
+
+        for sign, attr in (
+            (-1.0, "cut_preview_lower"),
+            (+1.0, "cut_preview_upper"),
+        ):
             actor = getattr(self, attr, None)
             pts_attr = f"_{attr}_points"
-            
-            # ✅ FIX: Check if we have VALID cached geometry
             pts = getattr(self, pts_attr, None)
+            poly = getattr(self, f"_{attr}_poly", None)
+
             needs_recreation = (
-                actor is None or 
-                pts is None or 
-                not hasattr(self, f"_{attr}_poly") or
-                getattr(self, f"_{attr}_poly", None) is None
+                actor is None
+                or pts is None
+                or poly is None
             )
-            
+
             if needs_recreation:
-                # ✅ ALWAYS create fresh geometry
+                if base_p0 is None or base_p1 is None:
+                    base_p0, base_p1 = self._get_vertical_segment(
+                        center,
+                        self.cut_vtk,
+                    )
+
+                if fast_nested:
+                    p0 = np.asarray(base_p0, dtype=float)
+                    p1 = np.asarray(base_p1, dtype=float)
+                else:
+                    p0 = np.asarray(base_p0, dtype=float).copy()
+                    p1 = np.asarray(base_p1, dtype=float).copy()
+                    p0[0] += sign * preview_depth
+                    p1[0] += sign * preview_depth
+
                 pts = vtk.vtkPoints()
                 pts.InsertNextPoint(*p0)
                 pts.InsertNextPoint(*p1)
-                
+
                 lines = vtk.vtkCellArray()
                 lines.InsertNextCell(2)
                 lines.InsertCellPoint(0)
                 lines.InsertCellPoint(1)
-                
+
                 poly = vtk.vtkPolyData()
                 poly.SetPoints(pts)
                 poly.SetLines(lines)
-                
+
                 mapper = vtk.vtkPolyDataMapper()
                 mapper.SetInputData(poly)
-                
-                # Remove old actor if exists
+
                 if actor is not None:
                     try:
                         ren.RemoveActor(actor)
                     except Exception:
                         pass
-                
+
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
                 self._mark_cut_preview_actor(actor, attr)
-                
-                # Yellow, visible lines
+
                 prop = actor.GetProperty()
-                prop.SetColor(1.0, 1.0, 0.0)  # Yellow
-                prop.SetLineWidth(2)  # Thicker for visibility
-                prop.SetOpacity(1.0)  # Full opacity
-                
-                # Force lines on top
+                prop.SetColor(1.0, 1.0, 0.0)
+                prop.SetLineWidth(2)
+                prop.SetOpacity(1.0)
                 self._configure_line_on_top(actor)
-                
+
+                if fast_nested:
+                    actor.SetPosition(
+                        float(sign * preview_depth),
+                        0.0,
+                        0.0,
+                    )
+
                 ren.AddActor(actor)
-                
-                # Cache references
+
                 setattr(self, attr, actor)
                 setattr(self, pts_attr, pts)
                 setattr(self, f"_{attr}_lines", lines)
                 setattr(self, f"_{attr}_poly", poly)
                 setattr(self, f"_{attr}_mapper", mapper)
-                
-                print(f"  🆕 Created {attr} at offset {sign * preview_depth:.2f}m")
-                
+
+                print(
+                    f"  🆕 Created {attr} at offset "
+                    f"{sign * preview_depth:.2f}m"
+                )
+
+            elif fast_nested:
+                if base_changed:
+                    if base_p0 is None or base_p1 is None:
+                        base_p0, base_p1 = self._get_vertical_segment(
+                            center,
+                            self.cut_vtk,
+                        )
+                    pts.SetPoint(0, *base_p0)
+                    pts.SetPoint(1, *base_p1)
+                    pts.Modified()
+                    poly.Modified()
+
+                # Normal drag frame: transforms only.
+                actor.SetPosition(
+                    float(sign * preview_depth),
+                    0.0,
+                    0.0,
+                )
+
             else:
-                # ✅ FIX: Update existing points WITHOUT Reset()
-                pts = getattr(self, pts_attr)
-                poly = getattr(self, f"_{attr}_poly")
-                
-                # Update the 2 existing points directly
+                # Historical non-nested geometry-update path.
+                p0 = np.asarray(base_p0, dtype=float).copy()
+                p1 = np.asarray(base_p1, dtype=float).copy()
+                p0[0] += sign * preview_depth
+                p1[0] += sign * preview_depth
                 pts.SetPoint(0, *p0)
                 pts.SetPoint(1, *p1)
                 pts.Modified()
                 poly.Modified()
-            
-            # Ensure visibility
+
             actor.VisibilityOn()
 
+        self._cut_preview_base_signature = base_signature
         self._schedule_cut_preview_render()
 
     def _rebuild_cut_index_map(self):

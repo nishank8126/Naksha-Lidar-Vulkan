@@ -3858,6 +3858,7 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
     dirty_flags = False
     render_ok = False
     actor = None
+    surface_owns_present = False
 
     try:
         if display_mode == "class":
@@ -3914,28 +3915,41 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
                     refresh_fn(reason="main_view_commit", changed_mask=changed_mask)
                 else:
                     from gui.surface_mode import refresh_surface_after_classification
-                    refresh_surface_after_classification(app, changed_mask, operation="main_view_commit", delay_ms=0)
+                    refresh_surface_after_classification(
+                        app, changed_mask, operation="main_view_commit", delay_ms=0
+                    )
                 fast_update = True
+                # Surface classification refresh owns Surface presentation.
+                # - no-topology edit: nothing in main view changed, do NOT redraw
+                # - exact rebuild: render_surface_mode already presents the mesh
+                # - debounced topology edit: timer will present when ready
+                surface_owns_present = True
+                actor = getattr(app, "_surface_mesh_actor", None)
             except Exception:
                 fast_update = False
+                surface_owns_present = False
 
-        actor = actor or _get_unified_actor(app)
-        if actor is not None:
-            mesh = getattr(actor, "_naksha_mesh", None)
-            vtk_ca = getattr(actor, "_naksha_vtk_array", None)
-            mapper = actor.GetMapper() if hasattr(actor, "GetMapper") else None
-            if vtk_ca is not None:
-                vtk_ca.Modified()
+        # Never dirty the hidden unified point actor while Surface is active.
+        # Doing so used to turn a metadata-only classification into a large VTK
+        # upload/render even after Surface itself correctly skipped rebuilding.
+        if display_mode != "surface":
+            actor = actor or _get_unified_actor(app)
+            if actor is not None:
+                mesh = getattr(actor, "_naksha_mesh", None)
+                vtk_ca = getattr(actor, "_naksha_vtk_array", None)
+                mapper = actor.GetMapper() if hasattr(actor, "GetMapper") else None
+                if vtk_ca is not None:
+                    vtk_ca.Modified()
+                    dirty_flags = True
+                if mesh is not None:
+                    mesh.GetPointData().Modified()
+                    mesh.Modified()
+                    dirty_flags = True
+                if mapper is not None:
+                    mapper.Modified()
+                    dirty_flags = True
+                actor.Modified()
                 dirty_flags = True
-            if mesh is not None:
-                mesh.GetPointData().Modified()
-                mesh.Modified()
-                dirty_flags = True
-            if mapper is not None:
-                mapper.Modified()
-                dirty_flags = True
-            actor.Modified()
-            dirty_flags = True
     except Exception as e:
         print(f"⚠️ guarantee_main_view_visual_refresh prep failed: {e}")
 
@@ -3945,7 +3959,12 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
         and reason == "cross_section_gpu_commit"
     )
     render_started = time.perf_counter()
-    if defer_cross_shaded_present:
+    if display_mode == "surface" and surface_owns_present:
+        # Surface refresh either changed nothing, already presented an exact
+        # rebuild, or scheduled the exact rebuild.  No synchronous giant-mesh
+        # redraw is required here.
+        render_ok = True
+    elif defer_cross_shaded_present:
         # A full faceted draw can take 100+ ms with every class visible. The
         # canonical buffers are already patched above; let the mouse event
         # finish, then coalesce rapid cross-section commits into one draw.

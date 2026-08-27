@@ -10171,6 +10171,103 @@ class ClassificationInteractor:
             self._clear_all_previews()
             self._last_active_tool = current_tool
 
+    def _has_incomplete_classification_gesture(self):
+        """Return whether this view owns classification input that is not finished."""
+        gesture_tool = (
+            getattr(self, "_gesture_tool", None)
+            or getattr(getattr(self, "app", None), "active_classify_tool", None)
+        )
+        # Brush changes are applied continuously while dragging and its release
+        # path records the undo entry. Never discard that transactional state as
+        # if it were a preview-only gesture.
+        if gesture_tool == "brush":
+            return False
+
+        drawing_points = getattr(self, "drawing_points", None)
+        cut_drawing_points = getattr(self, "drawing_points_display_cut", None)
+        cut_world_points = getattr(self, "drawing_points_world_cut", None)
+
+        return bool(
+            getattr(self, "P1", None) is not None
+            or getattr(self, "P1_display_cut", None) is not None
+            or getattr(self, "is_dragging", False)
+            or getattr(self, "click_to_finalize", False)
+            or getattr(self, "is_drawing_freehand", False)
+            or (drawing_points is not None and len(drawing_points) > 0)
+            or (cut_drawing_points is not None and len(cut_drawing_points) > 0)
+            or (cut_world_points is not None and len(cut_world_points) > 0)
+        )
+
+    def _cancel_incomplete_classification_gesture(self):
+        """Cancel this view's transient gesture without changing the active tool."""
+        if not self._has_incomplete_classification_gesture():
+            return False
+
+        try:
+            self._stop_deferred_left_release_watch()
+        except Exception:
+            pass
+        try:
+            self._suppress_snt_text(False)
+        except Exception:
+            pass
+
+        self._gesture_tool = None
+        self._press_pos = None
+        self._line_press_max_move_px = 0.0
+        self._last_line_preview_P2 = None
+        self._last_rectangle_preview_P2 = None
+        self._last_circle_preview_P2 = None
+
+        app = getattr(self, "app", None)
+        if app is not None:
+            app._classification_preview_active = False
+            app._suppress_section_refresh = False
+
+        self._clear_all_previews()
+        return True
+
+    def _cancel_incomplete_classification_gestures_in_other_views(self):
+        """Make an unfinished classification gesture exclusive to one section view."""
+        app = getattr(self, "app", None)
+        if app is None:
+            return 0
+
+        peers = []
+        section_interactors = getattr(app, "classify_interactors", None)
+        if isinstance(section_interactors, dict):
+            peers.extend(section_interactors.values())
+
+        cut_interactor = getattr(app, "cut_classify_interactor", None)
+        if cut_interactor is not None:
+            peers.append(cut_interactor)
+
+        cancelled = 0
+        seen = set()
+        for peer in peers:
+            if peer is None or peer is self:
+                continue
+            marker = id(peer)
+            if marker in seen:
+                continue
+            seen.add(marker)
+
+            cancel = getattr(peer, "_cancel_incomplete_classification_gesture", None)
+            if not callable(cancel):
+                continue
+            try:
+                if cancel():
+                    cancelled += 1
+            except Exception as exc:
+                print(f"⚠️ Failed to clear classification preview in another view: {exc}")
+
+        if cancelled:
+            print(
+                f"🧹 Cleared unfinished classification gesture from "
+                f"{cancelled} other view(s)"
+            )
+        return cancelled
+
     def _notify_style_left_button_up(self):
         """
         Safely forward a synthetic left-button-up to VTK without letting our
@@ -11416,9 +11513,15 @@ class ClassificationInteractor:
         if self._cached_renderer is None:
             return (0.0, 0.0, 0.0)
 
-        coord = vtk.vtkCoordinate()
-        coord.SetCoordinateSystemToDisplay()
-        coord.SetValue(x, y, 0)
+        # Reuse the VTK coordinate object. Main-view freehand now captures
+        # native mouse samples before the preview-render throttle, so creating
+        # a SWIG object per MouseMove would add avoidable interaction jitter.
+        coord = getattr(self, "_display_to_world_coord", None)
+        if coord is None:
+            coord = vtk.vtkCoordinate()
+            coord.SetCoordinateSystemToDisplay()
+            self._display_to_world_coord = coord
+        coord.SetValue(float(x), float(y), 0.0)
         try:
             return coord.GetComputedWorldValue(self._cached_renderer)
         except Exception:
@@ -12494,6 +12597,96 @@ class ClassificationInteractor:
         result.append(list(pts[-1]))
         return result
 
+
+    @staticmethod
+    def _centripetal_catmull_rom_smooth(points, steps=4):
+        """Corner-safe MAIN-view freehand spline for uneven mouse samples."""
+        import numpy as _np
+        pts = _np.asarray(points, dtype=_np.float64)
+        n = len(pts)
+        if n < 2:
+            return [tuple(map(float, p)) for p in pts]
+        if n == 2:
+            return [tuple(map(float, p)) for p in pts]
+
+        steps = max(2, int(steps))
+        eps = 1.0e-9
+        out = []
+
+        def _tj(ti, pa, pb):
+            dist = float(_np.linalg.norm(pb - pa))
+            return ti + max(dist ** 0.5, 1.0e-6)
+
+        def _blend(pa, pb, ta, tb, t):
+            den = tb - ta
+            if abs(den) <= eps:
+                return pa.copy()
+            return ((tb - t) / den) * pa + ((t - ta) / den) * pb
+
+        for i in range(n - 1):
+            p1 = pts[i]
+            p2 = pts[i + 1]
+            p0 = pts[i - 1] if i > 0 else (2.0 * p1 - p2)
+            p3 = pts[i + 2] if (i + 2) < n else (2.0 * p2 - p1)
+
+            t0 = 0.0
+            t1 = _tj(t0, p0, p1)
+            t2 = _tj(t1, p1, p2)
+            t3 = _tj(t2, p2, p3)
+
+            taus = _np.linspace(t1, t2, steps, endpoint=False)
+            chord = p2 - p1
+            chord2 = float(_np.dot(chord, chord))
+
+            for t in taus:
+                a1 = _blend(p0, p1, t0, t1, t)
+                a2 = _blend(p1, p2, t1, t2, t)
+                a3 = _blend(p2, p3, t2, t3, t)
+                b1 = _blend(a1, a2, t0, t2, t)
+                b2 = _blend(a2, a3, t1, t3, t)
+                q = _blend(b1, b2, t1, t2, t)
+
+                if chord2 > eps:
+                    progress = float(_np.dot(q - p1, chord) / chord2)
+                    tau01 = float((t - t1) / max(t2 - t1, eps))
+                    if (not _np.isfinite(progress)) or progress < -0.02 or progress > 1.02:
+                        q = p1 + tau01 * chord
+
+                if _np.all(_np.isfinite(q)):
+                    out.append((float(q[0]), float(q[1])))
+
+        out.append((float(pts[-1, 0]), float(pts[-1, 1])))
+        return out
+
+    def _capture_main_freehand_sample(self, dx, dy, min_pixel_step=2.0):
+        """Capture MAIN freehand path at native MouseMove cadence, without rendering."""
+        if not getattr(self, "is_drawing_freehand", False):
+            return False
+        if not self._is_main_view():
+            return False
+
+        try:
+            dx = float(dx)
+            dy = float(dy)
+            last = getattr(self, "_last_freehand_display_pos", None)
+            if last is not None:
+                ddx = dx - float(last[0])
+                ddy = dy - float(last[1])
+                if (ddx * ddx + ddy * ddy) < float(min_pixel_step) ** 2:
+                    return False
+
+            pt = self._display_to_world_fast(dx, dy)
+            u, v = self._get_view_coordinates(pt)
+            if not (np.isfinite(float(u)) and np.isfinite(float(v))):
+                return False
+
+            self.drawing_points.append((float(u), float(v)))
+            self._last_freehand_display_pos = (dx, dy)
+            self._freehand_native_samples = int(getattr(self, "_freehand_native_samples", 0)) + 1
+            return True
+        except Exception:
+            return False
+
     def _draw_freehand_preview(self, live_point=None):
         """
         ✅ PERFORMANCE FIX: Reuse VTK actor — NO RemoveActor/AddActor per frame.
@@ -13047,6 +13240,19 @@ class ClassificationInteractor:
                             self._line_press_max_move_px = _d
                     except Exception:
                         pass
+
+            # MAIN FREEHAND ONLY: capture geometry before the generic preview
+            # throttle. Rendering may stay at 30 FPS on huge point clouds, but
+            # the hand path itself is sampled at native mouse-event cadence.
+            try:
+                _pre_tool = getattr(getattr(self, "app", None), "active_classify_tool", None)
+                if (_pre_tool == "freehand"
+                        and getattr(self, "is_drawing_freehand", False)
+                        and self._is_main_view()):
+                    _fh_dx, _fh_dy = self._get_display_point()
+                    self._capture_main_freehand_sample(_fh_dx, _fh_dy, min_pixel_step=2.0)
+            except Exception:
+                pass
 
             current_time = time.time()
 
@@ -13678,15 +13884,16 @@ class ClassificationInteractor:
             elif tool == "freehand" and self.is_drawing_freehand:
                 u, v = self._get_view_coordinates(P2)
 
-                if len(self.drawing_points) == 0:
+                if self._is_main_view():
+                    # Main path already sampled above before preview throttling.
+                    pass
+                elif len(self.drawing_points) == 0:
                     self.drawing_points.append((u, v))
                     self._last_freehand_display_pos = (dx, dy)
                 else:
-                    # ✅ FIX: Pixel-based threshold for smooth drawing at all zoom levels
+                    # Preserve established section/cut sampling behaviour.
                     last_disp = getattr(self, "_last_freehand_display_pos", (0.0, 0.0))
                     pixel_dist = np.sqrt((dx - last_disp[0])**2 + (dy - last_disp[1])**2)
-                    
-                    # Add point if mouse moved > 3 pixels
                     if pixel_dist > 3.0:
                         self.drawing_points.append((u, v))
                         self._last_freehand_display_pos = (dx, dy)
@@ -13839,6 +14046,8 @@ class ClassificationInteractor:
 
         self._check_tool_changed()
         tool = getattr(self.app, "active_classify_tool", None)
+        if tool is not None:
+            self._cancel_incomplete_classification_gestures_in_other_views()
         if tool in ("above_line", "below_line", "parallel_line"):
             self.app._classification_preview_active = True
         if getattr(self, "click_to_finalize", False) and tool in ("above_line", "below_line", "parallel_line"):
@@ -14029,6 +14238,7 @@ class ClassificationInteractor:
         if tool == "freehand":
             self.is_drawing_freehand = True
             self.drawing_points = []
+            self._freehand_native_samples = 0
             if is_cut_interaction:
                 self.drawing_points_display_cut = [(x, y)]
             try:
@@ -14785,7 +14995,19 @@ class ClassificationInteractor:
                     self._classify_circle_main(center, radius, to_class)
 
                 elif tool == "freehand" and len(self.drawing_points) > 2:
-                    _smooth_fh = self._catmull_rom_smooth(self.drawing_points, steps=10)
+                    # Same corner-safe curve as MAIN preview so geometry matches.
+                    _smooth_fh = self._centripetal_catmull_rom_smooth(
+                        self.drawing_points, steps=4
+                    )
+                    if getattr(self.app, "_debug_perf", False):
+                        print(
+                            "FREEHAND_MAIN_PROFILE "
+                            f"native_samples={getattr(self, '_freehand_native_samples', 0)} "
+                            f"control_points={len(self.drawing_points)} "
+                            f"curve_points={len(_smooth_fh)} "
+                            f"preview_interval_ms={self._preview_interval_sec() * 1000.0:.1f} "
+                            "smoother=centripetal corner_guard=on"
+                        )
 
                     # Clear preview BEFORE classification for Surface mode safety.
                     self._clear_all_previews()
@@ -15875,8 +16097,12 @@ class ClassificationInteractor:
         if len(all_pts) < 2:
             return
 
-        # ── SMOOTH: Catmull-Rom spline → true curves, not straight segments ──
-        all_pts = self._catmull_rom_smooth(all_pts, steps=10)
+        # MAIN: dense native-event samples + corner-safe centripetal spline.
+        # SECTION/CUT: preserve the established smoother unchanged.
+        if self._is_main_view():
+            all_pts = self._centripetal_catmull_rom_smooth(all_pts, steps=4)
+        else:
+            all_pts = self._catmull_rom_smooth(all_pts, steps=10)
 
         # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
         if not hasattr(self, "_freehand_pts") or self.freehand_actor is None:
@@ -19255,4 +19481,3 @@ class ClassificationInteractor:
 
         # Emit signal — triggers cross-section refresh via _on_classification_finished
         self.app.classification_finished.emit(mask)
-
