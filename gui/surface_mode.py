@@ -19,7 +19,7 @@ from scipy.spatial import Delaunay, cKDTree
 
 try:
     from PySide6.QtWidgets import QApplication, QProgressDialog, QWidget
-    from PySide6.QtCore import QObject, QEvent, QEventLoop, Qt, QThread, Signal
+    from PySide6.QtCore import QObject, QEvent, QEventLoop, Qt, QThread, Signal, Slot
 except Exception:
     QApplication = None
     QProgressDialog = None
@@ -30,6 +30,7 @@ except Exception:
     Qt = None
     QThread = None
     Signal = None
+    Slot = None
 
 
 SURFACE_ACTOR_NAME = "surface_mesh"
@@ -49,10 +50,11 @@ except Exception:
     _SURFACE_HAS_TRIANGLE = False
 
 try:
-    from numba import njit
+    from numba import njit, prange
     _SURFACE_HAS_NUMBA = True
 except Exception:
     njit = None
+    prange = range
     _SURFACE_HAS_NUMBA = False
 
 
@@ -216,6 +218,139 @@ def _select_surface_representatives(
         "grid_count": int(count),
     }
 
+
+
+if _SURFACE_HAS_NUMBA:
+    @njit(cache=True, parallel=True)
+    def _surface_edge_keep_mask_numba(faces, xy, max_edge_sq):
+        """Exact long-edge predicate without allocating three Nx2 edge arrays."""
+        n = faces.shape[0]
+        keep = np.empty(n, dtype=np.bool_)
+        for i in prange(n):
+            i0 = int(faces[i, 0])
+            i1 = int(faces[i, 1])
+            i2 = int(faces[i, 2])
+
+            dx01 = xy[i0, 0] - xy[i1, 0]
+            dy01 = xy[i0, 1] - xy[i1, 1]
+            dx12 = xy[i1, 0] - xy[i2, 0]
+            dy12 = xy[i1, 1] - xy[i2, 1]
+            dx20 = xy[i2, 0] - xy[i0, 0]
+            dy20 = xy[i2, 1] - xy[i0, 1]
+
+            e01 = dx01 * dx01 + dy01 * dy01
+            e12 = dx12 * dx12 + dy12 * dy12
+            e20 = dx20 * dx20 + dy20 * dy20
+            keep[i] = (
+                e01 <= max_edge_sq
+                and e12 <= max_edge_sq
+                and e20 <= max_edge_sq
+            )
+        return keep
+
+
+    @njit(cache=True, parallel=True)
+    def _surface_face_colors_numba(
+        points,
+        faces,
+        light_x,
+        light_y,
+        light_z,
+        ambient,
+        z_lo,
+        z_hi,
+        stops,
+        ramp_colors,
+    ):
+        """Compute the exact elevation-ramp + Lambert color in one streaming pass."""
+        n = faces.shape[0]
+        out = np.empty((n, 3), dtype=np.uint8)
+        denom_z = z_hi - z_lo
+        nstops = stops.shape[0]
+
+        for i in prange(n):
+            ia = int(faces[i, 0])
+            ib = int(faces[i, 1])
+            ic = int(faces[i, 2])
+
+            ax = points[ia, 0]
+            ay = points[ia, 1]
+            az = points[ia, 2]
+            bx = points[ib, 0]
+            by = points[ib, 1]
+            bz = points[ib, 2]
+            cx = points[ic, 0]
+            cy = points[ic, 1]
+            cz = points[ic, 2]
+
+            v1x = bx - ax
+            v1y = by - ay
+            v1z = bz - az
+            v2x = cx - ax
+            v2y = cy - ay
+            v2z = cz - az
+
+            nx = v1y * v2z - v1z * v2y
+            ny = v1z * v2x - v1x * v2z
+            nz = v1x * v2y - v1y * v2x
+            nn = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-12
+            dot = (nx * light_x + ny * light_y + nz * light_z) / nn
+            if dot < 0.0:
+                dot = 0.0
+            elif dot > 1.0:
+                dot = 1.0
+            shade = ambient + (1.0 - ambient) * dot
+
+            zn = ((az + bz + cz) / 3.0 - z_lo) / denom_z
+            if zn < 0.0:
+                zn = 0.0
+            elif zn > 1.0:
+                zn = 1.0
+
+            # np.interp-equivalent linear interpolation over a tiny ramp.
+            if zn <= stops[0]:
+                r = ramp_colors[0, 0]
+                g = ramp_colors[0, 1]
+                b = ramp_colors[0, 2]
+            elif zn >= stops[nstops - 1]:
+                r = ramp_colors[nstops - 1, 0]
+                g = ramp_colors[nstops - 1, 1]
+                b = ramp_colors[nstops - 1, 2]
+            else:
+                hi = 1
+                while hi < nstops and zn > stops[hi]:
+                    hi += 1
+                lo = hi - 1
+                span = stops[hi] - stops[lo]
+                if span <= 1e-15:
+                    t = 0.0
+                else:
+                    t = (zn - stops[lo]) / span
+                r = ramp_colors[lo, 0] + (ramp_colors[hi, 0] - ramp_colors[lo, 0]) * t
+                g = ramp_colors[lo, 1] + (ramp_colors[hi, 1] - ramp_colors[lo, 1]) * t
+                b = ramp_colors[lo, 2] + (ramp_colors[hi, 2] - ramp_colors[lo, 2]) * t
+
+            r *= shade
+            g *= shade
+            b *= shade
+            if r < 0.0:
+                r = 0.0
+            elif r > 255.0:
+                r = 255.0
+            if g < 0.0:
+                g = 0.0
+            elif g > 255.0:
+                g = 255.0
+            if b < 0.0:
+                b = 0.0
+            elif b > 255.0:
+                b = 255.0
+
+            out[i, 0] = np.uint8(r)
+            out[i, 1] = np.uint8(g)
+            out[i, 2] = np.uint8(b)
+
+        return out
 
 def _triangulate_surface_xy(xy: np.ndarray):
     xy = np.asarray(xy, dtype=np.float64)
@@ -407,6 +542,31 @@ else:
     _SurfaceComputationWorker = None
 
 
+if QObject is not object and Slot is not None:
+    class _SurfaceAsyncResultRelay(QObject):
+        """Deliver worker results on the GUI thread before touching VTK/Qt."""
+
+        def __init__(self, on_finish, on_error, on_progress, parent=None):
+            super().__init__(parent)
+            self._on_finish = on_finish
+            self._on_error = on_error
+            self._on_progress = on_progress
+
+        @Slot(dict)
+        def handle_finished(self, result):
+            self._on_finish(result)
+
+        @Slot(str)
+        def handle_error(self, error_text):
+            self._on_error(error_text)
+
+        @Slot(int, str)
+        def handle_progress(self, value, message):
+            self._on_progress(value, message)
+else:
+    _SurfaceAsyncResultRelay = None
+
+
 def _surface_process_progress_events():
     """Keep progress painting alive without accepting user input."""
     try:
@@ -447,22 +607,28 @@ def _compute_surface_face_colors(
     z_hi: float,
     ramp=None,
 ) -> np.ndarray:
+    """Compute Surface cell colors without multi-GB temporary triangle arrays.
+
+    The mathematical result is unchanged: elevation ramp * Lambert shade.
+    Numba is used when available; otherwise the same NumPy math is executed in
+    bounded chunks so Slow/all-point Surface does not allocate ``points[faces]``
+    for tens of millions of triangles at once.
+    """
     if faces is None or len(faces) == 0:
         return np.zeros((0, 3), dtype=np.uint8)
 
-    tri = points[faces]
-    v1 = tri[:, 1] - tri[:, 0]
-    v2 = tri[:, 2] - tri[:, 0]
-    normals = np.cross(v1, v2)
-    normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12
+    pts = np.asarray(points, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int32)
 
     az = np.deg2rad(float(azimuth))
     el = np.deg2rad(float(angle))
-    light = np.array([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)], dtype=np.float64)
+    light = np.array(
+        [np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)],
+        dtype=np.float64,
+    )
     light /= np.linalg.norm(light) + 1e-12
-    shade = float(ambient) + (1.0 - float(ambient)) * np.clip(normals @ light, 0.0, 1.0)
 
-    z = points[:, 2]
+    z = pts[:, 2]
     lo = float(z_lo)
     hi = float(z_hi)
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -473,33 +639,82 @@ def _compute_surface_face_colors(
     if hi <= lo:
         hi = lo + 1.0
 
-    z_face = np.mean(z[faces], axis=1)
-    norm = np.clip((z_face - lo) / (hi - lo), 0.0, 1.0)
-
+    valid_ramp = None
     if ramp:
         try:
-            stops = np.array([float(pos) for pos, _ in ramp], dtype=np.float64)
-            colors = np.array([list(color[:3]) for _, color in ramp], dtype=np.float64)
-            if len(stops) >= 2:
-                rgb = np.column_stack([
-                    np.interp(norm, stops, colors[:, 0]),
-                    np.interp(norm, stops, colors[:, 1]),
-                    np.interp(norm, stops, colors[:, 2]),
-                ])
-            else:
-                raise ValueError("surface ramp needs at least two stops")
+            stops = np.asarray([float(pos) for pos, _ in ramp], dtype=np.float64)
+            colors = np.asarray([list(color[:3]) for _, color in ramp], dtype=np.float64)
+            if len(stops) >= 2 and len(colors) == len(stops):
+                valid_ramp = (stops, colors)
         except Exception:
-            ramp = None
+            valid_ramp = None
 
-    if not ramp:
+    if valid_ramp is None:
         stops = np.array([0.00, 0.25, 0.50, 0.75, 1.00], dtype=np.float64)
-        r = np.interp(norm, stops, np.array([0, 0, 0, 255, 255], dtype=np.float64))
-        g = np.interp(norm, stops, np.array([0, 200, 255, 255, 80], dtype=np.float64))
-        b = np.interp(norm, stops, np.array([255, 255, 0, 0, 0], dtype=np.float64))
-        rgb = np.column_stack([r, g, b])
+        colors = np.array(
+            [
+                [0, 0, 255],
+                [0, 200, 255],
+                [0, 255, 0],
+                [255, 255, 0],
+                [255, 80, 0],
+            ],
+            dtype=np.float64,
+        )
+    else:
+        stops, colors = valid_ramp
 
-    rgb *= shade[:, None]
-    return np.clip(rgb, 0, 255).astype(np.uint8)
+    # Fast exact streaming kernel. This avoids ~5-7 GB of temporary arrays on
+    # a 60-70M-face Slow Surface.
+    if _SURFACE_HAS_NUMBA:
+        try:
+            return _surface_face_colors_numba(
+                np.ascontiguousarray(pts),
+                np.ascontiguousarray(f),
+                float(light[0]),
+                float(light[1]),
+                float(light[2]),
+                float(ambient),
+                float(lo),
+                float(hi),
+                np.ascontiguousarray(stops),
+                np.ascontiguousarray(colors),
+            )
+        except Exception as exc:
+            print(f"SURFACE_ACCEL face_colors=fallback reason={type(exc).__name__}: {exc}")
+
+    # Memory-bounded NumPy fallback. Keep the chunk modest because each chunk
+    # still materializes three triangle point arrays and cross-product vectors.
+    chunk = max(50_000, int(os.environ.get("NAKSHA_SURFACE_COLOR_CHUNK", "750000")))
+    out = np.empty((len(f), 3), dtype=np.uint8)
+    ambient_f = float(ambient)
+    z_span = float(hi - lo)
+
+    for begin in range(0, len(f), chunk):
+        finish = min(begin + chunk, len(f))
+        fc = f[begin:finish]
+        p0 = pts[fc[:, 0]]
+        p1 = pts[fc[:, 1]]
+        p2 = pts[fc[:, 2]]
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normals = np.cross(v1, v2)
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12
+        shade = ambient_f + (1.0 - ambient_f) * np.clip(normals @ light, 0.0, 1.0)
+
+        z_face = (p0[:, 2] + p1[:, 2] + p2[:, 2]) / 3.0
+        norm = np.clip((z_face - lo) / z_span, 0.0, 1.0)
+        rgb = np.column_stack(
+            [
+                np.interp(norm, stops, colors[:, 0]),
+                np.interp(norm, stops, colors[:, 1]),
+                np.interp(norm, stops, colors[:, 2]),
+            ]
+        )
+        rgb *= shade[:, None]
+        out[begin:finish] = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    return out
 
 
 def _compute_surface_geometry_backend(
@@ -551,14 +766,20 @@ def _compute_surface_geometry_backend(
         return {"empty": True, "profile_timings": timings}
     _checkpoint("finite_filter")
 
+    # Only XY needs normalization for representative selection/triangulation.
+    # The previous Slow path materialized two separate Nx3 translated arrays
+    # (``local`` and ``local_pts``) before making the Nx2 triangulation buffer.
+    # At 34M points that was ~2.2 GB of avoidable memory traffic.  Preserve the
+    # exact same local XY coordinates while keeping global XYZ only once.
     offset = xyz.min(axis=0)
-    local = xyz - offset
-    xy_range = np.ptp(local[:, :2], axis=0)
+    max_xyz = xyz.max(axis=0)
+    xy_range = max_xyz[:2] - offset[:2]
     area = max(float(xy_range[0] * xy_range[1]), 1.0)
-    spacing = float(np.sqrt(area / max(len(local), 1)))
+    spacing = float(np.sqrt(area / max(len(xyz), 1)))
+    local_xy = np.ascontiguousarray(xyz[:, :2] - offset[:2], dtype=np.float64)
     _checkpoint("normalize_extent")
 
-    target_max = _surface_quality_target(quality_mode, len(local))
+    target_max = _surface_quality_target(quality_mode, len(xyz))
     user_precision = max(float(precision or 0.0), 0.0)
 
     _emit(35, f"Selecting {quality_mode.title()} Surface representatives...")
@@ -568,20 +789,22 @@ def _compute_surface_geometry_backend(
         selected_precision = 0.0
         rep_meta = {
             "strategy": "all_points",
-            "selected": int(len(local)),
+            "selected": int(len(xyz)),
             "target": int(target_max),
         }
-    elif len(local) <= target_max:
-        unique_local_idx = np.arange(len(local), dtype=np.int64)
+    elif len(xyz) <= target_max:
+        unique_local_idx = np.arange(len(xyz), dtype=np.int64)
         selected_precision = 0.0
         rep_meta = {
             "strategy": "under_target",
-            "selected": int(len(local)),
+            "selected": int(len(xyz)),
             "target": int(target_max),
         }
     else:
+        # _select_surface_representatives only reads columns 0/1, so an Nx2
+        # local array is behavior-identical to the previous Nx3 local array.
         unique_local_idx, selected_precision, rep_meta = _select_surface_representatives(
-            local, target_max, user_precision
+            local_xy, target_max, user_precision
         )
     _checkpoint("representative_select")
 
@@ -591,12 +814,13 @@ def _compute_surface_geometry_backend(
     if unique_local_idx is None or len(unique_local_idx) == len(xyz):
         # Avoid a second full copy in Slow/all-points mode.
         pts = xyz
+        xy = local_xy
         unique_global_idx = global_idx.astype(np.int64, copy=False)
     else:
         pts = xyz[unique_local_idx].copy()
+        xy = np.ascontiguousarray(local_xy[unique_local_idx], dtype=np.float64)
         unique_global_idx = global_idx[unique_local_idx].astype(np.int64, copy=False)
-    local_pts = pts - offset
-    xy = np.ascontiguousarray(local_pts[:, :2], dtype=np.float64)
+        del local_xy
     _checkpoint("representative_materialize")
 
     _emit(55, f"Triangulating Surface mesh ({quality_mode})...")
@@ -861,130 +1085,39 @@ def _surface_support_entry(code: int, entry: dict) -> bool:
 
 
 def surface_visible_mask(app) -> np.ndarray:
+    """Return the points used by Elevation Surface mode.
+
+    Surface is intentionally classification-independent. LAS classification is
+    metadata only for this display mode: reclassifying a point must never add
+    or remove it from the elevation mesh and must never trigger triangulation.
+
+    The existing flight-line filter is retained because it is an explicit data
+    visibility filter rather than a LAS-class filter.
+    """
     xyz = app.data.get("xyz") if getattr(app, "data", None) else None
     if xyz is None:
         return np.zeros(0, dtype=bool)
-
-    classes = app.data.get("classification")
-    from gui.flight_line_filter import flight_line_visibility_mask
-    line_mask = flight_line_visibility_mask(app, len(xyz))
-    if classes is None:
-        return line_mask
-
-    classes_arr = np.asarray(classes)
-    palette = surface_palette(app)
-    if not palette:
-        # Preserve the default Surface rule even without a palette.
-        if classes_arr.dtype == np.uint8:
-            lut = np.ones(256, dtype=bool)
-            lut[7] = False
-            lut[18] = False
-            return lut[classes_arr] & line_mask
-        return (~np.isin(classes_arr, np.array([7, 18], dtype=classes_arr.dtype))) & line_mask
-
-    # LAS classification is uint8 in normal loads. A LUT turns the old
-    # "one full-array comparison per visible class" into one O(N) gather.
-    if classes_arr.dtype == np.uint8:
-        lut = np.ones(256, dtype=bool)
-        lut[7] = False
-        lut[18] = False
-        for code, entry in palette.items():
-            try:
-                code_int = int(code)
-                if 0 <= code_int < 256:
-                    lut[code_int] = _surface_support_entry(code_int, entry)
-            except Exception:
-                continue
-        return lut[classes_arr] & line_mask
-
-    supported = []
-    present = np.unique(classes_arr)
-    for code in present:
-        code_int = int(code)
-        entry = palette.get(code_int, {"show": True})
-        if _surface_support_entry(code_int, entry):
-            supported.append(code_int)
-    if not supported:
-        return np.zeros(len(xyz), dtype=bool)
-    return np.isin(classes_arr, np.asarray(supported, dtype=classes_arr.dtype)) & line_mask
+    try:
+        from gui.flight_line_filter import flight_line_visibility_mask
+        line_mask = flight_line_visibility_mask(app, len(xyz))
+        if isinstance(line_mask, np.ndarray) and line_mask.dtype == bool and len(line_mask) == len(xyz):
+            return line_mask
+    except Exception:
+        pass
+    return np.ones(len(xyz), dtype=bool)
 
 def _class_is_surface_support(app, code: int) -> bool:
-    """
-    True if this class currently participates in Surface mesh generation.
-    Used to avoid unnecessary Surface rebuilds after classification.
-    """
-    try:
-        palette = surface_palette(app)
-        entry = palette.get(int(code), {"show": True})
-        return _surface_support_entry(int(code), entry)
-    except Exception:
-        return True
-
+    """Every LAS class participates in the elevation Surface."""
+    return True
 
 def surface_class_change_needs_rebuild(app, old_classes, new_class) -> bool:
-    """
-    Rebuild Surface only when classification changes Surface membership.
-    """
-    try:
-        old_classes = np.asarray(old_classes)
-        if old_classes.size == 0:
-            return False
-
-        new_support = _class_is_surface_support(app, int(new_class))
-
-        for old_code in np.unique(old_classes):
-            old_support = _class_is_surface_support(app, int(old_code))
-            if old_support != new_support:
-                return True
-
-        return False
-    except Exception:
-        return True
-
-
+    """Classification never changes Elevation Surface topology."""
+    return False
 
 def _surface_support_flags_for_values(app, values: np.ndarray) -> np.ndarray:
-    """Return Surface-membership flags for a small classification value array.
-
-    This is intentionally O(K), where K is the number of edited points.  It
-    must never scan the complete point cloud during a classification refresh.
-    """
+    """Compatibility helper: all class values remain Surface support."""
     arr = np.asarray(values).ravel()
-    if arr.size == 0:
-        return np.zeros(0, dtype=bool)
-
-    palette = surface_palette(app)
-
-    # Normal LAS classification storage is uint8.  A tiny LUT keeps this path
-    # essentially free even for tens of thousands of edited points.
-    if np.issubdtype(arr.dtype, np.integer):
-        try:
-            amin = int(arr.min())
-            amax = int(arr.max())
-        except Exception:
-            amin, amax = -1, 256
-        if amin >= 0 and amax < 256:
-            lut = np.ones(256, dtype=bool)
-            lut[7] = False
-            lut[18] = False
-            if palette:
-                for code, entry in palette.items():
-                    try:
-                        code_int = int(code)
-                        if 0 <= code_int < 256:
-                            lut[code_int] = _surface_support_entry(code_int, entry)
-                    except Exception:
-                        continue
-            return lut[arr.astype(np.uint8, copy=False)]
-
-    # Non-standard classification dtype fallback.  Still O(K), never O(N).
-    out = np.empty(arr.size, dtype=bool)
-    for code in np.unique(arr):
-        code_int = int(code)
-        entry = palette.get(code_int, {"show": True}) if palette else {"show": True}
-        out[arr == code] = _surface_support_entry(code_int, entry)
-    return out
-
+    return np.ones(arr.size, dtype=bool)
 
 def _surface_indices_from_step(step, total_points: int):
     """Return the point indices represented by an undo/redo step."""
@@ -1119,6 +1252,7 @@ def _surface_resolve_classification_transition(app, changed_mask, operation="cla
             "old_classes": np.empty(0, dtype=np.asarray(classes).dtype),
             "new_classes": np.empty(0, dtype=np.asarray(classes).dtype),
             "source": "empty",
+            "transaction_token": None,
         }
 
     # Explicit/pending transaction is primarily for signal-based callers that
@@ -1137,6 +1271,7 @@ def _surface_resolve_classification_transition(app, changed_mask, operation="cla
                             "old_classes": np.asarray(oldv),
                             "new_classes": np.asarray(newv),
                             "source": "pending",
+                            "transaction_token": ("pending", id(pending)),
                         }
                 except Exception:
                     pass
@@ -1172,6 +1307,9 @@ def _surface_resolve_classification_transition(app, changed_mask, operation="cla
         "old_classes": np.asarray(oldv),
         "new_classes": np.asarray(newv),
         "source": "redo_stack" if reverse else "undo_stack",
+        "transaction_token": (
+            "step", id(step), "reverse" if reverse else "forward"
+        ),
     }
 
 
@@ -1196,82 +1334,16 @@ def _surface_transition_membership_summary(app, transition):
 
 
 def _retag_surface_cache_after_classification_no_topology(app) -> bool:
-    """Retag the resident Surface cache after a metadata-only class edit.
-
-    Surface colors and geometry depend on XYZ/support membership, not the class
-    code itself.  When support membership is unchanged the existing mesh is
-    still exact.  Re-keying the cache prevents the next Surface mode switch from
-    rebuilding only because classification_revision advanced.
-    """
+    """Classification is absent from the Surface cache signature."""
     try:
-        old_sig = getattr(app, "_surface_resident_signature", None)
-        revision = int(getattr(app, "classification_revision", 0) or 0)
-        cache_revision = int(getattr(app, "_surface_cache_revision", 0) or 0)
-
-        # O(1) signature update: preserve the geometry/filter portion that made
-        # this mesh valid and advance only revision fields.
-        if isinstance(old_sig, tuple) and len(old_sig) >= 6:
-            new_sig = tuple(old_sig[:4]) + (revision, cache_revision) + tuple(old_sig[6:])
-        else:
-            # Rare compatibility fallback.  Avoid this in the normal hot path.
-            new_sig = surface_mesh_cache_signature(app)
-
-        store = _surface_cache_store_for_app(app)
-        entry = store.pop(old_sig, None) if old_sig is not None else None
-        if entry is None:
-            legacy = getattr(app, "_surface_mesh_cache", None)
-            if isinstance(legacy, dict):
-                entry = legacy
-
-        if isinstance(entry, dict):
-            entry["signature"] = new_sig
-            store[new_sig] = entry
-            store.move_to_end(new_sig)
-            while len(store) > _SURFACE_CACHE_MAX_ENTRIES:
-                store.popitem(last=False)
-            app._surface_mesh_cache = entry
-
-        app._surface_resident_signature = new_sig
-        app._surface_shortcut_signature = new_sig
-        app._surface_mesh_cache_dirty = False
-        app._surface_filter_dirty = False
         app._surface_needs_rebuild_after_classification = False
-        try:
-            _remember_surface_signature(app)
-        except Exception:
-            pass
         return True
-    except Exception as exc:
-        print(f"⚠️ Surface cache retag skipped: {exc}")
+    except Exception:
         return False
 
-
 def surface_visible_class_signature(app):
-    """Return the Surface-support policy signature without scanning point data.
-
-    Surface geometry depends on whether a class participates in the Surface,
-    not on whether that class happens to be present in the current LAS array.
-    Using the palette/support policy here removes an expensive ``np.unique``
-    over millions of classifications from cache checks and live refreshes.
-    """
-    try:
-        palette = surface_palette(app)
-        if not palette:
-            return ("DEFAULT_SURFACE_SUPPORT", "exclude", 7, 18)
-
-        supported = []
-        for code, entry in palette.items():
-            try:
-                code_int = int(code)
-            except Exception:
-                continue
-            if _surface_support_entry(code_int, entry):
-                supported.append(code_int)
-
-        return tuple(sorted(set(supported)))
-    except Exception:
-        return ("SURFACE_SIGNATURE_ERROR",)
-
+    """Classification-independent signature for Elevation Surface mode."""
+    return ("ELEVATION_SURFACE_ALL_CLASSES",)
 
 def _remember_surface_signature(app) -> None:
     """
@@ -1291,23 +1363,33 @@ def _remember_surface_signature(app) -> None:
 
 
 def mark_surface_filter_dirty(app, reason="classification/undo"):
-    """
-    Force next Surface call to rebuild, even if Surface is already active.
+    """Invalidate Surface only for real geometry/settings/filter changes.
 
-    Also invalidates Surface mesh cache safely.
-    This is required after classification, undo, redo, and Display Mode
-    class-filter changes.
+    Classification, undo/redo, class visibility and palette edits do not affect
+    the elevation Surface and therefore do not dirty its mesh/cache.
     """
+    reason_lc = str(reason or "").strip().lower()
+    class_only_tokens = (
+        "classification", "classify", "undo", "redo",
+        "class_filter", "class filter", "class_visibility", "class visibility",
+        "palette", "display class",
+    )
+    if any(token in reason_lc for token in class_only_tokens):
+        try:
+            app._surface_needs_rebuild_after_classification = False
+        except Exception:
+            pass
+        print(f"SURFACE_CLASSIFICATION_INDEPENDENT dirty_ignored=1 reason={reason_lc or 'classification'}")
+        return
+
     try:
         app._surface_visible_class_signature = None
-        app._surface_needs_rebuild_after_classification = True
         app._surface_filter_dirty = True
         app._surface_mesh_cache_dirty = True
         app._surface_dirty_reason = reason
         app._surface_cache_revision = int(getattr(app, "_surface_cache_revision", 0) or 0) + 1
     except Exception:
         pass
-
 
 def detach_surface_before_non_surface_mode(app, requested_mode=None):
     requested = str(requested_mode or "").lower().strip()
@@ -1467,6 +1549,7 @@ def detach_surface_before_non_surface_mode(app, requested_mode=None):
         app._surface_faces = None
         app._surface_global_to_unique = None
         app._surface_unique_global_indices = None
+        app._surface_vtk_buffers = None
 
         # Reset stale Surface ownership state when leaving/clearing Surface.
         target_mode = str(requested_mode or "rgb").lower().strip()
@@ -1902,15 +1985,7 @@ def _surface_data_signature(app) -> tuple:
 
 
 def surface_mesh_cache_signature(app) -> tuple:
-    """
-    Full cache signature.
-
-    Cache is valid only for:
-    - same loaded data
-    - same Surface visible classes
-    - same Surface parameters
-    - same Surface revision
-    """
+    """Surface cache signature, intentionally excluding classification revision."""
     try:
         try:
             preset_sig = current_surface_preset_signature(app)
@@ -1923,24 +1998,20 @@ def surface_mesh_cache_signature(app) -> tuple:
                 round(float(getattr(app, "surface_ambient", getattr(app, "shade_ambient", 0.22)) or 0.22), 6),
                 normalize_surface_quality(getattr(app, "surface_quality", "normal")),
             )
-
         ramp = getattr(app, "surface_color_ramp", None) or getattr(app, "elevation_color_ramp", None) or []
         ramp_sig = tuple(
             (round(float(pos), 6), tuple(int(c) for c in (color[:3] if isinstance(color, (list, tuple)) else color)))
             for pos, color in ramp
         )
-
         return (
             _surface_data_signature(app),
             preset_sig,
             normalize_surface_quality(getattr(app, "surface_quality", "normal")),
             ramp_sig,
-            int(getattr(app, "classification_revision", 0) or 0),
             int(getattr(app, "_surface_cache_revision", 0) or 0),
         )
     except Exception:
         return ("SURFACE_CACHE_SIGNATURE_ERROR",)
-
 
 def _surface_cache_store_for_app(app):
     store = getattr(app, "_surface_mesh_cache_store", None)
@@ -1971,11 +2042,23 @@ def _store_surface_mesh_cache(app) -> bool:
             "points": points,
             "faces": faces,
             "unique_global_indices": getattr(app, "_surface_unique_global_indices", None),
-            "global_to_unique": getattr(app, "_surface_global_to_unique", None),
+            # Kept for compatibility only. The previous Slow-mode Python dict
+            # contained one entry per Surface vertex (tens of millions of
+            # Python objects) and was not consumed anywhere in the project.
+            "global_to_unique": None,
+            "vtk_buffers": getattr(app, "_surface_vtk_buffers", None),
             "transient": transient_slow,
         }
 
         store = _surface_cache_store_for_app(app)
+        if transient_slow:
+            # Never retain two 30M+ Slow meshes after consecutive
+            # classifications.  The previous LRU limit of 2 was harmless for
+            # Fast/Normal meshes but could pin several extra GB because a Slow
+            # entry owns the old VTK mesh + NumPy connectivity buffers.
+            for old_key, old_entry in list(store.items()):
+                if isinstance(old_entry, dict) and old_entry.get("transient", False):
+                    store.pop(old_key, None)
         store[signature] = entry
         store.move_to_end(signature)
         while len(store) > _SURFACE_CACHE_MAX_ENTRIES:
@@ -2086,7 +2169,8 @@ def restore_cached_surface_mesh(app, signature=None) -> bool:
         app._surface_points = cache.get("points")
         app._surface_faces = cache.get("faces")
         app._surface_unique_global_indices = cache.get("unique_global_indices")
-        app._surface_global_to_unique = cache.get("global_to_unique")
+        app._surface_global_to_unique = None
+        app._surface_vtk_buffers = cache.get("vtk_buffers")
         app._surface_resident_signature = expected
         app.display_mode = "surface"
         app.current_display_mode = "surface"
@@ -2123,18 +2207,45 @@ def _grid_dedup_indices(points: np.ndarray, precision: float) -> np.ndarray:
 
 
 def _filter_long_edges(faces: np.ndarray, xy: np.ndarray, max_edge: float) -> np.ndarray:
+    """Filter triangles by absolute edge length without giant edge temporaries."""
     if faces is None or len(faces) == 0:
         return np.empty((0, 3), dtype=np.int32)
     if max_edge <= 0:
-        return faces.astype(np.int32, copy=False)
-    p0 = xy[faces[:, 0]]
-    p1 = xy[faces[:, 1]]
-    p2 = xy[faces[:, 2]]
-    e01 = np.linalg.norm(p0 - p1, axis=1)
-    e12 = np.linalg.norm(p1 - p2, axis=1)
-    e20 = np.linalg.norm(p2 - p0, axis=1)
-    keep = (e01 <= max_edge) & (e12 <= max_edge) & (e20 <= max_edge)
-    return faces[keep].astype(np.int32, copy=False)
+        return np.asarray(faces, dtype=np.int32)
+
+    f = np.asarray(faces, dtype=np.int32)
+    xy_arr = np.asarray(xy, dtype=np.float64)
+    max_edge_sq = float(max_edge) * float(max_edge)
+
+    if _SURFACE_HAS_NUMBA:
+        try:
+            keep = _surface_edge_keep_mask_numba(
+                np.ascontiguousarray(f),
+                np.ascontiguousarray(xy_arr),
+                max_edge_sq,
+            )
+            return f[keep].astype(np.int32, copy=False)
+        except Exception as exc:
+            print(f"SURFACE_ACCEL edge_filter=fallback reason={type(exc).__name__}: {exc}")
+
+    # Chunked NumPy fallback: exact squared-distance predicate, no sqrt needed.
+    chunk = max(100_000, int(os.environ.get("NAKSHA_SURFACE_EDGE_CHUNK", "1500000")))
+    keep = np.empty(len(f), dtype=bool)
+    for begin in range(0, len(f), chunk):
+        finish = min(begin + chunk, len(f))
+        fc = f[begin:finish]
+        p0 = xy_arr[fc[:, 0]]
+        p1 = xy_arr[fc[:, 1]]
+        p2 = xy_arr[fc[:, 2]]
+        d01 = np.sum((p0 - p1) * (p0 - p1), axis=1)
+        d12 = np.sum((p1 - p2) * (p1 - p2), axis=1)
+        d20 = np.sum((p2 - p0) * (p2 - p0), axis=1)
+        keep[begin:finish] = (
+            (d01 <= max_edge_sq)
+            & (d12 <= max_edge_sq)
+            & (d20 <= max_edge_sq)
+        )
+    return f[keep].astype(np.int32, copy=False)
 
 
 def _face_colors(points: np.ndarray, faces: np.ndarray, app) -> np.ndarray:
@@ -2153,20 +2264,104 @@ def _face_colors(points: np.ndarray, faces: np.ndarray, app) -> np.ndarray:
     )
 
 
+def _build_surface_polydata_native(points: np.ndarray, faces: np.ndarray, colors: np.ndarray):
+    """Build vtkPolyData from NumPy buffers without legacy packed-face conversion.
+
+    PyVista's legacy ``[3, i0, i1, i2, ...]`` construction allocates another
+    ~4 integers per face and then VTK converts that representation again.  On a
+    60-70M triangle Slow Surface that is >1 GB of avoidable memory traffic.
+    """
+    import vtk
+    from vtk.util import numpy_support
+
+    pts = np.ascontiguousarray(points, dtype=np.float64)
+    f = np.ascontiguousarray(faces, dtype=np.int32)
+    rgb = np.ascontiguousarray(colors, dtype=np.uint8)
+    nf = int(len(f))
+
+    vtk_pts_arr = numpy_support.numpy_to_vtk(pts, deep=False)
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(vtk_pts_arr)
+
+    max_conn = nf * 3
+    use_i32 = (
+        max_conn <= np.iinfo(np.int32).max
+        and (f.size == 0 or int(f.max(initial=0)) <= np.iinfo(np.int32).max)
+    )
+    if use_i32:
+        offsets = np.arange(0, max_conn + 1, 3, dtype=np.int32)
+        conn = f.reshape(-1)
+        vtk_offsets = numpy_support.numpy_to_vtk(
+            offsets, deep=False, array_type=vtk.VTK_INT
+        )
+        vtk_conn = numpy_support.numpy_to_vtk(
+            conn, deep=False, array_type=vtk.VTK_INT
+        )
+    else:
+        # Future-proof fallback for >2^31 connectivity entries.
+        offsets = np.arange(0, max_conn + 1, 3, dtype=np.int64)
+        conn = np.ascontiguousarray(f.reshape(-1), dtype=np.int64)
+        vtk_offsets = numpy_support.numpy_to_vtkIdTypeArray(offsets, deep=False)
+        vtk_conn = numpy_support.numpy_to_vtkIdTypeArray(conn, deep=False)
+
+    cells = vtk.vtkCellArray()
+    cells.SetData(vtk_offsets, vtk_conn)
+
+    vtk_rgb = numpy_support.numpy_to_vtk(
+        rgb, deep=False, array_type=vtk.VTK_UNSIGNED_CHAR
+    )
+    vtk_rgb.SetName("RGB")
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_points)
+    poly.SetPolys(cells)
+    poly.GetCellData().SetScalars(vtk_rgb)
+    poly.Modified()
+
+    # Keep Python-side buffers explicitly alive. vtk numpy arrays also retain a
+    # reference, but this makes cache ownership obvious and robust.
+    buffers = (pts, f, rgb, offsets, conn)
+    return pv.wrap(poly), buffers
+
+
 def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarray) -> bool:
     try:
-        faces_pv = np.hstack([np.full((len(faces), 1), 3, dtype=np.int32), faces.astype(np.int32)]).ravel()
-        mesh = pv.PolyData(points.astype(np.float64, copy=False), faces_pv)
-        mesh.cell_data["RGB"] = colors.astype(np.uint8, copy=False)
+        actor_prepare_t0 = time.perf_counter()
+        try:
+            mesh, vtk_buffers = _build_surface_polydata_native(points, faces, colors)
+            native_layout = True
+        except Exception as native_exc:
+            # Conservative compatibility fallback: preserve the old constructor
+            # on systems with an older VTK/PyVista ABI.
+            print(
+                "SURFACE_VTK_LAYOUT fallback=legacy "
+                f"reason={type(native_exc).__name__}: {native_exc}"
+            )
+            faces_pv = np.hstack(
+                [
+                    np.full((len(faces), 1), 3, dtype=np.int32),
+                    np.asarray(faces, dtype=np.int32),
+                ]
+            ).ravel()
+            mesh = pv.PolyData(np.asarray(points, dtype=np.float64), faces_pv)
+            mesh.cell_data["RGB"] = np.asarray(colors, dtype=np.uint8)
+            vtk_buffers = (points, faces, colors, faces_pv)
+            native_layout = False
+
+        prepare_ms = (time.perf_counter() - actor_prepare_t0) * 1000.0
 
         detach_surface_before_non_surface_mode(app, requested_mode="surface")
         remove_shaded_class_mesh_actors(app)
+        # A new exact base Surface supersedes every classification replacement
+        # skin accumulated by the fast local-update path.
+        _surface_remove_local_patch_actors(app)
 
         try:
             app.vtk_widget.remove_actor(SURFACE_ACTOR_NAME, render=False)
         except Exception:
             pass
 
+        upload_t0 = time.perf_counter()
         actor = app.vtk_widget.add_mesh(
             mesh,
             scalars="RGB",
@@ -2175,6 +2370,7 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
             name=SURFACE_ACTOR_NAME,
             render=False,
         )
+        upload_ms = (time.perf_counter() - upload_t0) * 1000.0
         setattr(actor, "_is_surface_mesh", True)
         setattr(actor, "_naksha_display_mode", "surface")
 
@@ -2188,19 +2384,30 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
 
         app._surface_mesh_actor = actor
         app._surface_mesh_polydata = mesh
-        app._surface_points = points
-        app._surface_faces = faces.astype(np.int32, copy=False)
+        app._surface_points = vtk_buffers[0]
+        app._surface_faces = vtk_buffers[1]
+        app._surface_vtk_buffers = vtk_buffers
 
         try:
             _restore_snt_grid_above_surface(app)
         except Exception as e:
             print(f"⚠️ Surface SNT/grid restore skipped: {e}")
 
+        render_t0 = time.perf_counter()
         app.vtk_widget.render()
+        render_ms = (time.perf_counter() - render_t0) * 1000.0
+        print(
+            "SURFACE_PROFILE scope=vtk_actor "
+            f"layout={'native' if native_layout else 'legacy'} "
+            f"prepare={prepare_ms:.1f}ms add_mesh={upload_ms:.1f}ms "
+            f"render={render_ms:.1f}ms points={len(app._surface_points)} "
+            f"faces={len(app._surface_faces)}"
+        )
         return True
     except Exception as e:
         print(f"⚠️ Surface actor build failed: {e}")
         return False
+
 
 def _surface_z_bounds_cached(app, xyz_all):
     """Cache expensive global Z percentiles per loaded point cloud."""
@@ -2427,9 +2634,16 @@ def render_surface_mode(app, vis_mask: Optional[np.ndarray] = None, silent: bool
                 pass
 
             app._surface_unique_global_indices = unique_global_idx
-            app._surface_global_to_unique = {
-                int(g): int(i) for i, g in enumerate(unique_global_idx)
-            }
+            # unique_global_idx is already sorted because it originates from
+            # flatnonzero / sorted representative indices.  Do NOT materialize
+            # a Python {global: local} dict here: on a 34M-point Slow Surface
+            # it consumes multiple GB and several seconds, and no live caller
+            # uses it.  Local lookup code uses searchsorted on this array.
+            app._surface_global_to_unique = None
+            print(
+                "SURFACE_INDEX_MAP strategy=sorted_array "
+                f"count={len(unique_global_idx):,} python_dict=skipped"
+            )
 
             try:
                 _store_surface_mesh_cache(app)
@@ -2580,182 +2794,707 @@ def _apply_surface_bridge_update(app, changed_mask=None, operation="classificati
     return ok
 
 
+def _surface_async_settings_signature(app):
+    """Return the geometry/settings signature for an in-flight Surface rebuild.
+
+    This intentionally excludes ``classification_revision``.  A support ->
+    support class edit does not change Surface topology, so it must not make a
+    perfectly valid background triangulation stale.  True support-membership
+    edits are tracked separately by ``_surface_topology_generation``.
+    """
+    try:
+        ramp = _normalize_surface_ramp(
+            getattr(app, "surface_color_ramp", None)
+            or getattr(app, "elevation_color_ramp", None)
+        )
+        ramp_sig = tuple(
+            (round(float(pos), 8), tuple(int(c) for c in color[:3]))
+            for pos, color in ramp
+        )
+        try:
+            from gui.flight_line_filter import flight_line_visibility_signature
+            flight_line_sig = flight_line_visibility_signature(app, 0)
+        except Exception:
+            flight_line_sig = ()
+        return (
+            _surface_data_signature(app),
+            surface_visible_class_signature(app),
+            flight_line_sig,
+            normalize_surface_quality(getattr(app, "surface_quality", "normal")),
+            round(float(getattr(app, "surface_dedup_precision", 0.0) or 0.0), 9),
+            round(float(getattr(app, "surface_max_edge", 0.0) or 0.0), 9),
+            round(float(getattr(app, "last_shade_azimuth", 45.0) or 45.0), 7),
+            round(float(getattr(app, "last_shade_angle", 45.0) or 45.0), 7),
+            round(float(getattr(app, "shade_ambient", 0.22) or 0.22), 7),
+            ramp_sig,
+        )
+    except Exception:
+        return ("SURFACE_ASYNC_SETTINGS_ERROR",)
+
+
+def _surface_print_backend_profile(result, quality_mode, raw_count, prefix="SURFACE_PROFILE"):
+    """Emit the same stage profile for synchronous and asynchronous builds."""
+    try:
+        profile_timings = result.get("profile_timings", {}) or {}
+        if not profile_timings:
+            return
+        stages = " ".join(
+            f"{name}={float(value)*1000.0:.1f}ms"
+            for name, value in profile_timings.items()
+        )
+        rep_meta = result.get("representative_meta", {}) or {}
+        print(
+            f"{prefix} scope=geometry_backend quality={quality_mode} "
+            f"{stages} raw={int(raw_count)} "
+            f"selected={len(result.get('points', []))} "
+            f"faces={len(result.get('faces', []))} "
+            f"triangulator={result.get('triangulator', 'unknown')} "
+            f"rep={rep_meta.get('strategy', 'unknown')}"
+        )
+    except Exception:
+        pass
+
+
+def _surface_async_cleanup_worker(app, worker):
+    """Release one background worker without touching a newer replacement."""
+    try:
+        if getattr(app, "_surface_async_worker", None) is worker:
+            app._surface_async_worker = None
+    except Exception:
+        pass
+    try:
+        # Async classification refresh never installs the input blocker, so do
+        # not call _surface_finish_build_guard() here (it can restore widgets
+        # belonging to a user-triggered build).  Only clear our own busy state.
+        if getattr(app, "_surface_async_worker", None) is None:
+            app._surface_building = False
+            app._surface_busy = False
+            app._surface_input_blocked = False
+    except Exception:
+        pass
+
+
+def _surface_schedule_latest_async_rebuild(app, delay_ms=50):
+    """Start one latest-state rebuild after an obsolete worker has finished."""
+    try:
+        if QThread is None or _SurfaceComputationWorker is None:
+            return False
+        if str(getattr(app, "display_mode", "") or "").lower() != "surface":
+            return False
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(
+            max(0, int(delay_ms)),
+            lambda: _start_surface_async_exact_rebuild(app),
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _start_surface_async_exact_rebuild(app) -> bool:
+    """Rebuild exact Surface topology in the background after classification.
+
+    The currently displayed Surface stays resident and interactive while the
+    expensive triangulation is computed.  VTK actor replacement still happens
+    on the GUI thread, but only after the geometry is ready.  If another real
+    topology edit occurs during the build, this result is discarded and one
+    rebuild of the latest state is scheduled.  No classification result is
+    dropped and no approximate topology is committed.
+    """
+    if _SurfaceComputationWorker is None or QThread is None:
+        return False
+    if getattr(app, "data", None) is None or "xyz" not in app.data:
+        return False
+    if str(getattr(app, "display_mode", "") or "").lower() != "surface":
+        return False
+
+    existing = getattr(app, "_surface_async_worker", None)
+    try:
+        existing_running = existing is not None and bool(existing.isRunning())
+    except Exception:
+        existing_running = existing is not None
+    if existing_running:
+        app._surface_async_rebuild_pending = True
+        print("SURFACE_ASYNC_REBUILD coalesced=1 reason=worker_already_running")
+        return True
+
+    t0 = time.perf_counter()
+    xyz_all = app.data["xyz"]
+    try:
+        vis_mask = surface_visible_mask(app)
+    except Exception:
+        vis_mask = None
+    if vis_mask is None or len(vis_mask) != len(xyz_all):
+        vis_mask = np.ones(len(xyz_all), dtype=bool)
+
+    global_idx = np.flatnonzero(vis_mask).astype(np.int64, copy=False)
+    if global_idx.size < 3:
+        print("⚠️ Surface async rebuild skipped — fewer than 3 eligible points")
+        return False
+
+    quality_mode = normalize_surface_quality(getattr(app, "surface_quality", "normal"))
+    app.surface_quality = quality_mode
+    precision = float(getattr(app, "surface_dedup_precision", 0.0) or 0.0)
+    target_max = _surface_quality_target(quality_mode, int(global_idx.size))
+    max_edge = float(getattr(app, "surface_max_edge", 0.0) or 0.0)
+    azimuth = float(getattr(app, "last_shade_azimuth", 45.0))
+    angle = float(getattr(app, "last_shade_angle", 45.0))
+    ambient = float(getattr(app, "shade_ambient", 0.22))
+    ramp = _normalize_surface_ramp(
+        getattr(app, "surface_color_ramp", None)
+        or getattr(app, "elevation_color_ramp", None)
+    )
+    z_bounds = _surface_z_bounds_cached(app, xyz_all)
+
+    generation = int(getattr(app, "_surface_topology_generation", 0) or 0)
+    settings_sig = _surface_async_settings_signature(app)
+    data_object_id = id(xyz_all)
+
+    worker = _SurfaceComputationWorker(
+        xyz_all,
+        global_idx,
+        precision,
+        target_max,
+        max_edge,
+        azimuth,
+        angle,
+        ambient,
+        ramp,
+        quality_mode=quality_mode,
+        z_bounds=z_bounds,
+    )
+    worker._naksha_surface_generation = generation
+    worker._naksha_surface_settings_signature = settings_sig
+    worker._naksha_surface_data_object_id = data_object_id
+    worker._naksha_surface_raw_count = int(global_idx.size)
+    worker._naksha_surface_started_at = t0
+
+    app._surface_async_worker = worker
+    app._surface_async_rebuild_pending = False
+    app._surface_building = True
+    app._surface_busy = True
+    app._surface_input_blocked = False
+
+    def _progress(value, message):
+        # Background refresh must never become modal.  A short status message is
+        # enough to show progress while classification/navigation remains usable.
+        try:
+            app.statusBar().showMessage(
+                f"Surface updating in background... {int(value)}% - {message}"
+            )
+        except Exception:
+            pass
+
+    def _finish(result):
+        worker_t0 = float(getattr(worker, "_naksha_surface_started_at", t0))
+        try:
+            mode_is_surface = str(getattr(app, "display_mode", "") or "").lower() == "surface"
+            current_xyz = None
+            try:
+                current_xyz = app.data.get("xyz") if getattr(app, "data", None) else None
+            except Exception:
+                current_xyz = None
+            same_data = current_xyz is not None and id(current_xyz) == data_object_id
+            same_generation = (
+                int(getattr(app, "_surface_topology_generation", 0) or 0) == generation
+            )
+            same_settings = _surface_async_settings_signature(app) == settings_sig
+
+            if not (mode_is_surface and same_data and same_generation and same_settings):
+                reasons = []
+                if not mode_is_surface:
+                    reasons.append("mode_changed")
+                if not same_data:
+                    reasons.append("data_changed")
+                if not same_generation:
+                    reasons.append("newer_topology_edit")
+                if not same_settings:
+                    reasons.append("settings_changed")
+                print(
+                    "SURFACE_ASYNC_REBUILD stale=1 discarded=1 reason="
+                    + ",".join(reasons or ["unknown"])
+                )
+                _surface_async_cleanup_worker(app, worker)
+                if mode_is_surface and same_data and bool(
+                    getattr(app, "_surface_needs_rebuild_after_classification", False)
+                ):
+                    _surface_schedule_latest_async_rebuild(app, 50)
+                return
+
+            _surface_print_backend_profile(
+                result,
+                quality_mode,
+                int(getattr(worker, "_naksha_surface_raw_count", global_idx.size)),
+            )
+
+            if result.get("empty", False):
+                print("⚠️ Surface async rebuild returned an empty mesh; keeping current Surface")
+                app._surface_needs_rebuild_after_classification = True
+                _surface_async_cleanup_worker(app, worker)
+                return
+
+            pts = result["points"]
+            faces = result["faces"]
+            colors = result["colors"]
+            unique_global_idx = result["unique_global_idx"]
+            app._surface_z_lo = float(result.get("z_lo", np.nan))
+            app._surface_z_hi = float(result.get("z_hi", np.nan))
+
+            actor_t0 = time.perf_counter()
+            ok = _set_mesh_actor(app, pts, faces, colors)
+            actor_ms = (time.perf_counter() - actor_t0) * 1000.0
+            if not ok:
+                app._surface_needs_rebuild_after_classification = True
+                app._surface_last_refresh_visual_change = False
+                app._surface_last_refresh_presented = False
+                print("⚠️ Surface async actor swap failed; keeping rebuild dirty")
+                _surface_async_cleanup_worker(app, worker)
+                return
+
+            app.display_mode = "surface"
+            app.current_display_mode = "surface"
+            app.surface_color_ramp = (
+                getattr(app, "surface_color_ramp", None)
+                or getattr(app, "elevation_color_ramp", None)
+            )
+            try:
+                app._suspend_grid_clicks = True
+            except Exception:
+                pass
+
+            app._surface_unique_global_indices = unique_global_idx
+            app._surface_global_to_unique = None
+            print(
+                "SURFACE_INDEX_MAP strategy=sorted_array "
+                f"count={len(unique_global_idx):,} python_dict=skipped"
+            )
+            _remember_surface_signature(app)
+            try:
+                _store_surface_mesh_cache(app)
+            except Exception as cache_exc:
+                print(f"⚠️ Surface async cache store skipped: {cache_exc}")
+
+            app._surface_needs_rebuild_after_classification = False
+            app._surface_filter_dirty = False
+            app._surface_mesh_cache_dirty = False
+            app._surface_async_rebuild_pending = False
+            app._surface_last_refresh_visual_change = True
+            app._surface_last_refresh_presented = True
+            total_ms = (time.perf_counter() - worker_t0) * 1000.0
+            print(
+                "SURFACE_ASYNC_REBUILD completed=1 exact=1 "
+                f"quality={quality_mode} raw={len(global_idx):,} "
+                f"faces={len(faces):,} actor_ms={actor_ms:.1f} total_ms={total_ms:.1f}"
+            )
+            try:
+                app.statusBar().showMessage(
+                    f"Surface updated ({len(faces):,} faces)", 2500
+                )
+            except Exception:
+                pass
+            _surface_async_cleanup_worker(app, worker)
+
+            # A duplicate caller may have marked a pending request while this
+            # exact generation was finishing.  Only start another build when a
+            # genuinely newer topology generation is dirty.
+            if bool(getattr(app, "_surface_async_rebuild_pending", False)) and bool(
+                getattr(app, "_surface_needs_rebuild_after_classification", False)
+            ):
+                _surface_schedule_latest_async_rebuild(app, 50)
+
+        except Exception as exc:
+            app._surface_needs_rebuild_after_classification = True
+            app._surface_last_refresh_visual_change = False
+            app._surface_last_refresh_presented = False
+            print(f"⚠️ Surface async finalize failed: {exc}")
+            _surface_async_cleanup_worker(app, worker)
+
+    def _error(error_text):
+        try:
+            app._surface_needs_rebuild_after_classification = True
+            app._surface_last_refresh_visual_change = False
+            app._surface_last_refresh_presented = False
+            print("⚠️ Surface async rebuild failed:\n" + str(error_text))
+            try:
+                app.statusBar().showMessage(
+                    "Surface background update failed; current Surface kept", 4000
+                )
+            except Exception:
+                pass
+        finally:
+            _surface_async_cleanup_worker(app, worker)
+
+    # Route callbacks through a QObject created on the GUI thread.  Directly
+    # connecting a QThread signal to a plain Python closure can execute the
+    # closure in an implementation-dependent thread; VTK actor replacement
+    # must never run from the worker thread.
+    if _SurfaceAsyncResultRelay is not None:
+        relay = _SurfaceAsyncResultRelay(_finish, _error, _progress, parent=worker)
+        worker._naksha_surface_relay = relay
+        worker.progress_signal.connect(relay.handle_progress)
+        worker.finished_signal.connect(relay.handle_finished)
+        worker.error_signal.connect(relay.handle_error)
+    else:
+        worker.progress_signal.connect(_progress)
+        worker.finished_signal.connect(_finish)
+        worker.error_signal.connect(_error)
+    try:
+        # Delete the QThread QObject only after run() has actually returned.
+        # The custom finished_signal is emitted *inside* run(), so deleting from
+        # its handler risks "QThread destroyed while thread is still running".
+        worker.finished.connect(worker.deleteLater)
+    except Exception:
+        pass
+    worker.start()
+    print(
+        "SURFACE_ASYNC_REBUILD started=1 exact=1 ui_blocked=0 "
+        f"generation={generation} quality={quality_mode} eligible={global_idx.size:,}"
+    )
+    return True
+
+
+
+def _surface_remove_local_patch_actors(app) -> None:
+    """Remove transient classification patch actors without touching the base Surface."""
+    patches = getattr(app, "_surface_local_patch_actors", None)
+    if not isinstance(patches, list) or not patches:
+        app._surface_local_patch_actors = []
+        return
+    plotter = getattr(app, "vtk_widget", None)
+    if plotter is not None:
+        for entry in patches:
+            actor = entry.get("actor") if isinstance(entry, dict) else entry
+            name = entry.get("name") if isinstance(entry, dict) else None
+            try:
+                if name:
+                    plotter.remove_actor(name, render=False)
+                elif actor is not None:
+                    plotter.remove_actor(actor, render=False)
+            except Exception:
+                pass
+    app._surface_local_patch_actors = []
+
+
+def _surface_build_local_patch_actor(app, result: dict, name: str, priority: float):
+    """Render a small exact local Surface replacement skin above the resident mesh.
+
+    The 30M+ point base mesh is deliberately left immutable.  This is the same
+    architectural idea used by the Shading local-update path: classification
+    commits create only a tiny replacement actor and therefore avoid a global
+    Delaunay + 60M-face VTK upload.
+    """
+    if not isinstance(result, dict) or result.get("empty", False):
+        return None
+    pts = np.asarray(result.get("points"), dtype=np.float64)
+    faces = np.asarray(result.get("faces"), dtype=np.int32).reshape(-1, 3)
+    colors = np.asarray(result.get("colors"), dtype=np.uint8).reshape(-1, 3)
+    if len(pts) < 3 or len(faces) == 0 or len(colors) != len(faces):
+        return None
+
+    try:
+        patch, buffers = _build_surface_polydata_native(pts, faces, colors)
+    except Exception:
+        packed = np.empty(len(faces) * 4, dtype=np.int32)
+        packed[0::4] = 3
+        packed[1::4] = faces[:, 0]
+        packed[2::4] = faces[:, 1]
+        packed[3::4] = faces[:, 2]
+        patch = pv.PolyData(pts, packed)
+        patch.cell_data["RGB"] = np.ascontiguousarray(colors, dtype=np.uint8)
+        buffers = (pts, faces, colors, packed)
+
+    actor = app.vtk_widget.add_mesh(
+        patch,
+        scalars="RGB",
+        rgb=True,
+        show_edges=False,
+        lighting=False,
+        smooth_shading=False,
+        preference="cell",
+        name=name,
+        render=False,
+    )
+    if actor is None:
+        return None
+
+    try:
+        setattr(actor, "_is_surface_mesh", True)
+        setattr(actor, "_is_surface_local_patch", True)
+        setattr(actor, "_naksha_display_mode", "surface")
+        actor.PickableOff()
+        if hasattr(actor, "UseBoundsOff"):
+            actor.UseBoundsOff()
+        prop = actor.GetProperty()
+        prop.SetInterpolationToFlat()
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.EdgeVisibilityOff()
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
+                float(priority), float(priority)
+            )
+            mapper.InterpolateScalarsBeforeMappingOff()
+    except Exception:
+        pass
+
+    # Keep all NumPy buffers alive for deep=False VTK arrays.
+    actor._naksha_surface_patch_buffers = buffers
+    return actor
+
+
+def _surface_local_membership_indices(app, transition: dict):
+    """Return only points whose edit actually changes Surface membership."""
+    if not isinstance(transition, dict):
+        return np.empty(0, dtype=np.int64)
+    idx = np.asarray(transition.get("indices", []), dtype=np.int64).ravel()
+    oldv = np.asarray(transition.get("old_classes", [])).ravel()
+    newv = np.asarray(transition.get("new_classes", [])).ravel()
+    if idx.size == 0 or oldv.size != idx.size or newv.size != idx.size:
+        return np.empty(0, dtype=np.int64)
+    old_support = _surface_support_flags_for_values(app, oldv)
+    new_support = _surface_support_flags_for_values(app, newv)
+    return idx[old_support != new_support].astype(np.int64, copy=False)
+
+
+def _surface_query_local_candidate_indices(app, changed_global_idx: np.ndarray):
+    """Find a bounded neighbourhood around topology-changing points.
+
+    One vectorized AABB pass over XYZ is intentionally preferred to building a
+    new 34M-point KDTree during classification.  The resulting local candidate
+    set is then spatially trimmed with a small KDTree.  On large tiles this is
+    memory-light and typically hundreds of milliseconds rather than tens of
+    seconds of global triangulation.
+    """
+    xyz = app.data.get("xyz") if getattr(app, "data", None) else None
+    if xyz is None:
+        return None, None
+    changed_global_idx = np.unique(np.asarray(changed_global_idx, dtype=np.int64).ravel())
+    changed_global_idx = changed_global_idx[(changed_global_idx >= 0) & (changed_global_idx < len(xyz))]
+    if changed_global_idx.size == 0:
+        return np.empty(0, dtype=np.int64), 0.0
+
+    changed_xy = np.asarray(xyz[changed_global_idx, :2], dtype=np.float64)
+    # First pass is deliberately generous enough to estimate local density.
+    seed_margin = float(getattr(app, "surface_local_patch_seed_margin", 4.0) or 4.0)
+    seed_margin = min(max(seed_margin, 1.5), 12.0)
+    lo = changed_xy.min(axis=0) - seed_margin
+    hi = changed_xy.max(axis=0) + seed_margin
+
+    x = xyz[:, 0]
+    y = xyz[:, 1]
+    broad_mask = ((x >= lo[0]) & (x <= hi[0]) & (y >= lo[1]) & (y <= hi[1]))
+    broad_idx = np.flatnonzero(broad_mask).astype(np.int64, copy=False)
+    if broad_idx.size < 3:
+        return broad_idx, seed_margin
+
+    # Estimate spacing from this bounded region and use it to choose a stitching
+    # radius.  Dense aerial LiDAR normally resolves to the 1.5-4 m floor.
+    area = max(float((hi[0] - lo[0]) * (hi[1] - lo[1])), 1.0)
+    spacing = float(np.sqrt(area / max(int(broad_idx.size), 1)))
+    radius = max(seed_margin * 0.5, spacing * 20.0, 1.5)
+    radius = min(radius, float(getattr(app, "surface_local_patch_max_radius", 8.0) or 8.0))
+
+    # The broad set may be elongated because a cross section edited a few
+    # separated points.  Keep only neighbourhoods around actual membership
+    # changes instead of triangulating the entire cross-section rectangle.
+    if broad_idx.size > 5_000:
+        try:
+            from scipy.spatial import cKDTree
+            broad_xy = np.asarray(xyz[broad_idx, :2], dtype=np.float64)
+            tree = cKDTree(broad_xy, leafsize=32)
+            hits = tree.query_ball_point(changed_xy, r=radius, workers=-1)
+            parts = [np.asarray(h, dtype=np.int64) for h in hits if len(h)]
+            if parts:
+                local_pos = np.unique(np.concatenate(parts))
+                broad_idx = broad_idx[local_pos]
+        except Exception as exc:
+            print(f"SURFACE_LOCAL_PATCH spatial_trim=fallback reason={type(exc).__name__}: {exc}")
+
+    return broad_idx, radius
+
+
+def _apply_surface_local_classification_patch(app, transition: dict, operation="classification") -> bool:
+    """Shading-style Surface refresh for bounded support-membership edits.
+
+    This path updates only the edited neighbourhood and leaves the giant base
+    Surface actor untouched.  It is intentionally used for interactive
+    classification/undo/redo.  A complete rebuild is still used when the edit
+    is too spatially large for a safe local patch or when Surface settings/data
+    are changed outside classification.
+    """
+    t0 = time.perf_counter()
+    if str(getattr(app, "display_mode", "") or "").lower() != "surface":
+        return False
+    if getattr(app, "_surface_mesh_actor", None) is None:
+        return False
+
+    topology_idx = _surface_local_membership_indices(app, transition)
+    if topology_idx.size == 0:
+        return True
+
+    # Large membership changes are not an interactive local-edit case.  Keep
+    # the existing exact/background fallback for those operations.
+    max_changed = int(getattr(app, "surface_local_patch_max_changed", 50_000) or 50_000)
+    if topology_idx.size > max_changed:
+        print(
+            "SURFACE_LOCAL_PATCH decision=FALLBACK_EXACT "
+            f"reason=changed_limit topology_changed={topology_idx.size:,} limit={max_changed:,}"
+        )
+        return False
+
+    candidate_idx, radius = _surface_query_local_candidate_indices(app, topology_idx)
+    if candidate_idx is None or candidate_idx.size < 3:
+        return False
+
+    max_candidates = int(getattr(app, "surface_local_patch_max_candidates", 300_000) or 300_000)
+    if candidate_idx.size > max_candidates:
+        print(
+            "SURFACE_LOCAL_PATCH decision=FALLBACK_EXACT "
+            f"reason=candidate_limit candidates={candidate_idx.size:,} limit={max_candidates:,}"
+        )
+        return False
+
+    classes = np.asarray(app.data.get("classification"))
+    cand_classes = classes[candidate_idx]
+    support = _surface_support_flags_for_values(app, cand_classes)
+    local_idx = candidate_idx[support]
+    if local_idx.size < 3:
+        return False
+
+    quality_mode = normalize_surface_quality(getattr(app, "surface_quality", "normal"))
+    precision = float(getattr(app, "surface_dedup_precision", 0.0) or 0.0)
+    max_edge = float(getattr(app, "surface_max_edge", 0.0) or 0.0)
+    azimuth = float(getattr(app, "last_shade_azimuth", 45.0))
+    angle = float(getattr(app, "last_shade_angle", 45.0))
+    ambient = float(getattr(app, "shade_ambient", 0.22))
+    ramp = _normalize_surface_ramp(
+        getattr(app, "surface_color_ramp", None)
+        or getattr(app, "elevation_color_ramp", None)
+    )
+    z_bounds = (
+        float(getattr(app, "_surface_z_lo", np.nan)),
+        float(getattr(app, "_surface_z_hi", np.nan)),
+    )
+    if not np.isfinite(z_bounds).all():
+        z_bounds = _surface_z_bounds_cached(app, app.data["xyz"])
+
+    result = _compute_surface_geometry_backend(
+        app.data["xyz"],
+        local_idx,
+        precision,
+        _surface_quality_target(quality_mode, int(local_idx.size)),
+        max_edge,
+        azimuth,
+        angle,
+        ambient,
+        ramp,
+        progress_callback=None,
+        quality_mode=quality_mode,
+        z_bounds=z_bounds,
+    )
+    if result.get("empty", False):
+        return False
+
+    generation = int(getattr(app, "_surface_local_patch_generation", 0) or 0) + 1
+    app._surface_local_patch_generation = generation
+    name = f"surface_live_classification_patch_{generation}"
+    # Stay above the stale base Surface but below SNT/DXF overlays (-50000).
+    priority = -5000.0 - float(min(generation, 5000)) * 0.5
+    actor = _surface_build_local_patch_actor(app, result, name, priority)
+    if actor is None:
+        return False
+
+    patches = getattr(app, "_surface_local_patch_actors", None)
+    if not isinstance(patches, list):
+        patches = []
+        app._surface_local_patch_actors = patches
+    patches.append({
+        "name": name,
+        "actor": actor,
+        "transaction_token": transition.get("transaction_token"),
+        "topology_indices": topology_idx.copy(),
+        "candidate_count": int(candidate_idx.size),
+    })
+
+    # Do NOT retag/store this as a globally exact mesh.  The base cache remains
+    # dirty so a later explicit Surface rebuild/mode re-entry can consolidate
+    # patches, while interactive classification stays immediate.
+    app._surface_mesh_cache_dirty = True
+    app._surface_filter_dirty = True
+    app._surface_needs_rebuild_after_classification = False
+    app._surface_last_refresh_visual_change = True
+    app._surface_last_refresh_presented = True
+    app._surface_last_local_token = transition.get("transaction_token")
+
+    try:
+        _restore_snt_grid_above_surface(app)
+    except Exception:
+        pass
+    try:
+        app.vtk_widget.render()
+    except Exception:
+        pass
+
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    print(
+        "SURFACE_LOCAL_PATCH decision=LOCAL_REFRESH "
+        f"operation={str(operation or 'classification')} "
+        f"topology_changed={topology_idx.size:,} candidates={candidate_idx.size:,} "
+        f"eligible={local_idx.size:,} faces={len(result.get('faces', [])):,} "
+        f"radius={radius:.2f}m elapsed={elapsed:.1f}ms global_rebuild_avoided=True"
+    )
+    return True
+
 def refresh_surface_after_classification(app, changed_mask=None, operation="classification", delay_ms=300):
-    """Refresh Surface after classification with Shading-style edit planning.
+    """Keep the existing elevation Surface after class edits.
 
-    Fast invariant:
-      * support -> support classification does NOT change Surface geometry
-      * non-support -> non-support classification does NOT change Surface geometry
-
-    Those edits now complete in O(K) using the existing undo transaction and do
-    not touch the multi-million-triangle Surface VTK object at all.
-
-    A true support-membership change still uses the existing exact rebuild path.
-    That preserves Surface correctness for noise/hidden/non-surface transitions
-    until a dedicated local-topology Surface patch is introduced.
+    Surface geometry/colors are derived from XYZ and Surface settings, not LAS
+    classification. Classification, undo and redo therefore skip local patches,
+    cache invalidation and all triangulation work.
     """
     if str(getattr(app, "display_mode", "") or "").lower() != "surface":
         return False
 
-    t_plan = time.perf_counter()
-    app._surface_last_refresh_visual_change = False
-    app._surface_last_refresh_presented = False
-
-    if changed_mask is None:
-        changed_mask = getattr(app, "_last_changed_mask", None)
-
-    transition = _surface_resolve_classification_transition(
-        app, changed_mask, operation=operation
-    )
-    summary = _surface_transition_membership_summary(app, transition)
-
-    if summary is not None:
-        changed_count = int(len(transition.get("indices", [])))
-        add_count = int(summary["add_count"])
-        remove_count = int(summary["remove_count"])
-
-        if not summary["topology_changed"]:
-            # If an older, genuinely topology-changing edit is already waiting
-            # on the debounce timer, do not retag that stale geometry as valid.
-            timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
-            prior_topology_pending = bool(
-                getattr(app, "_surface_needs_rebuild_after_classification", False)
-                and timer is not None
-                and getattr(timer, "isActive", lambda: False)()
-            )
-
-            if not prior_topology_pending:
-                _retag_surface_cache_after_classification_no_topology(app)
-
-            app._surface_last_refresh_visual_change = False
-            app._surface_last_refresh_presented = False
-            print(
-                "SURFACE_FAST_REFRESH decision=NO_TOPOLOGY_CHANGE "
-                f"operation={str(operation or 'classification')} "
-                f"changed={changed_count} support_add=0 support_remove=0 "
-                f"source={transition.get('source', 'unknown')} "
-                f"pending_prior_topology={int(prior_topology_pending)} "
-                f"elapsed={(time.perf_counter()-t_plan)*1000.0:.2f}ms"
-            )
-            return True
-
-        print(
-            "SURFACE_EDIT_PLAN decision=TOPOLOGY_CHANGE "
-            f"operation={str(operation or 'classification')} "
-            f"changed={changed_count} support_add={add_count} "
-            f"support_remove={remove_count} source={transition.get('source', 'unknown')}"
-        )
-
-    # From this point onward the existing exact Surface behavior is preserved.
-    # Unknown transitions also stay on the safe rebuild path.
     try:
-        app._surface_needs_rebuild_after_classification = True
+        timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+        if timer is not None and getattr(timer, "isActive", lambda: False)():
+            timer.stop()
     except Exception:
         pass
 
-    operation_lc = str(operation or "").lower()
-
-    # Keep the historical direct local-bridge route only when no transaction
-    # semantics are available.  For a KNOWN support-membership change that
-    # bridge would be topologically stale, so use the exact rebuild path.
-    if int(delay_ms or 0) <= 0 and operation_lc not in {"undo", "redo"} and summary is None:
-        try:
-            ok = _apply_surface_bridge_update(app, changed_mask=changed_mask, operation=operation)
-            if ok:
-                app._surface_needs_rebuild_after_classification = False
-                app._surface_last_refresh_visual_change = True
-                app._surface_last_refresh_presented = True
-                print("⚡ Surface classification changed — updated Surface mesh in-place")
-            else:
-                print("🔁 Surface in-place update unavailable — rebuilding Surface mesh")
-                ok = render_surface_mode(app, silent=True)
-                app._surface_last_refresh_visual_change = bool(ok)
-                app._surface_last_refresh_presented = bool(ok)
-                if ok:
-                    print("✅ Surface rebuilt after classification")
-                else:
-                    print("⚠️ Surface rebuild after classification returned False")
-            return ok
-        except Exception as e:
-            print(f"⚠️ Surface rebuild after classification failed: {e}")
-            return False
-
-    if operation_lc in {"undo", "redo"}:
-        try:
-            from gui.surface_mode import mark_surface_filter_dirty
-            mark_surface_filter_dirty(app, reason=operation_lc)
-        except Exception:
-            pass
-        try:
-            print(f"🔁 Surface {operation_lc} — rebuilding Surface mesh")
-            ok = render_surface_mode(app, silent=True)
-            app._surface_last_refresh_visual_change = bool(ok)
-            app._surface_last_refresh_presented = bool(ok)
-            if ok:
-                print(f"✅ Surface rebuilt after {operation_lc}")
-            else:
-                print(f"⚠️ Surface rebuild after {operation_lc} returned False")
-            return ok
-        except Exception as e:
-            print(f"⚠️ Surface rebuild after {operation_lc} failed: {e}")
-            return False
+    try:
+        app._surface_needs_rebuild_after_classification = False
+        app._surface_last_refresh_visual_change = False
+        app._surface_last_refresh_presented = False
+        app._surface_last_local_token = None
+        app._surface_last_topology_token = None
+    except Exception:
+        pass
 
     try:
-        from PySide6.QtCore import QTimer
+        _retag_surface_cache_after_classification_no_topology(app)
     except Exception:
-        try:
-            print("🔁 Surface classification changed — rebuilding Surface mesh now")
-            ok = render_surface_mode(app, silent=True)
-            app._surface_last_refresh_visual_change = bool(ok)
-            app._surface_last_refresh_presented = bool(ok)
-            return ok
-        except Exception as e:
-            print(f"⚠️ Surface rebuild after classification failed: {e}")
-            return False
+        pass
 
-    timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+    changed_count = 0
+    try:
+        sparse = getattr(app, "_last_changed_indices", None)
+        if isinstance(sparse, np.ndarray):
+            changed_count = int(sparse.size)
+        elif isinstance(changed_mask, np.ndarray) and changed_mask.dtype == bool:
+            changed_count = int(np.count_nonzero(changed_mask))
+    except Exception:
+        pass
 
-    if timer is None:
-        timer = QTimer(app)
-        timer.setSingleShot(True)
-        app._surface_rebuild_after_classification_timer = timer
-
-        def _run_surface_rebuild():
-            try:
-                if str(getattr(app, "display_mode", "") or "").lower() != "surface":
-                    return
-
-                if not bool(getattr(app, "_surface_needs_rebuild_after_classification", False)):
-                    return
-
-                print("🔁 Surface classification changed — rebuilding Surface mesh")
-                try:
-                    from gui.surface_mode import surface_visible_mask
-                    fresh_vis_mask = surface_visible_mask(app)
-                except Exception:
-                    fresh_vis_mask = None
-
-                ok = render_surface_mode(app, vis_mask=fresh_vis_mask, silent=True)
-                app._surface_needs_rebuild_after_classification = False
-                app._surface_last_refresh_visual_change = bool(ok)
-                app._surface_last_refresh_presented = bool(ok)
-
-                if ok:
-                    print("✅ Surface rebuilt after classification")
-                else:
-                    print("⚠️ Surface rebuild after classification returned False")
-
-            except Exception as e:
-                app._surface_last_refresh_visual_change = False
-                app._surface_last_refresh_presented = False
-                print(f"⚠️ Surface rebuild after classification failed: {e}")
-
-        timer.timeout.connect(_run_surface_rebuild)
-
-    timer.start(int(delay_ms))
-    app._surface_last_refresh_visual_change = False
-    app._surface_last_refresh_presented = False
-    print("⏳ Surface topology changed — exact rebuild scheduled")
+    print(
+        "SURFACE_CLASSIFICATION_INDEPENDENT decision=KEEP_EXISTING_SURFACE "
+        f"operation={str(operation or 'classification')} changed={changed_count} "
+        "triangulation=skipped local_patch=skipped cache_invalidated=0"
+    )
     return True
 
 
