@@ -13426,6 +13426,13 @@ class NakshaApp(QMainWindow):
                 self._draw_curve_context_active = False
                 self._deactivate_pending_cut_section_tool("switching to drawing")
 
+                # ✅ MUTUAL EXCLUSION: every draw tool (including the Ortho
+                # polygon tool and Hatch Area) reacts to left-click on the
+                # main view, which collides with Identify / Point Sync / SNT
+                # pick. Disable the point-pick tools whenever a draw tool is
+                # selected so they can never both be active at once.
+                self._deactivate_point_pick_tools()
+
                 # Deactivate curve tool when switching to a draw tool
                 if hasattr(self, "curve_tool") and self.curve_tool:
                     if getattr(self.curve_tool, "active", False):

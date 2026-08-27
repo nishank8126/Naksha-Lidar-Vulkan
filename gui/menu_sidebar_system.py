@@ -3761,8 +3761,15 @@ class IdentificationRibbon(QWidget):
                     if hasattr(self.app, 'cut_section_mode_on'):
                         self.app.cut_section_mode_on = False
 
+            # Cancel any active Draw tool (incl. Ortho polygon / Hatch Area) —
+            # it also reacts to left-click on the main view and collides with
+            # Identify. Mutual exclusion: Identify must dominate when enabled.
+            if self.app and hasattr(self.app, '_deactivate_digitize_tool'):
+                self.app._deactivate_digitize_tool()
+
         if self.identify_active:
             self.status_label.setText("Active")
+
 
             self.status_label.setStyleSheet("color: #4caf50; font-weight: bold;")
            
