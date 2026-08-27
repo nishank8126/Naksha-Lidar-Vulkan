@@ -6837,6 +6837,13 @@ class GridLabelManager:
             if ortho_tool is not None and len(getattr(ortho_tool, "points", []) or []) > 0:
                 return True
 
+        # 1c. Temp Fence tool: right-click finalises the fence — yield once
+        #     the user has placed at least one vertex, same as ortho-polygon.
+        tf_tool = getattr(app, "temp_fence_tool", None)
+        if tf_tool is not None and getattr(tf_tool, "active", False):
+            if getattr(tf_tool, "_drawing", False) and len(getattr(tf_tool, "_points", []) or []) > 0:
+                return True
+
         # 2. Measurement Tool: active during measurement drag
         mtool = getattr(app, "measurement_tool", None)
         if mtool and getattr(mtool, "is_measuring", False):
