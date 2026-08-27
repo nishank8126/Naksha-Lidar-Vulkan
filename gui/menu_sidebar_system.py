@@ -7429,23 +7429,16 @@ class ClosedByClassDialog(QDialog):
             print(f"   ✅ Converted ALL {from_class_count:,} From class points to To class")
 
             self.app._conversion_just_happened = True
-            # ✅ CRITICAL: Direct refresh - simple and always works
-            from gui.class_display import update_class_mode
-            update_class_mode(self.app, force_refresh=True)
-            print(f"   ✅ Main view refreshed (forced rebuild)")
-
-            # Refresh cross-sections if needed
-            if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
-                for view_idx in list(self.app.section_vtks.keys()):
-                    try:
-                        if hasattr(self.app, '_refresh_single_section_view'):
-                            self.app._refresh_single_section_view(view_idx)
-                    except Exception as e:
-                        print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
-
-            # Update point count widget
-            if hasattr(self.app, 'point_count_widget'):
-                self.app.point_count_widget.schedule_update()
+            # Sparse canonical refresh: do not rebuild the full unified actor.
+            self.app._last_changed_mask = final_mask
+            self.app._last_changed_indices = np.flatnonzero(final_mask).astype(np.intp, copy=False)
+            try:
+                self.app.classification_finished.emit(final_mask)
+                print(f"   ⚡ Sparse main/section refresh: {int(np.count_nonzero(final_mask)):,} pts")
+            except Exception as _emit_err:
+                from gui.unified_actor_manager import fast_classify_update
+                fast_classify_update(self.app, final_mask, int(to_class))
+                print(f"   ⚠️ Sparse signal refresh fallback used: {_emit_err}")
 
             # Refresh Cut Section view if active
             try:
@@ -7599,11 +7592,16 @@ class ClosedByClassDialog(QDialog):
             print(f"   ✅ Shaded mesh maintained after classification")
             
         elif display_mode == "class":
-            # Standard class-colored point actors
-            print(f"   🎨 Refreshing CLASS mode...")
-            from gui.class_display import update_class_mode
-            update_class_mode(self.app, force_refresh=True)
-            print(f"   ✅ Class mode refreshed")
+            # Patch only changed classes through the application-wide signal bus.
+            self.app._last_changed_mask = final_mask
+            self.app._last_changed_indices = convert_indices.astype(np.intp, copy=False)
+            try:
+                self.app.classification_finished.emit(final_mask)
+                print(f"   ⚡ Sparse CLASS refresh: {len(convert_indices):,} pts")
+            except Exception as _emit_err:
+                from gui.unified_actor_manager import fast_classify_update
+                fast_classify_update(self.app, final_mask, int(to_class))
+                print(f"   ⚠️ Sparse signal refresh fallback used: {_emit_err}")
             
         else:
             # Other display modes
@@ -7612,14 +7610,7 @@ class ClosedByClassDialog(QDialog):
             update_pointcloud(self.app, display_mode)
             print(f"   ✅ {display_mode} mode refreshed")
 
-        # Refresh cross-sections if needed
-        if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
-            for view_idx in list(self.app.section_vtks.keys()):
-                try:
-                    if hasattr(self.app, '_refresh_single_section_view'):
-                        self.app._refresh_single_section_view(view_idx)
-                except Exception as e:
-                    print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
+        # classification_finished already refreshed open section views.
 
         # Refresh Cut Section view if active
         try:
@@ -9687,16 +9678,15 @@ class ByClassHeightDialog(QDialog):
             changed_mask = np.zeros(total_pts, dtype=bool)
             changed_mask[convert_indices[valid]] = True
 
-            from gui.unified_actor_manager import fast_classify_update
-            ok = fast_classify_update(self.app, changed_mask, int(to_class))
-            if not ok:
-                return False
-
-            # Keep section mirrors and statistics in sync through app signal bus.
+            self.app._last_changed_mask = changed_mask
+            self.app._last_changed_indices = convert_indices[valid].astype(np.intp, copy=False)
             try:
                 self.app.classification_finished.emit(changed_mask)
             except Exception:
-                pass
+                from gui.unified_actor_manager import fast_classify_update
+                ok = fast_classify_update(self.app, changed_mask, int(to_class))
+                if not ok:
+                    return False
 
             elapsed = (time.perf_counter() - t0) * 1000
             print(f"   fast_inject unified update: {int(np.count_nonzero(changed_mask)):,} pts [{elapsed:.1f} ms]")
@@ -11711,15 +11701,19 @@ class InsideFenceDialog(QDialog):
         from gui.memory_manager import trim_undo_stack
         trim_undo_stack(self.app)
         
-        # Update VTK actors in-place
-        from gui.unified_actor_manager import fast_classify_update
-        fast_classify_update(self.app, final_mask, int(to_class))
-        
-        # Emit classification_finished to sync section views
+        # One canonical sparse commit.  classification_finished updates the
+        # changed main-view GPU buffers, section mirrors/actors, cut view, and
+        # statistics.  Avoid a preceding fast_classify_update() because that
+        # would patch/render the same main-view data twice.
+        self.app._last_changed_mask = final_mask
+        self.app._last_changed_indices = final_convert_indices.astype(np.intp, copy=False)
         try:
             self.app.classification_finished.emit(final_mask)
-        except Exception:
-            pass
+        except Exception as _emit_err:
+            # Emergency fallback only if the application signal bus is absent.
+            from gui.unified_actor_manager import fast_classify_update
+            fast_classify_update(self.app, final_mask, int(to_class))
+            print(f"   ⚠️ Sparse signal refresh fallback used: {_emit_err}")
             
         return converted_count, final_mask
 
@@ -12280,9 +12274,13 @@ class InsideFenceDialog(QDialog):
                 self._shading_force_rebuild(None)
             
             else:
-                # Standard Point Cloud Refresh
-                from gui.class_display import update_class_mode
-                update_class_mode(self.app, force_refresh=True)
+                # CLASS MODE IS ALREADY UPDATED BY _calculate_conversion().
+                # That method emits classification_finished(final_mask), whose
+                # canonical handler patches only the changed GPU class/RGB
+                # entries and refreshes open section views.  Calling
+                # update_class_mode(force_refresh=True) here rebuilt the entire
+                # 13M+ point unified actor for a tiny fence edit.
+                print("   ⚡ Sparse class refresh already committed — full actor rebuild skipped")
 
             # ════════════════════════════════════════════════════════════
             # CLEANUP
@@ -12327,16 +12325,8 @@ class InsideFenceDialog(QDialog):
             if self.ribbon_parent:
                 self.ribbon_parent.update_status(f"Converted {converted_count:,} points", "success")
 
-            if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
-                for view_idx in list(self.app.section_vtks.keys()):
-                    try:
-                        if hasattr(self.app, '_refresh_single_section_view'):
-                            self.app._refresh_single_section_view(view_idx)
-                    except Exception:
-                        pass
-
-            if hasattr(self.app, 'point_count_widget'):
-                self.app.point_count_widget.schedule_update()
+            # classification_finished already synchronized every open section
+            # and point statistics.  Do not rebuild each section actor again.
 
             QMessageBox.information(self, "Success", f"Converted {converted_count:,} points.")
 

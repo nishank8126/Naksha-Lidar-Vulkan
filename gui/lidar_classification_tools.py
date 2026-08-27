@@ -2667,8 +2667,23 @@ def classify_low_points(xyz, classification, from_classes, to_class,
             raise ValueError("fence_mask must match the point count")
         cand_mask &= fence
 
-    source_idx = np.flatnonzero(source_mask)
-    candidate_idx = np.where(cand_mask)[0]
+    candidate_idx = np.flatnonzero(cand_mask)
+
+    # Fence-local exact context acceleration.  A candidate can only be
+    # influenced by source points within `radius`, so when a fence is active
+    # there is no reason to build a KD-tree for source points on the other
+    # side of a multi-million-point tile.  Expand the candidate AABB by the
+    # query radius; this preserves exactly the same neighbors/results.
+    context_mask = source_mask
+    if fence_mask is not None and candidate_idx.size:
+        cand_xy = xyz[candidate_idx, :2]
+        mn = np.min(cand_xy, axis=0) - radius
+        mx = np.max(cand_xy, axis=0) + radius
+        context_mask = source_mask & (
+            (xyz[:, 0] >= mn[0]) & (xyz[:, 0] <= mx[0]) &
+            (xyz[:, 1] >= mn[1]) & (xyz[:, 1] <= mx[1])
+        )
+    source_idx = np.flatnonzero(context_mask)
     _log(
         2,
         f"Candidates: {len(candidate_idx):,}; "
@@ -2903,8 +2918,20 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
         else np.isin(classification, in_classes) & finite_mask
     )
     # Only affected candidates are fence-limited. Points immediately outside
-    # the fence remain valid neighborhood evidence.
-    in_idx = np.flatnonzero(in_mask)
+    # the fence remain valid neighborhood evidence.  For a fenced run, keep
+    # exactly the context that can possibly fall inside a candidate's 3D
+    # search sphere by clipping XY to the candidate AABB + radius.  This turns
+    # a whole-tile KD-tree into a small local KD-tree without changing counts.
+    context_in_mask = in_mask
+    if fence_mask is not None and candidate_idx.size:
+        cand_xy = xyz[candidate_idx, :2]
+        mn = np.min(cand_xy, axis=0) - radius
+        mx = np.max(cand_xy, axis=0) + radius
+        context_in_mask = in_mask & (
+            (xyz[:, 0] >= mn[0]) & (xyz[:, 0] <= mx[0]) &
+            (xyz[:, 1] >= mn[1]) & (xyz[:, 1] <= mx[1])
+        )
+    in_idx = np.flatnonzero(context_in_mask)
 
     def _result(indices, counts, stop_reason, detected_count=None):
         indices = np.asarray(indices, dtype=np.intp)
