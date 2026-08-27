@@ -323,6 +323,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         if cleanup_cut:
             cleanup_cut(f"switching to {tool_name} via shortcut")
     
+    # Deactivate temp fence tool when switching to any other tool.
+    if tool_name != "temp_fence":
+        _deactivate_temp_fence_safely(app_window, f"switching to {tool_name}")
+
     # ✅ NEW: If switching AWAY from cross-section while it was active, deactivate it properly 
     if tool_name != "cross_section" and getattr(app_window, "cross_section_active", False):
         print(f"🛑 Deactivating cross-section (switching to {tool_name} via shortcut)")

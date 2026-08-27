@@ -1965,7 +1965,18 @@ class DrawRibbon(QWidget):
     def _deactivate_accudraw_before_other_tool(self, next_tool=""):
         """Cancel unfinished AccuDraw draft and deactivate AccuDraw before switching tools."""
         try:
+            # Also deactivate temp fence tool when switching to draw tools.
             main_window = self.window()
+            tft = getattr(main_window, 'temp_fence_tool', None)
+            if tft is not None and getattr(tft, 'active', False):
+                try:
+                    tft.deactivate()
+                except Exception:
+                    pass
+                tft.active = False
+                if getattr(main_window, 'active_classify_tool', None) == 'temp_fence':
+                    main_window.active_classify_tool = None
+
             digitizer = getattr(main_window, "digitizer", None)
             accudraw_tool = getattr(digitizer, "accudraw_tool", None) if digitizer else None
 
@@ -5830,6 +5841,12 @@ class ByClassDialog(QDialog):
             mask = intersect_with_visible_flight_lines(
                 self.app, mask, len(classification), slot=0
             )
+            # Restrict to visible classes — hidden classes cannot be reclassified.
+            _palette = getattr(self.app, 'class_palette', None)
+            if isinstance(_palette, dict) and _palette:
+                _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
+                if _vis:
+                    mask &= np.isin(classification, _vis)
             converted_count = int(np.count_nonzero(mask))
             
             if converted_count == 0:
@@ -7273,6 +7290,12 @@ class ClosedByClassDialog(QDialog):
         section_mask = intersect_with_visible_flight_lines(
             self.app, section_mask, len(classification), slot=0
         )
+        # Restrict to visible classes — hidden classes cannot be reclassified.
+        _palette = getattr(self.app, 'class_palette', None)
+        if isinstance(_palette, dict) and _palette:
+            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
+            if _vis:
+                section_mask &= np.isin(classification, _vis)
 
         if self.selected_fences:
             combined_inside_mask = np.zeros(len(classification), dtype=bool)
@@ -9425,6 +9448,13 @@ class ByClassHeightDialog(QDialog):
             self.app, from_class_mask, len(classification), slot=0
         )
 
+        # Restrict to visible classes — hidden classes cannot be reclassified.
+        _palette = getattr(self.app, 'class_palette', None)
+        if isinstance(_palette, dict) and _palette:
+            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
+            if _vis:
+                from_class_mask &= np.isin(classification, _vis)
+
         from_class_count = np.sum(from_class_mask)
         
         if from_class_count == 0:
@@ -11545,6 +11575,13 @@ class InsideFenceDialog(QDialog):
             from_class_mask = (classification != to_class)
         else:
             from_class_mask = np.isin(classification, from_classes)
+
+        # Restrict to visible classes — hidden classes cannot be reclassified.
+        _palette = getattr(self.app, 'class_palette', None)
+        if isinstance(_palette, dict) and _palette:
+            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get('show', True)]
+            if _vis:
+                from_class_mask &= np.isin(classification, _vis)
             
         from_class_count = np.sum(from_class_mask)
         if from_class_count == 0:

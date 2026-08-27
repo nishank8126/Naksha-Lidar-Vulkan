@@ -4281,6 +4281,15 @@ class _BaseClassifyDialog(QDialog):
                 return
             kwargs["fence_mask"] = user_fence & line_mask
 
+        # Restrict fence to visible classes — hidden classes cannot be reclassified.
+        _palette = getattr(self.app, "class_palette", None)
+        if isinstance(_palette, dict) and _palette:
+            _vis = [int(c) for c, i in _palette.items() if isinstance(i, dict) and i.get("show", True)]
+            if _vis and "classification" in kwargs:
+                _vis_mask = np.isin(kwargs["classification"], _vis)
+                _cur = kwargs.get("fence_mask")
+                kwargs["fence_mask"] = (_vis_mask & _cur) if _cur is not None else _vis_mask
+
         self._prog = QProgressDialog(f"Running {name}…", "Cancel", 0, 100, self.app)
         self._prog.setWindowModality(Qt.NonModal)
         self._prog.setWindowTitle(name)

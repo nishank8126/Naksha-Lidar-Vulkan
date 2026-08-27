@@ -618,6 +618,19 @@ class GlobalShortcutFilter(QObject):
                     print("🛑 ESC - identification tool deactivated; left pan restored")
                     return True
 
+                # Deactivate temp fence tool on Escape
+                _tft = getattr(self.app_window, 'temp_fence_tool', None)
+                if _tft is not None and getattr(_tft, 'active', False):
+                    try:
+                        _tft.deactivate()
+                    except Exception:
+                        pass
+                    _tft.active = False
+                    if getattr(self.app_window, 'active_classify_tool', None) == 'temp_fence':
+                        self.app_window.active_classify_tool = None
+                    print("🛑 ESC - temp fence tool deactivated")
+                    return True
+
                 cross_action = getattr(self.app_window, 'cross_action', None)
                 cross_checked = bool(cross_action is not None and cross_action.isChecked())
                 cross_interactor_active = bool(getattr(self.app_window, 'cross_interactor', None) is not None)
