@@ -8909,12 +8909,23 @@ class NakshaApp(QMainWindow):
                     self._cancel_cross_section_tool_only()
                    
             if tool_name is None:
+                # ✅ Temp Fence tool lifecycle: returning to "no tool" (pan/idle)
+                # must stand down vertex capture too, or its left-click observer
+                # keeps consuming every click and blocks panning. Same stand-down
+                # already done below for switching to a different named tool.
+                try:
+                    _tft = getattr(self, "temp_fence_tool", None)
+                    if _tft is not None:
+                        _tft.deactivate()
+                except Exception as _e:
+                    print(f"⚠️ Temp fence stand-down failed: {_e}")
+
                 self.active_classify_tool = None
                 if hasattr(self, 'skip_main_view_refresh'):
                     self.skip_main_view_refresh = False
                 self._hide_class_picker_safely()
                 # Keep instance alive to preserve selections
-               
+
                 if hasattr(self, 'digitizer'):
                     self.digitizer.enabled = True
                     print("✅ Digitizer re-enabled")
