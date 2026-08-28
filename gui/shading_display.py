@@ -2276,7 +2276,7 @@
 # #                 face_normals=face_normals,
 # #             ).astype(np.float32)
 
-# #         face_classes = _face_class_ids(cm, cache.faces)
+# #         face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
 # #         face_colors = np.clip(
 # #             lut[np.clip(face_classes, 0, mc - 1)] * cache.shade[:, None],
 # #             0,
@@ -3196,7 +3196,7 @@
 # #                 code_int = int(code)
 # #                 if code_int < mc and code_int in vc:
 # #                     lut[code_int] = entry.get("color", (128, 128, 128))
-# #             face_classes = _face_class_ids(cm, cache.faces)
+# #             face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
 # #             shade = (
 # #                 cache.shade
 # #                 if cache.shade is not None and len(cache.shade) == len(cache.faces)
@@ -12868,6 +12868,15 @@ _FEATURE_AWARE_VERSION = 1
 _MULTICLASS_COLOR_OVERLAY_NAME = "shaded_mesh_live_multiclass_color"
 _INCIDENT_FACE_CACHE_MAX_NEW_VERTICES = 4096
 
+# Slow/all-points fidelity layer. The base faceted mesh remains completely
+# unchanged; this sparse point layer only restores class identity that a
+# one-class-per-triangle renderer would otherwise hide on mixed-class faces.
+# It is intentionally restricted to Slow multi-class shading so Fast/Normal,
+# single-class shading, topology edits, caches and classification performance
+# retain their established behaviour.
+_SHADING_CLASS_DETAIL_NAME = "shaded_mesh_class_detail"
+_SHADING_LIVE_CLASS_DETAIL_NAME = "shaded_mesh_live_class_detail"
+
 
 def normalize_shading_quality(value):
     """Return the persisted shading quality key used by UI and caches."""
@@ -13491,9 +13500,26 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
     checkpoint("delaunay")
 
     if len(faces) > 0:
+        # Slow means fidelity, not geometric simplification. The historical
+        # spacing/aspect thresholds reject skinny but valid triangles and can
+        # orphan LiDAR samples around poles, wires, roof edges and vertical
+        # returns. Slow only rejects numerical zero-area triangles; Fast and
+        # Normal retain the established thresholds unchanged.
+        slow_numeric_only = str(quality_mode or "normal").lower() == "slow"
+        if slow_numeric_only:
+            min_area = 1e-12
+            min_aspect = 1e-10
+            print(
+                "SHADING_DEGENERATE_POLICY mode=slow policy=numeric_only "
+                f"min_area={min_area:.1e} min_aspect={min_aspect:.1e}"
+            )
+        else:
+            min_area = (spacing * 0.1) ** 2
+            min_aspect = 0.001
         if HAS_NUMBA:
-            ma = (spacing * 0.1) ** 2
-            keep = _numba_degenerate_filter(faces, xy, ma, 0.001)
+            keep = _numba_degenerate_filter(
+                faces, xy, float(min_area), float(min_aspect)
+            )
             if np.any(~keep):
                 faces = faces[keep]
         else:
@@ -13507,8 +13533,7 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
             e1 = ((p2 - p1) ** 2).sum(1)
             e2 = ((p0 - p2) ** 2).sum(1)
             me = np.maximum(np.maximum(e0, e1), e2)
-            ma2 = (spacing * 0.1) ** 2
-            nd = (ta > ma2) & (ta / np.maximum(me, 1e-10) > 0.001)
+            nd = (ta > min_area) & (ta / np.maximum(me, 1e-20) > min_aspect)
             if np.any(~nd):
                 faces = faces[nd]
     checkpoint("degenerate_filter")
@@ -13537,6 +13562,25 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
         f"elapsed={feature_meta.get('elapsed', 0.0)*1000.0:.1f}ms"
     )
     checkpoint("feature_filter")
+
+    if str(quality_mode or "normal").lower() == "slow" and len(faces) > 0:
+        try:
+            used = np.zeros(len(xyz_unique), dtype=np.bool_)
+            face_chunk = 2_000_000
+            for begin in range(0, len(faces), face_chunk):
+                fc = faces[begin:begin + face_chunk]
+                used[fc[:, 0]] = True
+                used[fc[:, 1]] = True
+                used[fc[:, 2]] = True
+            orphan_count = int(len(used) - np.count_nonzero(used))
+            coverage = 100.0 * (len(used) - orphan_count) / max(len(used), 1)
+            print(
+                "SHADING_POINT_COVERAGE mode=slow "
+                f"input_vertices={len(used):,} referenced_vertices={len(used)-orphan_count:,} "
+                f"orphan_vertices={orphan_count:,} coverage={coverage:.6f}%"
+            )
+        except Exception as exc:
+            print(f"SHADING_POINT_COVERAGE status=unavailable reason={exc}")
 
     face_normals = None
     vertex_normals = None
@@ -14120,6 +14164,391 @@ def _remove_shaded_edge_overlay(app):
     app._shaded_mesh_edge_actor = None; app._shaded_mesh_edge_polydata = None
 
 
+def _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True):
+    """Remove only the MicroStation-fidelity class-detail point layers."""
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is not None:
+        if remove_static:
+            try:
+                plotter.remove_actor(_SHADING_CLASS_DETAIL_NAME, render=False)
+            except Exception:
+                pass
+        if remove_live:
+            try:
+                plotter.remove_actor(_SHADING_LIVE_CLASS_DETAIL_NAME, render=False)
+            except Exception:
+                pass
+    if remove_static:
+        app._shading_class_detail_actor = None
+        app._shading_class_detail_buffers = None
+    if remove_live:
+        app._shading_live_class_detail_actor = None
+        app._shading_live_class_detail_buffers = None
+
+
+def _shading_class_detail_enabled(app, cache) -> bool:
+    """Raw point-sprite fidelity overlay is retired; fidelity is facet-based."""
+    return False
+
+
+def _microstation_color_blend_enabled(app, cache) -> bool:
+    """Enable TerraScan/MicroStation-style class-color interpolation safely.
+
+    The geometry/topology pipeline is intentionally untouched.  Only Slow
+    multi-class shading uses per-vertex class RGB interpolation; Fast, Normal
+    and every single-class shading path retain the established faceted cell-RGB
+    renderer.  The environment switch is an emergency rollback without a code
+    change.
+    """
+    flag = os.environ.get('NAKSHA_SHADING_MICROSTATION_BLEND', '1').strip().lower()
+    if flag in ('0', 'false', 'off', 'no'):
+        return False
+    return (
+        normalize_shading_quality(getattr(app, 'shading_quality', 'normal')) == 'slow'
+        and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
+    )
+
+
+def _configure_microstation_color_blend_lighting(app, actor=None):
+    """Configure one directional light + flat triangle lighting for RGB blending.
+
+    TerraScan documents Color by Shading as a triangulated surface *colored by
+    class* and *shaded by triangle slope*.  The matching GPU formulation is:
+
+      per-vertex class RGB --barycentric interpolation--> fragment class color
+      flat triangle normal --directional Lambert light--> triangle brightness
+
+    This keeps each LAS class color exact at its source vertex while allowing
+    neighbouring class colors to blend naturally inside a triangle.  Lighting
+    stays flat/faceted: only COLOR is interpolated, not the triangle normal.
+    """
+    plotter = getattr(app, 'vtk_widget', None)
+    renderer = getattr(plotter, 'renderer', None) if plotter is not None else None
+    if renderer is None:
+        return False
+
+    azimuth = float(getattr(app, 'last_shade_azimuth', 45.0))
+    angle = float(getattr(app, 'last_shade_angle', 45.0))
+    ambient = float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0))
+
+    # Reuse one VTK light across classification edits.  Surface/other renderers
+    # may replace the renderer light collection, so verify membership before
+    # reusing the cached object.
+    key_light = getattr(app, '_shading_microstation_key_light', None)
+    light_live = False
+    if key_light is not None:
+        try:
+            lights = renderer.GetLights()
+            light_live = bool(lights and lights.IsItemPresent(key_light))
+        except Exception:
+            light_live = False
+
+    if not light_live:
+        try:
+            renderer.RemoveAllLights()
+        except Exception:
+            pass
+        key_light = vtk.vtkLight()
+        key_light.SetLightTypeToSceneLight()
+        key_light.SetPositional(False)
+        key_light.SetColor(1.0, 1.0, 1.0)
+        renderer.AddLight(key_light)
+        app._shading_microstation_key_light = key_light
+
+    zenith_rad = np.radians(90.0 - angle)
+    az_math_rad = np.radians(360.0 - azimuth + 90.0)
+    lx = np.sin(zenith_rad) * np.cos(az_math_rad)
+    ly = np.sin(zenith_rad) * np.sin(az_math_rad)
+    lz = np.cos(zenith_rad)
+    key_light.SetPosition(float(lx * 100.0), float(ly * 100.0), float(lz * 100.0))
+    key_light.SetFocalPoint(0.0, 0.0, 0.0)
+    key_light.SetIntensity(1.0)
+    try:
+        key_light.Modified()
+    except Exception:
+        pass
+
+    # With renderer ambient=white, property Ambient/Diffuse maps the existing
+    # Naksha ambient slider to a stable [ambient..1] brightness range.
+    try:
+        renderer.SetAmbient(1.0, 1.0, 1.0)
+    except Exception:
+        pass
+
+    actors = []
+    if actor is not None:
+        actors.append(actor)
+    else:
+        for candidate in (
+            getattr(app, '_shaded_mesh_actor', None),
+            getattr(app, '_shading_multiclass_color_overlay_actor', None),
+        ):
+            if candidate is not None:
+                actors.append(candidate)
+
+    for item in actors:
+        try:
+            prop = item.GetProperty()
+            prop.SetLighting(True)
+            prop.SetInterpolationToFlat()
+            prop.SetAmbient(ambient)
+            prop.SetDiffuse(max(0.0, 1.0 - ambient))
+            prop.SetSpecular(0.0)
+            prop.EdgeVisibilityOff()
+            item.Modified()
+        except Exception:
+            pass
+
+    signature = (round(azimuth, 4), round(angle, 4), round(ambient, 4))
+    if getattr(app, '_shading_microstation_light_signature', None) != signature:
+        app._shading_microstation_light_signature = signature
+        print(
+            'SHADING_COLOR_BLEND_LIGHT '
+            f'azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} '
+            'normal=flat_triangle color=barycentric_vertex_rgb'
+        )
+    return True
+
+
+def _shading_palette_rgb(app, class_values, visible_classes):
+    """Map a small/sparse class array to exact Display Mode RGB values."""
+    values = np.asarray(class_values).astype(np.int64, copy=False).ravel()
+    if values.size == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+    visible = set(int(c) for c in (visible_classes or ()))
+    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+    max_code = max([255, int(values.max(initial=0))] + palette_codes)
+    lut = np.zeros((max_code + 1, 3), dtype=np.uint8)
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        ci = int(code)
+        if 0 <= ci <= max_code and ci in visible:
+            try:
+                lut[ci] = np.asarray(entry.get('color', (128, 128, 128))[:3], dtype=np.uint8)
+            except Exception:
+                lut[ci] = (128, 128, 128)
+    clipped = np.clip(values, 0, max_code)
+    return lut[clipped]
+
+
+def _add_shading_class_detail_actor(app, name, xyz, rgb, *, live=False):
+    """Create one GPU point actor above the faceted mesh without altering it."""
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is None:
+        return None
+    xyz = np.ascontiguousarray(np.asarray(xyz, dtype=np.float64))
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8))
+    if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) == 0 or len(rgb) != len(xyz):
+        return None
+
+    try:
+        plotter.remove_actor(name, render=False)
+    except Exception:
+        pass
+
+    cloud = pv.PolyData(xyz)
+    cloud.point_data['RGB'] = rgb
+    point_size = float(os.environ.get('NAKSHA_SHADING_CLASS_DETAIL_SIZE', '3.0'))
+    point_size = min(max(point_size, 1.0), 8.0)
+    actor = plotter.add_mesh(
+        cloud,
+        scalars='RGB',
+        rgb=True,
+        style='points',
+        point_size=point_size,
+        render_points_as_spheres=False,
+        lighting=False,
+        preference='point',
+        name=name,
+        render=False,
+    )
+    if actor is None:
+        return None
+    try:
+        setattr(actor, '_is_shading_mesh', True)
+        setattr(actor, '_is_shading_class_detail', True)
+        setattr(actor, '_is_shading_live_class_detail', bool(live))
+        actor.PickableOff()
+        if hasattr(actor, 'UseBoundsOff'):
+            actor.UseBoundsOff()
+        prop = actor.GetProperty()
+        prop.SetLighting(False)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetSpecular(0.0)
+        prop.SetPointSize(point_size)
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            # Prefer a depth bias instead of physically moving LiDAR XYZ. VTK
+            # versions differ on point-offset support, so guard every call.
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            if hasattr(mapper, 'SetRelativeCoincidentTopologyPointOffsetParameter'):
+                mapper.SetRelativeCoincidentTopologyPointOffsetParameter(-8.0 if live else -6.0)
+            elif hasattr(mapper, 'SetResolveCoincidentTopologyPointOffsetParameter'):
+                mapper.SetResolveCoincidentTopologyPointOffsetParameter(-8.0 if live else -6.0)
+            mapper.InterpolateScalarsBeforeMappingOff()
+    except Exception:
+        pass
+
+    buffers = (xyz, rgb, cloud)
+    if live:
+        app._shading_live_class_detail_actor = actor
+        app._shading_live_class_detail_buffers = buffers
+    else:
+        app._shading_class_detail_actor = actor
+        app._shading_class_detail_buffers = buffers
+    return actor
+
+
+def _build_faceted_class_detail_overlay(app, cache, classes_raw, face_classes=None, visible_classes=None):
+    """Restore point-level class fidelity lost by majority-colored triangles.
+
+    The existing triangulation and 68M-cell RGB mesh are untouched. For Slow
+    multi-class shading only, mark representative vertices whose canonical class
+    differs from the class painted on at least one incident triangle. Vertices
+    not referenced by any surviving triangle are also retained as point detail.
+    Work is chunked so a 30M+ point / 60M+ face tile does not materialize another
+    full ``classes[faces]`` array.
+    """
+    if not _shading_class_detail_enabled(app, cache):
+        _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=False)
+        return True
+    if cache.faces is None or cache.unique_indices is None or cache.xyz_final is None:
+        return False
+
+    t0 = time.perf_counter()
+    faces = np.asarray(cache.faces, dtype=np.int32)
+    n_vertices = len(cache.unique_indices)
+    if n_vertices == 0 or len(faces) == 0:
+        return True
+    classes = np.asarray(classes_raw)
+    cm = classes[cache.unique_indices]
+    detail = np.zeros(n_vertices, dtype=np.bool_)
+    used = np.zeros(n_vertices, dtype=np.bool_)
+
+    # face_classes is already present during the normal flat render. If a caller
+    # does not have it, compute only one bounded chunk at a time.
+    supplied_fc = (
+        face_classes is not None and len(face_classes) == len(faces)
+    )
+    chunk = max(100_000, int(os.environ.get(
+        'NAKSHA_SHADING_CLASS_DETAIL_FACE_CHUNK', '1500000'
+    )))
+
+    for begin in range(0, len(faces), chunk):
+        end = min(begin + chunk, len(faces))
+        f = faces[begin:end]
+        c0 = cm[f[:, 0]]
+        c1 = cm[f[:, 1]]
+        c2 = cm[f[:, 2]]
+        if supplied_fc:
+            fc = np.asarray(face_classes[begin:end])
+        else:
+            fc = np.where(
+                c0 == c1,
+                c0,
+                np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+            )
+        used[f[:, 0]] = True
+        used[f[:, 1]] = True
+        used[f[:, 2]] = True
+        m0 = c0 != fc
+        m1 = c1 != fc
+        m2 = c2 != fc
+        if np.any(m0):
+            detail[f[m0, 0]] = True
+        if np.any(m1):
+            detail[f[m1, 1]] = True
+        if np.any(m2):
+            detail[f[m2, 2]] = True
+
+    orphaned = ~used
+    if np.any(orphaned):
+        detail |= orphaned
+
+    detail_idx = np.flatnonzero(detail).astype(np.int64, copy=False)
+    if detail_idx.size == 0:
+        _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=False)
+        print(
+            'SHADING_CLASS_DETAIL points=0 minority=0 orphaned=0 '
+            f'elapsed={(time.perf_counter()-t0)*1000.0:.1f}ms'
+        )
+        return True
+
+    vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
+    rgb = _shading_palette_rgb(app, cm[detail_idx], vc)
+    # Hidden/unknown palette entries map to black. They should not create black
+    # speckles over the mesh; geometry visibility semantics remain unchanged.
+    keep = np.any(rgb != 0, axis=1)
+    detail_idx = detail_idx[keep]
+    rgb = rgb[keep]
+    if detail_idx.size == 0:
+        _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=False)
+        return True
+
+    actor = _add_shading_class_detail_actor(
+        app, _SHADING_CLASS_DETAIL_NAME,
+        cache.xyz_final[detail_idx], rgb, live=False,
+    )
+    if actor is None:
+        return False
+
+    print(
+        'SHADING_CLASS_DETAIL status=enabled mode=slow '
+        f'points={len(detail_idx):,} orphaned={int(np.count_nonzero(orphaned)):,} '
+        f'vertices={n_vertices:,} faces={len(faces):,} '
+        f'elapsed={(time.perf_counter()-t0)*1000.0:.1f}ms '
+        'base_mesh_unchanged=True'
+    )
+    return True
+
+
+def _update_live_class_detail_overlay(app, cache, dirty_faces, classes_raw, visible_classes=None):
+    """Refresh only class-detail points belonging to locally edited faces."""
+    if not _shading_class_detail_enabled(app, cache):
+        _remove_shading_class_detail_overlays(app, remove_static=False, remove_live=True)
+        return True
+    dirty_faces = np.asarray(dirty_faces, dtype=np.int64).ravel()
+    if dirty_faces.size == 0:
+        return True
+    faces = np.asarray(cache.faces[dirty_faces], dtype=np.int32)
+    classes = np.asarray(classes_raw)
+    fvc = classes[cache.unique_indices[faces]]
+    c0, c1, c2 = fvc[:, 0], fvc[:, 1], fvc[:, 2]
+    fc = np.where(
+        c0 == c1,
+        c0,
+        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+    )
+
+    ids = []
+    m0 = c0 != fc
+    m1 = c1 != fc
+    m2 = c2 != fc
+    if np.any(m0): ids.append(faces[m0, 0])
+    if np.any(m1): ids.append(faces[m1, 1])
+    if np.any(m2): ids.append(faces[m2, 2])
+    if not ids:
+        _remove_shading_class_detail_overlays(app, remove_static=False, remove_live=True)
+        return True
+
+    unique_ids = np.unique(np.concatenate(ids)).astype(np.int64, copy=False)
+    vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
+    current_classes = classes[cache.unique_indices[unique_ids]]
+    rgb = _shading_palette_rgb(app, current_classes, vc)
+    keep = np.any(rgb != 0, axis=1)
+    unique_ids = unique_ids[keep]
+    rgb = rgb[keep]
+    if unique_ids.size == 0:
+        _remove_shading_class_detail_overlays(app, remove_static=False, remove_live=True)
+        return True
+
+    return _add_shading_class_detail_actor(
+        app, _SHADING_LIVE_CLASS_DETAIL_NAME,
+        cache.xyz_final[unique_ids], rgb, live=True,
+    ) is not None
+
+
 def _remove_multiclass_color_overlay(app, cache=None, clear_dirty=True):
     """Remove the tiny multi-class color overlay without touching base shading.
 
@@ -14210,6 +14639,7 @@ def _remove_fast_shading_overlays(app):
     except Exception:
         pass
     app._shading_multiclass_color_overlay_actor = None
+    _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
     try:
         for item in _cache_store.values():
             item._multiclass_dirty_faces.clear()
@@ -14231,6 +14661,7 @@ def detach_shading_before_non_shading_mode(app):
             except Exception:
                 pass
     _remove_fast_shading_overlays(app)
+    _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
     app._shaded_mesh_actor = None
     app._shaded_mesh_polydata = None
     app._shaded_mesh_edge_actor = None
@@ -15188,7 +15619,7 @@ def _hide_point_cloud_actors_for_shading(app):
         print(f"   ⚠️ Shading point actor hide skipped: {e}")
 
 def _face_class_ids(vertex_classes, faces):
-    """Choose one deterministic class per triangle without color interpolation."""
+    """Legacy deterministic majority class per triangle."""
     c0 = vertex_classes[faces[:, 0]]
     c1 = vertex_classes[faces[:, 1]]
     c2 = vertex_classes[faces[:, 2]]
@@ -15197,6 +15628,76 @@ def _face_class_ids(vertex_classes, faces):
         c0,
         np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
     )
+
+
+def _face_class_ids_shading(app, cache, vertex_classes, faces):
+    """Choose the displayed class for a shaded triangle.
+
+    Existing Fast/Normal/single-class behaviour is preserved exactly.  Only
+    Slow multi-class shading uses peak-vertex ownership: the class attached to
+    the highest-Z vertex owns the facet.  This keeps isolated/elevated class
+    samples (for example Default points above Ground) represented as shaded
+    triangles instead of being swallowed by a 2-vs-1 majority vote.
+    """
+    try:
+        is_slow = normalize_shading_quality(
+            getattr(app, 'shading_quality', 'normal')
+        ) == 'slow'
+        is_multi = int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
+        xyz = getattr(cache, 'xyz_unique', None)
+        if is_slow and is_multi and xyz is not None and len(xyz) == len(vertex_classes):
+            f = np.asarray(faces, dtype=np.int32)
+            z0 = xyz[f[:, 0], 2]
+            z1 = xyz[f[:, 1], 2]
+            z2 = xyz[f[:, 2], 2]
+            # Deterministic ties: v0, then v1, then v2.
+            choose1 = z1 > z0
+            best_z = np.where(choose1, z1, z0)
+            best_i = np.where(choose1, f[:, 1], f[:, 0])
+            choose2 = z2 > best_z
+            best_i = np.where(choose2, f[:, 2], best_i)
+            return np.asarray(vertex_classes)[best_i]
+    except Exception as exc:
+        print(f"SHADING_FACE_CLASS peak_fallback=majority reason={exc}")
+    return _face_class_ids(vertex_classes, faces)
+
+
+def _face_class_ids_sparse_shading(app, cache, face_vertex_classes, face_vertex_ids):
+    """Return face classes for a sparse already-expanded Nx3 face set.
+
+    Fast/Normal/single-class keep the established majority rule. Slow
+    multi-class uses the highest-Z vertex, exactly matching the full renderer
+    without materializing classifications for every 34M mesh vertex.
+    """
+    fvc = np.asarray(face_vertex_classes)
+    fids = np.asarray(face_vertex_ids, dtype=np.int32)
+    if fvc.ndim != 2 or fvc.shape[1] != 3 or fids.shape != fvc.shape:
+        raise ValueError("face_vertex_classes/ids must both be Nx3")
+    try:
+        is_slow = normalize_shading_quality(
+            getattr(app, 'shading_quality', 'normal')
+        ) == 'slow'
+        is_multi = int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
+        xyz = getattr(cache, 'xyz_unique', None)
+        if is_slow and is_multi and xyz is not None:
+            z0 = xyz[fids[:, 0], 2]
+            z1 = xyz[fids[:, 1], 2]
+            z2 = xyz[fids[:, 2], 2]
+            choose1 = z1 > z0
+            best_z = np.where(choose1, z1, z0)
+            best_slot = np.where(choose1, 1, 0)
+            choose2 = z2 > best_z
+            best_slot = np.where(choose2, 2, best_slot)
+            rows = np.arange(len(fvc), dtype=np.int64)
+            return fvc[rows, best_slot].astype(np.int64, copy=False)
+    except Exception as exc:
+        print(f"SHADING_FACE_CLASS sparse_peak_fallback=majority reason={exc}")
+    c0, c1, c2 = fvc[:, 0], fvc[:, 1], fvc[:, 2]
+    return np.where(
+        c0 == c1,
+        c0,
+        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
+    ).astype(np.int64, copy=False)
 
 
 def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
@@ -15229,8 +15730,12 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         ci = int(c)
         if ci < mc and ci in vc: lut[ci] = e.get("color", (128,128,128))
     amb = getattr(app, 'shade_ambient', 0.25)
-    # Enforce the current faceted policy for newly built and already-cached
-    # meshes alike.
+    # Slow multi-class keeps the exact current triangulation but presents class
+    # colors as per-vertex RGB, matching TerraScan's "colored by class, shaded
+    # by triangle slope" appearance.  Other quality/mode paths stay untouched.
+    blend_class_colors = _microstation_color_blend_enabled(app, cache)
+    # Enforce the current faceted-normal policy for newly built and cached meshes.
+    # In blend mode the NORMAL is still flat; only class RGB is interpolated.
     smooth_all_classes = False
     cache.smooth_all_classes = False
     em = getattr(app, '_shaded_mesh_polydata', None)
@@ -15242,7 +15747,57 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         cache._vtk_mesh = None
     checkpoint("class_map_lut_setup")
 
-    if smooth_all_classes:
+    if blend_class_colors:
+        # IMPORTANT: do not bake one class into the whole triangle.  Each mesh
+        # vertex keeps its own canonical class RGB.  OpenGL then performs the
+        # barycentric color interpolation visible in MicroStation/TerraScan,
+        # while VTK flat lighting uses the triangle slope for brightness.
+        vertex_colors = _shading_palette_rgb(app, cm, vc)
+
+        if (em is not None and ea is not None and
+                _get_rendered_cache_key(app) == cache.cache_key and
+                em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf):
+            try:
+                vtk_colors = em.GetPointData().GetScalars()
+                if vtk_colors is not None and vtk_colors.GetNumberOfTuples() == nv:
+                    numpy_support.vtk_to_numpy(vtk_colors)[:] = vertex_colors
+                    vtk_colors.Modified(); em.GetPointData().Modified(); em.Modified()
+                    ea.GetMapper().Modified()
+                    _configure_microstation_color_blend_lighting(app, ea)
+                    _set_rendered_cache_key(app, cache)
+                    for actor in _attachment_overlay_actors(app):
+                        vis = bool(actor.GetVisibility())
+                        if labels_hidden and _is_overlay_label_actor(actor):
+                            vis = False
+                        _restore_overlay_actor(app.vtk_widget.renderer, actor, vis)
+                    _hide_point_cloud_actors_for_shading(app)
+                    checkpoint('inplace_color_update_and_overlays')
+                    _restore_camera(app, saved_camera); app.vtk_widget.render()
+                    checkpoint('render_present')
+                    render_timings['total_render_path'] = time.perf_counter() - profile_start
+                    _emit_shading_profile(
+                        'render_inplace_blended', render_timings,
+                        points=nv, faces=nf, smooth=0, blend=1,
+                    )
+                    return
+            except Exception:
+                pass
+            cache._vtk_colors_ptr = None
+
+        if cached_mesh is not None:
+            mesh = cached_mesh
+            try:
+                mesh.GetCellData().RemoveArray('RGB')
+            except Exception:
+                pass
+            mesh.point_data['RGB'] = vertex_colors
+        else:
+            fv = np.empty(nf * 4, dtype=np.int32); fv[0::4] = 3
+            fv[1::4] = cache.faces[:,0]; fv[2::4] = cache.faces[:,1]; fv[3::4] = cache.faces[:,2]
+            mesh = pv.PolyData(cache.xyz_final, fv)
+            mesh.point_data['RGB'] = vertex_colors
+
+    elif smooth_all_classes:
         if cache.vertex_normals is None or len(cache.vertex_normals) != nv:
             face_normals = cache.face_normals
             if face_normals is None or len(face_normals) != nf:
@@ -15314,7 +15869,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
                 face_normals=face_normals,
             ).astype(np.float32)
 
-        face_classes = _face_class_ids(cm, cache.faces)
+        face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
         face_colors = np.clip(
             lut[np.clip(face_classes, 0, mc - 1)] * cache.shade[:, None],
             0,
@@ -15411,21 +15966,43 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     app._shading_remove_overlays = []
 
     app._shaded_mesh_actor = plotter.add_mesh(
-        mesh, scalars="RGB", rgb=True, show_edges=False, lighting=False,
-        smooth_shading=smooth_all_classes,
-        preference="point" if smooth_all_classes else "cell",
+        mesh, scalars="RGB", rgb=True, show_edges=False,
+        lighting=bool(blend_class_colors),
+        smooth_shading=False if blend_class_colors else smooth_all_classes,
+        preference="point" if (blend_class_colors or smooth_all_classes) else "cell",
         name="shaded_mesh", render=False,
     )
     if app._shaded_mesh_actor:
         setattr(app._shaded_mesh_actor, "_is_shading_mesh", True)
         p2 = app._shaded_mesh_actor.GetProperty()
-        if not smooth_all_classes:
-            p2.SetInterpolationToFlat()
-        p2.SetAmbient(1.); p2.SetDiffuse(0.); p2.SetSpecular(0.); p2.EdgeVisibilityOff()
+        if blend_class_colors:
+            _configure_microstation_color_blend_lighting(app, app._shaded_mesh_actor)
+        else:
+            if not smooth_all_classes:
+                p2.SetInterpolationToFlat()
+            p2.SetLighting(False)
+            p2.SetAmbient(1.); p2.SetDiffuse(0.); p2.SetSpecular(0.); p2.EdgeVisibilityOff()
     app._shaded_mesh_polydata = mesh; cache._vtk_colors_ptr = None
     cache._vtk_mesh = mesh
     _set_rendered_cache_key(app, cache)
     checkpoint("vtk_actor_create")
+
+    # Slow multi-class fidelity is now expressed by shaded FACETS, not raw
+    # point sprites.  Remove the previous minority-point overlay so Default /
+    # Building / vegetation samples appear as triangulated shaded regions.
+    _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
+    if blend_class_colors:
+        print(
+            'SHADING_COLOR_BLEND mode=slow active=1 '
+            'class_source=per_vertex interpolation=barycentric '
+            'lighting=flat_triangle_slope '
+            f'points={nv:,} faces={nf:,} raw_point_overlay=disabled'
+        )
+    elif normalize_shading_quality(getattr(app, 'shading_quality', 'normal')) == 'slow' and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1:
+        print(
+            "SHADING_FACE_CLASS policy=peak_vertex mode=slow active=1 "
+            f"points={nv:,} faces={nf:,} raw_point_overlay=disabled"
+        )
 
     renderer = plotter.renderer; nr = 0
     if not fast_cached_cleanup:
@@ -16449,12 +17026,10 @@ def _affected_faceted_faces(cache, changed_mask, total_points, changed_indices=N
 
 
 def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
-    """Commit sparse overlay colours to base before a topology-changing edit.
+    """Commit sparse overlay colors before a topology-changing edit.
 
-    This is intentionally NOT used for normal all-class classification.  It is
-    only a correctness bridge when an edit crosses the visible/hidden boundary
-    and the topology-aware legacy path must take over.  VTK may upload the large
-    base color buffer once here, which is acceptable for that rare case.
+    Slow blended shading commits only the touched VERTEX colors.  Legacy
+    Fast/Normal shading commits the touched CELL colors exactly as before.
     """
     dirty = getattr(cache, '_multiclass_dirty_faces', None)
     if not dirty:
@@ -16463,9 +17038,6 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
 
     mesh = getattr(app, '_shaded_mesh_polydata', None)
     if mesh is None or cache.faces is None or cache.unique_indices is None:
-        return False
-    cell_colors = mesh.GetCellData().GetScalars()
-    if cell_colors is None or cell_colors.GetNumberOfTuples() != len(cache.faces):
         return False
 
     data = getattr(app, 'data', None)
@@ -16480,17 +17052,41 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
         _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
         return True
 
-    base_faces = cache.faces[dirty_faces]
-    fvc = classes[cache.unique_indices[base_faces]]
-    c0, c1, c2 = fvc[:, 0], fvc[:, 1], fvc[:, 2]
-    face_classes = np.where(
-        c0 == c1,
-        c0,
-        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
-    ).astype(np.int64, copy=False)
-
     vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
     vc = set(int(c) for c in (vc or ()))
+
+    if _microstation_color_blend_enabled(app, cache):
+        point_colors = mesh.GetPointData().GetScalars()
+        if point_colors is None or point_colors.GetNumberOfTuples() != len(cache.unique_indices):
+            return False
+        dirty_vertices = np.unique(cache.faces[dirty_faces].ravel()).astype(np.int64, copy=False)
+        vertex_classes = classes[cache.unique_indices[dirty_vertices]]
+        rgb = _shading_palette_rgb(app, vertex_classes, vc)
+        numpy_support.vtk_to_numpy(point_colors)[dirty_vertices] = rgb
+        point_colors.Modified()
+        mesh.GetPointData().Modified(); mesh.Modified()
+        actor = getattr(app, '_shaded_mesh_actor', None)
+        if actor is not None and actor.GetMapper() is not None:
+            actor.GetMapper().Modified()
+            _configure_microstation_color_blend_lighting(app, actor)
+        print(
+            'SHADING_MULTI_BLEND_BAKE '
+            f'faces={len(dirty_faces)} vertices={len(dirty_vertices)} '
+            'reason=topology_membership_change'
+        )
+        _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+        return True
+
+    cell_colors = mesh.GetCellData().GetScalars()
+    if cell_colors is None or cell_colors.GetNumberOfTuples() != len(cache.faces):
+        return False
+
+    base_faces = cache.faces[dirty_faces]
+    fvc = classes[cache.unique_indices[base_faces]]
+    face_classes = _face_class_ids_sparse_shading(
+        app, cache, fvc, base_faces
+    )
+
     palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
     local_max = int(face_classes.max()) if face_classes.size else 0
     mc = max([255, local_max] + palette_codes) + 1
@@ -16524,21 +17120,14 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
     _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
     return True
 
-
 def _fast_multiclass_color_overlay(
         app, cache, changed_mask=None, changed_indices=None,
         visible_classes=None, schedule_render=True):
     """Refresh topology-stable multi-class shading without touching base RGB.
 
-    The base all-class mesh can contain tens of millions of cells.  Calling
-    ``cell_colors.Modified()`` on that mesh after a 50-point classification
-    makes VTK/OpenGL treat the complete cell-color buffer as dirty.  The CPU
-    patch is small, but the subsequent GPU upload/presentation is not.
-
-    This path keeps the base mesh and its 68M-cell RGB array completely static.
-    It builds one tiny exact-face overlay from only faces ever touched during
-    the current shading session.  Current canonical classifications are used on
-    every rebuild, so classification, undo and redo all display correctly.
+    Slow multi-class uses the same per-vertex RGB interpolation as the base
+    mesh.  Fast/Normal retain the established exact-face cell-color overlay.
+    In both cases the huge base geometry remains immutable during classification.
     """
     t0 = time.perf_counter()
     if getattr(cache, 'n_visible_classes', 0) <= 1:
@@ -16547,8 +17136,11 @@ def _fast_multiclass_color_overlay(
         cache.faces is None
         or cache.xyz_final is None
         or cache.unique_indices is None
-        or cache.shade is None
     ):
+        return False
+
+    blend_mode = _microstation_color_blend_enabled(app, cache)
+    if not blend_mode and cache.shade is None:
         return False
 
     data = getattr(app, 'data', None)
@@ -16584,7 +17176,6 @@ def _fast_multiclass_color_overlay(
     if not dirty:
         return True
 
-    # Deterministic ordering makes debugging and VTK replacement stable.
     dirty_faces = np.fromiter(dirty, dtype=np.int64, count=len(dirty))
     dirty_faces.sort()
 
@@ -16594,36 +17185,8 @@ def _fast_multiclass_color_overlay(
     local_faces = inverse.reshape(-1, 3).astype(np.int32, copy=False)
     local_xyz = np.ascontiguousarray(cache.xyz_final[local_vertex_ids])
 
-    # Compute exactly the same flat/faceted majority-class colour as the base
-    # renderer, but only for the sparse dirty faces.
-    global_face_indices = cache.unique_indices[base_faces]
-    fvc = classes[global_face_indices]
-    c0 = fvc[:, 0]
-    c1 = fvc[:, 1]
-    c2 = fvc[:, 2]
-    face_classes = np.where(
-        c0 == c1,
-        c0,
-        np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
-    ).astype(np.int64, copy=False)
-
     vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
     vc = set(int(c) for c in (vc or ()))
-    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
-    local_max = int(face_classes.max()) if face_classes.size else 0
-    mc = max([255, local_max] + palette_codes) + 1
-    lut = np.zeros((mc, 3), dtype=np.float32)
-    for code, entry in getattr(app, 'class_palette', {}).items():
-        code_int = int(code)
-        if 0 <= code_int < mc and code_int in vc:
-            lut[code_int] = entry.get('color', (128, 128, 128))
-
-    local_shade = np.asarray(cache.shade[dirty_faces], dtype=np.float32)
-    rgb = np.clip(
-        lut[np.clip(face_classes, 0, mc - 1)] * local_shade[:, None],
-        0,
-        255,
-    ).astype(np.uint8)
 
     packed = np.empty(len(local_faces) * 4, dtype=np.int32)
     packed[0::4] = 3
@@ -16631,7 +17194,40 @@ def _fast_multiclass_color_overlay(
     packed[2::4] = local_faces[:, 1]
     packed[3::4] = local_faces[:, 2]
     patch = pv.PolyData(local_xyz, packed)
-    patch.cell_data['RGB'] = rgb
+
+    if blend_mode:
+        # Keep the canonical class RGB on each local vertex.  The GPU blends
+        # those colors inside each triangle and applies one flat slope light.
+        local_classes = classes[cache.unique_indices[local_vertex_ids]]
+        rgb = _shading_palette_rgb(app, local_classes, vc)
+        patch.point_data['RGB'] = rgb
+        preference = 'point'
+        lighting = True
+    else:
+        global_face_indices = cache.unique_indices[base_faces]
+        fvc = classes[global_face_indices]
+        face_classes = _face_class_ids_sparse_shading(
+            app, cache, fvc, base_faces
+        )
+
+        palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+        local_max = int(face_classes.max()) if face_classes.size else 0
+        mc = max([255, local_max] + palette_codes) + 1
+        lut = np.zeros((mc, 3), dtype=np.float32)
+        for code, entry in getattr(app, 'class_palette', {}).items():
+            code_int = int(code)
+            if 0 <= code_int < mc and code_int in vc:
+                lut[code_int] = entry.get('color', (128, 128, 128))
+
+        local_shade = np.asarray(cache.shade[dirty_faces], dtype=np.float32)
+        rgb = np.clip(
+            lut[np.clip(face_classes, 0, mc - 1)] * local_shade[:, None],
+            0,
+            255,
+        ).astype(np.uint8)
+        patch.cell_data['RGB'] = rgb
+        preference = 'cell'
+        lighting = False
 
     plotter = getattr(app, 'vtk_widget', None)
     if plotter is None:
@@ -16646,9 +17242,9 @@ def _fast_multiclass_color_overlay(
         scalars='RGB',
         rgb=True,
         show_edges=False,
-        lighting=False,
+        lighting=lighting,
         smooth_shading=False,
-        preference='cell',
+        preference=preference,
         name=_MULTICLASS_COLOR_OVERLAY_NAME,
         render=False,
     )
@@ -16660,11 +17256,15 @@ def _fast_multiclass_color_overlay(
         setattr(actor, '_is_shading_color_overlay', True)
         actor.PickableOff()
         prop = actor.GetProperty()
-        prop.SetInterpolationToFlat()
-        prop.SetAmbient(1.0)
-        prop.SetDiffuse(0.0)
-        prop.SetSpecular(0.0)
-        prop.EdgeVisibilityOff()
+        if blend_mode:
+            _configure_microstation_color_blend_lighting(app, actor)
+        else:
+            prop.SetLighting(False)
+            prop.SetInterpolationToFlat()
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            prop.EdgeVisibilityOff()
         mapper = actor.GetMapper()
         if mapper is not None:
             mapper.StaticOn()
@@ -16675,17 +17275,36 @@ def _fast_multiclass_color_overlay(
         pass
 
     app._shading_multiclass_color_overlay_actor = actor
+    if not blend_mode:
+        try:
+            _update_live_class_detail_overlay(
+                app, cache, dirty_faces, classes, visible_classes=vc
+            )
+        except Exception as _detail_exc:
+            print(f"SHADING_CLASS_DETAIL live_update_fallback={_detail_exc}")
+
     total_ms = (time.perf_counter() - t0) * 1000.0
-    print(
-        'SHADING_MULTI_COLOR_OVERLAY '
-        f'changed_vertices={len(changed_unique)} '
-        f'new_faces={len(affected_faces)} dirty_faces={len(dirty_faces)} '
-        f'local_vertices={len(local_vertex_ids)} lookup={lookup_ms:.1f}ms '
-        f'total={total_ms:.1f}ms base_rgb_untouched=True'
-    )
+    if blend_mode:
+        print(
+            'SHADING_MULTI_BLEND_OVERLAY '
+            f'changed_vertices={len(changed_unique)} '
+            f'new_faces={len(affected_faces)} dirty_faces={len(dirty_faces)} '
+            f'local_vertices={len(local_vertex_ids)} lookup={lookup_ms:.1f}ms '
+            f'total={total_ms:.1f}ms base_rgb_untouched=True'
+        )
+    else:
+        print(
+            'SHADING_MULTI_COLOR_OVERLAY '
+            f'changed_vertices={len(changed_unique)} '
+            f'new_faces={len(affected_faces)} dirty_faces={len(dirty_faces)} '
+            f'local_vertices={len(local_vertex_ids)} lookup={lookup_ms:.1f}ms '
+            f'total={total_ms:.1f}ms base_rgb_untouched=True'
+        )
 
     if schedule_render:
-        app._shading_present_reason = 'multiclass_color_overlay'
+        app._shading_present_reason = (
+            'multiclass_blend_overlay' if blend_mode else 'multiclass_color_overlay'
+        )
         _schedule_fast_shaded_present(
             app, delay_ms=0, restart=True, wait_while_preview=True
         )
@@ -16711,6 +17330,56 @@ def _update_colors_gpu_fast(
         data = getattr(app, "data", None)
         cls_raw = data.get("classification") if isinstance(data, dict) else None
         xyz_raw = data.get("xyz") if isinstance(data, dict) else None
+
+        # Slow multi-class base meshes use POINT RGB.  Normal classification
+        # normally takes the tiny blend-overlay path above; this branch is the
+        # safe direct fallback and also handles full palette recolors.
+        if (
+            _microstation_color_blend_enabled(app, cache)
+            and cls_raw is not None
+            and cache.unique_indices is not None
+        ):
+            point_colors = mesh.GetPointData().GetScalars()
+            if point_colors is not None and point_colors.GetNumberOfTuples() == len(cache.unique_indices):
+                classes = np.asarray(cls_raw)
+                vp = numpy_support.vtk_to_numpy(point_colors)
+                changed_unique = np.empty(0, dtype=np.int64)
+                if changed_mask is not None and np.any(changed_mask) and xyz_raw is not None:
+                    if _changed_indices is not None:
+                        source_idx = np.asarray(_changed_indices, dtype=np.int64).ravel()
+                    else:
+                        source_idx = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
+                    g2u = cache.build_global_to_unique(len(xyz_raw))
+                    changed_unique = g2u[source_idx]
+                    changed_unique = np.unique(changed_unique[changed_unique >= 0]).astype(np.int64, copy=False)
+                    if changed_unique.size == 0:
+                        return True
+                    current_classes = classes[cache.unique_indices[changed_unique]]
+                    vp[changed_unique] = _shading_palette_rgb(app, current_classes, vc)
+                else:
+                    _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+                    current_classes = classes[cache.unique_indices]
+                    vp[:] = _shading_palette_rgb(app, current_classes, vc)
+
+                point_colors.Modified(); mesh.GetPointData().Modified(); mesh.Modified()
+                actor = getattr(app, '_shaded_mesh_actor', None)
+                if actor is not None:
+                    mapper = actor.GetMapper()
+                    if mapper is not None:
+                        mapper.Modified()
+                    _configure_microstation_color_blend_lighting(app, actor)
+
+                total_ms = (time.perf_counter() - t0) * 1000.0
+                print(
+                    'SHADING_VERTEX_COLOR_PATCH '
+                    f'changed_vertices={len(changed_unique)} total_vertices={len(cache.unique_indices)} '
+                    f'total={total_ms:.1f}ms blend=1'
+                )
+                if _defer_render:
+                    _schedule_fast_shaded_present(app, delay_ms=0)
+                else:
+                    app.vtk_widget.render()
+                return True
 
         cell_colors = mesh.GetCellData().GetScalars()
         if (
@@ -16753,14 +17422,9 @@ def _update_colors_gpu_fast(
                 target_faces = cache.faces[affected_faces]
                 global_face_indices = cache.unique_indices[target_faces]
                 fvc = classes[global_face_indices]
-                c0 = fvc[:, 0]
-                c1 = fvc[:, 1]
-                c2 = fvc[:, 2]
-                face_classes = np.where(
-                    c0 == c1,
-                    c0,
-                    np.where(c0 == c2, c0, np.where(c1 == c2, c1, c0)),
-                ).astype(np.int64, copy=False)
+                face_classes = _face_class_ids_sparse_shading(
+                    app, cache, fvc, target_faces
+                )
 
                 local_max = int(face_classes.max()) if face_classes.size else 0
                 mc = max(palette_max, local_max) + 1
@@ -16806,6 +17470,7 @@ def _update_colors_gpu_fast(
             # It bakes current canonical classes into the base RGB buffer, so
             # the sparse live overlay is no longer needed.
             _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+            _remove_shading_class_detail_overlays(app, remove_static=False, remove_live=True)
             cm = classes[cache.unique_indices]
             class_max = int(cm.max()) if cm.size else 0
             mc = max(palette_max, class_max) + 1
@@ -16815,7 +17480,7 @@ def _update_colors_gpu_fast(
                 if 0 <= code_int < mc and code_int in vc:
                     lut[code_int] = entry.get("color", (128, 128, 128))
 
-            face_classes = _face_class_ids(cm, cache.faces)
+            face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
             colors_np[:] = np.clip(
                 lut[np.clip(face_classes, 0, mc - 1)] * shade[:, None],
                 0,
@@ -18589,6 +19254,35 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
 
     t0 = time.perf_counter()
     saved_camera = _save_camera(app)
+
+    if _microstation_color_blend_enabled(app, cache):
+        if cache.needs_shading_update(azimuth, angle, ambient):
+            # Keep the established CPU shade cache coherent for emergency
+            # fallback paths, but do not rebuild/re-upload the 34M vertex RGB.
+            if cache.face_normals is None or len(cache.face_normals) != len(cache.faces):
+                cache.face_normals = _compute_face_normals(cache.xyz_unique, cache.faces)
+            cache.shade = _compute_face_shade(
+                cache.xyz_unique, cache.faces, azimuth, angle, ambient,
+                face_normals=cache.face_normals,
+            )
+            cache.last_azimuth = azimuth
+            cache.last_angle = angle
+            cache.last_ambient = ambient
+
+        _configure_microstation_color_blend_lighting(
+            app, getattr(app, '_shaded_mesh_actor', None)
+        )
+        overlay_actor = getattr(app, '_shading_multiclass_color_overlay_actor', None)
+        if overlay_actor is not None:
+            _configure_microstation_color_blend_lighting(app, overlay_actor)
+        _restore_camera(app, saved_camera)
+        app.vtk_widget.render()
+        print(
+            'SHADING_LIGHT_ONLY status=updated_gpu_blend '
+            f'azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} '
+            f'elapsed={(time.perf_counter()-t0)*1000:.1f}ms topology_rebuild=0 color_upload=0'
+        )
+        return True
 
     if cache.needs_shading_update(azimuth, angle, ambient):
         if cache.face_normals is None or len(cache.face_normals) != len(cache.faces):
