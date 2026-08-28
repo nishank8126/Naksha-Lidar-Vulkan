@@ -894,6 +894,18 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     if tool in ("Depth", "RGB", "Intensity", "Elevation", "Line", "Class", "Surface"):
         
         print(f"🎨 Switching to {tool} display mode")
+
+        # Older LineMode shortcuts stored the selection under "lines".
+        # Normalize it before either class or flight-line state is applied so
+        # saved shortcuts from previous versions remain fully functional.
+        if (
+            tool == "Line"
+            and isinstance(preset, dict)
+            and "flight_lines" not in preset
+            and "lines" in preset
+        ):
+            preset = dict(preset)
+            preset["flight_lines"] = dict(preset.get("lines", {}) or {})
         
         # ✅ Deactivate curve tool when switching display modes
         _deactivate_curve_tool_safely(app_window, f"switching to {tool} mode")

@@ -69,13 +69,20 @@ def decode_classes(text):
 
 
 def encode_line_mode_preset(payload: dict) -> str:
+    classes = {
+        str(int(code)): {"show": bool(info.get("show", True))}
+        for code, info in dict(payload.get("classes", {}) or {}).items()
+        if isinstance(info, dict)
+    }
+    raw_lines = payload.get("flight_lines", payload.get("lines", {}))
     lines = {
         str(int(line_id)): bool(shown)
-        for line_id, shown in dict(payload.get("lines", {}) or {}).items()
+        for line_id, shown in dict(raw_lines or {}).items()
     }
     return json.dumps({
         "__type__": "line_mode_preset",
         "target_view": 0,
+        "classes": classes,
         "lines": lines,
     })
 
@@ -89,9 +96,16 @@ def decode_line_mode_preset(value):
             return None
         return {
             "target_view": 0,
+            "classes": {
+                int(code): {"show": bool(info.get("show", True))}
+                for code, info in dict(data.get("classes", {}) or {}).items()
+                if isinstance(info, dict)
+            },
             "lines": {
                 int(line_id): bool(shown)
-                for line_id, shown in dict(data.get("lines", {}) or {}).items()
+                for line_id, shown in dict(
+                    data.get("lines", data.get("flight_lines", {})) or {}
+                ).items()
             },
         }
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -99,9 +113,52 @@ def decode_line_mode_preset(value):
 
 
 def summarize_line_mode_preset(preset: dict) -> str:
+    classes = dict((preset or {}).get("classes", {}) or {})
+    class_visible = sum(
+        1 for info in classes.values()
+        if isinstance(info, dict) and info.get("show", True)
+    )
     lines = dict((preset or {}).get("lines", {}) or {})
     visible = sum(1 for shown in lines.values() if shown)
-    return f"Line Mode: {visible}/{len(lines)} flight lines"
+    return (
+        f"Line: {class_visible}/{len(classes)} classes, "
+        f"{visible}/{len(lines)} flight lines"
+    )
+
+
+def line_mode_to_display_visibility_preset(preset):
+    """Convert legacy LineMode data to the canonical Main View Line preset."""
+    preset = dict(preset or {})
+    return {
+        "mode": "Line",
+        "target_view": 0,
+        "classes": dict(preset.get("classes", {}) or {}),
+        "flight_lines": {
+            int(line_id): bool(shown)
+            for line_id, shown in dict(
+                preset.get("flight_lines", preset.get("lines", {})) or {}
+            ).items()
+        },
+    }
+
+
+def _is_owned_qt_object(owner, candidate):
+    """Return True when candidate is owner or belongs to its Qt parent chain."""
+    current = candidate
+    visited = set()
+    while current is not None and id(current) not in visited:
+        if current is owner:
+            return True
+        visited.add(id(current))
+        parent_getter = getattr(current, "parent", None)
+        if not callable(parent_getter):
+            break
+        try:
+            current = parent_getter()
+        except RuntimeError:
+            break
+    return False
+
 
 def encode_display_preset(payload: dict) -> str:
     try:
@@ -1676,9 +1733,12 @@ class ClassVisibilityPicker(QDialog):
         from PySide6.QtCore import QEvent
         if event.type() == QEvent.WindowActivate and self.isVisible():
             activated = obj
-            is_self   = (activated is self)
-            is_parent = (self.parent() and activated is self.parent())
-            if not is_self and not is_parent:
+            is_owned = _is_owned_qt_object(self, activated)
+            is_parent = (
+                self.parent() is not None
+                and activated is self.parent()
+            )
+            if not is_owned and not is_parent:
                 if hasattr(activated, 'isWindow') and activated.isWindow():
                     self.hide()
         return super().eventFilter(obj, event)
@@ -3440,10 +3500,10 @@ class ShortcutManager(QWidget):
                 mod       = modifier.lower()
                 key_upper = key.upper()
 
-                if tool in ("Line", "LineMode"):
-                    preset_payload = entry.get("line_mode_preset") or {
-                        "target_view": 0, "lines": {}
-                    }
+                if tool == "LineMode":
+                    preset_payload = line_mode_to_display_visibility_preset(
+                        entry.get("line_mode_preset")
+                    )
                     shortcuts[(mod, key_upper)] = {
                         "tool": "Line",
                         "preset": preset_payload,
@@ -4335,13 +4395,21 @@ class ShortcutManager(QWidget):
             decode_line_mode_preset(cell.data(Qt.UserRole))
             if cell is not None else None
         )
-        picker = LineModePresetDialog(
-            self.app_window, preset=preset, parent=self
+        picker = ClassVisibilityPicker(
+            self.app_window, mode="line", parent=self
         )
+        if preset and preset.get("classes"):
+            picker.set_selected_classes(preset["classes"])
+        if preset:
+            picker.set_line_visibility(preset.get("lines", {}))
         self._line_mode_picker = picker
 
         def on_accepted():
-            line_preset = picker.get_preset()
+            line_preset = {
+                "target_view": 0,
+                "classes": picker.get_selected_classes(),
+                "lines": picker.get_line_visibility(),
+            }
             item = QTableWidgetItem(summarize_line_mode_preset(line_preset))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             item.setData(Qt.UserRole, encode_line_mode_preset(line_preset))
@@ -4358,7 +4426,9 @@ class ShortcutManager(QWidget):
                 if combo in shortcuts:
                     shortcuts[combo] = {
                         "tool": "Line",
-                        "preset": line_preset,
+                        "preset": line_mode_to_display_visibility_preset(
+                            line_preset
+                        ),
                     }
             try:
                 self.auto_save_shortcuts()
@@ -5237,7 +5307,9 @@ class ShortcutManager(QWidget):
                     )
                     shortcuts[(mod, key)] = {
                         "tool": "Line",
-                        "preset": preset_payload or {"target_view": 0, "lines": {}},
+                        "preset": line_mode_to_display_visibility_preset(
+                            preset_payload
+                        ),
                     }
                     continue
 
@@ -5467,7 +5539,16 @@ class ShortcutManager(QWidget):
                     key       = entry.get("key", "F1")
                     tool      = entry.get("tool", "AboveLine")
                     if tool == "LineMode":
-                        tool = "Line"
+                        preset_payload = line_mode_to_display_visibility_preset(
+                            entry.get("line_mode_preset")
+                        )
+                        shortcuts[(
+                            modifier.lower(), key.upper()
+                        )] = {
+                            "tool": "Line",
+                            "preset": preset_payload,
+                        }
+                        continue
                     mod       = modifier.lower()
                     key_upper = key.upper()
 
@@ -5480,16 +5561,6 @@ class ShortcutManager(QWidget):
                             views = preset_payload.get("views", {})
                             print(f"   ✅ {mod}+{key_upper} → DisplayMode "
                                   f"(views: {list(views.keys())}) [stored, NOT applied]")
-                        continue
-
-                    if tool == "LineMode":
-                        preset_payload = entry.get("line_mode_preset") or {
-                            "target_view": 0, "lines": {}
-                        }
-                        shortcuts[(mod, key_upper)] = {
-                            "tool": "Line",
-                            "preset": preset_payload,
-                        }
                         continue
 
                     if tool == "Surface":

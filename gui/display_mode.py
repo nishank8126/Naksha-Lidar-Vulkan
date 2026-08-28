@@ -2186,6 +2186,16 @@ class DisplayModeDialog(QDialog):
 
     def _open_lines_dialog(self):
         """Open a persistent selector; changes commit only when OK is clicked."""
+        existing_popup = getattr(self, "_lines_popup", None)
+        if existing_popup is not None:
+            try:
+                if existing_popup.isVisible():
+                    existing_popup.raise_()
+                    existing_popup.activateWindow()
+                    return
+            except RuntimeError:
+                self._lines_popup = None
+
         self._rebuild_lines_menu()
         app = self._get_app_window()
         line_ids = list(getattr(self, "_line_ids", []) or [])
@@ -2199,7 +2209,9 @@ class DisplayModeDialog(QDialog):
 
         popup = QDialog(self)
         popup.setWindowTitle("Display Lines")
-        popup.setModal(True)
+        popup.setModal(False)
+        popup.setWindowModality(Qt.NonModal)
+        popup.setAttribute(Qt.WA_DeleteOnClose, True)
         popup.setMinimumWidth(285)
         popup.setMaximumHeight(520)
         popup.setStyleSheet(get_dialog_stylesheet())
@@ -2262,13 +2274,12 @@ class DisplayModeDialog(QDialog):
         ok_btn = QPushButton("OK")
         close_btn = QPushButton("Close")
         ok_btn.setDefault(True)
-        ok_btn.clicked.connect(popup.accept)
         close_btn.clicked.connect(popup.reject)
         footer.addWidget(ok_btn)
         footer.addWidget(close_btn)
         root.addLayout(footer)
 
-        if popup.exec() == QDialog.Accepted:
+        def apply_line_visibility():
             slot_visibility = {
                 int(lid): check.isChecked() for lid, check in checks.items()
             }
@@ -2315,6 +2326,22 @@ class DisplayModeDialog(QDialog):
                         )
             except Exception as exc:
                 print(f"⚠️ Flight-line filter refresh failed: {exc}")
+
+        # Applying is intentionally non-destructive to the popup lifecycle:
+        # users can inspect the result, adjust lines, and apply again. Only
+        # Close (or the title-bar X) dismisses this selector.
+        ok_btn.clicked.connect(apply_line_visibility)
+        self._lines_popup = popup
+
+        def clear_popup_reference(*_args):
+            if getattr(self, "_lines_popup", None) is popup:
+                self._lines_popup = None
+
+        popup.finished.connect(clear_popup_reference)
+        popup.destroyed.connect(clear_popup_reference)
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
 
     @staticmethod
     def _recover_flight_line_ids(app):

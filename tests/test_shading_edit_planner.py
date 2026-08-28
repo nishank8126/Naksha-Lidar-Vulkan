@@ -88,6 +88,63 @@ def test_does_not_recover_unrelated_undo_entry():
     assert shading._recover_classification_delta(app, np.array([3, 9])) is None
 
 
+def test_multiclass_history_fast_path_accepts_scalar_target_classes():
+    cache = SimpleNamespace(n_visible_classes=3)
+    app = SimpleNamespace(_shading_visibility_override={1, 2, 3})
+    changed_mask = np.array([False, True, False, True], dtype=bool)
+
+    with (
+        mock.patch.object(shading, "get_cache", return_value=cache),
+        mock.patch.object(
+            shading, "_fast_multiclass_color_overlay", return_value=True
+        ) as overlay,
+        mock.patch.object(
+            shading, "refresh_shaded_after_classification_fast"
+        ) as generic_refresh,
+    ):
+        result = shading.refresh_shaded_after_history_fast(
+            app,
+            changed_mask,
+            np.array([1, 2], dtype=np.uint8),
+            np.uint8(3),
+            "undo",
+        )
+
+    assert result is True
+    np.testing.assert_array_equal(
+        overlay.call_args.kwargs["changed_indices"], [1, 3]
+    )
+    generic_refresh.assert_not_called()
+
+
+def test_history_membership_change_delegates_with_normalized_delta():
+    cache = SimpleNamespace(n_visible_classes=3)
+    app = SimpleNamespace(_shading_visibility_override={1, 2, 3})
+    changed_mask = np.array([False, True, True], dtype=bool)
+
+    with (
+        mock.patch.object(shading, "get_cache", return_value=cache),
+        mock.patch.object(
+            shading,
+            "refresh_shaded_after_classification_fast",
+            return_value=True,
+        ) as generic_refresh,
+    ):
+        result = shading.refresh_shaded_after_history_fast(
+            app,
+            changed_mask,
+            np.uint8(9),
+            np.array([1, 2], dtype=np.uint8),
+            "redo",
+        )
+
+    assert result is True
+    delta = generic_refresh.call_args.kwargs["delta"]
+    np.testing.assert_array_equal(delta.changed_indices, [1, 2])
+    np.testing.assert_array_equal(delta.old_classes, [9, 9])
+    np.testing.assert_array_equal(delta.new_classes, [1, 2])
+
+
 def test_overlay_remove_drops_affected_actor_and_rebuilds_survivors():
     widget = SimpleNamespace(remove_actor=mock.Mock())
     app = SimpleNamespace(

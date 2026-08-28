@@ -10199,28 +10199,26 @@ class NakshaApp(QMainWindow):
         # 5. Refresh shaded mesh if in shaded mode
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
-                from gui.shading_display import (
-                    ClassificationDelta,
-                    refresh_shaded_after_classification_fast,
-                )
-                refresh_shaded_after_classification_fast(
+                from gui.shading_display import refresh_shaded_after_history_fast
+                refreshed = refresh_shaded_after_history_fast(
                     self,
-                    changed_mask=mask,
-                    delta=ClassificationDelta(
-                        changed_indices=np.flatnonzero(mask),
-                        old_classes=classes_before_undo,
-                        new_classes=np.asarray(old_cls),
-                        operation="undo",
-                        origin_view="undo",
-                    ),
+                    mask,
+                    classes_before_undo,
+                    old_cls,
+                    "undo",
                 )
+                if not refreshed:
+                    raise RuntimeError("undo shading fast path declined")
             except Exception as _se:
+                print(f"SHADING_HISTORY_FAST status=failed operation=undo error={_se}")
                 try:
-                    from gui.shading_display import update_shaded_class, clear_shading_cache
-                    clear_shading_cache("undo fallback")
-                    update_shaded_class(self, force_rebuild=True)
+                    from gui.shading_display import refresh_shaded_after_undo_fast
+                    if not refresh_shaded_after_undo_fast(self, mask):
+                        raise RuntimeError("legacy undo shading path declined")
                 except Exception:
-                    pass
+                    from gui.shading_display import update_shaded_class, clear_shading_cache
+                    clear_shading_cache("undo topology fallback")
+                    update_shaded_class(self, force_rebuild=True)
 
         self._last_changed_mask = None
         self._last_changed_indices = None
@@ -10294,28 +10292,26 @@ class NakshaApp(QMainWindow):
         # 5. Refresh shaded mesh if needed
         if getattr(self, "display_mode", None) == "shaded_class":
             try:
-                from gui.shading_display import (
-                    ClassificationDelta,
-                    refresh_shaded_after_classification_fast,
-                )
-                refresh_shaded_after_classification_fast(
+                from gui.shading_display import refresh_shaded_after_history_fast
+                refreshed = refresh_shaded_after_history_fast(
                     self,
-                    changed_mask=mask,
-                    delta=ClassificationDelta(
-                        changed_indices=np.flatnonzero(mask),
-                        old_classes=classes_before_redo,
-                        new_classes=np.asarray(new_cls),
-                        operation="redo",
-                        origin_view="redo",
-                    ),
+                    mask,
+                    classes_before_redo,
+                    new_cls,
+                    "redo",
                 )
+                if not refreshed:
+                    raise RuntimeError("redo shading fast path declined")
             except Exception as _se:
+                print(f"SHADING_HISTORY_FAST status=failed operation=redo error={_se}")
                 try:
-                    from gui.shading_display import update_shaded_class, clear_shading_cache
-                    clear_shading_cache("redo fallback")
-                    update_shaded_class(self, force_rebuild=True)
+                    from gui.shading_display import refresh_shaded_after_undo_fast
+                    if not refresh_shaded_after_undo_fast(self, mask):
+                        raise RuntimeError("legacy redo shading path declined")
                 except Exception:
-                    pass
+                    from gui.shading_display import update_shaded_class, clear_shading_cache
+                    clear_shading_cache("redo topology fallback")
+                    update_shaded_class(self, force_rebuild=True)
 
         # 5. Emit signal (now mirrors are clean before _on_classification_finished runs)
         self.classification_finished.emit(mask)

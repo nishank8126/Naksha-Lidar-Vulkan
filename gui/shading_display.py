@@ -16908,6 +16908,94 @@ def _check_previous_classes_visible(app, ci, va):
         return set(int(c) for c in app.class_palette.keys()).issubset(set(va.tolist()))
     except: return False
 
+
+def _normalize_history_classes(values, changed_count):
+    """Return one class value per changed point for heterogeneous undo entries."""
+    array = np.asarray(values).ravel()
+    if array.size == changed_count:
+        return array
+    if array.size == 1 and changed_count > 0:
+        return np.full(changed_count, array[0], dtype=array.dtype)
+    return None
+
+
+def refresh_shaded_after_history_fast(
+        app, changed_mask, old_classes, new_classes, operation):
+    """Patch shading for undo/redo without rebuilding stable multi-class topology.
+
+    Classification tools store history in more than one valid representation:
+    some keep one target class while others keep one class per changed point.
+    Normalize both forms here and use the explicit before/after transition.
+    """
+    changed_indices = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
+    if changed_indices.size == 0:
+        return True
+
+    old_values = _normalize_history_classes(
+        old_classes, changed_indices.size
+    )
+    new_values = _normalize_history_classes(
+        new_classes, changed_indices.size
+    )
+    if old_values is None or new_values is None:
+        print(
+            "SHADING_HISTORY_FAST status=unsupported_history_shape "
+            f"operation={operation} changed={changed_indices.size}"
+        )
+        return False
+
+    cache = get_cache()
+    visible_classes = _get_shading_visibility(app)
+    is_single = getattr(cache, "n_visible_classes", 0) == 1
+
+    if not is_single:
+        visible_array = np.asarray(
+            sorted(int(code) for code in visible_classes), dtype=np.int32
+        )
+        old_visible = np.isin(old_values, visible_array)
+        new_visible = np.isin(new_values, visible_array)
+        if not np.any(old_visible != new_visible):
+            if not np.any(new_visible):
+                return True
+            if _fast_multiclass_color_overlay(
+                app,
+                cache,
+                changed_mask=changed_mask,
+                changed_indices=changed_indices,
+                visible_classes=visible_classes,
+            ):
+                print(
+                    "SHADING_HISTORY_FAST status=overlay "
+                    f"operation={operation} changed={changed_indices.size}"
+                )
+                return True
+            if _update_colors_gpu_fast(
+                app,
+                cache,
+                changed_mask=changed_mask,
+                _visible_classes=visible_classes,
+                _defer_render=True,
+                _changed_indices=changed_indices,
+            ):
+                print(
+                    "SHADING_HISTORY_FAST status=color_patch "
+                    f"operation={operation} changed={changed_indices.size}"
+                )
+                return True
+
+    return refresh_shaded_after_classification_fast(
+        app,
+        changed_mask=changed_mask,
+        delta=ClassificationDelta(
+            changed_indices=changed_indices,
+            old_classes=old_values,
+            new_classes=new_values,
+            operation=str(operation or "history"),
+            origin_view="undo_redo_history",
+        ),
+    )
+
+
 def refresh_shaded_after_undo_fast(app, changed_mask=None):
     """Optimized undo handling for single-class shading."""
     cache = get_cache()
@@ -19479,6 +19567,7 @@ class ShadingControlPanel(QWidget):
 
 __all__ = ['update_shaded_class', 'refresh_shaded_colors_fast', 'refresh_shaded_colors_only',
     'refresh_shaded_after_classification_fast', 'refresh_shaded_after_undo_fast',
+    'refresh_shaded_after_history_fast',
     'refresh_shaded_after_visibility_change', 'handle_shaded_view_change',
     '_multi_class_region_undo_patch', 'ShadingControlPanel', 'clear_shading_cache',
     'detach_shading_before_non_shading_mode',
