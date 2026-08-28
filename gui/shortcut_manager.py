@@ -13,6 +13,11 @@ from torch import layout
 
 from .class_picker import ClassPicker
 from .theme_manager import get_dialog_stylesheet
+from .shading_preset_quality import (
+    SHADING_QUALITY_CHOICES,
+    normalize_shading_preset_quality,
+    shading_quality_label,
+)
 
 TOOLS = [
     "AboveLine", "BelowLine", "ParallelLine", "Rectangle", "Circle",
@@ -604,13 +609,17 @@ def encode_shading_preset(payload: dict) -> str:
                 "color": list(v.get("color", (128, 128, 128))),
             }
 
+        quality_mode = normalize_shading_preset_quality(
+            payload.get("quality_mode"),
+            payload.get("speed"),
+        )
         preset = {
             "__type__": "shading_mode_preset",
             "azimuth": float(payload.get("azimuth", 45.0)),
             "angle": float(payload.get("angle", 45.0)),
             "ambient": float(payload.get("ambient", 0.1)),
             "quality": float(payload.get("quality", 100.0)),
-            "speed": int(payload.get("speed", 1)),
+            "quality_mode": quality_mode,
             "classes": classes_json,
         }
         return json.dumps(preset)
@@ -638,7 +647,10 @@ def decode_shading_preset(text: str):
             "angle": float(data.get("angle", 45.0)),
             "ambient": float(data.get("ambient", 0.1)),
             "quality": float(data.get("quality", 100.0)),
-            "speed": int(data.get("speed", 1)),
+            "quality_mode": normalize_shading_preset_quality(
+                data.get("quality_mode"),
+                data.get("speed"),
+            ),
             "classes": classes,
         }
     except Exception:
@@ -1513,10 +1525,21 @@ class ClassVisibilityPicker(QDialog):
             shading_layout.addWidget(self.quality_spin, 3, 1)
 
             shading_layout.addWidget(QLabel("Speed:"), 4, 0)
-            self.speed_spin = QSpinBox()
-            self.speed_spin.setRange(1, 10)
-            self.speed_spin.setValue(1)
-            shading_layout.addWidget(self.speed_spin, 4, 1)
+            if mode == "shading":
+                self.shading_quality_combo = QComboBox()
+                for label, quality_key in SHADING_QUALITY_CHOICES:
+                    self.shading_quality_combo.addItem(label, quality_key)
+                self.shading_quality_combo.setCurrentIndex(1)
+                self.shading_quality_combo.setToolTip(
+                    "Fast uses 1M representatives, Normal uses 3M, and "
+                    "Slow triangulates every eligible point."
+                )
+                shading_layout.addWidget(self.shading_quality_combo, 4, 1)
+            else:
+                self.speed_spin = QSpinBox()
+                self.speed_spin.setRange(1, 10)
+                self.speed_spin.setValue(1)
+                shading_layout.addWidget(self.speed_spin, 4, 1)
 
             if mode == "surface":
                 shading_layout.addWidget(QLabel("Max Edge:"), 5, 0)
@@ -2237,8 +2260,13 @@ class ClassVisibilityPicker(QDialog):
             "angle": self.angle_spin.value(),
             "ambient": self.ambient_spin.value(),
             "quality": self.quality_spin.value(),
-            "speed": self.speed_spin.value()
         }
+        if self.mode == "shading":
+            params["quality_mode"] = str(
+                self.shading_quality_combo.currentData() or "normal"
+            )
+        else:
+            params["speed"] = self.speed_spin.value()
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             params["max_edge"] = self.max_edge_spin.value()
         return params
@@ -2268,7 +2296,17 @@ class ClassVisibilityPicker(QDialog):
         self.angle_spin.setValue(params.get("angle", 45.0))
         self.ambient_spin.setValue(params.get("ambient", 0.1))
         self.quality_spin.setValue(params.get("quality", 100.0))
-        self.speed_spin.setValue(params.get("speed", 1))
+        if self.mode == "shading":
+            quality_mode = normalize_shading_preset_quality(
+                params.get("quality_mode"),
+                params.get("speed"),
+            )
+            quality_index = self.shading_quality_combo.findData(quality_mode)
+            self.shading_quality_combo.setCurrentIndex(
+                quality_index if quality_index >= 0 else 1
+            )
+        else:
+            self.speed_spin.setValue(params.get("speed", 1))
         if self.mode == "surface" and hasattr(self, "max_edge_spin"):
             self.max_edge_spin.setValue(params.get("max_edge", 0.0))
 
@@ -3606,7 +3644,7 @@ class ShortcutManager(QWidget):
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             item.setData(Qt.UserRole, encode_shading_preset({
                 "azimuth": 45.0, "angle": 45.0, "ambient": 0.1,
-                "quality": 100.0, "speed": 1, "classes": {}
+                "quality": 100.0, "quality_mode": "normal", "classes": {}
             }))
             self.table.setItem(row, self.COL_CLASSES, item)
             if not self._is_loading_shortcuts:
@@ -4524,13 +4562,14 @@ class ShortcutManager(QWidget):
                 "angle":   shading_params.get("angle",   45.0),
                 "ambient": shading_params.get("ambient", 0.1),
                 "quality": shading_params.get("quality", 100.0),
-                "speed":   shading_params.get("speed",   1),
+                "quality_mode": shading_params.get("quality_mode", "normal"),
                 "classes": selected_classes
             }
 
             visible_count = sum(1 for c in selected_classes.values() if c.get("show"))
+            quality_label = shading_quality_label(preset["quality_mode"])
             summary = (f"Shading: {preset['azimuth']}°/{preset['angle']}°, "
-                       f"{visible_count} visible, Speed={preset['speed']}")
+                       f"{visible_count} visible, Speed={quality_label}")
 
             item = QTableWidgetItem(summary)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -5013,21 +5052,23 @@ class ShortcutManager(QWidget):
                                            if info.get("show")]
                                 az    = preset_payload.get("azimuth", 45.0)
                                 ang   = preset_payload.get("angle",   45.0)
-                                speed = preset_payload.get("speed",   1)
+                                quality_label = shading_quality_label(
+                                    preset_payload.get("quality_mode", "normal")
+                                )
                                 item = QTableWidgetItem(
-                                    f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={speed}")
+                                    f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={quality_label}")
                                 item.setData(Qt.UserRole, parts[3])
                             else:
                                 item = QTableWidgetItem("Preset: Not configured yet")
                                 item.setData(Qt.UserRole, encode_shading_preset({
                                     "azimuth": 45.0, "angle": 45.0, "ambient": 0.1,
-                                    "quality": 100.0, "speed": 1, "classes": {}
+                                    "quality": 100.0, "quality_mode": "normal", "classes": {}
                                 }))
                         else:
                             item = QTableWidgetItem("Preset: Not configured yet")
                             item.setData(Qt.UserRole, encode_shading_preset({
                                 "azimuth": 45.0, "angle": 45.0, "ambient": 0.1,
-                                "quality": 100.0, "speed": 1, "classes": {}
+                                "quality": 100.0, "quality_mode": "normal", "classes": {}
                             }))
                         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                         self.table.setItem(row, self.COL_CLASSES, item)
@@ -5580,11 +5621,16 @@ class ShortcutManager(QWidget):
                         if preset_payload:
                             az  = preset_payload.get("azimuth", 45)
                             ang = preset_payload.get("angle",   45)
-                            speed = preset_payload.get("speed", 1)
+                            quality_label = shading_quality_label(
+                                normalize_shading_preset_quality(
+                                    preset_payload.get("quality_mode"),
+                                    preset_payload.get("speed"),
+                                )
+                            )
                             visible = [c for c, info in (preset_payload.get("classes", {}) or {}).items()
                                        if info.get("show", True)]
                             item = QTableWidgetItem(
-                                f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={speed}"
+                                f"Shading: {az}°/{ang}°, {len(visible)} visible, Speed={quality_label}"
                             )
                         else:
                             item = QTableWidgetItem("Preset: Not configured yet")
