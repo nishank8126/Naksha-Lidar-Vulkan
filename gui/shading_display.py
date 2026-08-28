@@ -12868,12 +12868,10 @@ _FEATURE_AWARE_VERSION = 1
 _MULTICLASS_COLOR_OVERLAY_NAME = "shaded_mesh_live_multiclass_color"
 _INCIDENT_FACE_CACHE_MAX_NEW_VERTICES = 4096
 
-# Slow/all-points fidelity layer. The base faceted mesh remains completely
-# unchanged; this sparse point layer only restores class identity that a
-# one-class-per-triangle renderer would otherwise hide on mixed-class faces.
-# It is intentionally restricted to Slow multi-class shading so Fast/Normal,
-# single-class shading, topology edits, caches and classification performance
-# retain their established behaviour.
+# Legacy class-detail point-layer names retained for cleanup compatibility.
+# Current multi-class fidelity is facet-based for Fast / Normal / Slow: class
+# RGB lives on mesh vertices and is barycentrically interpolated by the GPU.
+# Single-class shading keeps its established topology/edit implementation.
 _SHADING_CLASS_DETAIL_NAME = "shaded_mesh_class_detail"
 _SHADING_LIVE_CLASS_DETAIL_NAME = "shaded_mesh_live_class_detail"
 
@@ -14194,33 +14192,34 @@ def _shading_class_detail_enabled(app, cache) -> bool:
 def _microstation_color_blend_enabled(app, cache) -> bool:
     """Enable TerraScan/MicroStation-style class-color interpolation safely.
 
-    The geometry/topology pipeline is intentionally untouched.  Only Slow
-    multi-class shading uses per-vertex class RGB interpolation; Fast, Normal
-    and every single-class shading path retain the established faceted cell-RGB
-    renderer.  The environment switch is an emergency rollback without a code
+    Geometry density remains controlled exclusively by the selected shading
+    quality (Fast / Normal / Slow).  For every MULTI-CLASS quality, presentation
+    is identical: canonical class RGB is stored per representative vertex, the
+    GPU barycentrically interpolates those colors inside each triangle, and the
+    triangle keeps flat/faceted slope lighting.
+
+    Single-class shading intentionally keeps its established cell/facet path so
+    all existing local add/remove, undo/redo and topology-edit behaviour remains
+    untouched.  The environment switch is an emergency rollback without a code
     change.
     """
     flag = os.environ.get('NAKSHA_SHADING_MICROSTATION_BLEND', '1').strip().lower()
     if flag in ('0', 'false', 'off', 'no'):
         return False
-    return (
-        normalize_shading_quality(getattr(app, 'shading_quality', 'normal')) == 'slow'
-        and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
-    )
+    return int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
 
 
 def _configure_microstation_color_blend_lighting(app, actor=None):
-    """Configure one directional light + flat triangle lighting for RGB blending.
+    """Configure MicroStation-style soft faceted lighting for RGB blending.
 
-    TerraScan documents Color by Shading as a triangulated surface *colored by
-    class* and *shaded by triangle slope*.  The matching GPU formulation is:
+    The class-color interpolation stays exactly per vertex.  Only the lighting
+    presentation is softened so very narrow/steep LiDAR triangles do not turn
+    into black scan-line-like hatching when the complete all-points mesh is
+    viewed from a distance.
 
-      per-vertex class RGB --barycentric interpolation--> fragment class color
-      flat triangle normal --directional Lambert light--> triangle brightness
-
-    This keeps each LAS class color exact at its source vertex while allowing
-    neighbouring class colors to blend naturally inside a triangle.  Lighting
-    stays flat/faceted: only COLOR is interpolated, not the triangle normal.
+    Geometry, Delaunay faces, class RGB, classification refresh and cache data
+    are untouched.  A weak opposite-azimuth fill light plus a conservative
+    ambient floor compresses only the darkest end of the Lambert response.
     """
     plotter = getattr(app, 'vtk_widget', None)
     renderer = getattr(plotter, 'renderer', None) if plotter is not None else None
@@ -14231,23 +14230,56 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
     angle = float(getattr(app, 'last_shade_angle', 45.0))
     ambient = float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0))
 
-    # Reuse one VTK light across classification edits.  Surface/other renderers
-    # may replace the renderer light collection, so verify membership before
-    # reusing the cached object.
+    # Multi-class triangulations can contain narrow legitimate facets, especially
+    # in Slow/all-points mode.  With a single hard key light those facets can
+    # collapse to dark 1-pixel streaks at overview scale.  Keep the user's ambient
+    # control, but never allow the shared blend presentation below this floor.
+    try:
+        ambient_floor = float(os.environ.get(
+            'NAKSHA_SHADING_BLEND_AMBIENT_FLOOR', '0.42'
+        ))
+    except Exception:
+        ambient_floor = 0.42
+    ambient_floor = float(np.clip(ambient_floor, 0.0, 0.80))
+    effective_ambient = max(ambient, ambient_floor)
+
+    try:
+        key_intensity = float(os.environ.get(
+            'NAKSHA_SHADING_BLEND_KEY_INTENSITY', '0.85'
+        ))
+    except Exception:
+        key_intensity = 0.85
+    try:
+        fill_intensity = float(os.environ.get(
+            'NAKSHA_SHADING_BLEND_FILL_INTENSITY', '0.18'
+        ))
+    except Exception:
+        fill_intensity = 0.18
+    key_intensity = float(np.clip(key_intensity, 0.0, 2.0))
+    fill_intensity = float(np.clip(fill_intensity, 0.0, 1.0))
+
+    # Reuse the two lights across classification edits.  Other display modes can
+    # replace the renderer light collection, so validate both cached objects.
     key_light = getattr(app, '_shading_microstation_key_light', None)
-    light_live = False
-    if key_light is not None:
+    fill_light = getattr(app, '_shading_microstation_fill_light', None)
+    lights_live = False
+    if key_light is not None and fill_light is not None:
         try:
             lights = renderer.GetLights()
-            light_live = bool(lights and lights.IsItemPresent(key_light))
+            lights_live = bool(
+                lights
+                and lights.IsItemPresent(key_light)
+                and lights.IsItemPresent(fill_light)
+            )
         except Exception:
-            light_live = False
+            lights_live = False
 
-    if not light_live:
+    if not lights_live:
         try:
             renderer.RemoveAllLights()
         except Exception:
             pass
+
         key_light = vtk.vtkLight()
         key_light.SetLightTypeToSceneLight()
         key_light.SetPositional(False)
@@ -14255,21 +14287,38 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
         renderer.AddLight(key_light)
         app._shading_microstation_key_light = key_light
 
+        fill_light = vtk.vtkLight()
+        fill_light.SetLightTypeToSceneLight()
+        fill_light.SetPositional(False)
+        # Neutral fill: do not tint LAS classification colors.
+        fill_light.SetColor(1.0, 1.0, 1.0)
+        renderer.AddLight(fill_light)
+        app._shading_microstation_fill_light = fill_light
+
     zenith_rad = np.radians(90.0 - angle)
     az_math_rad = np.radians(360.0 - azimuth + 90.0)
     lx = np.sin(zenith_rad) * np.cos(az_math_rad)
     ly = np.sin(zenith_rad) * np.sin(az_math_rad)
     lz = np.cos(zenith_rad)
+
     key_light.SetPosition(float(lx * 100.0), float(ly * 100.0), float(lz * 100.0))
     key_light.SetFocalPoint(0.0, 0.0, 0.0)
-    key_light.SetIntensity(1.0)
-    try:
-        key_light.Modified()
-    except Exception:
-        pass
+    key_light.SetIntensity(key_intensity)
 
-    # With renderer ambient=white, property Ambient/Diffuse maps the existing
-    # Naksha ambient slider to a stable [ambient..1] brightness range.
+    # Opposite XY direction but still above the terrain.  This is a fill, not a
+    # second sun: it lifts steep facets that face away from the key light while
+    # preserving broad terrain relief and the exact barycentric class blend.
+    fill_z = max(float(lz), 0.20)
+    fill_light.SetPosition(float(-lx * 100.0), float(-ly * 100.0), fill_z * 100.0)
+    fill_light.SetFocalPoint(0.0, 0.0, 0.0)
+    fill_light.SetIntensity(fill_intensity)
+
+    for light in (key_light, fill_light):
+        try:
+            light.Modified()
+        except Exception:
+            pass
+
     try:
         renderer.SetAmbient(1.0, 1.0, 1.0)
     except Exception:
@@ -14291,21 +14340,34 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
             prop = item.GetProperty()
             prop.SetLighting(True)
             prop.SetInterpolationToFlat()
-            prop.SetAmbient(ambient)
-            prop.SetDiffuse(max(0.0, 1.0 - ambient))
+            prop.SetAmbient(effective_ambient)
+            prop.SetDiffuse(max(0.0, 1.0 - effective_ambient))
             prop.SetSpecular(0.0)
             prop.EdgeVisibilityOff()
+            # Never let a back-face/culling policy turn thin all-point facets into
+            # holes/black chatter when zoomed out.
+            try:
+                prop.BackfaceCullingOff()
+                prop.FrontfaceCullingOff()
+            except Exception:
+                pass
             item.Modified()
         except Exception:
             pass
 
-    signature = (round(azimuth, 4), round(angle, 4), round(ambient, 4))
+    signature = (
+        round(azimuth, 4), round(angle, 4), round(ambient, 4),
+        round(effective_ambient, 4), round(key_intensity, 4),
+        round(fill_intensity, 4),
+    )
     if getattr(app, '_shading_microstation_light_signature', None) != signature:
         app._shading_microstation_light_signature = signature
         print(
             'SHADING_COLOR_BLEND_LIGHT '
             f'azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} '
-            'normal=flat_triangle color=barycentric_vertex_rgb'
+            f'effective_ambient={effective_ambient:.3f} '
+            f'key={key_intensity:.2f} fill={fill_intensity:.2f} '
+            'normal=flat_triangle color=barycentric_vertex_rgb soft_background=1'
         )
     return True
 
@@ -15514,16 +15576,19 @@ def _hide_point_cloud_actors_for_shading(app):
         if plotter is None:
             return
 
-        def _is_preserved_overlay(actor):
+        def _is_attachment_or_shading_actor(actor):
+            # These are intentional overlays and must remain visible.  A generic
+            # _naksha_preserve flag is NOT sufficient here because large point
+            # actors may also carry it for normal display-mode bookkeeping.
             return bool(
                 getattr(actor, "_is_dxf_actor", False)
                 or getattr(actor, "_is_snt_actor", False)
-                or getattr(actor, "_naksha_preserve", False)
                 or getattr(actor, "_is_shading_mesh", False)
             )
 
-        def _is_large_point_cloud_actor(actor):
-            if actor is None or _is_preserved_overlay(actor):
+        def _looks_like_large_point_cloud(actor):
+            """Identify raw/LOD point renderers even when they are 'preserved'."""
+            if actor is None or _is_attachment_or_shading_actor(actor):
                 return False
             if actor is getattr(app, "_shaded_mesh_actor", None):
                 return False
@@ -15533,17 +15598,43 @@ def _hide_point_cloud_actors_for_shading(app):
                 if poly is None:
                     return False
                 n_points = int(poly.GetNumberOfPoints())
-                n_cells = int(poly.GetNumberOfCells())
                 if n_points <= 1000:
                     return False
-                point_like = n_cells == 0 or n_cells == n_points
-                if not point_like:
+                n_cells = int(poly.GetNumberOfCells())
+                n_polys = int(poly.GetNumberOfPolys()) if hasattr(poly, "GetNumberOfPolys") else 0
+                n_strips = int(poly.GetNumberOfStrips()) if hasattr(poly, "GetNumberOfStrips") else 0
+                n_lines = int(poly.GetNumberOfLines()) if hasattr(poly, "GetNumberOfLines") else 0
+                n_verts = int(poly.GetNumberOfVerts()) if hasattr(poly, "GetNumberOfVerts") else 0
+
+                # Raw clouds are vertex-only datasets.  This catches unified,
+                # class, LOD and boundary point actors whose VTK cell counts are
+                # not exactly n_points (a case the old detector could miss).
+                geometry_is_points = (
+                    n_polys == 0
+                    and n_strips == 0
+                    and n_lines == 0
+                    and (n_verts > 0 or n_cells == 0 or n_cells == n_points)
+                )
+                if not geometry_is_points:
                     return False
+
                 pd = poly.GetPointData() if hasattr(poly, "GetPointData") else None
                 has_point_scalars = bool(pd and (pd.GetArray("RGB") or pd.GetScalars()))
-                return bool(getattr(actor, "_naksha_pyvista_points", False) or has_point_scalars)
+                return bool(
+                    getattr(actor, "_naksha_pyvista_points", False)
+                    or has_point_scalars
+                    or n_verts > 0
+                )
             except Exception:
                 return False
+
+        def _is_large_point_cloud_actor(actor):
+            # Preserve the established destructive-cleanup contract: actors
+            # explicitly marked _naksha_preserve are not removed here.  They are
+            # handled by the non-destructive visibility pass below instead.
+            if getattr(actor, "_naksha_preserve", False):
+                return False
+            return _looks_like_large_point_cloud(actor)
 
         actors = getattr(plotter, "actors", {}) or {}
         names_to_remove = []
@@ -15588,6 +15679,33 @@ def _hide_point_cloud_actors_for_shading(app):
                     actor.SetVisibility(False)
                 except Exception:
                     pass
+
+        # Some production point/LOD actors intentionally carry _naksha_preserve
+        # so generic actor cleanup does not destroy them.  In shaded mode they
+        # must still be invisible, otherwise their coincident vertices appear as
+        # dark dotted/scan-line hatching over the triangulated surface.  Hide
+        # them non-destructively so switching back to a point display can restore
+        # the same actor without rebuilding it.
+        suppressed_preserved = []
+        for name, actor in list((getattr(plotter, "actors", {}) or {}).items()):
+            try:
+                if (
+                    getattr(actor, "_naksha_preserve", False)
+                    and _looks_like_large_point_cloud(actor)
+                    and bool(actor.GetVisibility())
+                ):
+                    actor.SetVisibility(False)
+                    suppressed_preserved.append(str(name))
+            except Exception:
+                pass
+        if suppressed_preserved:
+            preview = ",".join(suppressed_preserved[:4])
+            suffix = "..." if len(suppressed_preserved) > 4 else ""
+            print(
+                "SHADING_POINT_NOISE_SUPPRESS "
+                f"hidden={len(suppressed_preserved)} actors={preview}{suffix} "
+                "mode=non_destructive"
+            )
 
         renderer = getattr(plotter, "renderer", None)
         if renderer is not None:
@@ -15730,9 +15848,10 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         ci = int(c)
         if ci < mc and ci in vc: lut[ci] = e.get("color", (128,128,128))
     amb = getattr(app, 'shade_ambient', 0.25)
-    # Slow multi-class keeps the exact current triangulation but presents class
-    # colors as per-vertex RGB, matching TerraScan's "colored by class, shaded
-    # by triangle slope" appearance.  Other quality/mode paths stay untouched.
+    # Every multi-class quality uses the same MicroStation/TerraScan presentation:
+    # class RGB lives on each representative vertex and is barycentrically blended
+    # by the GPU while the triangle normal remains flat/faceted.  Fast / Normal /
+    # Slow still differ ONLY in geometry density; single-class behaviour is intact.
     blend_class_colors = _microstation_color_blend_enabled(app, cache)
     # Enforce the current faceted-normal policy for newly built and cached meshes.
     # In blend mode the NORMAL is still flat; only class RGB is interpolated.
@@ -15987,18 +16106,19 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     _set_rendered_cache_key(app, cache)
     checkpoint("vtk_actor_create")
 
-    # Slow multi-class fidelity is now expressed by shaded FACETS, not raw
-    # point sprites.  Remove the previous minority-point overlay so Default /
-    # Building / vegetation samples appear as triangulated shaded regions.
+    # Multi-class fidelity is expressed by shaded FACETS, not raw point sprites,
+    # for every quality.  Fast / Normal / Slow keep their existing representative
+    # counts and topology; only the RGB presentation is shared across qualities.
     _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
+    quality_mode = normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
     if blend_class_colors:
         print(
-            'SHADING_COLOR_BLEND mode=slow active=1 '
+            f'SHADING_COLOR_BLEND mode={quality_mode} active=1 '
             'class_source=per_vertex interpolation=barycentric '
             'lighting=flat_triangle_slope '
             f'points={nv:,} faces={nf:,} raw_point_overlay=disabled'
         )
-    elif normalize_shading_quality(getattr(app, 'shading_quality', 'normal')) == 'slow' and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1:
+    elif quality_mode == 'slow' and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1:
         print(
             "SHADING_FACE_CLASS policy=peak_vertex mode=slow active=1 "
             f"points={nv:,} faces={nf:,} raw_point_overlay=disabled"

@@ -2,6 +2,7 @@
 from PySide6.QtGui import QKeySequence
 from flask import views
 from .execute_tool import execute_tool
+from .shading_preset_quality import normalize_shading_preset_quality, shading_quality_label
 # ✅ ADD this class in the same file as GlobalShortcutFilter, BEFORE it
 
 try:
@@ -2114,6 +2115,17 @@ class GlobalShortcutFilter(QObject):
                     print(f"🌗 APPLYING SHADINGMODE PRESET FROM SHORTCUT")
                     print(f"{'='*60}")
 
+                    quality_mode = normalize_shading_preset_quality(
+                        preset.get("quality_mode"),
+                        preset.get("speed"),
+                    )
+                    previous_quality = normalize_shading_preset_quality(
+                        getattr(self.app_window, "shading_quality", "normal")
+                    )
+                    previous_display_mode = str(
+                        getattr(self.app_window, "display_mode", "") or ""
+                    ).lower()
+
                     # ============================================================
                     # GUARD: Skip if same shading already active
                     # ============================================================
@@ -2135,7 +2147,8 @@ class GlobalShortcutFilter(QObject):
                                 getattr(self.app_window, 'shade_ambient', -1) -
                                 preset.get('ambient', 0.2)
                             ) < 0.01
-                            if _az_match and _an_match and _am_match:
+                            _quality_match = previous_quality == quality_mode
+                            if _az_match and _an_match and _am_match and _quality_match:
                                 _p_vis = set(
                                     int(c) for c, i in
                                     preset.get("classes", {}).items()
@@ -2301,6 +2314,21 @@ class GlobalShortcutFilter(QObject):
                     self.app_window.last_shade_azimuth = azimuth
                     self.app_window.last_shade_angle   = angle
                     self.app_window.shade_ambient      = ambient
+                    self.app_window.shading_quality   = quality_mode
+
+                    try:
+                        dlg = getattr(self.app_window, "display_mode_dialog", None)
+                        if dlg is not None:
+                            dlg._shading_quality_value = quality_mode
+                            combo = getattr(dlg, "shading_quality", None)
+                            if combo is not None:
+                                quality_index = combo.findData(quality_mode)
+                                if quality_index >= 0:
+                                    combo.blockSignals(True)
+                                    combo.setCurrentIndex(quality_index)
+                                    combo.blockSignals(False)
+                    except Exception as _quality_ui_err:
+                        print(f"   ⚠️ Could not sync shading speed selector: {_quality_ui_err}")
 
                     try:
                         panel = getattr(self.app_window, 'shading_panel', None)
@@ -2322,9 +2350,10 @@ class GlobalShortcutFilter(QObject):
                     # press. Classification commits update the live mesh
                     # incrementally; forcing Delaunay for all 13M points here
                     # caused the 10–15 second refresh seen in the audit log.
-                    _shading_force_rebuild = str(
-                        getattr(self.app_window, "display_mode", "")
-                    ).lower() != "shaded_class"
+                    # Quality is part of shading_display's cache key. Let it
+                    # restore/build the requested Fast/Normal/Slow geometry
+                    # instead of discarding a valid quality-specific cache.
+                    _shading_force_rebuild = previous_display_mode != "shaded_class"
                     update_shaded_class(
                         self.app_window,
                         azimuth=azimuth,
@@ -2347,7 +2376,7 @@ class GlobalShortcutFilter(QObject):
                     )
 
                     print(f"   ✅ Shading done: az={azimuth}° angle={angle}° "
-                        f"| {visible_count} classes")
+                        f"| {visible_count} classes | Speed={shading_quality_label(quality_mode)}")
                     print(f"{'='*60}\n")
 
                     if hasattr(self.app_window, 'statusBar'):

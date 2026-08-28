@@ -27,6 +27,8 @@
     "AttachSNT": "attach_snt",
 }
 
+from .shading_preset_quality import normalize_shading_preset_quality
+
 try:
     from shiboken6 import isValid as _qt_object_is_valid
 except ImportError:
@@ -544,7 +546,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             angle = preset.get("angle", 45.0)
             ambient = preset.get("ambient", 0.1)
             quality = preset.get("quality", 100.0)
-            speed = preset.get("speed", 1)
+            quality_mode = normalize_shading_preset_quality(
+                preset.get("quality_mode"),
+                preset.get("speed"),
+            )
             classes = preset.get("classes", {})
             
             print(f"   🌗 Shading: az={azimuth}°, angle={angle}°, ambient={ambient}")
@@ -560,13 +565,25 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                     panel.el_spin.setValue(angle)
                 if hasattr(panel, 'quality_spin'):
                     panel.quality_spin.setValue(quality)
-                if hasattr(panel, 'speed_spin'):
-                    panel.speed_spin.setValue(speed)
-                
                 print("   ✅ Shading parameters set in panel")
             
             # Apply ambient
             app_window.shade_ambient = ambient
+            app_window.shading_quality = quality_mode
+
+            try:
+                dlg = getattr(app_window, "display_mode_dialog", None)
+                if dlg is not None:
+                    dlg._shading_quality_value = quality_mode
+                    combo = getattr(dlg, "shading_quality", None)
+                    if combo is not None:
+                        quality_index = combo.findData(quality_mode)
+                        if quality_index >= 0:
+                            combo.blockSignals(True)
+                            combo.setCurrentIndex(quality_index)
+                            combo.blockSignals(False)
+            except Exception:
+                pass
             
             # ✅ CRITICAL: Only update visibility for classes in the preset
             if classes and hasattr(app_window, 'class_palette'):
