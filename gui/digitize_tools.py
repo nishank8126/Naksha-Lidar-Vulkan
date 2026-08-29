@@ -11483,6 +11483,17 @@ class DigitizeManager:
         except Exception as e:
             print(f"⚠️ Failed to clean up text tool: {e}")
 
+        # ✅ Clear the temp fence (if any) alongside Draw > Clear. Without
+        # this, a yellow temp fence outline remains on the canvas after the
+        # user explicitly clears drawings, which is confusing because every
+        # other drawn element was removed.
+        try:
+            temp_fence_tool = getattr(self.app, "temp_fence_tool", None)
+            if temp_fence_tool is not None and hasattr(temp_fence_tool, "remove_fence"):
+                temp_fence_tool.remove_fence()
+        except Exception as e:
+            print(f"⚠️ Failed to clear temp fence during Draw > Clear: {e}")
+
 
         # currently selected drawing do not survive the global clear.
         try:
