@@ -7267,20 +7267,8 @@ class NakshaApp(QMainWindow):
             panel.ensurePolished()
             panel.adjustSize()
             panel.resize(panel.sizeHint())
-            panel.setAttribute(Qt.WA_DontShowOnScreen, True)
-            panel.show()
-            QApplication.processEvents()
         except Exception:
             pass
-        finally:
-            try:
-                panel.hide()
-            except Exception:
-                pass
-            try:
-                panel.setAttribute(Qt.WA_DontShowOnScreen, False)
-            except Exception:
-                pass
 
         return panel
 
@@ -7353,10 +7341,12 @@ class NakshaApp(QMainWindow):
             return False
 
         panel = getattr(self, "shading_panel", None)
-        if (panel is not None
-                and _qt_object_is_valid(panel)
-                and hasattr(panel, "sync_from_app")):
-            panel.sync_from_app()
+        if panel is not None and _qt_object_is_valid(panel):
+            sync = getattr(panel, "sync_from_app", None)
+            if not callable(sync):
+                sync = getattr(panel, "refresh_from_app", None)
+            if callable(sync):
+                sync()
 
         dock.show()
         dock.raise_()
@@ -16197,45 +16187,43 @@ class NakshaApp(QMainWindow):
             except Exception:
                 return False
 
-        pickers = []
-
-        try:
-            cell_picker = vtk.vtkCellPicker()
-            cell_picker.SetTolerance(float(tolerance))
-            cell_picker.PickFromListOn()
-            cell_picker.AddPickList(actor)
-            pickers.append(("cell", cell_picker))
-        except Exception:
-            pass
-
+        # Hardware prop selection is effectively constant-time even for the
+        # 69M-face Slow shading mesh. A vtkCellPicker performs a CPU cell
+        # intersection and can block the right-click popup for seconds, so it
+        # is strictly a compatibility fallback when hardware picking errors.
         try:
             prop_picker = vtk.vtkPropPicker()
             if hasattr(prop_picker, "PickFromListOn"):
                 prop_picker.PickFromListOn()
             if hasattr(prop_picker, "AddPickList"):
                 prop_picker.AddPickList(actor)
-            pickers.append(("prop", prop_picker))
+            picked = bool(prop_picker.Pick(
+                float(display_x), float(display_y), 0.0, renderer
+            ))
+            if not picked:
+                return False
+            picked_actor = (
+                prop_picker.GetActor()
+                if hasattr(prop_picker, "GetActor") else None
+            )
+            if picked_actor is None and hasattr(prop_picker, "GetViewProp"):
+                picked_actor = prop_picker.GetViewProp()
+            return picked_actor is actor
         except Exception:
             pass
 
-        for picker_name, picker in pickers:
-            try:
-                picked = bool(picker.Pick(float(display_x), float(display_y), 0.0, renderer))
-                if not picked:
-                    continue
+        try:
+            cell_picker = vtk.vtkCellPicker()
+            cell_picker.SetTolerance(float(tolerance))
+            cell_picker.PickFromListOn()
+            cell_picker.AddPickList(actor)
+            if not cell_picker.Pick(
+                    float(display_x), float(display_y), 0.0, renderer):
+                return False
+            return cell_picker.GetActor() is actor
+        except Exception:
+            return False
 
-                picked_actor = None
-                if hasattr(picker, "GetActor"):
-                    picked_actor = picker.GetActor()
-                if picked_actor is None and hasattr(picker, "GetViewProp"):
-                    picked_actor = picker.GetViewProp()
-
-                if picked_actor is actor:
-                    return True
-            except Exception:
-                continue
-
-        return False
     def _store_zoom_anchor(self, vtk_widget, interactor=None, display_x=None, display_y=None):
         if vtk_widget is None:
             return

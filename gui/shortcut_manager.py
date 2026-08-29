@@ -1563,9 +1563,19 @@ class ClassVisibilityPicker(QDialog):
             self.az_spin.setValue(45.0)
             shading_layout.addWidget(self.az_spin, 0, 1)
 
-            shading_layout.addWidget(QLabel("Angle (°):"), 1, 0)
+            shading_layout.addWidget(QLabel("Sharpness:" if mode == "shading" else "Angle (°):"), 1, 0)
             self.angle_spin = QDoubleSpinBox()
-            self.angle_spin.setRange(0, 90)
+            if mode == "shading":
+                self.angle_spin.setRange(0, 999)
+                self.angle_spin.setSingleStep(5.0)
+                self.angle_spin.setToolTip(
+                    "0..90 = established sharpness response; "
+                    "91..999 = progressive overdrive. "
+                    "Ambient remains the brightness control."
+                )
+            else:
+                # Surface still uses a real physical light angle.
+                self.angle_spin.setRange(0, 90)
             self.angle_spin.setValue(45.0)
             shading_layout.addWidget(self.angle_spin, 1, 1)
 
@@ -2581,7 +2591,10 @@ class ClassVisibilityPicker(QDialog):
             return
         try:
             self.az_spin.setValue(getattr(self.app_window, 'last_shade_azimuth', 45.0))
-            self.angle_spin.setValue(getattr(self.app_window, 'last_shade_angle', 45.0))
+            self.angle_spin.setValue(getattr(
+                self.app_window, 'shading_sharpness_angle',
+                getattr(self.app_window, 'last_shade_angle', 45.0)
+            ))
             self.ambient_spin.setValue(getattr(self.app_window, 'shade_ambient', 0.25))
         except Exception:
             pass

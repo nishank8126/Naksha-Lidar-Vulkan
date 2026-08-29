@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import numpy as np
+
 import gui.unified_actor_manager as uam
 from gui.cross_section.section_zoom import SectionWheelZoomEventFilter
 from gui.gpu_render_manager import GPURenderManager
@@ -81,6 +83,61 @@ def test_intentionally_hidden_full_actor_is_never_revealed(monkeypatch):
     assert full.visible == 0
     assert lod.visible == 0
     assert sync_calls == []
+
+
+def test_flight_line_data_patch_does_not_reveal_actor_hidden_by_shading(monkeypatch):
+    class _FakeArray:
+        def __init__(self):
+            self.values = np.zeros(3, dtype=np.uint8)
+            self.modified = False
+
+        def Modified(self):
+            self.modified = True
+
+    class _FakePointData:
+        def __init__(self, array):
+            self.array = array
+
+        def GetArray(self, name):
+            return self.array if name == "FlightVisible" else None
+
+    class _FakeMesh:
+        def __init__(self, array):
+            self.point_data = _FakePointData(array)
+            self.modified = False
+
+        def GetPointData(self):
+            return self.point_data
+
+        def Modified(self):
+            self.modified = True
+
+    flight_array = _FakeArray()
+    mesh = _FakeMesh(flight_array)
+    actor = _FakeActor(visible=0)
+    actor._naksha_mesh = mesh
+    plotter = SimpleNamespace(actors={uam.UNIFIED_ACTOR_NAME: actor})
+    app = SimpleNamespace(
+        display_mode="shaded_class",
+        _unified_actor=actor,
+        vtk_widget=plotter,
+        data={
+            "xyz": np.zeros((3, 3), dtype=np.float64),
+            "point_source_id": np.array([10, 20, 10], dtype=np.uint16),
+        },
+        flight_line_visibility_by_slot={0: {10: True, 20: False}},
+    )
+    monkeypatch.setattr(
+        uam.numpy_support,
+        "vtk_to_numpy",
+        lambda vtk_array: vtk_array.values,
+    )
+
+    assert uam.fast_main_flight_line_visibility_update(app, render=False)
+    np.testing.assert_array_equal(flight_array.values, [1, 0, 1])
+    assert flight_array.modified
+    assert mesh.modified
+    assert actor.visible == 0
 
 
 def test_production_navigation_never_switches_actors():

@@ -567,7 +567,10 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                     panel.quality_spin.setValue(quality)
                 print("   ✅ Shading parameters set in panel")
             
-            # Apply ambient
+            # Shading controls are decoupled: Angle is facet sharpness;
+            # Ambient is brightness; Surface keeps its own legacy light angle.
+            app_window.last_shade_azimuth = azimuth
+            app_window.shading_sharpness_angle = angle
             app_window.shade_ambient = ambient
             app_window.shading_quality = quality_mode
 
