@@ -382,7 +382,10 @@ class TempFenceTool:
                 return
             x, y = self._event_pos(obj)
             _builtin_print(f"🩺 [tempfence] left press: screen=({x:.0f},{y:.0f}) active={self.active} drawing={self._drawing} pts={len(self._points)}")
-            world = self._display_to_plane(x, y)
+            # ✅ Use magnetic pick (falls back to z-plane ray) so a vertex
+            # placed near an existing drawing point/line snaps to it —
+            # matches the draw-tool polygon's behavior at every zoom level.
+            world = self._pick_to_plane(x, y)
             _builtin_print(f"🩺 [tempfence] world={world} plane_z={self._plane_z}")
             if world is None:
                 _safe_status(self.app, "⚠️ Temp Fence: cannot place a vertex — use a plan/top view")
@@ -427,7 +430,10 @@ class TempFenceTool:
             if not self._drawing or not self._points:
                 return
             x, y = self._event_pos(obj)
-            world = self._display_to_plane(x, y)
+            # ✅ Magnetic pick so the rubber-band preview tracks nearby
+            # geometry (falls back to the z-plane ray when nothing is
+            # picked) — matches the draw-tool polygon preview.
+            world = self._pick_to_plane(x, y)
             if world is None:
                 return
             self._rebuild_preview(cursor_xy=(world[0], world[1]))
@@ -524,7 +530,7 @@ class TempFenceTool:
         return 0.0
 
     def _display_to_plane(self, x, y):
-        """Intersect the camera ray through display (x, y) with the z-plane."""
+        """Intersect the viewing ray through display (x, y) with the z-plane."""
         ren = self._renderer()
         if ren is None:
             return None
@@ -532,41 +538,130 @@ class TempFenceTool:
         if z0 is None:
             z0 = self._plane_z = self._resolve_plane_z()
         try:
+            # ✅ ZOOM FIX (mirrors digitizer._project_to_z_plane): derive the
+            # viewing ray from the near AND far display points. This is exact
+            # for parallel AND perspective projection at any zoom level.
+            # The old single-point + camera-position construction was only
+            # valid for perspective — in plan/parallel views it amplified the
+            # cursor offset (vertices landing far from the cursor on zoom).
             ren.SetDisplayPoint(float(x), float(y), 0.0)
             ren.DisplayToWorld()
-            # ✅ FIX: GetWorldPoint (not GetDisplayPoint) — after DisplayToWorld
-            # the world coordinates are in GetWorldPoint, not GetDisplayPoint.
-            # In VTK 9.5 Python bindings GetWorldPoint() RETURNS the tuple
-            # (it takes no out-array argument).
-            wp = ren.GetWorldPoint()
-            w = wp[3] if len(wp) > 3 else 1.0
-            if abs(w) < 1e-12:
+            near = ren.GetWorldPoint()
+            ren.SetDisplayPoint(float(x), float(y), 1.0)
+            ren.DisplayToWorld()
+            far = ren.GetWorldPoint()
+            if (near is None or far is None
+                    or len(near) < 4 or len(far) < 4
+                    or abs(near[3]) < 1e-9 or abs(far[3]) < 1e-9):
                 return None
-            wx, wy, wz = wp[0] / w, wp[1] / w, wp[2] / w
-
-            cam = ren.GetActiveCamera()
-            cx, cy, cz = cam.GetPosition()
-            dx, dy, dz = wx - cx, wy - cy, wz - cz
-            if abs(dz) < 1e-9:
+            nx, ny, nz = near[0] / near[3], near[1] / near[3], near[2] / near[3]
+            fx, fy, fz = far[0] / far[3], far[1] / far[3], far[2] / far[3]
+            dz = fz - nz
+            if abs(dz) < 1e-10:
                 return None
-            t = (z0 - cz) / dz
-            if t <= 0:
+            t = (z0 - nz) / dz
+            if t < -1e-9 or t > 1.0 + 1e-9:
                 return None
-            return (cx + dx * t, cy + dy * t, z0)
+            return (nx + t * (fx - nx), ny + t * (fy - ny), z0)
         except Exception as e:
             _builtin_print(f"⚠️ TempFenceTool: display→world failed: {e}")
+            return None
+
+    def _pick_to_plane(self, x, y):
+        """Pick the nearest visible point/line under display (x, y) and project
+        it onto the drawing z-plane.
+
+        Mirrors the magnetic-snap fallback in the digitizer: first try a
+        vtkPropPicker against the renderer's visible props; if nothing is
+        picked, fall back to the viewing-ray intersection with the z-plane
+        (which is what the draw-tool polygon uses when there is nothing to
+        snap to). The result is always in world (x, y, z0) — the same shape
+        that _display_to_plane returns — so callers can use the two
+        interchangeably.
+        """
+        ren = self._renderer()
+        w = self._vtk_widget()
+        if ren is None or w is None:
+            return self._display_to_plane(x, y)
+        try:
+            picker = vtk.vtkPropPicker()
+            picker.Pick(float(x), float(y), 0.0, ren)
+            wp = picker.GetPickPosition()
+            if wp is not None and len(wp) >= 3:
+                # vtkPropPicker returns (0,0,0) when nothing was picked —
+                # detect that by checking the picked Prop.
+                if picker.GetActor() is not None or picker.GetProp3D() is not None:
+                    z0 = self._plane_z
+                    if z0 is None:
+                        z0 = self._plane_z = self._resolve_plane_z()
+                    return (float(wp[0]), float(wp[1]), float(z0))
+        except Exception:
+            pass
+        return self._display_to_plane(x, y)
+
+    def _screen_to_world_tolerance(self, screen_pixels=15):
+        """Convert a screen-pixel tolerance to world units at the current zoom.
+
+        Mirrors digitizer._screen_to_world_tolerance: two display points that
+        differ by `screen_pixels` on the viewport are back-projected to the
+        drawing plane and their world-space distance is returned. The result
+        is zoom-independent — when the user zooms in, two pixels cover fewer
+        world units, so the snap tolerance automatically tightens.
+        """
+        try:
+            w = self._vtk_widget()
+            if w is None:
+                return None
+            sz = w.size()
+            cx = sz.width() / 2.0
+            cy = sz.height() / 2.0
+            p0 = self._display_to_plane(cx, cy)
+            p1 = self._display_to_plane(cx + float(screen_pixels), cy)
+            if p0 is None or p1 is None:
+                return None
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            return (dx * dx + dy * dy) ** 0.5
+        except Exception:
             return None
 
     # ------------------------------------------------------------------
     # Actors
     # ------------------------------------------------------------------
     def _make_line_actor(self, pts, color=(1.0, 1.0, 0.0), width=2.0):
-        """Build a polyline + vertex-points actor from a list of (x, y, z)."""
+        """Build a polyline + vertex-points actor from a list of (x, y, z).
+
+        ZOOM FIX (mirrors digitizer._build_styled_polydata_world): with large
+        UTM coordinates (e.g. 700000, 5800000) the GPU's float32 pipeline
+        loses sub-millimeter precision and the outline visibly jitters or
+        drifts when the user zooms. We store points relative to the first
+        vertex in the vtkPolyData and put the first vertex's absolute
+        position on the actor via SetPosition — the GPU then only ever sees
+        small numbers, and the renderer adds the offset back in double
+        precision.
+
+        Shading / occlusion fix: the yellow outline is laid directly on top
+        of the shaded point cloud, so without a coincident-topology polygon
+        offset it z-fights and disappears behind the surface. Every other
+        overlay in the app uses SetResolveCoincidentTopologyToPolygonOffset
+        + SetRelativeCoincidentTopologyLineOffsetParameters(-3, -3); we
+        apply the same pair here so the fence always draws on top.
+        """
         if not pts:
             return None
+
+        # Origin for the recentered polydata — first vertex keeps the actor
+        # position in world space, the polydata coords stay small.
+        ox, oy, oz = (float(pts[0][0]), float(pts[0][1]), float(pts[0][2]))
+
         vpoints = vtk.vtkPoints()
+        vpoints.SetDataTypeToDouble()
         for p in pts:
-            vpoints.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+            vpoints.InsertNextPoint(
+                float(p[0]) - ox,
+                float(p[1]) - oy,
+                float(p[2]) - oz,
+            )
 
         poly = vtk.vtkPolyData()
         poly.SetPoints(vpoints)
@@ -589,8 +684,26 @@ class TempFenceTool:
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(poly)
+        # Shading fix: push the line/vertex geometry slightly toward the
+        # camera so it always wins the depth test against coincident point
+        # cloud / surface geometry. Matches the settings used by every
+        # other overlay actor in the app (see digitizer lines 2935-2936,
+        # 9484-9485, 9552-9553).
+        try:
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-3, -3)
+        except Exception:
+            pass
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        # ZOOM FIX: place the recentered polydata at the first vertex's
+        # absolute world position. VTK applies this offset in double
+        # precision during the render, so zoom drift vanishes even at
+        # large UTM coordinates.
+        try:
+            actor.SetPosition(ox, oy, oz)
+        except Exception:
+            pass
         prop = actor.GetProperty()
         prop.SetColor(*color)
         prop.SetLineWidth(width)
@@ -654,6 +767,75 @@ class TempFenceTool:
             self._preview_actor = None
             self._render()
 
+    def _snap_finalize_vertices(self, coords):
+        """Snap the last vertex of a finalized polygon to a nearby target.
+
+        Mirrors the smartline finalize snap in digitizer._finalize_smart_line
+        (lines 8946+): with an 8-screen-pixel tolerance converted to world
+        units (zoom-independent), snap the last vertex to:
+          (a) the polygon's own first vertex (so the closing click lands
+              exactly on the start — closes the polygon cleanly); OR
+          (b) any vertex of an existing digitizer drawing (so the temp fence
+              can be snapped to previously-drawn geometry, exactly like the
+              draw-tool polygon does).
+        If neither target is within tolerance, returns coords unchanged.
+        On any failure (no digitizer, no widget, bad tolerance), silently
+        returns coords — snap is a convenience, never a correctness gate.
+        """
+        try:
+            if not coords or len(coords) < 2:
+                return coords
+            tol = self._screen_to_world_tolerance(screen_pixels=8)
+            if tol is None or tol <= 0:
+                return coords
+
+            # Candidate snap targets: own first vertex + digitizer drawing
+            # vertices. Own-first comes first so that closing-click snaps
+            # take priority over a nearby unrelated drawing vertex.
+            candidates = [coords[0]]
+
+            digitizer = getattr(self.app, "digitizer", None)
+            if digitizer is not None:
+                try:
+                    drawings = getattr(digitizer, "drawings", None)
+                    if drawings is not None:
+                        for d in drawings:
+                            dcoords = d.get("coords") if isinstance(d, dict) else None
+                            if not dcoords:
+                                continue
+                            for c in dcoords:
+                                try:
+                                    candidates.append(
+                                        (float(c[0]), float(c[1]), float(c[2] if len(c) > 2 else coords[-1][2]))
+                                    )
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
+
+            last = coords[-1]
+            best = None
+            best_d2 = tol * tol
+            for cand in candidates:
+                dx = cand[0] - last[0]
+                dy = cand[1] - last[1]
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = cand
+            if best is None:
+                return coords
+
+            out = list(coords)
+            out[-1] = (float(best[0]), float(best[1]), float(best[2]))
+            try:
+                _builtin_print(f"[tempfence] snap: last vertex snapped to ({best[0]:.3f}, {best[1]:.3f}, {best[2]:.3f})")
+            except Exception:
+                pass
+            return out
+        except Exception:
+            return coords
+
     # ------------------------------------------------------------------
     # Finalize → fence + popup
     # ------------------------------------------------------------------
@@ -665,6 +847,11 @@ class TempFenceTool:
                 return
 
             coords = [(float(p[0]), float(p[1]), float(p[2])) for p in self._points]
+            # Snap the last vertex to the polygon's own start or to a nearby
+            # drawing vertex (8px screen tolerance, zoom-independent) — this
+            # is what makes the closing click feel magnetic, exactly like
+            # the draw-tool polygon / smartline.
+            coords = self._snap_finalize_vertices(coords)
             # Close the visible outline (coords list itself stays open, like
             # the digitizer polygon — masks treat polygons as closed).
             outline = list(coords) + [coords[0]]
@@ -838,26 +1025,71 @@ class TempFenceTool:
         _builtin_print("🔲 Temp fence set on By Class dialog")
 
     def _watch_completion(self, dlg):
-        """Poll the dialog; when its conversion completes, remove the fence."""
+        """Poll the dialog until it either (a) reports a completed conversion
+        — in which case we ask the user whether to keep or delete the fence,
+        or (b) is closed / hidden without classifying — in which case we
+        auto-remove the orphaned temp fence.
+
+        Previously the poller only fired on the `_conversion_completed`
+        flag, so closing the By Class dialog without clicking Convert left
+        the yellow fence stranded on the canvas. That matches the user's
+        reported bug ("I select fence or anything to do classification but
+        I do not do any classification, I just close that popup, that time
+        still fence is there").
+        """
         self._stop_watch()
         timer = QTimer()
         timer.setInterval(400)
 
+        def _is_done():
+            fs = getattr(dlg, "_fence_sel", None)
+            if fs is not None:
+                return bool(getattr(fs, "_conversion_completed", False))
+            return bool(getattr(dlg, "_conversion_completed", False))
+
+        def _is_gone():
+            """True when the dialog is no longer visible or has been
+            destroyed. Covers: user clicked ✕, pressed Esc, dialog was
+            replaced, or the C++ wrapper was deleted."""
+            try:
+                # isVisible() returns False for closed / hidden dialogs.
+                # A closed modal dialog often still exists but is hidden.
+                sip_deleted = False
+                try:
+                    import shiboken6  # type: ignore
+                    sip_deleted = not shiboken6.isValid(dlg)
+                except Exception:
+                    pass
+                if sip_deleted:
+                    return True
+                return not dlg.isVisible()
+            except RuntimeError:
+                # Accessing the wrapper after C++ deletion raises
+                # RuntimeError — treat as gone.
+                return True
+            except Exception:
+                return False
+
         def _check():
             try:
-                fs = getattr(dlg, "_fence_sel", None)
-                if fs is not None:
-                    done = bool(getattr(fs, "_conversion_completed", False))
-                else:
-                    done = bool(getattr(dlg, "_conversion_completed", False))
-                if done:
+                if _is_done():
                     timer.stop()
                     _builtin_print("🔲 By Class conversion completed — asking user about the temp fence")
                     self._ask_keep_or_delete()
+                    return
+                if _is_gone():
+                    timer.stop()
+                    _builtin_print("🔲 By Class dialog closed without conversion — removing temp fence")
+                    self.remove_fence()
+                    return
             except RuntimeError:
-                # Dialog was destroyed (C++ object deleted) — stop watching.
+                # Dialog C++ object deleted between poll iterations.
                 timer.stop()
                 self._stop_watch()
+                try:
+                    self.remove_fence()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
