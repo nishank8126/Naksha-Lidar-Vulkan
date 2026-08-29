@@ -7465,6 +7465,11 @@ def fast_main_flight_line_visibility_update(app, render: bool = True) -> bool:
     ``render=False`` is used by mode-switch code to batch FlightVisible,
     palette/uniform, and RGB changes into one final render. Existing callers
     retain the old immediate-render behavior because the default is True.
+
+    This function updates point data only. It must not change actor visibility:
+    Shaded Classification and Surface intentionally keep the cached unified
+    point actor hidden, and cross-section palette synchronization can reach this
+    helper through ``_get_unified_actor``.
     """
     t0 = time.perf_counter()
     actor = getattr(app, "_unified_actor", None)
@@ -7506,7 +7511,6 @@ def fast_main_flight_line_visibility_update(app, render: bool = True) -> bool:
     actor._naksha_flight_line_signature = flight_line_visibility_signature(app, 0)
     actor._naksha_flight_np_ref = vtk_values
     actor._naksha_flight_vtk = arr
-    actor.SetVisibility(1)
     if render and plotter is not None:
         plotter.render()
     elapsed = (time.perf_counter() - t0) * 1000.0

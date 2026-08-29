@@ -12866,6 +12866,8 @@ _FEATURE_AWARE_VERSION = 1
 # immutable.  Local class edits are displayed through one tiny exact-face
 # overlay, just like the existing single-class live-add path.
 _MULTICLASS_COLOR_OVERLAY_NAME = "shaded_mesh_live_multiclass_color"
+_MULTICLASS_LIVE_TIP_NAME = "shaded_mesh_live_multiclass_tip"
+_MULTICLASS_STATIC_BLEND_PREFIX = "shaded_mesh_static_multiclass_blend_"
 _INCIDENT_FACE_CACHE_MAX_NEW_VERTICES = 4096
 
 # Legacy class-detail point-layer names retained for cleanup compatibility.
@@ -14209,17 +14211,701 @@ def _microstation_color_blend_enabled(app, cache) -> bool:
     return int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
 
 
+
+def _crisp_multiclass_facets_enabled(app, cache) -> bool:
+    """Use a crisp cell-shaded base plus a mixed-class blend overlay.
+
+    This is a presentation-only policy for multi-class Shaded Classification.
+    The canonical point set, Delaunay topology, class membership, cache keys and
+    classification edit machinery are untouched.  Same-color/same-class terrain
+    is rendered as one solid flat-shaded triangle per TIN face; only faces whose
+    displayed vertex colours differ are overlaid with barycentric class blending.
+    """
+    flag = os.environ.get('NAKSHA_SHADING_CRISP_FACETS', '1').strip().lower()
+    if flag in ('0', 'false', 'off', 'no'):
+        return False
+    return bool(
+        _microstation_color_blend_enabled(app, cache)
+        and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
+    )
+
+
+def _crisp_blend_ambient_floor(app) -> float:
+    """Return the shared anti-black floor for crisp and GPU-lit shading.
+
+    The crisp base is already rendered as solid CELL RGB with VTK lighting
+    disabled, so it no longer needs the old 0.42 safety clamp that was used to
+    hide GPU normal/scan-line chatter.  Keeping that legacy clamp made broad,
+    low ground faces stay almost uniformly bright even when Sharpness was
+    increased.  Use the same small floor as the mixed-class GPU overlays so
+    Ambient remains the brightness control and Sharpness can expose real TIN
+    facet contrast all the way down to the lowest terrain points.
+    """
+    try:
+        floor = float(os.environ.get(
+            'NAKSHA_SHADING_BLEND_AMBIENT_FLOOR', '0.08'
+        ))
+    except Exception:
+        floor = 0.08
+    return float(np.clip(floor, 0.0, 0.30))
+
+
+def _crisp_sharpness_contrast_gain(sharpness_value) -> float:
+    """Map the 0..999 Sharpness control to pure-facet contrast gain.
+
+    Sharpness=45 is deliberately gain=1 so the established default look stays
+    stable.  Values below 45 soften tiny ground-slope differences; values above
+    45 progressively amplify them.  The 90..200 overdrive range is intentionally
+    strong, then continues with the existing smaller tail through 999.
+
+    This is a *presentation-only* multiplier around the intensity of a
+    horizontal face.  It never changes vertices, triangles, classes or the
+    user's Ambient value.
+    """
+    legacy, overdrive = _shading_sharpness_response(sharpness_value)
+    # 0 -> 0.55, 45 -> 1.00, 90 -> 1.45.
+    gain = 0.55 + 0.90 * legacy
+    # Make 90..200 very visible on low/small-slope terrain while retaining a
+    # progressive tail to 999.  At 200 gain is ~5.95; at 999 ~6.45.
+    gain += 5.0 * overdrive
+    return float(np.clip(gain, 0.35, 6.50))
+
+
+def _crisp_shade_chunk(app, cache, face_ids):
+    """Return Sharpness-aware CELL shade for the solid crisp TIN base.
+
+    ``cache.shade`` contains the raw hillshade from the exact face normals.  The
+    crisp base actor itself has lighting disabled, therefore every Sharpness
+    change that should be visible on pure/ground faces has to be baked into
+    these CELL RGB values.
+
+    Contrast is amplified around a horizontal-face pivot instead of simply
+    multiplying brightness.  This keeps a flat ground face at approximately the
+    same brightness while making small slope/aspect differences between adjacent
+    ground triangles increasingly clear.  Ambient remains only the shadow floor.
+    """
+    ids = np.asarray(face_ids, dtype=np.int64)
+    if cache.shade is None or len(cache.shade) != len(cache.faces):
+        return np.ones(len(ids), dtype=np.float32)
+    raw = np.asarray(cache.shade[ids], dtype=np.float32)
+    try:
+        src_ambient = float(np.clip(
+            getattr(cache, 'last_ambient', getattr(app, 'shade_ambient', 0.25)),
+            0.0, 0.95,
+        ))
+    except Exception:
+        src_ambient = 0.25
+    shadow_floor = max(src_ambient, _crisp_blend_ambient_floor(app))
+
+    sharpness_angle = _shading_sharpness_angle(app)
+    gain = _crisp_sharpness_contrast_gain(sharpness_angle)
+
+    # cache.last_angle is the *effective* light elevation used to generate raw
+    # hillshade.  Above Sharpness 90 it becomes progressively more grazing.
+    try:
+        effective_elevation = float(np.clip(cache.last_angle, 5.0, 85.0))
+    except Exception:
+        effective_elevation = _shading_fixed_light_elevation(app)
+    base_elevation = _shading_fixed_light_elevation(app)
+
+    # For a horizontal normal N=(0,0,1), N.L == sin(light elevation).
+    # Re-centre around that value so a perfectly flat face does not get darker
+    # merely because Sharpness is raised.  Only deviations caused by actual TIN
+    # slope/aspect are amplified.
+    raw_horizontal = max(
+        float(np.sin(np.radians(effective_elevation))), src_ambient
+    )
+    target_horizontal = max(
+        float(np.sin(np.radians(base_elevation))), shadow_floor
+    )
+
+    sharpened = target_horizontal + (raw - raw_horizontal) * gain
+    return np.asarray(
+        np.clip(sharpened, shadow_floor, 1.0), dtype=np.float32
+    )
+
+
+def _build_crisp_base_face_colors(app, cache, vertex_classes, visible_classes,
+                                  face_ids=None):
+    """Build deterministic flat RGB for TIN faces in bounded-memory chunks.
+
+    For pure faces, using vertex-0's class is exact because all three displayed
+    colours are identical.  Mixed-colour faces are covered by the static blend
+    overlay, so their base colour is only a hidden fallback.  This avoids the
+    3x 69M-class temporary arrays previously required by face majority/peak
+    materialisation and keeps Slow/all-points RAM bounded.
+    """
+    faces = cache.faces if face_ids is None else cache.faces[np.asarray(face_ids, dtype=np.int64)]
+    n_faces = len(faces)
+    if n_faces == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+
+    vc = set(int(c) for c in (visible_classes or ()))
+    classes = np.asarray(vertex_classes)
+    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+    class_max = int(classes.max()) if classes.size else 0
+    max_code = max([255, class_max] + palette_codes)
+    lut = np.zeros((max_code + 1, 3), dtype=np.float32)
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        ci = int(code)
+        if 0 <= ci <= max_code and ci in vc:
+            lut[ci] = entry.get('color', (128, 128, 128))
+
+    out = np.empty((n_faces, 3), dtype=np.uint8)
+    chunk = max(50_000, int(os.environ.get(
+        'NAKSHA_SHADING_CRISP_COLOR_CHUNK', '1000000'
+    )))
+    for begin in range(0, n_faces, chunk):
+        end = min(begin + chunk, n_faces)
+        fc = faces[begin:end]
+        cid = np.asarray(classes[fc[:, 0]], dtype=np.int64)
+        rgb = lut[np.clip(cid, 0, max_code)]
+        if face_ids is None:
+            shade_ids = np.arange(begin, end, dtype=np.int64)
+        else:
+            shade_ids = np.asarray(face_ids, dtype=np.int64)[begin:end]
+        sh = _crisp_shade_chunk(app, cache, shade_ids)
+        out[begin:end] = np.clip(rgb * sh[:, None], 0, 255).astype(np.uint8)
+    return out
+
+
+def _display_color_key_lut(app, vertex_classes, visible_classes):
+    """Pack visible palette RGB into one integer per class for fast comparisons."""
+    classes = np.asarray(vertex_classes)
+    palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+    class_max = int(classes.max()) if classes.size else 0
+    max_code = max([255, class_max] + palette_codes)
+    lut = np.zeros(max_code + 1, dtype=np.int32)
+    vc = set(int(c) for c in (visible_classes or ()))
+    for code, entry in getattr(app, 'class_palette', {}).items():
+        ci = int(code)
+        if not (0 <= ci <= max_code and ci in vc):
+            continue
+        try:
+            r, g, b = [int(v) & 255 for v in entry.get('color', (128, 128, 128))[:3]]
+        except Exception:
+            r, g, b = 128, 128, 128
+        lut[ci] = (r << 16) | (g << 8) | b
+    return lut
+
+
+def _crisp_mixed_face_budget(total_faces):
+    """Return the safe mixed-face budget for the crisp barycentric overlay.
+
+    Large all-class tiles commonly have more than eight million mixed faces.
+    Falling back to full-vertex blending at that point reintroduces visible
+    scan-line hatching on otherwise pure ground facets. Scale the default with
+    topology size while retaining a bounded upper limit and the existing
+    environment override.
+    """
+    configured = os.environ.get('NAKSHA_SHADING_CRISP_MAX_MIXED_FACES')
+    if configured is not None:
+        try:
+            return max(0, int(configured))
+        except (TypeError, ValueError):
+            pass
+    try:
+        face_count = max(0, int(total_faces))
+    except (TypeError, ValueError):
+        face_count = 0
+    scaled = int(np.ceil(face_count * 0.25))
+    return min(20_000_000, max(12_000_000, scaled))
+
+
+def _collect_mixed_display_faces(app, cache, vertex_classes, visible_classes):
+    """Return faces whose three displayed class colours are not identical.
+
+    The scan is chunked, so the 69M-face Slow mesh never materialises three
+    full-size class arrays.  A safety ceiling prevents a pathological dataset
+    from creating an unreasonably large secondary blend actor; in that rare case
+    the renderer falls back to the existing full-vertex blend path.
+    """
+    faces = cache.faces
+    if faces is None or len(faces) == 0:
+        return np.empty(0, dtype=np.int64), 0, True
+    classes = np.asarray(vertex_classes)
+    key_lut = _display_color_key_lut(app, classes, visible_classes)
+    chunk = max(100_000, int(os.environ.get(
+        'NAKSHA_SHADING_CRISP_SCAN_CHUNK', '2000000'
+    )))
+    max_mixed = _crisp_mixed_face_budget(len(faces))
+    parts = []
+    total = 0
+    for begin in range(0, len(faces), chunk):
+        fc = faces[begin:begin + chunk]
+        c0 = np.asarray(classes[fc[:, 0]], dtype=np.int64)
+        c1 = np.asarray(classes[fc[:, 1]], dtype=np.int64)
+        c2 = np.asarray(classes[fc[:, 2]], dtype=np.int64)
+        k0 = key_lut[np.clip(c0, 0, len(key_lut) - 1)]
+        k1 = key_lut[np.clip(c1, 0, len(key_lut) - 1)]
+        k2 = key_lut[np.clip(c2, 0, len(key_lut) - 1)]
+        local = np.flatnonzero((k0 != k1) | (k0 != k2)).astype(np.int64, copy=False)
+        if local.size:
+            total += int(local.size)
+            if max_mixed and total > max_mixed:
+                return None, total, False
+            parts.append(local + begin)
+    if not parts:
+        return np.empty(0, dtype=np.int64), 0, True
+    return np.concatenate(parts), total, True
+
+
+def _remove_static_multiclass_blend_overlays(app):
+    """Remove presentation-only static mixed-class blend actors."""
+    plotter = getattr(app, 'vtk_widget', None)
+    entries = getattr(app, '_shading_static_blend_overlays', None) or []
+    removed = 0
+    if plotter is not None:
+        names = set()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get('name'):
+                names.add(str(entry['name']))
+        try:
+            names.update(
+                str(name) for name in plotter.actors.keys()
+                if str(name).startswith(_MULTICLASS_STATIC_BLEND_PREFIX)
+            )
+        except Exception:
+            pass
+        for name in names:
+            try:
+                plotter.remove_actor(name, render=False)
+                removed += 1
+            except Exception:
+                pass
+    app._shading_static_blend_overlays = []
+    return removed
+
+
+def _attach_explicit_cell_normals(poly, normals):
+    """Attach exact face normals without creating point normals/smoothing."""
+    if poly is None or normals is None or len(normals) == 0:
+        return None
+    buf = np.ascontiguousarray(np.asarray(normals), dtype=np.float32)
+    vtk_normals = numpy_support.numpy_to_vtk(buf, deep=False)
+    vtk_normals.SetName('Normals')
+    poly.GetCellData().SetNormals(vtk_normals)
+    poly.GetCellData().Modified()
+    poly.Modified()
+    return buf
+
+
+def _sharp_multiclass_tip_enabled(app, cache) -> bool:
+    """Presentation-only sharpened apex for isolated class vertices.
+
+    The full Delaunay, all-point coverage and canonical barycentric blend remain
+    unchanged.  This layer adds a small coplanar triangular core only when one
+    displayed vertex colour differs from the other two.  It makes the actual
+    LiDAR/class vertex read as a crisp apex instead of a soft blurred cone.
+    """
+    # Disabled by default: on dense multi-class clouds this presentation layer
+    # creates millions of small solid-colour triangles which read as coloured
+    # spots at point/class tips. Keep an explicit opt-in for diagnostics only.
+    flag = os.environ.get('NAKSHA_SHADING_SHARP_TIPS', '0').strip().lower()
+    if flag in ('0', 'false', 'off', 'no'):
+        return False
+    return bool(
+        _crisp_multiclass_facets_enabled(app, cache)
+        and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
+    )
+
+
+_SHADING_SHARPNESS_LEGACY_MAX = 90.0
+_SHADING_SHARPNESS_MAX = 999.0
+_SHADING_SHARPNESS_STRONG_MAX = 200.0
+_SHADING_SHARPNESS_STRONG_RESPONSE = 0.90
+
+
+def _shading_sharpness_angle(app, explicit=None) -> float:
+    """Return the Shaded-Classification facet sharpness control (0..999).
+
+    Values 0..90 preserve the previous response exactly.  Values above 90 are
+    an *overdrive* range: they continue reducing opposite fill-light energy and
+    lower the lighting incidence angle for visible facet contrast, while
+    Ambient remains the brightness control.
+    """
+    if explicit is None:
+        explicit = getattr(
+            app, 'shading_sharpness_angle',
+            getattr(app, 'last_shade_angle', 45.0),
+        )
+    try:
+        return float(np.clip(float(explicit), 0.0, _SHADING_SHARPNESS_MAX))
+    except Exception:
+        return 45.0
+
+
+def _shading_sharpness_response(sharpness_value):
+    """Return ``(legacy, overdrive)`` normalized sharpness responses.
+
+    ``legacy`` is 0..1 and is byte-for-byte compatible with the old 0..90
+    behaviour. ``overdrive`` supplies a strong, linear 90..200 response, then
+    retains a smaller progressive tail through 999. This makes every change up
+    to 200 clearly visible without changing total directional light energy.
+    """
+    try:
+        value = float(np.clip(
+            float(sharpness_value), 0.0, _SHADING_SHARPNESS_MAX
+        ))
+    except Exception:
+        value = 45.0
+    legacy = float(np.clip(value / _SHADING_SHARPNESS_LEGACY_MAX, 0.0, 1.0))
+    if value <= _SHADING_SHARPNESS_LEGACY_MAX:
+        return legacy, 0.0
+    strong_span = max(
+        _SHADING_SHARPNESS_STRONG_MAX - _SHADING_SHARPNESS_LEGACY_MAX,
+        1.0,
+    )
+    if value <= _SHADING_SHARPNESS_STRONG_MAX:
+        strong_t = (value - _SHADING_SHARPNESS_LEGACY_MAX) / strong_span
+        overdrive = _SHADING_SHARPNESS_STRONG_RESPONSE * strong_t
+    else:
+        tail_span = max(
+            _SHADING_SHARPNESS_MAX - _SHADING_SHARPNESS_STRONG_MAX,
+            1.0,
+        )
+        tail_t = (value - _SHADING_SHARPNESS_STRONG_MAX) / tail_span
+        overdrive = (
+            _SHADING_SHARPNESS_STRONG_RESPONSE
+            + (1.0 - _SHADING_SHARPNESS_STRONG_RESPONSE) * tail_t
+        )
+    return legacy, float(np.clip(overdrive, 0.0, 1.0))
+
+
+def _shading_fixed_light_elevation(app) -> float:
+    """Stable internal sun elevation for multi-class shading."""
+    value = getattr(app, 'shading_light_elevation', None)
+    if value is None:
+        value = os.environ.get('NAKSHA_SHADING_LIGHT_ELEVATION', '45.0')
+    try:
+        return float(np.clip(float(value), 5.0, 85.0))
+    except Exception:
+        return 45.0
+
+
+def _shading_effective_light_elevation(app, sharpness_overdrive=0.0) -> float:
+    """Return the render light elevation, with visible over-90 sharpening.
+
+    The legacy 0..90 range keeps the configured 45-degree light exactly. Above
+    90, lowering the grazing angle progressively through 200 increases actual
+    facet-to-facet contrast. This avoids the old invisible 95/5 -> 100/0
+    key/fill-only tail while leaving topology, colours and Ambient untouched.
+    """
+    base = _shading_fixed_light_elevation(app)
+    overdrive = float(np.clip(sharpness_overdrive, 0.0, 1.0))
+    minimum = 12.0
+    return float(np.clip(base - (base - minimum) * overdrive, minimum, 85.0))
+
+
+
+def _sharp_tip_parameters(app=None):
+    """Derive isolated-class apex crispness from the Sharpness control.
+
+    Higher sharpness => a smaller, more needle-like solid core and stronger
+    retention of the apex class colour. Explicit environment overrides still
+    take precedence for production tuning/rollback.
+    """
+    sharpness = _shading_sharpness_angle(app) if app is not None else 45.0
+    t, overdrive = _shading_sharpness_response(sharpness)
+
+    if 'NAKSHA_SHADING_SHARP_TIP_FRACTION' in os.environ:
+        try:
+            fraction = float(os.environ['NAKSHA_SHADING_SHARP_TIP_FRACTION'])
+        except Exception:
+            fraction = 0.30
+    else:
+        # Preserve the old 0..90 curve exactly, then continue tightening the
+        # apex from 0.16 toward ~0.04 through the 90..999 overdrive range.
+        fraction = 0.48 - 0.32 * (t ** 0.85)
+        if overdrive > 0.0:
+            fraction -= 0.12 * overdrive
+
+    if 'NAKSHA_SHADING_SHARP_TIP_COLOR_RETENTION' in os.environ:
+        try:
+            edge_retention = float(os.environ['NAKSHA_SHADING_SHARP_TIP_COLOR_RETENTION'])
+        except Exception:
+            edge_retention = 0.86
+    else:
+        edge_retention = 0.70 + 0.28 * (t ** 0.75)
+        if overdrive > 0.0:
+            edge_retention += 0.02 * overdrive
+
+    fraction = float(np.clip(fraction, 0.035, 0.60))
+    edge_retention = float(np.clip(edge_retention, 0.55, 1.0))
+    return fraction, edge_retention
+
+def _build_sharp_multiclass_tip_actor(app, cache, *, name, xyz, faces,
+                                      vertex_classes, visible_classes,
+                                      face_normals=None, live=False):
+    """Build a tiny crisp triangular core around unique-colour face vertices.
+
+    No base vertex/face is moved or replaced.  The small overlay is constructed
+    strictly inside the existing face plane, uses the exact original face normal
+    for lighting, and keeps the surrounding barycentric blend fully visible.
+    """
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is None or not _sharp_multiclass_tip_enabled(app, cache):
+        return None, None, 0
+
+    faces = np.asarray(faces, dtype=np.int32)
+    xyz = np.asarray(xyz)
+    classes = np.asarray(vertex_classes)
+    if len(faces) == 0 or len(xyz) == 0 or len(classes) != len(xyz):
+        return None, None, 0
+
+    vc = set(int(c) for c in (visible_classes or ()))
+    vrgb = np.ascontiguousarray(_shading_palette_rgb(app, classes, vc), dtype=np.uint8)
+    packed_key = (
+        (vrgb[:, 0].astype(np.int32) << 16)
+        | (vrgb[:, 1].astype(np.int32) << 8)
+        | vrgb[:, 2].astype(np.int32)
+    )
+
+    k0 = packed_key[faces[:, 0]]
+    k1 = packed_key[faces[:, 1]]
+    k2 = packed_key[faces[:, 2]]
+    m0 = (k0 != k1) & (k1 == k2)
+    m1 = (k1 != k0) & (k0 == k2)
+    m2 = (k2 != k0) & (k0 == k1)
+    n_tip = int(np.count_nonzero(m0) + np.count_nonzero(m1) + np.count_nonzero(m2))
+    if n_tip == 0:
+        return None, None, 0
+
+    max_faces = max(0, int(os.environ.get(
+        'NAKSHA_SHADING_SHARP_TIP_MAX_FACES', '2000000'
+    )))
+
+    rows0 = np.flatnonzero(m0).astype(np.int64, copy=False)
+    rows1 = np.flatnonzero(m1).astype(np.int64, copy=False)
+    rows2 = np.flatnonzero(m2).astype(np.int64, copy=False)
+    rows = np.concatenate((rows0, rows1, rows2))
+    tip_ids = np.concatenate((
+        faces[rows0, 0], faces[rows1, 1], faces[rows2, 2]
+    )).astype(np.int64, copy=False)
+    side_b = np.concatenate((
+        faces[rows0, 1], faces[rows1, 0], faces[rows2, 0]
+    )).astype(np.int64, copy=False)
+    side_c = np.concatenate((
+        faces[rows0, 2], faces[rows1, 2], faces[rows2, 1]
+    )).astype(np.int64, copy=False)
+
+    if max_faces and len(rows) > max_faces:
+        # Deterministic thinning is a safety valve only.  Normal static chunks
+        # are 250k faces, so the production path keeps every sharp tip.
+        pick = np.linspace(0, len(rows) - 1, max_faces, dtype=np.int64)
+        rows = rows[pick]
+        tip_ids = tip_ids[pick]
+        side_b = side_b[pick]
+        side_c = side_c[pick]
+
+    fraction, edge_retention = _sharp_tip_parameters(app)
+    p0 = np.asarray(xyz[tip_ids], dtype=np.float64)
+    pb = np.asarray(xyz[side_b], dtype=np.float64)
+    pc = np.asarray(xyz[side_c], dtype=np.float64)
+    p1 = p0 + fraction * (pb - p0)
+    p2 = p0 + fraction * (pc - p0)
+
+    out_xyz = np.empty((len(rows) * 3, 3), dtype=np.float64)
+    out_xyz[0::3] = p0
+    out_xyz[1::3] = p1
+    out_xyz[2::3] = p2
+
+    c0 = vrgb[tip_ids].astype(np.float32)
+    cb = vrgb[side_b].astype(np.float32)
+    cc = vrgb[side_c].astype(np.float32)
+    c1 = edge_retention * c0 + (1.0 - edge_retention) * cb
+    c2 = edge_retention * c0 + (1.0 - edge_retention) * cc
+    out_rgb = np.empty((len(rows) * 3, 3), dtype=np.uint8)
+    out_rgb[0::3] = np.clip(c0, 0, 255).astype(np.uint8)
+    out_rgb[1::3] = np.clip(c1, 0, 255).astype(np.uint8)
+    out_rgb[2::3] = np.clip(c2, 0, 255).astype(np.uint8)
+
+    tri = np.arange(len(rows) * 3, dtype=np.int32).reshape(-1, 3)
+    packed = np.empty(len(rows) * 4, dtype=np.int32)
+    packed[0::4] = 3
+    packed[1::4] = tri[:, 0]
+    packed[2::4] = tri[:, 1]
+    packed[3::4] = tri[:, 2]
+
+    patch = pv.PolyData(np.ascontiguousarray(out_xyz), packed)
+    patch.point_data['RGB'] = np.ascontiguousarray(out_rgb, dtype=np.uint8)
+
+    normal_buf = None
+    if face_normals is not None and len(face_normals) == len(faces):
+        normal_buf = _attach_explicit_cell_normals(
+            patch, np.asarray(face_normals)[rows]
+        )
+
+    try:
+        plotter.remove_actor(name, render=False)
+    except Exception:
+        pass
+
+    actor = plotter.add_mesh(
+        patch,
+        scalars='RGB',
+        rgb=True,
+        show_edges=False,
+        lighting=True,
+        smooth_shading=False,
+        preference='point',
+        name=name,
+        render=False,
+    )
+    if actor is None:
+        return None, None, 0
+
+    try:
+        setattr(actor, '_is_shading_mesh', True)
+        setattr(actor, '_is_shading_sharp_tip', True)
+        actor.PickableOff()
+        _configure_microstation_color_blend_lighting(app, actor)
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
+                -12.0 if live else -7.0,
+                -12.0 if live else -7.0,
+            )
+            mapper.InterpolateScalarsBeforeMappingOff()
+    except Exception:
+        pass
+
+    buffers = (
+        out_xyz, out_rgb, packed, tri, rows, tip_ids, side_b, side_c,
+        normal_buf, vrgb,
+    )
+    actor._naksha_sharp_tip_buffers = buffers
+    return actor, buffers, int(len(rows))
+
+
+def _build_static_multiclass_blend_overlays(app, cache, vertex_classes,
+                                            visible_classes, mixed_faces):
+    """Overlay only mixed-colour faces with barycentric class RGB.
+
+    The underlying complete TIN stays one crisp cell-shaded surface.  Mixed
+    class boundaries are rendered in bounded chunks with point RGB plus explicit
+    CELL normals, so class colours blend inside each triangle while each facet
+    remains geometrically flat and sharply separated from its neighbours.
+    """
+    _remove_static_multiclass_blend_overlays(app)
+    plotter = getattr(app, 'vtk_widget', None)
+    if plotter is None:
+        return 0, 0
+    ids = np.asarray(mixed_faces, dtype=np.int64).ravel()
+    if ids.size == 0:
+        app._shading_static_blend_overlays = []
+        return 0, 0
+
+    classes = np.asarray(vertex_classes)
+    vc = set(int(c) for c in (visible_classes or ()))
+    chunk_faces = max(25_000, int(os.environ.get(
+        'NAKSHA_SHADING_CRISP_OVERLAY_CHUNK', '250000'
+    )))
+    entries = []
+    total_vertices = 0
+    blend_actor_count = 0
+    sharp_tip_faces = 0
+    sharp_tip_actors = 0
+    for chunk_no, begin in enumerate(range(0, len(ids), chunk_faces)):
+        chunk_ids = ids[begin:begin + chunk_faces]
+        base_faces = np.asarray(cache.faces[chunk_ids], dtype=np.int32)
+        flat = base_faces.reshape(-1)
+        local_ids, inverse = np.unique(flat, return_inverse=True)
+        local_faces = inverse.reshape(-1, 3).astype(np.int32, copy=False)
+        local_xyz = np.ascontiguousarray(cache.xyz_final[local_ids])
+        rgb = _shading_palette_rgb(app, classes[local_ids], vc)
+
+        packed = np.empty(len(local_faces) * 4, dtype=np.int32)
+        packed[0::4] = 3
+        packed[1::4] = local_faces[:, 0]
+        packed[2::4] = local_faces[:, 1]
+        packed[3::4] = local_faces[:, 2]
+        patch = pv.PolyData(local_xyz, packed)
+        patch.point_data['RGB'] = np.ascontiguousarray(rgb, dtype=np.uint8)
+
+        normal_buf = None
+        if cache.face_normals is not None and len(cache.face_normals) == len(cache.faces):
+            normal_buf = _attach_explicit_cell_normals(
+                patch, cache.face_normals[chunk_ids]
+            )
+
+        name = f'{_MULTICLASS_STATIC_BLEND_PREFIX}{chunk_no}'
+        actor = plotter.add_mesh(
+            patch,
+            scalars='RGB',
+            rgb=True,
+            show_edges=False,
+            lighting=True,
+            smooth_shading=False,
+            preference='point',
+            name=name,
+            render=False,
+        )
+        if actor is None:
+            continue
+        try:
+            setattr(actor, '_is_shading_mesh', True)
+            setattr(actor, '_is_shading_static_blend', True)
+            actor.PickableOff()
+            _configure_microstation_color_blend_lighting(app, actor)
+            mapper = actor.GetMapper()
+            if mapper is not None:
+                mapper.StaticOn()
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-3.0, -3.0)
+                mapper.InterpolateScalarsBeforeMappingOff()
+        except Exception:
+            pass
+        # Keep every zero-copy/VTK-backed NumPy buffer alive with the actor.
+        buffers = (local_xyz, packed, rgb, normal_buf, local_ids, local_faces, chunk_ids)
+        actor._naksha_crisp_blend_buffers = buffers
+        entries.append({'name': name, 'actor': actor, 'buffers': buffers})
+        blend_actor_count += 1
+        total_vertices += int(len(local_ids))
+
+        # Sharpen only the actual isolated class apex.  The surrounding mixed
+        # face still uses the established barycentric blend.
+        local_classes = classes[local_ids]
+        local_normals = (
+            cache.face_normals[chunk_ids]
+            if cache.face_normals is not None and len(cache.face_normals) == len(cache.faces)
+            else None
+        )
+        tip_name = f'{_MULTICLASS_STATIC_BLEND_PREFIX}tip_{chunk_no}'
+        tip_actor, tip_buffers, tip_count = _build_sharp_multiclass_tip_actor(
+            app, cache, name=tip_name, xyz=local_xyz, faces=local_faces,
+            vertex_classes=local_classes, visible_classes=vc,
+            face_normals=local_normals, live=False,
+        )
+        if tip_actor is not None:
+            entries.append({'name': tip_name, 'actor': tip_actor, 'buffers': tip_buffers})
+            sharp_tip_actors += 1
+            sharp_tip_faces += int(tip_count)
+
+    app._shading_static_blend_overlays = entries
+    if sharp_tip_faces:
+        fraction, retention = _sharp_tip_parameters(app)
+        print(
+            'SHADING_SHARP_TIPS status=enabled kind=static '
+            f'faces={sharp_tip_faces:,} actors={sharp_tip_actors} '
+            f'fraction={fraction:.3f} color_retention={retention:.3f} '
+            'topology_unchanged=1 base_blend_preserved=1'
+        )
+    return blend_actor_count, total_vertices
+
 def _configure_microstation_color_blend_lighting(app, actor=None):
-    """Configure MicroStation-style soft faceted lighting for RGB blending.
+    """Flat faceted lighting with Sharpness independent of brightness.
 
-    The class-color interpolation stays exactly per vertex.  Only the lighting
-    presentation is softened so very narrow/steep LiDAR triangles do not turn
-    into black scan-line-like hatching when the complete all-points mesh is
-    viewed from a distance.
+    Multi-class Shaded Classification controls now mean:
+      Azimuth   -> direction around the terrain.
+      Sharpness -> face/tip contrast, not sun elevation.
+      Ambient   -> brightness / shadow floor.
 
-    Geometry, Delaunay faces, class RGB, classification refresh and cache data
-    are untouched.  A weak opposite-azimuth fill light plus a conservative
-    ambient floor compresses only the darkest end of the Lambert response.
+    Values through 90 keep the legacy 45-degree elevation. Overdrive lowers the
+    incidence angle for visible facet contrast. Geometry/topology/class RGB,
+    Ambient control and barycentric colour blending are untouched.
     """
     plotter = getattr(app, 'vtk_widget', None)
     renderer = getattr(plotter, 'renderer', None) if plotter is not None else None
@@ -14227,39 +14913,66 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
         return False
 
     azimuth = float(getattr(app, 'last_shade_azimuth', 45.0))
-    angle = float(getattr(app, 'last_shade_angle', 45.0))
+    sharpness_angle = _shading_sharpness_angle(app)
     ambient = float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0))
+    sharpness, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
 
-    # Multi-class triangulations can contain narrow legitimate facets, especially
-    # in Slow/all-points mode.  With a single hard key light those facets can
-    # collapse to dark 1-pixel streaks at overview scale.  Keep the user's ambient
-    # control, but never allow the shared blend presentation below this floor.
+    # Ambient now owns brightness. Keep only a very small anti-black safety floor
+    light_elevation = _shading_effective_light_elevation(
+        app, sharpness_overdrive
+    )
+    # instead of the previous 0.42 clamp that made Ambient=0.25 ineffective.
     try:
         ambient_floor = float(os.environ.get(
-            'NAKSHA_SHADING_BLEND_AMBIENT_FLOOR', '0.42'
+            'NAKSHA_SHADING_BLEND_AMBIENT_FLOOR', '0.08'
         ))
     except Exception:
-        ambient_floor = 0.42
-    ambient_floor = float(np.clip(ambient_floor, 0.0, 0.80))
+        ambient_floor = 0.08
+    ambient_floor = float(np.clip(ambient_floor, 0.0, 0.30))
     effective_ambient = max(ambient, ambient_floor)
 
-    try:
-        key_intensity = float(os.environ.get(
-            'NAKSHA_SHADING_BLEND_KEY_INTENSITY', '0.85'
-        ))
-    except Exception:
-        key_intensity = 0.85
-    try:
-        fill_intensity = float(os.environ.get(
-            'NAKSHA_SHADING_BLEND_FILL_INTENSITY', '0.18'
-        ))
-    except Exception:
-        fill_intensity = 0.18
+    # Keep directional energy roughly constant. Sharpness only redistributes it
+    # between key and opposite fill, increasing face-to-face contrast without
+    # acting like a brightness slider.
+    if ('NAKSHA_SHADING_BLEND_KEY_INTENSITY' in os.environ or
+            'NAKSHA_SHADING_BLEND_FILL_INTENSITY' in os.environ):
+        try:
+            key_intensity = float(os.environ.get(
+                'NAKSHA_SHADING_BLEND_KEY_INTENSITY', '0.85'
+            ))
+        except Exception:
+            key_intensity = 0.85
+        try:
+            fill_intensity = float(os.environ.get(
+                'NAKSHA_SHADING_BLEND_FILL_INTENSITY', '0.18'
+            ))
+        except Exception:
+            fill_intensity = 0.18
+    else:
+        try:
+            total_directional = float(os.environ.get(
+                'NAKSHA_SHADING_DIRECTIONAL_ENERGY', '1.05'
+            ))
+        except Exception:
+            total_directional = 1.05
+        total_directional = float(np.clip(total_directional, 0.25, 1.50))
+        # 0..90 is unchanged: key_ratio runs 0.58 -> 0.95. Most overdrive
+        # contrast is deliberately distributed across 90..200, with a smaller
+        # tail through 999 instead of visually saturating immediately after 90.
+        # Total directional energy stays constant, so Ambient remains the
+        # brightness control while facet-to-facet contrast gets stronger.
+        key_ratio = (
+            0.58
+            + 0.37 * sharpness
+            + 0.049 * sharpness_overdrive
+        )
+        key_ratio = float(np.clip(key_ratio, 0.50, 0.999))
+        key_intensity = total_directional * key_ratio
+        fill_intensity = total_directional * (1.0 - key_ratio)
+
     key_intensity = float(np.clip(key_intensity, 0.0, 2.0))
     fill_intensity = float(np.clip(fill_intensity, 0.0, 1.0))
 
-    # Reuse the two lights across classification edits.  Other display modes can
-    # replace the renderer light collection, so validate both cached objects.
     key_light = getattr(app, '_shading_microstation_key_light', None)
     fill_light = getattr(app, '_shading_microstation_fill_light', None)
     lights_live = False
@@ -14267,8 +14980,7 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
         try:
             lights = renderer.GetLights()
             lights_live = bool(
-                lights
-                and lights.IsItemPresent(key_light)
+                lights and lights.IsItemPresent(key_light)
                 and lights.IsItemPresent(fill_light)
             )
         except Exception:
@@ -14279,50 +14991,32 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
             renderer.RemoveAllLights()
         except Exception:
             pass
+        key_light = vtk.vtkLight(); key_light.SetLightTypeToSceneLight()
+        key_light.SetPositional(False); key_light.SetColor(1.0, 1.0, 1.0)
+        renderer.AddLight(key_light); app._shading_microstation_key_light = key_light
+        fill_light = vtk.vtkLight(); fill_light.SetLightTypeToSceneLight()
+        fill_light.SetPositional(False); fill_light.SetColor(1.0, 1.0, 1.0)
+        renderer.AddLight(fill_light); app._shading_microstation_fill_light = fill_light
 
-        key_light = vtk.vtkLight()
-        key_light.SetLightTypeToSceneLight()
-        key_light.SetPositional(False)
-        key_light.SetColor(1.0, 1.0, 1.0)
-        renderer.AddLight(key_light)
-        app._shading_microstation_key_light = key_light
-
-        fill_light = vtk.vtkLight()
-        fill_light.SetLightTypeToSceneLight()
-        fill_light.SetPositional(False)
-        # Neutral fill: do not tint LAS classification colors.
-        fill_light.SetColor(1.0, 1.0, 1.0)
-        renderer.AddLight(fill_light)
-        app._shading_microstation_fill_light = fill_light
-
-    zenith_rad = np.radians(90.0 - angle)
+    # The 0..90 legacy range keeps the configured elevation. Overdrive lowers
+    # the incidence angle so 90..200 has a strong, visible facet response.
+    zenith_rad = np.radians(90.0 - light_elevation)
     az_math_rad = np.radians(360.0 - azimuth + 90.0)
     lx = np.sin(zenith_rad) * np.cos(az_math_rad)
     ly = np.sin(zenith_rad) * np.sin(az_math_rad)
     lz = np.cos(zenith_rad)
 
-    key_light.SetPosition(float(lx * 100.0), float(ly * 100.0), float(lz * 100.0))
-    key_light.SetFocalPoint(0.0, 0.0, 0.0)
-    key_light.SetIntensity(key_intensity)
-
-    # Opposite XY direction but still above the terrain.  This is a fill, not a
-    # second sun: it lifts steep facets that face away from the key light while
-    # preserving broad terrain relief and the exact barycentric class blend.
+    key_light.SetPosition(float(lx*100.0), float(ly*100.0), float(lz*100.0))
+    key_light.SetFocalPoint(0.0, 0.0, 0.0); key_light.SetIntensity(key_intensity)
     fill_z = max(float(lz), 0.20)
-    fill_light.SetPosition(float(-lx * 100.0), float(-ly * 100.0), fill_z * 100.0)
-    fill_light.SetFocalPoint(0.0, 0.0, 0.0)
-    fill_light.SetIntensity(fill_intensity)
+    fill_light.SetPosition(float(-lx*100.0), float(-ly*100.0), fill_z*100.0)
+    fill_light.SetFocalPoint(0.0, 0.0, 0.0); fill_light.SetIntensity(fill_intensity)
 
     for light in (key_light, fill_light):
-        try:
-            light.Modified()
-        except Exception:
-            pass
-
-    try:
-        renderer.SetAmbient(1.0, 1.0, 1.0)
-    except Exception:
-        pass
+        try: light.Modified()
+        except Exception: pass
+    try: renderer.SetAmbient(1.0, 1.0, 1.0)
+    except Exception: pass
 
     actors = []
     if actor is not None:
@@ -14332,23 +15026,17 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
             getattr(app, '_shaded_mesh_actor', None),
             getattr(app, '_shading_multiclass_color_overlay_actor', None),
         ):
-            if candidate is not None:
-                actors.append(candidate)
+            if candidate is not None: actors.append(candidate)
 
     for item in actors:
         try:
             prop = item.GetProperty()
-            prop.SetLighting(True)
-            prop.SetInterpolationToFlat()
+            prop.SetLighting(True); prop.SetInterpolationToFlat()
             prop.SetAmbient(effective_ambient)
-            prop.SetDiffuse(max(0.0, 1.0 - effective_ambient))
-            prop.SetSpecular(0.0)
-            prop.EdgeVisibilityOff()
-            # Never let a back-face/culling policy turn thin all-point facets into
-            # holes/black chatter when zoomed out.
+            prop.SetDiffuse(max(0.0, 1.0-effective_ambient))
+            prop.SetSpecular(0.0); prop.EdgeVisibilityOff()
             try:
-                prop.BackfaceCullingOff()
-                prop.FrontfaceCullingOff()
+                prop.BackfaceCullingOff(); prop.FrontfaceCullingOff()
             except Exception:
                 pass
             item.Modified()
@@ -14356,21 +15044,23 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
             pass
 
     signature = (
-        round(azimuth, 4), round(angle, 4), round(ambient, 4),
-        round(effective_ambient, 4), round(key_intensity, 4),
-        round(fill_intensity, 4),
+        round(azimuth,4), round(sharpness_angle,4),
+        round(sharpness_overdrive,4), round(light_elevation,4),
+        round(ambient,4), round(effective_ambient,4),
+        round(key_intensity,4), round(fill_intensity,4),
     )
     if getattr(app, '_shading_microstation_light_signature', None) != signature:
         app._shading_microstation_light_signature = signature
         print(
-            'SHADING_COLOR_BLEND_LIGHT '
-            f'azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} '
-            f'effective_ambient={effective_ambient:.3f} '
-            f'key={key_intensity:.2f} fill={fill_intensity:.2f} '
-            'normal=flat_triangle color=barycentric_vertex_rgb soft_background=1'
+            'SHADING_SHARPNESS_CONTROL '
+            f'azimuth={azimuth:.2f} sharpness={sharpness_angle:.2f} '
+            f'overdrive={sharpness_overdrive:.3f} '
+            f'light_elevation={light_elevation:.2f} '
+            f'ambient_brightness={ambient:.3f} effective_ambient={effective_ambient:.3f} '
+            f'key={key_intensity:.3f} fill={fill_intensity:.3f} '
+            'semantics=decoupled topology_rebuild=0 color_upload=0'
         )
     return True
-
 
 def _shading_palette_rgb(app, class_values, visible_classes):
     """Map a small/sparse class array to exact Display Mode RGB values."""
@@ -14624,7 +15314,12 @@ def _remove_multiclass_color_overlay(app, cache=None, clear_dirty=True):
             plotter.remove_actor(_MULTICLASS_COLOR_OVERLAY_NAME, render=False)
         except Exception:
             pass
+        try:
+            plotter.remove_actor(_MULTICLASS_LIVE_TIP_NAME, render=False)
+        except Exception:
+            pass
     app._shading_multiclass_color_overlay_actor = None
+    app._shading_multiclass_tip_actor = None
 
     if clear_dirty:
         caches = []
@@ -14650,6 +15345,7 @@ def _remove_fast_shading_overlays(app):
         app._shading_add_overlays = []
         app._shading_remove_overlays = []
         app._shading_multiclass_color_overlay_actor = None
+        app._shading_static_blend_overlays = []
         try:
             for item in _cache_store.values():
                 item._multiclass_dirty_faces.clear()
@@ -14701,6 +15397,14 @@ def _remove_fast_shading_overlays(app):
     except Exception:
         pass
     app._shading_multiclass_color_overlay_actor = None
+    try:
+        if _MULTICLASS_LIVE_TIP_NAME in plotter.actors:
+            plotter.remove_actor(_MULTICLASS_LIVE_TIP_NAME, render=False)
+            removed += 1
+    except Exception:
+        pass
+    app._shading_multiclass_tip_actor = None
+    removed += _remove_static_multiclass_blend_overlays(app)
     _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
     try:
         for item in _cache_store.values():
@@ -14805,6 +15509,9 @@ class ShadingGeometryCache:
         self.shade = None; self.vertex_shade = None; self.unique_indices = None
         self.offset = None; self.spacing = 0.0; self.max_edge_factor = 3.0
         self.last_azimuth = -1; self.last_angle = -1; self.last_ambient = -1
+        # User-facing multi-class facet Sharpness is independent from the
+        # internal physical light elevation stored in ``last_angle``.
+        self.last_crisp_sharpness = -1.0
         self.visible_classes_hash = None; self.n_visible_classes = 0
         self.single_class_id = None; self.visible_classes_set = None
         self.smooth_all_classes = False
@@ -14844,6 +15551,10 @@ class ShadingGeometryCache:
     def is_fully_current(self, xyz, vc, az, an, am, app):
         if not self.is_geometry_valid(xyz, vc): return False
         if self.needs_shading_update(az, an, am): return False
+        if int(self.n_visible_classes or 0) > 1:
+            current_sharpness = _shading_sharpness_angle(app)
+            if abs(float(self.last_crisp_sharpness) - current_sharpness) > .001:
+                return False
         return getattr(app, '_shaded_mesh_actor', None) is not None
     def is_geometry_valid(self, xyz, vc):
         if self.xyz_unique is None or self.faces is None or len(self.faces) == 0: return False
@@ -15111,7 +15822,7 @@ def _queue_incremental_patch(app, sci):
     timer.start(1000)
 
 
-def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
+def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
                         max_edge_factor=3.0, force_rebuild=False,
                         single_class_max_edge=None, **kwargs):
     global _active_app_ref
@@ -15152,9 +15863,34 @@ def update_shaded_class(app, azimuth=45., angle=45., ambient=0.25,
         print(f"  ⚠️ Surface cleanup before shaded_class skipped: {_surface_cleanup_err}")
 
     azimuth = getattr(app, 'last_shade_azimuth', azimuth)
-    angle = getattr(app, 'last_shade_angle', angle)
     ambient = getattr(app, 'shade_ambient', ambient)
     vc = _get_shading_visibility(app)
+
+    # In multi-class shading the user-facing Angle is facet SHARPNESS.
+    # 0..90 keeps the established 45-degree light elevation.  Above 90 the
+    # existing overdrive progressively lowers the effective elevation to make
+    # low/small-slope TIN facets respond strongly.  The crisp-base contrast
+    # remap keeps the horizontal-ground brightness anchored, so Ambient remains
+    # the brightness/shadow-floor control rather than Sharpness.
+    requested_angle = angle
+    if len(vc) > 1:
+        sharpness_angle = _shading_sharpness_angle(app, requested_angle)
+        app.shading_sharpness_angle = sharpness_angle
+        _, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
+        angle = _shading_effective_light_elevation(
+            app, sharpness_overdrive
+        )
+        # ``last_shade_angle`` is the internal physical light elevation used by
+        # local classification/undo refresh paths.  The popup value itself is
+        # stored independently in ``shading_sharpness_angle``.
+        app.last_shade_angle = angle
+    else:
+        angle = float(
+            getattr(app, 'last_shade_angle', 45.0)
+            if requested_angle is None else requested_angle
+        )
+        app.last_shade_angle = angle
+
     quality_mode = normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
     app.shading_quality = quality_mode
     requested_cache_key = _build_cache_key(
@@ -15823,6 +16559,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     # A full render/recolor bakes canonical classes into the base mesh.  Drop
     # any temporary multi-class color overlay before touching that base actor.
     _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+    _remove_static_multiclass_blend_overlays(app)
     profile_start = time.perf_counter()
     stage_start = profile_start
     render_timings = OrderedDict()
@@ -15853,6 +16590,24 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     # by the GPU while the triangle normal remains flat/faceted.  Fast / Normal /
     # Slow still differ ONLY in geometry density; single-class behaviour is intact.
     blend_class_colors = _microstation_color_blend_enabled(app, cache)
+    crisp_hybrid = bool(blend_class_colors and _crisp_multiclass_facets_enabled(app, cache))
+    mixed_faces = np.empty(0, dtype=np.int64)
+    mixed_count = 0
+    mixed_budget = _crisp_mixed_face_budget(nf)
+    if crisp_hybrid:
+        mixed_faces, mixed_count, crisp_ok = _collect_mixed_display_faces(
+            app, cache, cm, vc
+        )
+        if not crisp_ok:
+            crisp_hybrid = False
+            mixed_faces = np.empty(0, dtype=np.int64)
+            print(
+                'SHADING_CRISP_FACETS status=fallback reason=mixed_face_safety_guard '
+                f'candidate_mixed_faces={mixed_count:,} '
+                f'mixed_face_budget={mixed_budget:,} '
+                'fallback=full_vertex_blend'
+            )
+    app._shading_crisp_hybrid_active = bool(crisp_hybrid)
     # Enforce the current faceted-normal policy for newly built and cached meshes.
     # In blend mode the NORMAL is still flat; only class RGB is interpolated.
     smooth_all_classes = False
@@ -15866,7 +16621,74 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         cache._vtk_mesh = None
     checkpoint("class_map_lut_setup")
 
-    if blend_class_colors:
+    if crisp_hybrid:
+        # Crisp MicroStation-style presentation:
+        #   1) every TIN face is a solid cell-shaded triangle (no sub-pixel
+        #      point-colour lighting chatter on the broad/low ground surface),
+        #   2) only mixed DISPLAY-colour faces receive the barycentric blend
+        #      overlay built below.
+        face_colors = _build_crisp_base_face_colors(app, cache, cm, vc)
+        cache.last_crisp_sharpness = _shading_sharpness_angle(app)
+
+        if (em is not None and ea is not None and
+                _get_rendered_cache_key(app) == cache.cache_key and
+                em.GetNumberOfPoints() == nv and em.GetNumberOfCells() == nf):
+            try:
+                vtk_colors = em.GetCellData().GetScalars()
+                if vtk_colors is not None and vtk_colors.GetNumberOfTuples() == nf:
+                    numpy_support.vtk_to_numpy(vtk_colors)[:] = face_colors
+                    vtk_colors.Modified(); em.GetCellData().Modified(); em.Modified()
+                    ea.GetMapper().Modified()
+                    prop = ea.GetProperty()
+                    prop.SetLighting(False); prop.SetInterpolationToFlat()
+                    prop.SetAmbient(1.0); prop.SetDiffuse(0.0); prop.SetSpecular(0.0)
+                    prop.EdgeVisibilityOff(); prop.SetOpacity(1.0)
+                    actor_count, blend_vertices = _build_static_multiclass_blend_overlays(
+                        app, cache, cm, vc, mixed_faces
+                    )
+                    _set_rendered_cache_key(app, cache)
+                    for actor in _attachment_overlay_actors(app):
+                        vis = bool(actor.GetVisibility())
+                        if labels_hidden and _is_overlay_label_actor(actor):
+                            vis = False
+                        _restore_overlay_actor(app.vtk_widget.renderer, actor, vis)
+                    _hide_point_cloud_actors_for_shading(app)
+                    checkpoint('inplace_crisp_color_update_and_overlays')
+                    _restore_camera(app, saved_camera); app.vtk_widget.render()
+                    checkpoint('render_present')
+                    render_timings['total_render_path'] = time.perf_counter() - profile_start
+                    _emit_shading_profile(
+                        'render_inplace_crisp_blend', render_timings,
+                        points=nv, faces=nf, smooth=0, blend=1,
+                        mixed_faces=mixed_count, blend_actors=actor_count,
+                    )
+                    print(
+                        'SHADING_CRISP_FACETS status=enabled '
+                        f'faces={nf:,} mixed_faces={mixed_count:,} '
+                        f'mixed_face_budget={mixed_budget:,} '
+                        f'pure_faces={nf-mixed_count:,} blend_actors={actor_count} '
+                        f'blend_vertices={blend_vertices:,} all_points_preserved=1 '
+                        'topology_unchanged=1 base=cell_shaded overlay=vertex_blend'
+                    )
+                    return
+            except Exception as exc:
+                print(f'SHADING_CRISP_FACETS inplace_fallback={exc}')
+            cache._vtk_colors_ptr = None
+
+        if cached_mesh is not None:
+            mesh = cached_mesh
+            try:
+                mesh.GetPointData().RemoveArray('RGB')
+            except Exception:
+                pass
+            mesh.cell_data['RGB'] = face_colors
+        else:
+            fv = np.empty(nf * 4, dtype=np.int32); fv[0::4] = 3
+            fv[1::4] = cache.faces[:,0]; fv[2::4] = cache.faces[:,1]; fv[3::4] = cache.faces[:,2]
+            mesh = pv.PolyData(cache.xyz_final, fv)
+            mesh.cell_data['RGB'] = face_colors
+
+    elif blend_class_colors:
         # IMPORTANT: do not bake one class into the whole triangle.  Each mesh
         # vertex keeps its own canonical class RGB.  OpenGL then performs the
         # barycentric color interpolation visible in MicroStation/TerraScan,
@@ -16086,15 +16908,20 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
 
     app._shaded_mesh_actor = plotter.add_mesh(
         mesh, scalars="RGB", rgb=True, show_edges=False,
-        lighting=bool(blend_class_colors),
+        lighting=bool(blend_class_colors and not crisp_hybrid),
         smooth_shading=False if blend_class_colors else smooth_all_classes,
-        preference="point" if (blend_class_colors or smooth_all_classes) else "cell",
+        preference=("cell" if crisp_hybrid else ("point" if (blend_class_colors or smooth_all_classes) else "cell")),
         name="shaded_mesh", render=False,
     )
     if app._shaded_mesh_actor:
         setattr(app._shaded_mesh_actor, "_is_shading_mesh", True)
         p2 = app._shaded_mesh_actor.GetProperty()
-        if blend_class_colors:
+        if crisp_hybrid:
+            p2.SetLighting(False)
+            p2.SetInterpolationToFlat()
+            p2.SetAmbient(1.0); p2.SetDiffuse(0.0); p2.SetSpecular(0.0)
+            p2.EdgeVisibilityOff(); p2.SetOpacity(1.0)
+        elif blend_class_colors:
             _configure_microstation_color_blend_lighting(app, app._shaded_mesh_actor)
         else:
             if not smooth_all_classes:
@@ -16110,12 +16937,27 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     # for every quality.  Fast / Normal / Slow keep their existing representative
     # counts and topology; only the RGB presentation is shared across qualities.
     _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True)
+    static_blend_actors = 0
+    static_blend_vertices = 0
+    if crisp_hybrid:
+        static_blend_actors, static_blend_vertices = _build_static_multiclass_blend_overlays(
+            app, cache, cm, vc, mixed_faces
+        )
+        print(
+            'SHADING_CRISP_FACETS status=enabled '
+            f'faces={nf:,} mixed_faces={mixed_count:,} pure_faces={nf-mixed_count:,} '
+            f'mixed_face_budget={mixed_budget:,} '
+            f'blend_actors={static_blend_actors} blend_vertices={static_blend_vertices:,} '
+            'all_points_preserved=1 topology_unchanged=1 '
+            'base=cell_shaded overlay=vertex_blend explicit_cell_normals=1'
+        )
     quality_mode = normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
     if blend_class_colors:
         print(
             f'SHADING_COLOR_BLEND mode={quality_mode} active=1 '
             'class_source=per_vertex interpolation=barycentric '
             'lighting=flat_triangle_slope '
+            f'presentation={"crisp_hybrid" if crisp_hybrid else "full_vertex_blend"} '
             f'points={nv:,} faces={nf:,} raw_point_overlay=disabled'
         )
     elif quality_mode == 'slow' and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1:
@@ -17263,6 +18105,30 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
     vc = visible_classes if visible_classes is not None else _get_shading_visibility(app)
     vc = set(int(c) for c in (vc or ()))
 
+    if bool(getattr(app, '_shading_crisp_hybrid_active', False)):
+        cell_colors = mesh.GetCellData().GetScalars()
+        if cell_colors is None or cell_colors.GetNumberOfTuples() != len(cache.faces):
+            return False
+        cm = classes[cache.unique_indices]
+        rgb = _build_crisp_base_face_colors(
+            app, cache, cm, vc, face_ids=dirty_faces
+        )
+        numpy_support.vtk_to_numpy(cell_colors)[dirty_faces] = rgb
+        cell_colors.Modified(); mesh.GetCellData().Modified(); mesh.Modified()
+        actor = getattr(app, '_shaded_mesh_actor', None)
+        if actor is not None and actor.GetMapper() is not None:
+            actor.GetMapper().Modified()
+        # The topology-aware operation that follows will rebuild presentation.
+        # Drop the old static/dynamic boundary overlays rather than exposing stale
+        # class colours during that short transition.
+        _remove_static_multiclass_blend_overlays(app)
+        print(
+            'SHADING_CRISP_BLEND_BAKE '
+            f'faces={len(dirty_faces)} reason=topology_membership_change'
+        )
+        _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
+        return True
+
     if _microstation_color_blend_enabled(app, cache):
         point_colors = mesh.GetPointData().GetScalars()
         if point_colors is None or point_colors.GetNumberOfTuples() != len(cache.unique_indices):
@@ -17409,6 +18275,11 @@ def _fast_multiclass_color_overlay(
         local_classes = classes[cache.unique_indices[local_vertex_ids]]
         rgb = _shading_palette_rgb(app, local_classes, vc)
         patch.point_data['RGB'] = rgb
+        _dynamic_normal_buf = None
+        if cache.face_normals is not None and len(cache.face_normals) == len(cache.faces):
+            _dynamic_normal_buf = _attach_explicit_cell_normals(
+                patch, cache.face_normals[dirty_faces]
+            )
         preference = 'point'
         lighting = True
     else:
@@ -17477,12 +18348,41 @@ def _fast_multiclass_color_overlay(
         if mapper is not None:
             mapper.StaticOn()
             mapper.SetResolveCoincidentTopologyToPolygonOffset()
-            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-4.0, -4.0)
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-8.0, -8.0)
             mapper.InterpolateScalarsBeforeMappingOff()
     except Exception:
         pass
 
     app._shading_multiclass_color_overlay_actor = actor
+    if blend_mode:
+        try:
+            actor._naksha_crisp_dynamic_normal_buffer = _dynamic_normal_buf
+        except Exception:
+            pass
+
+        # Keep classification/undo/redo visually identical to the full render:
+        # dirty mixed faces receive the same small crisp apex core.
+        dynamic_normals = (
+            cache.face_normals[dirty_faces]
+            if cache.face_normals is not None and len(cache.face_normals) == len(cache.faces)
+            else None
+        )
+        tip_actor, tip_buffers, tip_count = _build_sharp_multiclass_tip_actor(
+            app, cache, name=_MULTICLASS_LIVE_TIP_NAME,
+            xyz=local_xyz, faces=local_faces, vertex_classes=local_classes,
+            visible_classes=vc, face_normals=dynamic_normals, live=True,
+        )
+        app._shading_multiclass_tip_actor = tip_actor
+        if tip_actor is not None:
+            try:
+                tip_actor._naksha_sharp_tip_buffers = tip_buffers
+            except Exception:
+                pass
+            if tip_count:
+                print(
+                    'SHADING_SHARP_TIPS status=enabled kind=live '
+                    f'faces={tip_count} dirty_faces={len(dirty_faces)}'
+                )
     if not blend_mode:
         try:
             _update_live_class_detail_overlay(
@@ -17544,6 +18444,7 @@ def _update_colors_gpu_fast(
         # safe direct fallback and also handles full palette recolors.
         if (
             _microstation_color_blend_enabled(app, cache)
+            and not bool(getattr(app, '_shading_crisp_hybrid_active', False))
             and cls_raw is not None
             and cache.unique_indices is not None
         ):
@@ -17642,7 +18543,11 @@ def _update_colors_gpu_fast(
                     if 0 <= code_int < mc and code_int in vc:
                         lut[code_int] = entry.get("color", (128, 128, 128))
 
-                target_shade = shade[affected_faces]
+                target_shade = (
+                    _crisp_shade_chunk(app, cache, affected_faces)
+                    if bool(getattr(app, '_shading_crisp_hybrid_active', False))
+                    else shade[affected_faces]
+                )
                 colors_np[affected_faces] = np.clip(
                     lut[np.clip(face_classes, 0, mc - 1)]
                     * target_shade[:, None],
@@ -17688,12 +18593,15 @@ def _update_colors_gpu_fast(
                 if 0 <= code_int < mc and code_int in vc:
                     lut[code_int] = entry.get("color", (128, 128, 128))
 
-            face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
-            colors_np[:] = np.clip(
-                lut[np.clip(face_classes, 0, mc - 1)] * shade[:, None],
-                0,
-                255,
-            ).astype(np.uint8)
+            if bool(getattr(app, '_shading_crisp_hybrid_active', False)):
+                colors_np[:] = _build_crisp_base_face_colors(app, cache, cm, vc)
+            else:
+                face_classes = _face_class_ids_shading(app, cache, cm, cache.faces)
+                colors_np[:] = np.clip(
+                    lut[np.clip(face_classes, 0, mc - 1)] * shade[:, None],
+                    0,
+                    255,
+                ).astype(np.uint8)
 
             cell_colors.Modified()
             mesh.GetCellData().Modified()
@@ -17703,6 +18611,21 @@ def _update_colors_gpu_fast(
                 mapper = actor.GetMapper()
                 if mapper is not None:
                     mapper.Modified()
+
+            if bool(getattr(app, '_shading_crisp_hybrid_active', False)):
+                mixed_faces, mixed_count, crisp_ok = _collect_mixed_display_faces(
+                    app, cache, cm, vc
+                )
+                if crisp_ok:
+                    _build_static_multiclass_blend_overlays(
+                        app, cache, cm, vc, mixed_faces
+                    )
+                else:
+                    _remove_static_multiclass_blend_overlays(app)
+                    print(
+                        'SHADING_CRISP_FACETS status=palette_recolor_fallback '
+                        f'candidate_mixed_faces={mixed_count:,}'
+                    )
 
             if _defer_render:
                 _schedule_fast_shaded_present(app, delay_ms=0)
@@ -19422,13 +20345,132 @@ def handle_shaded_view_change(app, view_name):
         pass
 
 
-def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
-    """Update lighting on the currently rendered shading topology only.
 
-    This path never rebuilds representatives, triangles, or the spatial index.
-    It reuses the currently rendered cache entry and updates only shade/color
-    arrays. If no valid live shaded mesh exists, it safely falls back to the
-    normal shading update path.
+def _enforce_crisp_base_actor_state(app):
+    """Keep the crisp-hybrid base as solid, edge-free CELL-shaded facets.
+
+    The initial crisp renderer intentionally disables VTK lighting on the base
+    mesh because its face shade is already baked into CELL RGB.  Re-enabling
+    actor lighting on that same mesh produces the dark scan-line/hatched look
+    seen after using the Shading popup.  This helper restores the exact actor
+    presentation used by ``_render_mesh`` without touching topology.
+    """
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    if actor is None:
+        return False
+    try:
+        actor.SetVisibility(True)
+        prop = actor.GetProperty()
+        if prop is not None:
+            prop.SetLighting(False)
+            prop.SetInterpolationToFlat()
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            prop.EdgeVisibilityOff()
+            prop.SetOpacity(1.0)
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.StaticOn()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.InterpolateScalarsBeforeMappingOff()
+            mapper.Modified()
+        actor.Modified()
+        return True
+    except Exception as exc:
+        print(f'SHADING_CRISP_BASE_STATE status=failed reason={exc}')
+        return False
+
+
+def _refresh_crisp_base_face_colors_in_place(app, cache, classes_raw):
+    """Refresh crisp base CELL RGB on the existing TIN, without retriangulation.
+
+    Azimuth/Ambient modify ``cache.shade`` in the lighting-only path.  The crisp
+    multi-class base is *not* GPU lit; therefore those new face shades must be
+    copied back to its existing cell-color buffer.  Work is chunked so a 69M
+    face Slow mesh does not allocate a second full RGB array.
+    """
+    mesh = getattr(app, '_shaded_mesh_polydata', None)
+    actor = getattr(app, '_shaded_mesh_actor', None)
+    faces = getattr(cache, 'faces', None)
+    unique_indices = getattr(cache, 'unique_indices', None)
+    if mesh is None or actor is None or faces is None or unique_indices is None:
+        return False
+    n_faces = int(len(faces))
+    if n_faces <= 0:
+        return False
+
+    try:
+        vtk_colors = mesh.GetCellData().GetScalars()
+        if vtk_colors is None or int(vtk_colors.GetNumberOfTuples()) != n_faces:
+            return False
+        colors_np = numpy_support.vtk_to_numpy(vtk_colors)
+        if colors_np.ndim != 2 or colors_np.shape[0] != n_faces or colors_np.shape[1] < 3:
+            return False
+
+        classes = np.asarray(classes_raw)
+        vc = set(int(c) for c in (_get_shading_visibility(app) or ()))
+        palette_codes = [int(c) for c in getattr(app, 'class_palette', {}).keys()]
+        try:
+            class_max = int(classes.max()) if classes.size else 0
+        except Exception:
+            class_max = 0
+        max_code = max([255, class_max] + palette_codes)
+        lut = np.zeros((max_code + 1, 3), dtype=np.float32)
+        for code, entry in getattr(app, 'class_palette', {}).items():
+            ci = int(code)
+            if 0 <= ci <= max_code and ci in vc:
+                lut[ci] = entry.get('color', (128, 128, 128))
+
+        chunk = max(50_000, int(os.environ.get(
+            'NAKSHA_SHADING_CRISP_LIGHT_CHUNK', '1000000'
+        )))
+        t0 = time.perf_counter()
+        for begin in range(0, n_faces, chunk):
+            end = min(begin + chunk, n_faces)
+            fc = faces[begin:end]
+            # Crisp-base ownership is intentionally identical to the initial
+            # renderer: vertex-0 supplies the hidden/base class RGB; mixed faces
+            # keep their separate barycentric overlay above this actor.
+            rep_ids = np.asarray(unique_indices[fc[:, 0]], dtype=np.int64)
+            cid = np.asarray(classes[rep_ids], dtype=np.int64)
+            rgb = lut[np.clip(cid, 0, max_code)]
+            face_ids = np.arange(begin, end, dtype=np.int64)
+            sh = _crisp_shade_chunk(app, cache, face_ids)
+            colors_np[begin:end, :3] = np.clip(
+                rgb * sh[:, None], 0, 255
+            ).astype(np.uint8)
+
+        vtk_colors.Modified()
+        mesh.GetCellData().Modified()
+        mesh.Modified()
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.Modified()
+        _enforce_crisp_base_actor_state(app)
+        print(
+            'SHADING_CRISP_BASE_REFRESH status=updated '
+            f'faces={n_faces:,} elapsed={(time.perf_counter()-t0)*1000:.1f}ms '
+            'topology_rebuild=0 actor_rebuild=0 presentation=solid_cell_facets'
+        )
+        return True
+    except Exception as exc:
+        print(f'SHADING_CRISP_BASE_REFRESH status=failed reason={exc}')
+        return False
+
+def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
+    """Update live shading without rebuilding representatives or triangles.
+
+    Multi-class ``angle`` is the user-facing Sharpness control.  The important
+    split is presentation-aware:
+
+    * crisp-hybrid base = baked CELL RGB, lighting MUST stay OFF;
+    * mixed-class overlays = point RGB + flat GPU lighting;
+    * non-crisp blend = the base mesh itself may use GPU lighting.
+
+    This keeps the exact TIN produced by Shaded Classification intact when the
+    popup changes Azimuth/Sharpness/Ambient and prevents the hatched/line-based
+    regression caused by enabling lighting on the crisp base actor.
     """
     data = getattr(app, "data", None)
     if not isinstance(data, dict):
@@ -19438,132 +20480,255 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
     if xyz_raw is None or classes_raw is None:
         return False
 
-    azimuth = float(getattr(app, 'last_shade_azimuth', 45.0) if azimuth is None else azimuth)
-    angle = float(getattr(app, 'last_shade_angle', 45.0) if angle is None else angle)
-    ambient = float(getattr(app, 'shade_ambient', 0.25) if ambient is None else ambient)
-
-    app.last_shade_azimuth = azimuth
-    app.last_shade_angle = angle
-    app.shade_ambient = ambient
+    azimuth = float(
+        getattr(app, 'last_shade_azimuth', 45.0)
+        if azimuth is None else azimuth
+    )
+    ambient = float(
+        getattr(app, 'shade_ambient', 0.25)
+        if ambient is None else ambient
+    )
 
     rendered_key = _get_rendered_cache_key(app)
     cache = _cache_store.get(rendered_key) if rendered_key is not None else None
     actor_live = (
         getattr(app, '_shaded_mesh_actor', None) is not None
         and getattr(app, 'vtk_widget', None) is not None
-        and "shaded_mesh" in getattr(app.vtk_widget, 'actors', {})
+        and 'shaded_mesh' in getattr(app.vtk_widget, 'actors', {})
     )
-
-    if (cache is None or not actor_live or cache.visible_classes_set is None
-            or not cache.is_geometry_valid(xyz_raw, cache.visible_classes_set)):
-        print("SHADING_LIGHT_ONLY status=fallback reason=no_valid_live_geometry")
+    if (
+        cache is None
+        or not actor_live
+        or cache.visible_classes_set is None
+        or not cache.is_geometry_valid(xyz_raw, cache.visible_classes_set)
+    ):
+        print('SHADING_LIGHT_ONLY status=fallback reason=no_valid_live_geometry')
         update_shaded_class(app, azimuth, angle, ambient, force_rebuild=False)
         return False
 
     t0 = time.perf_counter()
     saved_camera = _save_camera(app)
+    app.last_shade_azimuth = azimuth
+    app.shade_ambient = ambient
 
     if _microstation_color_blend_enabled(app, cache):
-        if cache.needs_shading_update(azimuth, angle, ambient):
-            # Keep the established CPU shade cache coherent for emergency
-            # fallback paths, but do not rebuild/re-upload the 34M vertex RGB.
+        sharpness_angle = _shading_sharpness_angle(app, angle)
+        _, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
+        light_elevation = _shading_effective_light_elevation(
+            app, sharpness_overdrive
+        )
+        app.shading_sharpness_angle = sharpness_angle
+        app.last_shade_angle = light_elevation
+
+        previous_crisp_sharpness = float(
+            getattr(cache, 'last_crisp_sharpness', -1.0)
+        )
+        crisp_sharpness_changed = (
+            abs(previous_crisp_sharpness - sharpness_angle) > 0.001
+        )
+
+        # Geometry stays immutable.  Recompute only the canonical per-face shade
+        # used by the crisp CELL-RGB base when Azimuth/Ambient/effective light
+        # elevation changed.  Sharpness 0..90 keeps the same 45-degree raw
+        # hillshade, but still requires a CELL-RGB refresh because the crisp
+        # contrast gain itself changes.
+        raw_shade_changed = cache.needs_shading_update(
+            azimuth, light_elevation, ambient
+        )
+        if raw_shade_changed:
             if cache.face_normals is None or len(cache.face_normals) != len(cache.faces):
-                cache.face_normals = _compute_face_normals(cache.xyz_unique, cache.faces)
+                cache.face_normals = _compute_face_normals(
+                    cache.xyz_unique, cache.faces
+                )
             cache.shade = _compute_face_shade(
-                cache.xyz_unique, cache.faces, azimuth, angle, ambient,
+                cache.xyz_unique,
+                cache.faces,
+                azimuth,
+                light_elevation,
+                ambient,
                 face_normals=cache.face_normals,
             )
             cache.last_azimuth = azimuth
-            cache.last_angle = angle
+            cache.last_angle = light_elevation
             cache.last_ambient = ambient
 
-        _configure_microstation_color_blend_lighting(
-            app, getattr(app, '_shaded_mesh_actor', None)
+        base_color_changed = bool(
+            raw_shade_changed or crisp_sharpness_changed
         )
-        overlay_actor = getattr(app, '_shading_multiclass_color_overlay_actor', None)
+
+        crisp_hybrid = bool(
+            getattr(app, '_shading_crisp_hybrid_active', False)
+            and _crisp_multiclass_facets_enabled(app, cache)
+        )
+
+        if crisp_hybrid:
+            # CRITICAL: never call _configure_microstation_color_blend_lighting
+            # on the crisp base.  The initial renderer deliberately keeps that
+            # actor unlit because its shade is already baked into CELL RGB.
+            # Turning VTK lighting back on is what creates the dark dotted/
+            # scan-line hatching seen after popup Apply.
+            refreshed = True
+            if base_color_changed:
+                refreshed = _refresh_crisp_base_face_colors_in_place(
+                    app, cache, classes_raw
+                )
+            else:
+                # No lighting parameter changed; just re-assert the solid
+                # presentation state without touching the CELL RGB buffer.
+                refreshed = _enforce_crisp_base_actor_state(app)
+            if not refreshed:
+                # Safe correctness fallback: reuse the same cached topology and
+                # the exact initial crisp renderer.  This still does NOT run
+                # Delaunay/representative generation.
+                print(
+                    'SHADING_LIGHT_ONLY crisp_fallback=render_cached_topology '
+                    'topology_rebuild=0'
+                )
+                _render_mesh(
+                    app, cache, classes_raw, saved_camera,
+                    cached_restore=True,
+                )
+                return True
+            _enforce_crisp_base_actor_state(app)
+            cache.last_crisp_sharpness = sharpness_angle
+        else:
+            _configure_microstation_color_blend_lighting(
+                app, getattr(app, '_shaded_mesh_actor', None)
+            )
+
+        # Only presentation overlays are GPU-lit in crisp-hybrid mode.
+        overlay_actor = getattr(
+            app, '_shading_multiclass_color_overlay_actor', None
+        )
         if overlay_actor is not None:
             _configure_microstation_color_blend_lighting(app, overlay_actor)
+        for entry in (getattr(app, '_shading_static_blend_overlays', None) or []):
+            overlay = entry.get('actor') if isinstance(entry, dict) else None
+            if overlay is not None:
+                _configure_microstation_color_blend_lighting(app, overlay)
+
+        # Re-assert shading ownership before presenting.  Cross-section,
+        # classification and LOD workflows can legitimately touch point-actor
+        # visibility; if one becomes visible above the TIN it appears as dark
+        # dotted/scan-line bands, not as a true triangle edge.
+        _hide_point_cloud_actors_for_shading(app)
+        if crisp_hybrid:
+            _remove_shaded_edge_overlay(app)
+            _enforce_crisp_base_actor_state(app)
+
         _restore_camera(app, saved_camera)
+        app.vtk_widget.renderer.ResetCameraClippingRange()
         app.vtk_widget.render()
         print(
-            'SHADING_LIGHT_ONLY status=updated_gpu_blend '
-            f'azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} '
-            f'elapsed={(time.perf_counter()-t0)*1000:.1f}ms topology_rebuild=0 color_upload=0'
+            'SHADING_LIGHT_ONLY status=updated_gpu_sharpness '
+            f'azimuth={azimuth:.2f} sharpness={sharpness_angle:.2f} '
+            f'light_elevation={light_elevation:.2f} ambient={ambient:.3f} '
+            f'elapsed={(time.perf_counter()-t0)*1000:.1f}ms '
+            f'crisp_hybrid={int(crisp_hybrid)} '
+            'topology_rebuild=0 geometry_rebuild=0 '
+            f'color_upload={int(crisp_hybrid and base_color_changed)} '
+            f'raw_shade_update={int(raw_shade_changed)} '
+            f'sharpness_refresh={int(crisp_sharpness_changed)} '
+            'brightness_source=ambient'
         )
         return True
 
-    if cache.needs_shading_update(azimuth, angle, ambient):
+    # Single-class keeps the established legacy path exactly as before.
+    legacy_angle = float(
+        getattr(app, 'last_shade_angle', 45.0)
+        if angle is None else angle
+    )
+    app.last_shade_angle = legacy_angle
+    if cache.needs_shading_update(azimuth, legacy_angle, ambient):
         if cache.face_normals is None or len(cache.face_normals) != len(cache.faces):
-            cache.face_normals = _compute_face_normals(cache.xyz_unique, cache.faces)
-
+            cache.face_normals = _compute_face_normals(
+                cache.xyz_unique, cache.faces
+            )
         cache.shade = _compute_face_shade(
-            cache.xyz_unique, cache.faces, azimuth, angle, ambient,
+            cache.xyz_unique,
+            cache.faces,
+            azimuth,
+            legacy_angle,
+            ambient,
             face_normals=cache.face_normals,
         )
-
-        if getattr(cache, "smooth_all_classes", False):
+        if getattr(cache, 'smooth_all_classes', False):
             if cache.vertex_normals is None or len(cache.vertex_normals) != len(cache.xyz_unique):
                 cache.vertex_normals = _compute_vertex_normals(
-                    cache.xyz_unique, cache.faces, cache.face_normals,
+                    cache.xyz_unique, cache.faces, cache.face_normals
                 )
             cache.vertex_shade = _compute_shading(
-                cache.vertex_normals, azimuth, angle, ambient,
+                cache.vertex_normals,
+                azimuth,
+                legacy_angle,
+                ambient,
                 z_values=cache.xyz_unique[:, 2],
             )
-
         cache.last_azimuth = azimuth
-        cache.last_angle = angle
+        cache.last_angle = legacy_angle
         cache.last_ambient = ambient
         cache._vtk_colors_ptr = None
 
     _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=True)
     print(
-        "SHADING_LIGHT_ONLY status=updated "
-        f"azimuth={azimuth:.2f} angle={angle:.2f} ambient={ambient:.3f} "
-        f"elapsed={(time.perf_counter()-t0)*1000:.1f}ms topology_rebuild=0"
+        'SHADING_LIGHT_ONLY status=updated_single_class '
+        f'azimuth={azimuth:.2f} angle={legacy_angle:.2f} ambient={ambient:.3f} '
+        f'elapsed={(time.perf_counter()-t0)*1000:.1f}ms topology_rebuild=0'
     )
     return True
 
 class ShadingControlPanel(QWidget):
     def __init__(self, app):
-        super().__init__(); self.app = app; self.setWindowTitle("Shading")
-        layout = QVBoxLayout()
-        for label, attr, rng, default, step in [("Max edge (m):", "max_edge", (1,1000), 100, 10), ("Azimuth:", "az", (0,360), 45, 5), ("Angle:", "el", (0,90), 45, 5), ("Ambient:", "amb", (0,1), 0.25, 0.05)]:
-            h = QHBoxLayout(); h.addWidget(QLabel(label)); spin = QDoubleSpinBox(); spin.setRange(*rng); spin.setValue(default); spin.setSingleStep(step)
-            setattr(self, attr, spin); h.addWidget(spin); layout.addLayout(h)
-        btn = QPushButton("Apply"); btn.clicked.connect(self._on_apply); layout.addWidget(btn)
-        rb = QPushButton("Full Rebuild"); rb.clicked.connect(self._on_full_rebuild); layout.addWidget(rb)
+        super().__init__(); self.app=app; self.setWindowTitle('Shading')
+        layout=QVBoxLayout()
+        rows=[
+            ('Max edge (m):','max_edge',(1,1000),100,10),
+            ('Azimuth:','az',(0,360),45,5),
+            ('Sharpness:','el',(0,999),45,5),
+            ('Ambient (brightness):','amb',(0,1),0.25,0.05),
+        ]
+        for label,attr,rng,default,step in rows:
+            h=QHBoxLayout(); h.addWidget(QLabel(label)); spin=QDoubleSpinBox()
+            spin.setRange(*rng); spin.setValue(default); spin.setSingleStep(step)
+            setattr(self,attr,spin); h.addWidget(spin); layout.addLayout(h)
+        try:
+            self.el.setToolTip('0..90 keeps the established response; 91..999 adds progressive sharpness overdrive. Ambient controls brightness.')
+            self.amb.setToolTip('Controls brightness/shadow floor without changing facet sharpness.')
+        except Exception:
+            pass
+        btn=QPushButton('Apply'); btn.clicked.connect(self._on_apply); layout.addWidget(btn)
+        rb=QPushButton('Full Rebuild'); rb.clicked.connect(self._on_full_rebuild); layout.addWidget(rb)
         self.setLayout(layout); self._restore_from_app()
-        
+
     def _restore_from_app(self):
-        for a, s in [('last_shade_azimuth', 'az'), ('last_shade_angle', 'el'), ('shade_ambient', 'amb')]:
-            v = getattr(self.app, a, None)
-            if v is not None: getattr(self, s).setValue(v)
+        self.az.setValue(float(getattr(self.app,'last_shade_azimuth',45.0)))
+        self.el.setValue(_shading_sharpness_angle(self.app))
+        self.amb.setValue(float(getattr(self.app,'shade_ambient',0.25)))
+
     def refresh_from_app(self):
-        for app_attr, spin_name in [
-            ('last_shade_azimuth', 'az'),
-            ('last_shade_angle',   'el'),
-            ('shade_ambient',      'amb'),
-        ]:
-            v = getattr(self.app, app_attr, None)
-            if v is not None:
-                spin = getattr(self, spin_name)
-                spin.blockSignals(True)
-                spin.setValue(v)
-                spin.blockSignals(False)        
+        vals=[
+            ('az',float(getattr(self.app,'last_shade_azimuth',45.0))),
+            ('el',_shading_sharpness_angle(self.app)),
+            ('amb',float(getattr(self.app,'shade_ambient',0.25))),
+        ]
+        for name,value in vals:
+            spin=getattr(self,name); spin.blockSignals(True); spin.setValue(value); spin.blockSignals(False)
+
     def _on_apply(self):
-        # Apply changes lighting only. The current triangulation, representative
-        # points, faces, and spatial index remain untouched. Max Edge is applied
-        # only by the explicit Full Rebuild button below.
-        self.app.last_shade_azimuth = self.az.value()
-        self.app.last_shade_angle = self.el.value()
-        self.app.shade_ambient = self.amb.value()
-        update_shading_lighting_only(
-            self.app, self.az.value(), self.el.value(), self.amb.value(),
-        )
+        self.app.last_shade_azimuth=self.az.value()
+        self.app.shading_sharpness_angle=self.el.value()
+        self.app.shade_ambient=self.amb.value()
+        update_shading_lighting_only(self.app,self.az.value(),self.el.value(),self.amb.value())
+
     def _on_full_rebuild(self):
-        self.app.last_shade_azimuth = self.az.value(); self.app.last_shade_angle = self.el.value(); self.app.shade_ambient = self.amb.value()
-        clear_shading_cache("manual"); update_shaded_class(self.app, self.az.value(), self.el.value(), self.amb.value(), force_rebuild=True, single_class_max_edge=self.max_edge.value())
+        self.app.last_shade_azimuth=self.az.value()
+        self.app.shading_sharpness_angle=self.el.value()
+        self.app.shade_ambient=self.amb.value()
+        clear_shading_cache('manual')
+        update_shaded_class(
+            self.app,self.az.value(),self.el.value(),self.amb.value(),
+            force_rebuild=True,single_class_max_edge=self.max_edge.value(),
+        )
 
 __all__ = ['update_shaded_class', 'refresh_shaded_colors_fast', 'refresh_shaded_colors_only',
     'refresh_shaded_after_classification_fast', 'refresh_shaded_after_undo_fast',

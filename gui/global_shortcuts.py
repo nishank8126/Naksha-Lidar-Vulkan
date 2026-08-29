@@ -2140,8 +2140,10 @@ class GlobalShortcutFilter(QObject):
                                 preset.get('azimuth', 45.0)
                             ) < 0.01
                             _an_match = abs(
-                                getattr(self.app_window, 'last_shade_angle', -1) -
-                                preset.get('angle', 45.0)
+                                getattr(
+                                    self.app_window, 'shading_sharpness_angle',
+                                    getattr(self.app_window, 'last_shade_angle', -1)
+                                ) - preset.get('angle', 45.0)
                             ) < 0.01
                             _am_match = abs(
                                 getattr(self.app_window, 'shade_ambient', -1) -
@@ -2312,7 +2314,7 @@ class GlobalShortcutFilter(QObject):
                     ambient = preset.get("ambient",  0.2)
 
                     self.app_window.last_shade_azimuth = azimuth
-                    self.app_window.last_shade_angle   = angle
+                    self.app_window.shading_sharpness_angle = angle
                     self.app_window.shade_ambient      = ambient
                     self.app_window.shading_quality   = quality_mode
 
