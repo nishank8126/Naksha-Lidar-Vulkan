@@ -4751,6 +4751,23 @@ class _BaseClassifyDialog(QDialog):
             )
         live_refresh_dispatched = False
         if changed > 0 and mask is not None:
+            # Match the normal classification tools: preserve old/new classes
+            # until the main-view commit so all-class shading can take its
+            # color-only/crisp-overlay path without rebuilding the TIN.
+            if str(getattr(self.app, "display_mode", "") or "").lower() == "shaded_class":
+                try:
+                    from gui.shading_display import ClassificationDelta
+                    self.app._pending_shading_delta = ClassificationDelta(
+                        changed_indices=np.asarray(indices, dtype=np.int64).copy(),
+                        old_classes=np.asarray(old_c).copy(),
+                        new_classes=np.asarray(new_c).copy(),
+                        operation=str(result.get("routine", name) or "lidar_classification"),
+                        origin_view="lidar_classification_tool",
+                    )
+                except Exception as exc:
+                    self.app._pending_shading_delta = None
+                    print(f"   ⚠️ LiDAR shading delta setup skipped: {exc}")
+
             live_refresh_dispatched = self._notify_classification_views(
                 result,
                 mask,
@@ -4990,17 +5007,42 @@ class _BaseClassifyDialog(QDialog):
                 
             elif display_mode == "shaded_class":
                 try:
-                    from gui.shading_display import clear_shading_cache, update_shaded_class
-                    clear_shading_cache("classification changed")
-                    update_shaded_class(
-                        self.app,
-                        getattr(self.app, "last_shade_azimuth", 45.0),
-                        getattr(self.app, "last_shade_angle", 45.0),
-                        getattr(self.app, "shade_ambient", 0.2),
-                        force_rebuild=True
-                    )
-                except Exception:
-                    pass
+                    from gui.shading_display import refresh_shaded_after_classification_fast
+
+                    changed_mask = getattr(self.app, "_last_changed_mask", None)
+                    delta = getattr(self.app, "_pending_shading_delta", None)
+                    if changed_mask is not None and np.any(changed_mask):
+                        ok = refresh_shaded_after_classification_fast(
+                            self.app,
+                            changed_mask=changed_mask,
+                            delta=delta,
+                        )
+                        if ok:
+                            print(
+                                "   ⚡ LiDAR shaded sparse fallback used — "
+                                "full TIN rebuild skipped"
+                            )
+                        else:
+                            raise RuntimeError("sparse shading refresh declined")
+                    else:
+                        # No changed subset to patch; presentation is already current.
+                        self.app.vtk_widget.render()
+                except Exception as sparse_exc:
+                    # True emergency fallback only (stale/missing shading cache or
+                    # a topology transition that the local path cannot satisfy).
+                    print(f"   ⚠️ LiDAR sparse shading fallback failed: {sparse_exc}")
+                    try:
+                        from gui.shading_display import clear_shading_cache, update_shaded_class
+                        clear_shading_cache("classification sparse fallback failed")
+                        update_shaded_class(
+                            self.app,
+                            getattr(self.app, "last_shade_azimuth", 45.0),
+                            getattr(self.app, "last_shade_angle", 45.0),
+                            getattr(self.app, "shade_ambient", 0.2),
+                            force_rebuild=True
+                        )
+                    except Exception:
+                        pass
             
             # Force VTK render to be sure
             if hasattr(self.app, "vtk_widget"):
