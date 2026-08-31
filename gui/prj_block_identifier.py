@@ -8683,23 +8683,13 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
                         _actor_xy_by_label[block_data['label']] = (x, y)
 
-                        circle = vtk.vtkRegularPolygonSource()
-                        circle.SetNumberOfSides(50)
-                        circle.SetRadius(30)
-                        circle.SetCenter(x, y, 1)
-                        circle.GeneratePolygonOff()
-
-                        mapper = vtk.vtkPolyDataMapper()
-                        mapper.SetInputConnection(circle.GetOutputPort())
-
-                        highlight_actor = vtk.vtkActor()
-                        highlight_actor.SetMapper(mapper)
-                        highlight_actor.GetProperty().SetColor(1.0, 0.0, 0.0)
-                        highlight_actor.GetProperty().SetLineWidth(5)
-                        highlight_actor.GetProperty().SetOpacity(1.0)
-
-                        renderer.AddActor(highlight_actor)
-                        self._highlight_actors.append(highlight_actor)
+                        # ✅ Removed: red identify circle. Its center came from
+                        # the label actor's bounding-box midpoint, which for
+                        # elongated/diagonal blocks can sit well outside the
+                        # actual polygon. The block boundary outline (drawn
+                        # separately below) already highlights the match, so
+                        # the circle was redundant and sometimes misleading.
+                        highlight_actor = None
 
                         if hasattr(actor, 'GetProperty'):
                             original_color = actor.GetProperty().GetColor()
@@ -8718,7 +8708,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     self._highlighted_blocks[block_label] = {
                         'actor': actor,
                         'block_data': block_data,
-                        'highlight_actor': self._highlight_actors[i] if i < len(self._highlight_actors) else None
+                        'highlight_actor': None,  # circle marker removed
                     }
 
                 # Cancel any pending auto-clear from previous identify
