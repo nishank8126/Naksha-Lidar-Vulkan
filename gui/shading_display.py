@@ -895,33 +895,33 @@ try:
 except ImportError:
     HAS_NUMBA = False
 
-# -- DIAGNOSTIC: Print accelerator status at import time --------------
+# ── DIAGNOSTIC: Print accelerator status at import time ──────────────
 def _print_accel_status():
     import sys
     frozen = getattr(sys, 'frozen', False)
     print(f"\n{'='*60}")
-    print(f"?? SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV'})")
+    print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV'})")
     print(f"{'='*60}")
-    print(f"   numba    : {'? LOADED' if HAS_NUMBA else '? MISSING — normals/shading will be 3-5x slower'}")
-    print(f"   triangle : {'? LOADED' if HAS_TRIANGLE else '? MISSING — Delaunay will use scipy (2x slower)'}")
-    print(f"   scipy    : {'? LOADED' if HAS_SCIPY else '? MISSING — no triangulation possible'}")
+    print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading will be 3-5x slower'}")
+    print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay will use scipy (2x slower)'}")
+    print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation possible'}")
     
     # Check numpy threading (MKL vs OpenBLAS)
     try:
         np_config = np.__config__
         blas_info = str(getattr(np_config, 'blas_opt_info', {}))
         if 'mkl' in blas_info.lower():
-            print(f"   numpy BLAS: ? MKL (multi-threaded)")
+            print(f"   numpy BLAS: ✅ MKL (multi-threaded)")
         elif 'openblas' in blas_info.lower():
-            print(f"   numpy BLAS: ?? OpenBLAS")
+            print(f"   numpy BLAS: ⚠️ OpenBLAS")
         else:
-            print(f"   numpy BLAS: ?? unknown ({blas_info[:80]})")
+            print(f"   numpy BLAS: ⚠️ unknown ({blas_info[:80]})")
     except Exception:
         try:
             cfg = np.show_config(mode='dicts')
             print(f"   numpy BLAS: {cfg}")
         except Exception:
-            print(f"   numpy BLAS: ?? cannot determine")
+            print(f"   numpy BLAS: ⚠️ cannot determine")
     
     # Check thread counts
     import os
@@ -1184,16 +1184,16 @@ if HAS_NUMBA:
     threading.Thread(target=_warmup_numba_jit, daemon=True).start()
 
 
-# -- DIAGNOSTIC: Print accelerator status at import time ----------------------
+# ── DIAGNOSTIC: Print accelerator status at import time ──────────────────────
 def _print_accel_status():
     import sys as _sys
     frozen = getattr(_sys, 'frozen', False)
     print(f"\n{'='*60}")
-    print(f"?? SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV MODE'})")
+    print(f"🔧 SHADING ACCELERATOR STATUS ({'FROZEN EXE' if frozen else 'DEV MODE'})")
     print(f"{'='*60}")
-    print(f"   numba    : {'? LOADED' if HAS_NUMBA else '? MISSING — normals/shading 3-5x slower'}")
-    print(f"   triangle : {'? LOADED' if HAS_TRIANGLE else '? MISSING — Delaunay via scipy (2x slower)'}")
-    print(f"   scipy    : {'? LOADED' if HAS_SCIPY else '? MISSING — no triangulation available'}")
+    print(f"   numba    : {'✅ LOADED' if HAS_NUMBA else '❌ MISSING — normals/shading 3-5x slower'}")
+    print(f"   triangle : {'✅ LOADED' if HAS_TRIANGLE else '❌ MISSING — Delaunay via scipy (2x slower)'}")
+    print(f"   scipy    : {'✅ LOADED' if HAS_SCIPY else '❌ MISSING — no triangulation available'}")
     for var in ('MKL_NUM_THREADS', 'OMP_NUM_THREADS',
                 'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
         print(f"   {var}: {os.environ.get(var, 'NOT SET')}")
@@ -1714,6 +1714,46 @@ def _shading_sharpness_angle(app, explicit=None) -> float:
         return float(np.clip(float(explicit), 0.0, _SHADING_SHARPNESS_MAX))
     except Exception:
         return 45.0
+
+
+def _resolve_requested_multiclass_sharpness(app, requested_angle) -> float:
+    """Resolve user Sharpness without confusing it with light elevation.
+
+    Multi-class Shaded Classification stores two different values:
+    ``shading_sharpness_angle`` is the user-facing 0..999 facet
+    Sharpness, while ``last_shade_angle`` is the internal physical
+    light elevation used by cached/local shading calculations.
+
+    Older callers can still pass ``last_shade_angle`` back as the
+    ``angle`` argument to ``update_shaded_class``. Treat that exact
+    internal value as a legacy re-entry only when it differs from
+    the stored user Sharpness. Popup/full-rebuild requests remain
+    authoritative because they store ``shading_sharpness_angle``
+    before invoking the shading update.
+    """
+    if requested_angle is None:
+        return _shading_sharpness_angle(app)
+
+    try:
+        explicit = float(requested_angle)
+    except Exception:
+        return _shading_sharpness_angle(app)
+
+    stored_sharpness = getattr(app, 'shading_sharpness_angle', None)
+    stored_physical = getattr(app, 'last_shade_angle', None)
+    if stored_sharpness is not None and stored_physical is not None:
+        try:
+            sharpness_value = float(stored_sharpness)
+            physical_value = float(stored_physical)
+            if (
+                abs(explicit - physical_value) <= 1e-9
+                and abs(sharpness_value - physical_value) > 1e-9
+            ):
+                return _shading_sharpness_angle(app, sharpness_value)
+        except Exception:
+            pass
+
+    return _shading_sharpness_angle(app, explicit)
 
 
 def _shading_sharpness_response(sharpness_value):
@@ -2927,7 +2967,7 @@ def _store_representative_seed(rep_key, result):
 
 def clear_shading_representative_cache(reason=""):
     if reason and _representative_store:
-        print(f"   ??? Representative cache cleared: {reason}")
+        print(f"   🗑️ Representative cache cleared: {reason}")
     _representative_store.clear()
 
 
@@ -2970,7 +3010,7 @@ class ShadingGeometryCache:
         self._vtk_mesh = None
         self._needs_compaction = False
     def clear(self, reason=""):
-        if reason: print(f"   ??? Cache cleared: {reason}")
+        if reason: print(f"   🗑️ Cache cleared: {reason}")
         self._vtk_colors_ptr = None
         self._clear_internal()
         import gc
@@ -3156,15 +3196,15 @@ def invalidate_cache_for_new_file(fp=""): clear_shading_cache("new file", all_en
 def _get_shading_visibility(app):
     so = getattr(app, '_shading_visibility_override', None)
     if so is not None:
-        print(f"   ?? Shading visibility from SHORTCUT OVERRIDE: {sorted(so)}"); return so
+        print(f"   📍 Shading visibility from SHORTCUT OVERRIDE: {sorted(so)}"); return so
     d = getattr(app, 'display_mode_dialog', None) or getattr(app, 'display_dialog', None)
     if d:
         vp = getattr(d, 'view_palettes', None)
         if vp and 0 in vp:
             vc = {int(c) for c, e in vp[0].items() if e.get("show", True)}
-            if vc: print(f"   ?? Shading visibility from Display Mode (Slot 0): {sorted(vc)}"); return vc
+            if vc: print(f"   📍 Shading visibility from Display Mode (Slot 0): {sorted(vc)}"); return vc
     vc = {int(c) for c, e in app.class_palette.items() if e.get("show", True)}
-    if vc: print(f"   ?? Shading visibility from class_palette: {sorted(vc)}")
+    if vc: print(f"   📍 Shading visibility from class_palette: {sorted(vc)}")
     return vc
 
 def _save_camera(app):
@@ -3254,6 +3294,116 @@ def _queue_incremental_patch(app, sci):
     timer.start(1000)
 
 
+def _prepare_scene_for_shading(app):
+    """Give Shaded Classification exclusive ownership of terrain presentation.
+
+    This is intentionally presentation-only.  It does NOT clear Shading or
+    Surface geometry caches, does NOT touch Delaunay/representative topology,
+    and does NOT remove SNT/DXF/grid/digitizer overlays.
+
+    The guard exists because Shading can be entered through several independent
+    callers (Display Mode Apply, shortcuts, app.set_display_mode, cache restore,
+    and refresh helpers).  Keeping Surface parking and stale-render cleanup here
+    prevents one caller from leaving a coincident actor behind while another
+    caller assumes the scene is already clean.
+    """
+    plotter = getattr(app, 'vtk_widget', None)
+    surface_was_visible = False
+    surface_visible_after = False
+    legacy_edges_removed = 0
+    shading_props_normalized = 0
+
+    # 1) Park Surface exactly once, preserving its resident cache/GPU state.
+    try:
+        surface_actor = getattr(app, '_surface_mesh_actor', None)
+        if surface_actor is not None:
+            try:
+                surface_was_visible = bool(surface_actor.GetVisibility())
+            except Exception:
+                surface_was_visible = False
+
+        from gui.surface_mode import detach_surface_before_non_surface_mode
+        detach_surface_before_non_surface_mode(
+            app,
+            requested_mode='shaded_class',
+        )
+
+        # Defensive fallback for a registry actor that survived because an
+        # older Surface build did not keep app._surface_mesh_actor in sync.
+        if plotter is not None:
+            surface_registry_actor = (
+                getattr(plotter, 'actors', {}) or {}
+            ).get('surface_mesh')
+            if surface_registry_actor is not None:
+                try:
+                    surface_registry_actor.SetVisibility(False)
+                except Exception:
+                    pass
+
+        surface_actor = getattr(app, '_surface_mesh_actor', None)
+        if surface_actor is not None:
+            try:
+                surface_visible_after = bool(surface_actor.GetVisibility())
+            except Exception:
+                surface_visible_after = False
+    except Exception as exc:
+        print(
+            'SHADING_SCENE_GUARD '
+            f'surface_cleanup_failed={type(exc).__name__}:{exc}'
+        )
+
+    # 2) A historical shaded edge actor must never survive a manual re-entry.
+    try:
+        if plotter is not None and 'shaded_mesh_edges' in (
+            getattr(plotter, 'actors', {}) or {}
+        ):
+            legacy_edges_removed = 1
+        _remove_shaded_edge_overlay(app)
+    except Exception:
+        pass
+
+    # 3) Suppress raw/unified/LOD point actors.  These are the common source
+    # of dark dotted/scan-line hatching over an otherwise correct TIN.
+    try:
+        _hide_point_cloud_actors_for_shading(app)
+    except Exception as exc:
+        print(
+            'SHADING_SCENE_GUARD '
+            f'point_cleanup_failed={type(exc).__name__}:{exc}'
+        )
+
+    # 4) Reassert filled-surface state on any already-resident shading actors.
+    # This is important on cached restores and costs no geometry rebuild.
+    if plotter is not None:
+        try:
+            for _name, actor in list((getattr(plotter, 'actors', {}) or {}).items()):
+                if actor is None or not bool(getattr(actor, '_is_shading_mesh', False)):
+                    continue
+                try:
+                    prop = actor.GetProperty()
+                    if prop is not None:
+                        prop.SetRepresentationToSurface()
+                        prop.EdgeVisibilityOff()
+                        shading_props_normalized += 1
+                    mapper = actor.GetMapper()
+                    if mapper is not None:
+                        mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                        mapper.InterpolateScalarsBeforeMappingOff()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    print(
+        'SHADING_SCENE_GUARD '
+        f'surface_was_visible={int(surface_was_visible)} '
+        f'surface_visible_after={int(surface_visible_after)} '
+        f'legacy_edges_removed={legacy_edges_removed} '
+        f'shading_props_normalized={shading_props_normalized} '
+        'generic_polydata_scan=0 topology_rebuild=0 cache_clear=0'
+    )
+
+
 def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
                         max_edge_factor=3.0, force_rebuild=False,
                         single_class_max_edge=None, **kwargs):
@@ -3264,6 +3414,11 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
         return
     xyz_raw = data.get("xyz"); classes_raw = data.get("classification")
     if xyz_raw is None or classes_raw is None: return
+
+    # Central scene ownership must run before ANY early return/cache path.
+    # This guarantees that manual View -> Shading cannot leave Surface, stale
+    # edge actors or raw point actors competing in the depth buffer.
+    _prepare_scene_for_shading(app)
 
     # Flight-line selection is a global geometry filter.  Shading works on a
     # compacted input so unchecked source IDs cannot contribute vertices or
@@ -3278,21 +3433,12 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
             app.vtk_widget.render()
         except Exception:
             pass
-        print("?? All flight lines are off — shaded point cloud hidden")
+        print("ℹ️ All flight lines are off — shaded point cloud hidden")
         return
     if not np.all(_line_mask):
         xyz_raw = xyz_raw[_line_mask]
         classes_raw = classes_raw[_line_mask]
         force_rebuild = True
-
-    # Surface -> Shading safety:
-    # Shading can be called by shortcut, Display Mode, or cached geometry restore.
-    # All paths must remove Surface mesh before any early-return/cache path.
-    try:
-        from gui.surface_mode import detach_surface_before_non_surface_mode
-        detach_surface_before_non_surface_mode(app, requested_mode="shaded_class")
-    except Exception as _surface_cleanup_err:
-        print(f"  ?? Surface cleanup before shaded_class skipped: {_surface_cleanup_err}")
 
     azimuth = getattr(app, 'last_shade_azimuth', azimuth)
     ambient = getattr(app, 'shade_ambient', ambient)
@@ -3306,7 +3452,7 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
     # the brightness/shadow-floor control rather than Sharpness.
     requested_angle = angle
     if len(vc) > 1:
-        sharpness_angle = _shading_sharpness_angle(app, requested_angle)
+        sharpness_angle = _resolve_requested_multiclass_sharpness(app, requested_angle)
         app.shading_sharpness_angle = sharpness_angle
         _, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
         angle = _shading_effective_light_elevation(
@@ -3343,12 +3489,12 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
             app.vtk_widget.render()
         except Exception:
             pass
-        print(" ? Requested shading preset already current")
+        print(" ⚡ Requested shading preset already current")
         return
 
     if not force_rebuild and cache.is_geometry_valid(xyz_raw, vc):
         if rendered_cache_key != requested_cache_key:
-            print("   ?? Restoring requested shading preset from cache")
+            print("   🔁 Restoring requested shading preset from cache")
         _refresh_from_cache(app, cache, azimuth, angle, ambient); return
     if not force_rebuild and cache.is_cached_subset_of(vc, xyz_raw):
         try:
@@ -3505,16 +3651,16 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
     is_sc = (nv == 1)
     print(f"\n{'='*60}")
     quality_mode = normalize_shading_quality(getattr(app, "shading_quality", "normal"))
-    print(f"?? {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode, {quality_mode})")
+    print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode, {quality_mode})")
     print(f"{'='*60}")
     t_total = time.time()
 
-    # -- Ensure numba JIT is fully compiled before timing real work ----
+    # ── Ensure numba JIT is fully compiled before timing real work ────
     if HAS_NUMBA and not getattr(_build_visible_geometry, '_numba_warmed', False):
         t_w = time.time()
         _warmup_numba_jit()
         _build_visible_geometry._numba_warmed = True
-        print(f"   ?? Numba JIT warmup: {(time.time()-t_w)*1000:.0f}ms")
+        print(f"   🔥 Numba JIT warmup: {(time.time()-t_w)*1000:.0f}ms")
 
     app.last_shade_azimuth = azimuth; app.last_shade_angle = angle
     app.shade_ambient = ambient; app.display_mode = "shaded_class"
@@ -3636,12 +3782,12 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
         cache._cached_face_class = None
         cache._tri_lod_factor = res["lod_factor"]
 
-        # -- PHASE 5: Render --
+        # ── PHASE 5: Render ──
         _render_mesh(app, cache, classes_raw, saved_camera)
-        print(f"   ? COMPLETE: {time.time()-t_total:.1f}s")
+        print(f"   ✅ COMPLETE: {time.time()-t_total:.1f}s")
         print(f"{'='*60}\n")
     except Exception as e:
-        print(f"   ? Error: {e}"); import traceback; traceback.print_exc()
+        print(f"   ❌ Error: {e}"); import traceback; traceback.print_exc()
     finally:
         progress.finish()
 
@@ -3878,6 +4024,7 @@ def _hide_point_cloud_actors_for_shading(app):
         renderer = getattr(plotter, "renderer", None)
         if renderer is not None:
             anonymous_to_remove = []
+            anonymous_to_hide = []
             try:
                 actor_collection = renderer.GetActors()
                 actor_collection.InitTraversal()
@@ -3888,10 +4035,24 @@ def _hide_point_cloud_actors_for_shading(app):
                         continue
                     if id(actor) in known_ids:
                         continue
-                    if _is_large_point_cloud_actor(actor):
-                        anonymous_to_remove.append(actor)
+                    # Anonymous actors are not present in plotter.actors, so the
+                    # preserved-actor visibility pass above cannot see them.
+                    # Detect the geometry first, then preserve-or-remove exactly
+                    # like the registered path.
+                    if _looks_like_large_point_cloud(actor):
+                        if getattr(actor, "_naksha_preserve", False):
+                            anonymous_to_hide.append(actor)
+                        else:
+                            anonymous_to_remove.append(actor)
             except Exception:
                 anonymous_to_remove = []
+                anonymous_to_hide = []
+
+            for actor in anonymous_to_hide:
+                try:
+                    actor.SetVisibility(False)
+                except Exception:
+                    pass
 
             for actor in anonymous_to_remove:
                 try:
@@ -3902,7 +4063,7 @@ def _hide_point_cloud_actors_for_shading(app):
                     except Exception:
                         pass
     except Exception as e:
-        print(f"   ?? Shading point actor hide skipped: {e}")
+        print(f"   ⚠️ Shading point actor hide skipped: {e}")
 
 def _face_class_ids(vertex_classes, faces):
     """Legacy deterministic majority class per triangle."""
@@ -4071,8 +4232,10 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
                     numpy_support.vtk_to_numpy(vtk_colors)[:] = face_colors
                     vtk_colors.Modified(); em.GetCellData().Modified(); em.Modified()
                     ea.GetMapper().Modified()
-                    app._shaded_mesh_actor = ea
-                    _enforce_crisp_base_actor_state(app)
+                    prop = ea.GetProperty()
+                    prop.SetLighting(False); prop.SetInterpolationToFlat()
+                    prop.SetAmbient(1.0); prop.SetDiffuse(0.0); prop.SetSpecular(0.0)
+                    prop.EdgeVisibilityOff(); prop.SetOpacity(1.0)
                     actor_count, blend_vertices = _build_static_multiclass_blend_overlays(
                         app, cache, cm, vc, mixed_faces
                     )
@@ -4345,10 +4508,14 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     )
     if app._shaded_mesh_actor:
         setattr(app._shaded_mesh_actor, "_is_shading_mesh", True)
-        setattr(app._shaded_mesh_actor, "_is_shading_crisp_base", bool(crisp_hybrid))
         p2 = app._shaded_mesh_actor.GetProperty()
+        p2.SetRepresentationToSurface()
+        p2.EdgeVisibilityOff()
         if crisp_hybrid:
-            _enforce_crisp_base_actor_state(app)
+            p2.SetLighting(False)
+            p2.SetInterpolationToFlat()
+            p2.SetAmbient(1.0); p2.SetDiffuse(0.0); p2.SetSpecular(0.0)
+            p2.EdgeVisibilityOff(); p2.SetOpacity(1.0)
         elif blend_class_colors:
             _configure_microstation_color_blend_lighting(app, app._shaded_mesh_actor)
         else:
@@ -4436,7 +4603,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
                             nr += 1
                     except Exception:
                         pass
-        if nr > 0: print(f"   ? Restored {nr} DXF/SNT actors")
+        if nr > 0: print(f"   ✅ Restored {nr} DXF/SNT actors")
     else:
         # Fast shading builds intentionally keep SNT/DXF overlays alive instead
         # of rebuilding them.  Once the new shaded mesh actor is inserted,
@@ -4464,7 +4631,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
 
         print(
             f"SHADING_ACTOR_FAST_PATH cached_restore={int(bool(cached_restore))} "
-            f"overlays=preserved actor_scan=skipped overlay_requeued={overlay_requeued}"
+            f"overlays=preserved actor_scan=scene_guard overlay_requeued={overlay_requeued}"
         )
     checkpoint("overlay_restore")
     _restore_camera(app, saved_camera); plotter.set_background("black")
@@ -4515,10 +4682,10 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         points=nv, faces=nf, smooth=int(smooth_all_classes),
         restored_actors=nr, cached_mesh=int(cached_mesh is not None),
     )
-    print(f"   ?? Shaded Mesh [{ms}]: {nf:,} faces in {(time.time()-t0)*1000:.0f}ms")
-# ---------------------------------------------------------------
+    print(f"   🎨 Shaded Mesh [{ms}]: {nf:,} faces in {(time.time()-t0)*1000:.0f}ms")
+# ═══════════════════════════════════════════════════════════════
 # ALL REMAINING FUNCTIONS — identical behavior, compressed
-# ---------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════
 def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None):
     """Optimized classification update for single-class shading."""
     cache = get_cache()
@@ -4695,7 +4862,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
         if getattr(cache, '_multiclass_dirty_faces', None):
             _bake_multiclass_color_overlay_into_base(app, cache, vc)
 
-    # ? FAST PATH for single-class: blacken affected faces immediately, queue rebuild
+    # ✅ FAST PATH for single-class: blacken affected faces immediately, queue rebuild
     if isc and sci is not None:
         mesh = getattr(app, '_shaded_mesh_polydata', None)
         if np.all(nh) and mesh:
@@ -4723,7 +4890,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
     # Handle visibility changes
     if np.all(nvis):
         if _check_previous_classes_visible(app, ci, va):
-            # ? FIX: Check for orphaned vertices before taking color-only fast path
+            # ✅ FIX: Check for orphaned vertices before taking color-only fast path
             _has_orphaned_cls = False
             _uv_cls = np.zeros(len(cache.unique_indices), dtype=bool)
             if cache.faces is not None and len(cache.faces) > 0:
@@ -4736,7 +4903,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
                     return True
         nvg = ci[nvis]
         mg = nvg[g2u[nvg] < 0]
-        # ? FIX: Also find orphaned vertices (in unique_indices but not in any face)
+        # ✅ FIX: Also find orphaned vertices (in unique_indices but not in any face)
         if len(mg) == 0:
             _uv_cls2 = np.zeros(len(cache.unique_indices), dtype=bool)
             if cache.faces is not None and len(cache.faces) > 0:
@@ -4819,7 +4986,7 @@ def _incremental_visibility_patch(app, cgi, vcs):
             km = ~fwc
             cache.faces = cache.faces[km]
             cache.face_normals = cache.face_normals[km] if cache.face_normals is not None else None
-            # ? FIX: Recompute ALL kept face shading with global z-range
+            # ✅ FIX: Recompute ALL kept face shading with global z-range
             cache.shade = _compute_face_shade_global_z(
                 cache.xyz_unique, cache.faces, az, an, am,
                 face_normals=cache.face_normals)
@@ -4850,7 +5017,7 @@ def _incremental_visibility_patch(app, cgi, vcs):
     if len(bv) < 3:
         cache.faces = vf
         cache.face_normals = vn
-        # ? FIX: global z-range for kept faces
+        # ✅ FIX: global z-range for kept faces
         cache.shade = _compute_face_shade_global_z(
             cache.xyz_unique, vf, az, an, am, face_normals=vn)
         if vn is not None and len(vn) > 0:
@@ -4900,7 +5067,7 @@ def _incremental_visibility_patch(app, cgi, vcs):
     cache.faces = np.vstack([vf, pf])
     cache.face_normals = pn if vn is None else np.vstack([vn, pn])
     
-    # ? FIX: Single call with global z-range for ALL faces
+    # ✅ FIX: Single call with global z-range for ALL faces
     cache.shade = _compute_face_shade_global_z(
         cache.xyz_unique, cache.faces, az, an, am,
         face_normals=cache.face_normals)
@@ -5073,7 +5240,7 @@ def _multi_class_region_undo_patch(app, changed_mask, vcs):
     cache.faces = np.vstack([fo, npf])
     cache.face_normals = pn if no is None else np.vstack([no, pn])
     
-    # ? FIX: Single shade call with global z-range for ALL faces
+    # ✅ FIX: Single shade call with global z-range for ALL faces
     cache.shade = _compute_face_shade_global_z(
         cache.xyz_unique, cache.faces, az, an, am,
         face_normals=cache.face_normals)
@@ -5326,7 +5493,7 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
     
     # Fast path: all changed points still visible AND all have faces
     if np.all(nv) and _check_previous_classes_visible(app, ci, va):
-        # ? FIX: Check for orphaned vertices (in unique_indices but not in any face)
+        # ✅ FIX: Check for orphaned vertices (in unique_indices but not in any face)
         has_orphaned = False
         vp_check = np.flatnonzero(ic)
         if len(vp_check) > 0:
@@ -5348,7 +5515,7 @@ def refresh_shaded_after_undo_fast(app, changed_mask=None):
     hm = aim & (~nv)  # Was in mesh, now hidden
     vm = nv & (~aim)  # Now visible, wasn't in mesh
     
-    # ? FIX: Only suppress vm for vertices that are genuinely new (not in unique_indices).
+    # ✅ FIX: Only suppress vm for vertices that are genuinely new (not in unique_indices).
     # Orphaned vertices (in unique_indices but not in faces) must NOT be suppressed.
     if np.any(vm) and _check_previous_classes_visible(app, ci, va):
         # Keep vm=True for orphaned vertices (in unique_indices but not in any face)
@@ -6169,7 +6336,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     rgi = ci[cls[ci] == sci]
     if len(rgi) == 0: return
 
-    # ? FIX: Use cache values first for shading parameters
+    # ✅ FIX: Use cache values first for shading parameters
     az_ = cache.last_azimuth if cache.last_azimuth >= 0 else getattr(app, 'last_shade_azimuth', 45.)
     an_ = cache.last_angle if cache.last_angle >= 0 else getattr(app, 'last_shade_angle', 45.)
     am_ = cache.last_ambient if cache.last_ambient >= 0 else getattr(app, 'shade_ambient', .25)
@@ -6239,7 +6406,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
     lo = lx.min(axis=0); lxo = lx - lo
     ns = np.sqrt(max((lxo[:,0].max()-lxo[:,0].min())*(lxo[:,1].max()-lxo[:,1].min()), 1.) / max(len(lx), 1))
     
-    # ? OPTIMIZATION: Coarser precision for faster triangulation during undo
+    # ✅ OPTIMIZATION: Coarser precision for faster triangulation during undo
     pr = max(ns * 0.5, 0.01)  # Coarser than normal
     pu = len(lx) / max((pr/max(ns, 1e-9))**2, 1)
     if pu > 50000: pr = max(pr * np.sqrt(pu / 50000), 0.01)  # Lower threshold
@@ -7814,7 +7981,6 @@ def _enforce_crisp_base_actor_state(app):
     if actor is None:
         return False
     try:
-        setattr(actor, '_is_shading_crisp_base', True)
         actor.SetVisibility(True)
         prop = actor.GetProperty()
         if prop is not None:

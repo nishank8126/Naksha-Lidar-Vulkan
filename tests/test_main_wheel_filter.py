@@ -1,5 +1,5 @@
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt
-from PySide6.QtGui import QMouseEvent, QWheelEvent
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
 import pytest
 
 from gui.app_window import MainWheelZoomEventFilter, NakshaApp
@@ -422,6 +422,30 @@ def test_escape_deactivates_every_active_identification_mode_once():
         assert tool.deactivate_calls == 1
 
     assert not app._deactivate_active_identification_tools_for_escape()
+
+
+def test_main_canvas_escape_deactivates_point_sync_before_vtk_consumes_key():
+    app = _App()
+    point_sync = _EscTool()
+    app.point_sync_tool = point_sync
+    app._deactivate_active_identification_tools_for_escape = lambda: (
+        point_sync.deactivate() or True
+    ) if point_sync.active else False
+    navigation_filter = MainWheelZoomEventFilter(app)
+    event = QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier)
+
+    assert navigation_filter.eventFilter(_Canvas(), event)
+    assert not point_sync.active
+    assert point_sync.deactivate_calls == 1
+
+
+def test_main_canvas_escape_is_preserved_when_identification_is_inactive():
+    app = _App()
+    app._deactivate_active_identification_tools_for_escape = lambda: False
+    navigation_filter = MainWheelZoomEventFilter(app)
+    event = QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier)
+
+    assert not navigation_filter.eventFilter(_Canvas(), event)
 
 
 def test_queued_move_without_middle_finishes_and_later_release_is_swallowed():

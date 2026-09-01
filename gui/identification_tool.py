@@ -262,7 +262,11 @@ class IdentificationTool(QObject):
         restricted to the fields checked in the View Fields dialog (Display ▸
         Fields) and to data actually kept in memory for the loaded cloud.
         """
-        from gui.dialogs.view_fields_dialog import FIELD_SPECS, DEFAULT_CHECKED
+        from gui.dialogs.view_fields_dialog import (
+            DEFAULT_CHECKED,
+            FIELD_SPECS,
+            find_image_dimension_name,
+        )
 
         selected = getattr(self.app, "selected_view_fields", None)
         selected = set(selected) if selected is not None else set(DEFAULT_CHECKED)
@@ -279,6 +283,11 @@ class IdentificationTool(QObject):
 
         data = getattr(self.app, "data", None) or {}
         if point_index is not None:
+            image_key = find_image_dimension_name(data.keys())
+            image_values = data.get(image_key) if image_key is not None else None
+            if image_values is not None and 0 <= point_index < len(image_values):
+                raw_values["Image"] = str(image_values[point_index])
+
             intensity = data.get("intensity")
             if intensity is not None and 0 <= point_index < len(intensity):
                 raw_values["Intensity"] = f"{float(intensity[point_index]):.1f}"

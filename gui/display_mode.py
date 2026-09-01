@@ -4,7 +4,7 @@ import os as _os
 import copy as _copy
 
 from PySide6.QtGui import QColor, QFont, QIcon, QAction, QActionGroup
-from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker
+from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker, QEvent
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -673,7 +673,7 @@ class _WeightBulkPopup(QDialog):
 
     def __init__(self, parent_dialog):
         super().__init__(parent_dialog,
-                         Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+                         Qt.Tool | Qt.FramelessWindowHint)
         self.setObjectName("weightBulkPopup")
         self._dialog = parent_dialog
         self._anchor_global = None
@@ -936,13 +936,32 @@ class DisplayModeDialog(QDialog):
         ##
         self.view_borders = {i: 0 for i in range(6)}
         ##
+        # Display Mode is a normal non-modal NakshaAI utility window.
+        # It must NEVER be globally always-on-top: clicking the main NakshaAI
+        # window or another application should naturally move that window in
+        # front.  We keep it as a real top-level Qt.Window (rather than
+        # Qt.Tool/owned-window) so it is also allowed to move behind the main
+        # window when the user changes focus.
         self.setWindowFlags(
             Qt.Window |
-            Qt.WindowStaysOnTopHint |
             Qt.WindowMinimizeButtonHint |
             Qt.WindowMaximizeButtonHint |
             Qt.WindowCloseButtonHint
         )
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+
+        # Owner-state synchronization is observational only.  The dialog stays
+        # open after Apply and after focus changes.  It is minimized/restored
+        # with NakshaAI without stealing focus on restore.
+        self._owner_state_sync = False
+        self._owner_minimized_me = False
+        self._was_visible_before_owner_minimize = False
+        self._user_minimized = False
+        if parent is not None:
+            try:
+                parent.installEventFilter(self)
+            except Exception:
+                pass
 
 
         from PySide6.QtCore import QSettings
@@ -2583,7 +2602,7 @@ class DisplayModeDialog(QDialog):
         quality_mode = str(self.shading_quality.currentData() or "normal").lower()
         if self.current_slot == 0 and idx in (1, 6) and quality_mode == "slow":
             total_points = len(app.data.get("xyz", [])) if isinstance(getattr(app, "data", None), dict) else 0
-            if total_points > 5_000_000:
+            if total_points > 25_000_000:
                 mode_name = "Shading" if idx == 1 else "Surface"
                 answer = QMessageBox.question(
                     self,
@@ -2629,14 +2648,11 @@ class DisplayModeDialog(QDialog):
         fast_path_handled = False
 
         if self.current_slot == 0 and idx == 1:
-            # Shaded Classification — trigger shading backend.
-            # Remove Surface first because this fast path bypasses app.set_display_mode().
-            try:
-                from gui.surface_mode import detach_surface_before_non_surface_mode
-                detach_surface_before_non_surface_mode(app, requested_mode="shaded_class")
-            except Exception as _surface_cleanup_err:
-                print(f"⚠️ Surface cleanup before Display Mode shading skipped: {_surface_cleanup_err}")
-
+            # Shaded Classification — trigger the shading backend.
+            # Scene ownership (Surface parking, stale edge cleanup and point
+            # actor suppression) is centralized in update_shaded_class().
+            # Keeping it there makes View-menu Apply, shortcuts, cached restore
+            # and programmatic mode switches follow one identical entry path.
             app.display_mode = "shaded_class"
             print("🔳 Borders DISABLED for shaded_class mode (forced to 0%)")
             print("🎨 Display mode → shaded_class")
@@ -2645,8 +2661,16 @@ class DisplayModeDialog(QDialog):
                     update_shaded_class, has_cached_geometry
                 )
                 azimuth = getattr(app, 'last_shade_azimuth', 45.0)
-                angle   = getattr(app, 'last_shade_angle',   45.0)
-                ambient = getattr(app, 'shade_ambient',       0.25)
+                # IMPORTANT: this argument is the USER-facing facet Sharpness
+                # (0..999) in multi-class shading. last_shade_angle stores the
+                # internal physical light elevation and must not be fed back as
+                # Sharpness when Display Mode re-enters Shading.
+                sharpness = getattr(
+                    app,
+                    'shading_sharpness_angle',
+                    getattr(app, 'last_shade_angle', 45.0),
+                )
+                ambient = getattr(app, 'shade_ambient', 0.25)
                 new_vis = set(
                     int(c) for c, e in class_map.items() if e.get("show", True)
                 )
@@ -2658,10 +2682,10 @@ class DisplayModeDialog(QDialog):
 
                 if _xyz is not None and has_cached_geometry(_xyz, new_vis, quality_mode=quality_mode):
                     print("   âš¡ Geometry cached â€” skipping rebuild")
-                    update_shaded_class(app, azimuth, angle, ambient,
+                    update_shaded_class(app, azimuth, sharpness, ambient,
                                         force_rebuild=False)
                 else:
-                    update_shaded_class(app, azimuth, angle, ambient,
+                    update_shaded_class(app, azimuth, sharpness, ambient,
                                         force_rebuild=True)
             except Exception as _se:
                 print(f"âš ï¸ Shading backend failed: {_se}")
@@ -2882,27 +2906,127 @@ class DisplayModeDialog(QDialog):
         self.save_global_settings()
         self.hide()
 
+    def _sync_with_owner_window_state(self):
+        """Mirror NakshaAI minimize/restore without changing dialog lifetime.
+
+        Important ownership rules:
+          * clicking another window/app never hides or closes Display Mode;
+          * minimizing NakshaAI minimizes an open Display Mode window;
+          * restoring NakshaAI restores only a dialog that NakshaAI minimized;
+          * a dialog manually minimized by the user stays minimized;
+          * owner restore never raises/activates Display Mode.
+        """
+        owner = self._get_app_window()
+        if owner is None:
+            return
+
+        try:
+            owner_minimized = bool(owner.windowState() & Qt.WindowMinimized)
+        except Exception:
+            return
+
+        if owner_minimized:
+            try:
+                if not self.isVisible():
+                    return
+                # If the user had already minimized Display Mode manually, do
+                # not claim ownership of that state and do not auto-restore it.
+                if self.windowState() & Qt.WindowMinimized:
+                    return
+
+                self._was_visible_before_owner_minimize = True
+                self._owner_minimized_me = True
+                self._owner_state_sync = True
+                try:
+                    self.showMinimized()
+                finally:
+                    self._owner_state_sync = False
+                print("DISPLAY_MODE_WINDOW owner=minimized action=minimize_dialog")
+            except Exception:
+                self._owner_state_sync = False
+            return
+
+        # Owner returned to normal. Restore only an owner-forced minimize.
+        if self._owner_minimized_me and self._was_visible_before_owner_minimize:
+            try:
+                self._owner_state_sync = True
+                try:
+                    self.showNormal()
+                    # Do not steal focus from the just-restored NakshaAI window.
+                    # A later explicit Display Mode command may raise it again.
+                    self.lower()
+                finally:
+                    self._owner_state_sync = False
+                print("DISPLAY_MODE_WINDOW owner=restored action=restore_dialog_background")
+            except Exception:
+                self._owner_state_sync = False
+            finally:
+                self._owner_minimized_me = False
+                self._was_visible_before_owner_minimize = False
+
+    def eventFilter(self, obj, event):
+        owner = self._get_app_window()
+        if obj is owner and event is not None:
+            try:
+                event_type = event.type()
+                if event_type == QEvent.WindowStateChange:
+                    self._sync_with_owner_window_state()
+                elif event_type == QEvent.Close:
+                    # App shutdown owns the true native close. Normal user X on
+                    # Display Mode itself is still handled by closeEvent below.
+                    self._allow_native_close = True
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
     def show_safely(self):
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        """Show only on an explicit Display Mode request.
+
+        This is the ONLY place we intentionally raise/activate the dialog.
+        Apply, shortcuts and focus changes never call hide/close here.
+        """
+        try:
+            if self.windowFlags() & Qt.WindowStaysOnTopHint:
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        except Exception:
+            pass
         self.setWindowFlag(Qt.Tool, False)
+
         if self.windowState() & Qt.WindowMinimized:
             self.showNormal()
         else:
             self.show()
+
+        self._user_minimized = False
+        self._owner_minimized_me = False
+        self._was_visible_before_owner_minimize = False
         self._sync_color_mode_state()
+
+        # Explicit open should come to the front; after this, native OS z-order
+        # is respected and any clicked window is free to move above it.
         self.raise_()
         self.activateWindow()
         try:
             self.setFocus(Qt.ActiveWindowFocusReason)
         except Exception:
             pass
+        print("DISPLAY_MODE_WINDOW action=explicit_show topmost=0")
 
     def changeEvent(self, event):
-        """
-        Preserve native minimize behavior so the dialog lives in the taskbar
-        while minimized instead of being force-hidden.
-        """
+        """Track manual minimize separately from owner-forced minimize."""
         super().changeEvent(event)
+        try:
+            if event.type() == QEvent.WindowStateChange:
+                minimized = bool(self.windowState() & Qt.WindowMinimized)
+                if not self._owner_state_sync:
+                    self._user_minimized = minimized
+                    if minimized:
+                        # Manual minimize must never be auto-restored by NakshaAI.
+                        self._owner_minimized_me = False
+                        self._was_visible_before_owner_minimize = False
+                        print("DISPLAY_MODE_WINDOW action=user_minimized")
+        except Exception:
+            pass
 
     
 

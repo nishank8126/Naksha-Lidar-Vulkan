@@ -178,6 +178,29 @@ class MainWheelZoomEventFilter(QObject):
             return False
         event_type = event.type()
 
+        # VTK can consume a canvas key press before the application-wide
+        # shortcut filter sees it. Keep Escape reliable for click-identify
+        # modes at the canvas boundary, while leaving every other Escape
+        # action untouched when no such mode is active.
+        if event_type == QEvent.KeyPress:
+            try:
+                is_plain_escape = (
+                    event.key() == Qt.Key_Escape
+                    and event.modifiers() == Qt.NoModifier
+                )
+            except Exception:
+                is_plain_escape = False
+            if is_plain_escape:
+                deactivate = getattr(
+                    app,
+                    "_deactivate_active_identification_tools_for_escape",
+                    None,
+                )
+                if callable(deactivate) and deactivate():
+                    event.accept()
+                    return True
+            return False
+
         # Main 2D middle-pan is owned at the Qt boundary. This prevents the
         # same physical drag from reaching both the digitizer's manual camera
         # path and VTK's interactor style.
@@ -925,6 +948,7 @@ class NakshaApp(QMainWindow):
         self.to_class = None
         self.last_shade_azimuth = 45.0
         self.last_shade_angle = 45.0
+        self.shading_sharpness_angle = 45.0
         self.shade_coverage_target = 0.70
         self.shading_dock = None
         self.shading_panel = None
@@ -7591,19 +7615,15 @@ class NakshaApp(QMainWindow):
                 mode = "class"
                 self.display_mode = "class"
             else:
-                # Surface and Shading are both mesh-based display modes.
-                # Remove Surface actor before building/restoring Shading mesh.
-                try:
-                    from gui.surface_mode import detach_surface_before_non_surface_mode
-                    detach_surface_before_non_surface_mode(self, requested_mode="shaded_class")
-                except Exception as _surface_cleanup_err:
-                    print(f"  ⚠️ Surface cleanup before shaded_class skipped: {_surface_cleanup_err}")
-
+                # Shading owns all scene cleanup centrally inside
+                # update_shaded_class().  Do not park Surface here as well;
+                # duplicate caller cleanup caused the same Surface actor to be
+                # processed twice on one mode switch.
                 from .shading_display import update_shaded_class
                 update_shaded_class(
                     self,
                     getattr(self, "last_shade_azimuth", 45.0),
-                    getattr(self, "last_shade_angle", 45.0),
+                    getattr(self, "shading_sharpness_angle", 45.0),
                     getattr(self, "shade_ambient", 0.2),
                 )
                 dock = self._ensure_shading_controls_dock()
@@ -9628,7 +9648,7 @@ class NakshaApp(QMainWindow):
                     from gui.shading_display import update_shaded_class
                     
                     azimuth = getattr(self, "last_shade_azimuth", 45.0)
-                    angle = getattr(self, "last_shade_angle", 45.0)
+                    angle = getattr(self, "shading_sharpness_angle", 45.0)
                     ambient = getattr(self, "shade_ambient", 0.2)
                     
                     update_shaded_class(self, azimuth, angle, ambient)
@@ -11160,7 +11180,7 @@ class NakshaApp(QMainWindow):
                 update_shaded_class(
                     self,
                     getattr(self, "last_shade_azimuth", 45.0),
-                    getattr(self, "last_shade_angle", 45.0),
+                    getattr(self, "shading_sharpness_angle", 45.0),
                     getattr(self, "shade_ambient", 0.2),
                 )
                 print("✅ Main view rebuilt (shaded)")
@@ -11405,7 +11425,7 @@ class NakshaApp(QMainWindow):
                     update_shaded_class(
                         self,
                         getattr(self, "last_shade_azimuth", 45.0),
-                        getattr(self, "last_shade_angle", 45.0),
+                        getattr(self, "shading_sharpness_angle", 45.0),
                         getattr(self, "shade_ambient", 0.2)
                     )
                     print(f"   ✅ Main View refreshed (shaded_class mode)")
@@ -13900,7 +13920,7 @@ class NakshaApp(QMainWindow):
         update_shaded_class(
             self,
             azimuth=getattr(self, "last_shade_azimuth", 45.0),
-            angle=getattr(self, "last_shade_angle", 45.0),
+            angle=getattr(self, "shading_sharpness_angle", 45.0),
             ambient=ambient,
             percentile_filter=getattr(self, "shade_quality", 99.0),
             downsample=getattr(self, "shade_speed", 1)
@@ -13930,7 +13950,7 @@ class NakshaApp(QMainWindow):
         update_shaded_class(
             self,
             azimuth=getattr(self, "last_shade_azimuth", 45.0),
-            angle=getattr(self, "last_shade_angle", 45.0),
+            angle=getattr(self, "shading_sharpness_angle", 45.0),
             ambient=getattr(self, "shade_ambient", 0.2),
             percentile_filter=getattr(self, "shade_quality", 99.0),
             downsample=getattr(self, "shade_speed", 1)
@@ -14168,7 +14188,7 @@ class NakshaApp(QMainWindow):
             elif self.display_mode == "shaded_class":
                 from .shading_display import update_shaded_class
                 update_shaded_class(self, getattr(self, "last_shade_azimuth", 45.0),
-                                    getattr(self, "last_shade_angle", 45.0),
+                                    getattr(self, "shading_sharpness_angle", 45.0),
                                     getattr(self, "shade_ambient", 0.2))
             else:
                 from .pointcloud_display import update_pointcloud
@@ -15233,8 +15253,8 @@ class NakshaApp(QMainWindow):
 
     def open_display_mode(self):
             """
-            Open Display Mode dialog with MAXIMUM visibility enforceme
-            Works on all platforms (Windows, Linux, macOS).
+            Open Display Mode as a normal non-modal NakshaAI utility window.
+            Explicit open raises it once; subsequent focus follows native OS z-order.
             """
             from PySide6.QtCore import Qt
 
@@ -15252,7 +15272,10 @@ class NakshaApp(QMainWindow):
                     dialog.sync_with_app_state()
                 except Exception as e:
                     print(f"⚠️ Dialog sync failed on open: {e}")
-            dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            # Display Mode is intentionally NOT globally always-on-top.
+            # show_safely() raises it only for this explicit user request;
+            # afterwards native Windows z-order is respected.
+            dialog.setWindowFlag(Qt.WindowStaysOnTopHint, False)
             if hasattr(dialog, 'show_safely'):
                 dialog.show_safely()
             else:

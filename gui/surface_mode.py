@@ -1068,9 +1068,12 @@ def surface_palette(app) -> dict:
 
 
 def _surface_support_entry(code: int, entry: dict) -> bool:
-    """
-    Decide whether a class should participate in terrain Surface generation.
-    Default rule: checked/visible classes participate, but obvious noise classes do not.
+    """Return whether one class participates in the current Surface.
+
+    Display Mode checkboxes are authoritative for Surface membership. This makes
+    single-class, multi-class and all-class Surface use the exact same semantics.
+    Optional ``surface`` / ``surface_support`` keys remain valid explicit project
+    overrides, but no LAS class is silently removed merely because of its code.
     """
     if not entry.get("show", True):
         return False
@@ -1078,46 +1081,135 @@ def _surface_support_entry(code: int, entry: dict) -> bool:
         return bool(entry.get("surface"))
     if entry.get("surface_support", None) is not None:
         return bool(entry.get("surface_support"))
-
-    # LAS/common non-terrain classes that should not drive the surface.
-    non_surface = {7, 18}  # low/noise/high-noise
-    return int(code) not in non_surface
+    return True
 
 
 def surface_visible_mask(app) -> np.ndarray:
-    """Return the points used by Elevation Surface mode.
-
-    Surface is intentionally classification-independent. LAS classification is
-    metadata only for this display mode: reclassifying a point must never add
-    or remove it from the elevation mesh and must never trigger triangulation.
-
-    The existing flight-line filter is retained because it is an explicit data
-    visibility filter rather than a LAS-class filter.
-    """
     xyz = app.data.get("xyz") if getattr(app, "data", None) else None
     if xyz is None:
         return np.zeros(0, dtype=bool)
-    try:
-        from gui.flight_line_filter import flight_line_visibility_mask
-        line_mask = flight_line_visibility_mask(app, len(xyz))
-        if isinstance(line_mask, np.ndarray) and line_mask.dtype == bool and len(line_mask) == len(xyz):
-            return line_mask
-    except Exception:
-        pass
-    return np.ones(len(xyz), dtype=bool)
+
+    classes = app.data.get("classification")
+    from gui.flight_line_filter import flight_line_visibility_mask
+    line_mask = flight_line_visibility_mask(app, len(xyz))
+    if classes is None:
+        return line_mask
+
+    classes_arr = np.asarray(classes)
+    palette = surface_palette(app)
+    if not palette:
+        # Before the Display Mode palette exists, preserve the historical
+        # all-class Surface behavior (flight-line visibility still applies).
+        return line_mask
+
+    # An explicit palette is an exact membership request. Start hidden and turn
+    # on only checked classes, otherwise an unknown/unlisted class can leak into
+    # a requested single-class Surface.
+    if classes_arr.dtype == np.uint8:
+        lut = np.zeros(256, dtype=bool)
+        for code, entry in palette.items():
+            try:
+                code_int = int(code)
+                if 0 <= code_int < 256:
+                    lut[code_int] = _surface_support_entry(code_int, entry)
+            except Exception:
+                continue
+        return lut[classes_arr] & line_mask
+
+    supported = []
+    for code, entry in palette.items():
+        try:
+            code_int = int(code)
+        except Exception:
+            continue
+        if _surface_support_entry(code_int, entry):
+            supported.append(code_int)
+    if not supported:
+        return np.zeros(len(xyz), dtype=bool)
+    return np.isin(classes_arr, np.asarray(supported, dtype=classes_arr.dtype)) & line_mask
 
 def _class_is_surface_support(app, code: int) -> bool:
-    """Every LAS class participates in the elevation Surface."""
-    return True
+    """
+    True if this class currently participates in Surface mesh generation.
+    Used to avoid unnecessary Surface rebuilds after classification.
+    """
+    try:
+        palette = surface_palette(app)
+        if not palette:
+            return True
+        code_int = int(code)
+        entry = palette.get(code_int)
+        if entry is None:
+            return False
+        return _surface_support_entry(code_int, entry)
+    except Exception:
+        return True
+
 
 def surface_class_change_needs_rebuild(app, old_classes, new_class) -> bool:
-    """Classification never changes Elevation Surface topology."""
-    return False
+    """
+    Rebuild Surface only when classification changes Surface membership.
+    """
+    try:
+        old_classes = np.asarray(old_classes)
+        if old_classes.size == 0:
+            return False
+
+        new_support = _class_is_surface_support(app, int(new_class))
+
+        for old_code in np.unique(old_classes):
+            old_support = _class_is_surface_support(app, int(old_code))
+            if old_support != new_support:
+                return True
+
+        return False
+    except Exception:
+        return True
+
+
 
 def _surface_support_flags_for_values(app, values: np.ndarray) -> np.ndarray:
-    """Compatibility helper: all class values remain Surface support."""
+    """Return Surface-membership flags for a small classification value array.
+
+    This is intentionally O(K), where K is the number of edited points.  It
+    must never scan the complete point cloud during a classification refresh.
+    """
     arr = np.asarray(values).ravel()
-    return np.ones(arr.size, dtype=bool)
+    if arr.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    palette = surface_palette(app)
+    if not palette:
+        return np.ones(arr.size, dtype=bool)
+
+    # Use the exact same checked-class membership LUT as the full Surface. This
+    # keeps classification, Undo and Redo consistent with the active filter in
+    # O(K), where K is only the edited points.
+    if np.issubdtype(arr.dtype, np.integer):
+        try:
+            amin = int(arr.min())
+            amax = int(arr.max())
+        except Exception:
+            amin, amax = -1, 256
+        if amin >= 0 and amax < 256:
+            lut = np.zeros(256, dtype=bool)
+            for code, entry in palette.items():
+                try:
+                    code_int = int(code)
+                    if 0 <= code_int < 256:
+                        lut[code_int] = _surface_support_entry(code_int, entry)
+                except Exception:
+                    continue
+            return lut[arr.astype(np.uint8, copy=False)]
+
+    out = np.zeros(arr.size, dtype=bool)
+    for code in np.unique(arr):
+        code_int = int(code)
+        entry = palette.get(code_int)
+        if entry is not None:
+            out[arr == code] = _surface_support_entry(code_int, entry)
+    return out
+
 
 def _surface_indices_from_step(step, total_points: int):
     """Return the point indices represented by an undo/redo step."""
@@ -1334,16 +1426,82 @@ def _surface_transition_membership_summary(app, transition):
 
 
 def _retag_surface_cache_after_classification_no_topology(app) -> bool:
-    """Classification is absent from the Surface cache signature."""
+    """Retag the resident Surface cache after a metadata-only class edit.
+
+    Surface colors and geometry depend on XYZ/support membership, not the class
+    code itself.  When support membership is unchanged the existing mesh is
+    still exact.  Re-keying the cache prevents the next Surface mode switch from
+    rebuilding only because classification_revision advanced.
+    """
     try:
+        old_sig = getattr(app, "_surface_resident_signature", None)
+        revision = int(getattr(app, "classification_revision", 0) or 0)
+        cache_revision = int(getattr(app, "_surface_cache_revision", 0) or 0)
+
+        # O(1) signature update: preserve the geometry/filter portion that made
+        # this mesh valid and advance only revision fields.
+        if isinstance(old_sig, tuple) and len(old_sig) >= 6:
+            new_sig = tuple(old_sig[:4]) + (revision, cache_revision) + tuple(old_sig[6:])
+        else:
+            # Rare compatibility fallback.  Avoid this in the normal hot path.
+            new_sig = surface_mesh_cache_signature(app)
+
+        store = _surface_cache_store_for_app(app)
+        entry = store.pop(old_sig, None) if old_sig is not None else None
+        if entry is None:
+            legacy = getattr(app, "_surface_mesh_cache", None)
+            if isinstance(legacy, dict):
+                entry = legacy
+
+        if isinstance(entry, dict):
+            entry["signature"] = new_sig
+            store[new_sig] = entry
+            store.move_to_end(new_sig)
+            while len(store) > _SURFACE_CACHE_MAX_ENTRIES:
+                store.popitem(last=False)
+            app._surface_mesh_cache = entry
+
+        app._surface_resident_signature = new_sig
+        app._surface_shortcut_signature = new_sig
+        app._surface_mesh_cache_dirty = False
+        app._surface_filter_dirty = False
         app._surface_needs_rebuild_after_classification = False
+        try:
+            _remember_surface_signature(app)
+        except Exception:
+            pass
         return True
-    except Exception:
+    except Exception as exc:
+        print(f"⚠️ Surface cache retag skipped: {exc}")
         return False
 
+
 def surface_visible_class_signature(app):
-    """Classification-independent signature for Elevation Surface mode."""
-    return ("ELEVATION_SURFACE_ALL_CLASSES",)
+    """Return the Surface-support policy signature without scanning point data.
+
+    Surface geometry depends on whether a class participates in the Surface,
+    not on whether that class happens to be present in the current LAS array.
+    Using the palette/support policy here removes an expensive ``np.unique``
+    over millions of classifications from cache checks and live refreshes.
+    """
+    try:
+        palette = surface_palette(app)
+        if not palette:
+            return ("ELEVATION_SURFACE_ALL_CLASSES",)
+
+        supported = []
+        for code, entry in palette.items():
+            try:
+                code_int = int(code)
+            except Exception:
+                continue
+            if _surface_support_entry(code_int, entry):
+                supported.append(code_int)
+
+        return tuple(sorted(set(supported)))
+    except Exception:
+        return ("SURFACE_SIGNATURE_ERROR",)
+
 
 def _remember_surface_signature(app) -> None:
     """
@@ -1363,33 +1521,23 @@ def _remember_surface_signature(app) -> None:
 
 
 def mark_surface_filter_dirty(app, reason="classification/undo"):
-    """Invalidate Surface only for real geometry/settings/filter changes.
-
-    Classification, undo/redo, class visibility and palette edits do not affect
-    the elevation Surface and therefore do not dirty its mesh/cache.
     """
-    reason_lc = str(reason or "").strip().lower()
-    class_only_tokens = (
-        "classification", "classify", "undo", "redo",
-        "class_filter", "class filter", "class_visibility", "class visibility",
-        "palette", "display class",
-    )
-    if any(token in reason_lc for token in class_only_tokens):
-        try:
-            app._surface_needs_rebuild_after_classification = False
-        except Exception:
-            pass
-        print(f"SURFACE_CLASSIFICATION_INDEPENDENT dirty_ignored=1 reason={reason_lc or 'classification'}")
-        return
+    Force next Surface call to rebuild, even if Surface is already active.
 
+    Also invalidates Surface mesh cache safely.
+    This is required after classification, undo, redo, and Display Mode
+    class-filter changes.
+    """
     try:
         app._surface_visible_class_signature = None
+        app._surface_needs_rebuild_after_classification = True
         app._surface_filter_dirty = True
         app._surface_mesh_cache_dirty = True
         app._surface_dirty_reason = reason
         app._surface_cache_revision = int(getattr(app, "_surface_cache_revision", 0) or 0) + 1
     except Exception:
         pass
+
 
 def detach_surface_before_non_surface_mode(app, requested_mode=None):
     requested = str(requested_mode or "").lower().strip()
@@ -1415,6 +1563,30 @@ def detach_surface_before_non_surface_mode(app, requested_mode=None):
             )
             actor = getattr(app, "_surface_mesh_actor", None)
             if actor is not None and not transient_resident:
+                try:
+                    actor_visible = bool(actor.GetVisibility())
+                except Exception:
+                    actor_visible = True
+                if not actor_visible:
+                    # Already parked by this or another authoritative display
+                    # transition. Keep the operation silent and idempotent,
+                    # while preserving the established mode-state restoration.
+                    target_mode = requested or "rgb"
+                    if str(getattr(app, "display_mode", "") or "").lower() == "surface":
+                        app.display_mode = target_mode
+                    if str(getattr(app, "current_display_mode", "") or "").lower() == "surface":
+                        app.current_display_mode = target_mode
+                    try:
+                        app._suspend_grid_clicks = False
+                    except Exception:
+                        pass
+                    try:
+                        unified_actor = getattr(app, "_unified_actor", None)
+                        if unified_actor is not None:
+                            unified_actor.VisibilityOn()
+                    except Exception:
+                        pass
+                    return
                 try:
                     actor.VisibilityOff()
                 except Exception:
@@ -1985,7 +2157,15 @@ def _surface_data_signature(app) -> tuple:
 
 
 def surface_mesh_cache_signature(app) -> tuple:
-    """Surface cache signature, intentionally excluding classification revision."""
+    """
+    Full cache signature.
+
+    Cache is valid only for:
+    - same loaded data
+    - same Surface visible classes
+    - same Surface parameters
+    - same Surface revision
+    """
     try:
         try:
             preset_sig = current_surface_preset_signature(app)
@@ -1998,20 +2178,24 @@ def surface_mesh_cache_signature(app) -> tuple:
                 round(float(getattr(app, "surface_ambient", getattr(app, "shade_ambient", 0.22)) or 0.22), 6),
                 normalize_surface_quality(getattr(app, "surface_quality", "normal")),
             )
+
         ramp = getattr(app, "surface_color_ramp", None) or getattr(app, "elevation_color_ramp", None) or []
         ramp_sig = tuple(
             (round(float(pos), 6), tuple(int(c) for c in (color[:3] if isinstance(color, (list, tuple)) else color)))
             for pos, color in ramp
         )
+
         return (
             _surface_data_signature(app),
             preset_sig,
             normalize_surface_quality(getattr(app, "surface_quality", "normal")),
             ramp_sig,
+            int(getattr(app, "classification_revision", 0) or 0),
             int(getattr(app, "_surface_cache_revision", 0) or 0),
         )
     except Exception:
         return ("SURFACE_CACHE_SIGNATURE_ERROR",)
+
 
 def _surface_cache_store_for_app(app):
     store = getattr(app, "_surface_mesh_cache_store", None)
@@ -2099,6 +2283,7 @@ def restore_cached_surface_mesh(app, signature=None) -> bool:
             except Exception:
                 pass
             try:
+                _configure_surface_base_actor(actor)
                 actor.VisibilityOn()
             except Exception:
                 pass
@@ -2151,11 +2336,15 @@ def restore_cached_surface_mesh(app, signature=None) -> bool:
             scalars="RGB",
             rgb=True,
             show_edges=False,
+            lighting=False,
+            smooth_shading=False,
+            preference="cell",
             name=SURFACE_ACTOR_NAME,
             render=False,
         )
         setattr(actor, "_is_surface_mesh", True)
         setattr(actor, "_naksha_display_mode", "surface")
+        _configure_surface_base_actor(actor)
 
         try:
             unified_actor = getattr(app, "_unified_actor", None)
@@ -2177,6 +2366,8 @@ def restore_cached_surface_mesh(app, signature=None) -> bool:
         app._surface_shortcut_signature = expected
         _remember_surface_signature(app)
         store.move_to_end(expected)
+
+        _hide_point_cloud_actors_for_surface(app)
 
         try:
             _restore_snt_grid_above_surface(app)
@@ -2324,6 +2515,126 @@ def _build_surface_polydata_native(points: np.ndarray, faces: np.ndarray, colors
     return pv.wrap(poly), buffers
 
 
+def _configure_surface_base_actor(actor) -> None:
+    """Force a clean solid-cell Surface presentation with no hatch/edge pass.
+
+    Surface RGB already contains the elevation-ramp Lambert lighting. A second
+    VTK lighting/interpolation pass is both unnecessary and a source of dark
+    striping when the mesh is viewed close up.
+    """
+    if actor is None:
+        return
+    try:
+        prop = actor.GetProperty()
+        if prop is not None:
+            try:
+                prop.SetRepresentationToSurface()
+            except Exception:
+                pass
+            prop.SetLighting(False)
+            prop.SetInterpolationToFlat()
+            prop.SetAmbient(1.0)
+            prop.SetDiffuse(0.0)
+            prop.SetSpecular(0.0)
+            prop.EdgeVisibilityOff()
+            prop.SetOpacity(1.0)
+    except Exception:
+        pass
+    try:
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            try:
+                mapper.StaticOn()
+            except Exception:
+                pass
+            try:
+                mapper.InterpolateScalarsBeforeMappingOff()
+            except Exception:
+                pass
+            try:
+                if hasattr(mapper, "SetResolveCoincidentTopologyToOff"):
+                    mapper.SetResolveCoincidentTopologyToOff()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _hide_point_cloud_actors_for_surface(app) -> int:
+    """Hide raw/class/LOD point actors while the Surface mesh owns the canvas.
+
+    Actors are hidden rather than destroyed, preserving the existing RGB/Class
+    mode caches. DXF/SNT/drawing geometry is deliberately not touched.
+    """
+    hidden = 0
+    try:
+        plotter = getattr(app, "vtk_widget", None)
+        if plotter is None:
+            return 0
+        surface_actor = getattr(app, "_surface_mesh_actor", None)
+
+        def _is_overlay(actor):
+            return bool(
+                actor is surface_actor
+                or getattr(actor, "_is_surface_mesh", False)
+                or getattr(actor, "_is_dxf_actor", False)
+                or getattr(actor, "_is_snt_actor", False)
+            )
+
+        def _looks_like_point_cloud(actor):
+            if actor is None or _is_overlay(actor):
+                return False
+            try:
+                mapper = actor.GetMapper()
+                poly = mapper.GetInput() if mapper is not None else None
+                if poly is None or int(poly.GetNumberOfPoints()) <= 1000:
+                    return False
+                n_polys = int(poly.GetNumberOfPolys()) if hasattr(poly, "GetNumberOfPolys") else 0
+                n_strips = int(poly.GetNumberOfStrips()) if hasattr(poly, "GetNumberOfStrips") else 0
+                n_lines = int(poly.GetNumberOfLines()) if hasattr(poly, "GetNumberOfLines") else 0
+                n_verts = int(poly.GetNumberOfVerts()) if hasattr(poly, "GetNumberOfVerts") else 0
+                n_cells = int(poly.GetNumberOfCells())
+                return (
+                    n_polys == 0 and n_strips == 0 and n_lines == 0
+                    and (n_verts > 0 or n_cells == 0 or n_cells == int(poly.GetNumberOfPoints()))
+                )
+            except Exception:
+                return False
+
+        for name, actor in list((getattr(plotter, "actors", {}) or {}).items()):
+            ns = str(name).lower()
+            should_hide = (
+                ns.startswith("class_")
+                or ns in ("main_pc", "main_pc_border", "_naksha_unified_cloud")
+                or bool(getattr(actor, "_naksha_pyvista_points", False))
+                or _looks_like_point_cloud(actor)
+            )
+            if should_hide and not _is_overlay(actor):
+                try:
+                    if actor.GetVisibility():
+                        actor.VisibilityOff()
+                        hidden += 1
+                except Exception:
+                    pass
+
+        for attr_name in (
+            "_unified_actor", "main_pc_actor", "point_cloud_actor",
+            "_main_point_actor", "_lod_actor", "_boundary_point_actor",
+        ):
+            actor = getattr(app, attr_name, None)
+            if actor is None or _is_overlay(actor):
+                continue
+            try:
+                if actor.GetVisibility():
+                    actor.VisibilityOff()
+                    hidden += 1
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"SURFACE_POINT_ISOLATION status=warning error={exc}")
+    return hidden
+
+
 def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarray) -> bool:
     try:
         actor_prepare_t0 = time.perf_counter()
@@ -2367,12 +2678,16 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
             scalars="RGB",
             rgb=True,
             show_edges=False,
+            lighting=False,
+            smooth_shading=False,
+            preference="cell",
             name=SURFACE_ACTOR_NAME,
             render=False,
         )
         upload_ms = (time.perf_counter() - upload_t0) * 1000.0
         setattr(actor, "_is_surface_mesh", True)
         setattr(actor, "_naksha_display_mode", "surface")
+        _configure_surface_base_actor(actor)
 
         # Surface mode should show the terrain mesh, not the class/RGB point actor.
         try:
@@ -2387,6 +2702,10 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
         app._surface_points = vtk_buffers[0]
         app._surface_faces = vtk_buffers[1]
         app._surface_vtk_buffers = vtk_buffers
+
+        hidden_points = _hide_point_cloud_actors_for_surface(app)
+        if hidden_points:
+            print(f"SURFACE_POINT_ISOLATION hidden={hidden_points} zfight_removed=1")
 
         try:
             _restore_snt_grid_above_surface(app)
@@ -2508,6 +2827,15 @@ def render_surface_mode(app, vis_mask: Optional[np.ndarray] = None, silent: bool
             vis_mask = np.ones(len(xyz_all), dtype=bool)
 
         global_idx = np.flatnonzero(vis_mask)
+        try:
+            print(
+                "SURFACE_CLASS_FILTER "
+                f"classes={surface_visible_class_signature(app)} "
+                f"eligible={global_idx.size:,} total={len(xyz_all):,} "
+                "exact_checkbox_membership=1"
+            )
+        except Exception:
+            pass
         if global_idx.size < 3:
             detach_surface_before_non_surface_mode(app, requested_mode="surface")
             return False
@@ -3450,51 +3778,322 @@ def _apply_surface_local_classification_patch(app, transition: dict, operation="
     return True
 
 def refresh_surface_after_classification(app, changed_mask=None, operation="classification", delay_ms=300):
-    """Keep the existing elevation Surface after class edits.
+    """Refresh Surface after classification with Shading-style edit planning.
 
-    Surface geometry/colors are derived from XYZ and Surface settings, not LAS
-    classification. Classification, undo and redo therefore skip local patches,
-    cache invalidation and all triangulation work.
+    Fast invariant:
+      * support -> support classification does NOT change Surface geometry
+      * non-support -> non-support classification does NOT change Surface geometry
+
+    Those edits now complete in O(K) using the existing undo transaction and do
+    not touch the multi-million-triangle Surface VTK object at all.
+
+    A true support-membership change first uses the bounded local topology
+    replacement patch. Only spatially huge/unsupported edits fall back to the
+    exact asynchronous full Surface rebuild.
     """
     if str(getattr(app, "display_mode", "") or "").lower() != "surface":
         return False
 
-    try:
-        timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
-        if timer is not None and getattr(timer, "isActive", lambda: False)():
-            timer.stop()
-    except Exception:
-        pass
+    t_plan = time.perf_counter()
+    app._surface_last_refresh_visual_change = False
+    app._surface_last_refresh_presented = False
 
-    try:
-        app._surface_needs_rebuild_after_classification = False
-        app._surface_last_refresh_visual_change = False
-        app._surface_last_refresh_presented = False
-        app._surface_last_local_token = None
-        app._surface_last_topology_token = None
-    except Exception:
-        pass
+    if changed_mask is None:
+        changed_mask = getattr(app, "_last_changed_mask", None)
 
-    try:
-        _retag_surface_cache_after_classification_no_topology(app)
-    except Exception:
-        pass
-
-    changed_count = 0
-    try:
-        sparse = getattr(app, "_last_changed_indices", None)
-        if isinstance(sparse, np.ndarray):
-            changed_count = int(sparse.size)
-        elif isinstance(changed_mask, np.ndarray) and changed_mask.dtype == bool:
-            changed_count = int(np.count_nonzero(changed_mask))
-    except Exception:
-        pass
-
-    print(
-        "SURFACE_CLASSIFICATION_INDEPENDENT decision=KEEP_EXISTING_SURFACE "
-        f"operation={str(operation or 'classification')} changed={changed_count} "
-        "triangulation=skipped local_patch=skipped cache_invalidated=0"
+    transition = _surface_resolve_classification_transition(
+        app, changed_mask, operation=operation
     )
+    summary = _surface_transition_membership_summary(app, transition)
+
+    if summary is not None:
+        changed_count = int(len(transition.get("indices", [])))
+        add_count = int(summary["add_count"])
+        remove_count = int(summary["remove_count"])
+
+        if not summary["topology_changed"]:
+            # If an older, genuinely topology-changing edit is already waiting
+            # on the debounce timer, do not retag that stale geometry as valid.
+            timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+            timer_active = bool(
+                timer is not None and getattr(timer, "isActive", lambda: False)()
+            )
+            async_worker = getattr(app, "_surface_async_worker", None)
+            try:
+                async_active = async_worker is not None and bool(async_worker.isRunning())
+            except Exception:
+                async_active = async_worker is not None
+            prior_topology_pending = bool(
+                getattr(app, "_surface_needs_rebuild_after_classification", False)
+                and (timer_active or async_active)
+            )
+
+            if not prior_topology_pending:
+                _retag_surface_cache_after_classification_no_topology(app)
+
+            app._surface_last_refresh_visual_change = False
+            app._surface_last_refresh_presented = False
+            print(
+                "SURFACE_FAST_REFRESH decision=NO_TOPOLOGY_CHANGE "
+                f"operation={str(operation or 'classification')} "
+                f"changed={changed_count} support_add=0 support_remove=0 "
+                f"source={transition.get('source', 'unknown')} "
+                f"pending_prior_topology={int(prior_topology_pending)} "
+                f"elapsed={(time.perf_counter()-t_plan)*1000.0:.2f}ms"
+            )
+            return True
+
+        # The same classification transaction can reach Surface twice
+        # (classifier + cross-section commit).  Local patches are transaction
+        # scoped, so the second hook must become a no-op.
+        transaction_token = transition.get("transaction_token")
+        if (
+            transaction_token is not None
+            and transaction_token == getattr(app, "_surface_last_local_token", None)
+        ):
+            print(
+                "SURFACE_EDIT_PLAN decision=TOPOLOGY_CHANGE duplicate=coalesced "
+                f"operation={str(operation or 'classification')} "
+                f"changed={changed_count} support_add={add_count} "
+                f"support_remove={remove_count} source={transition.get('source', 'unknown')} "
+                "path=local_patch"
+            )
+            return True
+
+        # Interactive classification now mirrors Shading: first try an exact
+        # bounded replacement skin.  This avoids touching the 34M-point base
+        # Surface or launching a 50-second full Delaunay for a handful of
+        # support-membership changes.
+        try:
+            if _apply_surface_local_classification_patch(
+                app, transition, operation=operation
+            ):
+                print(
+                    "SURFACE_EDIT_PLAN decision=TOPOLOGY_CHANGE "
+                    f"operation={str(operation or 'classification')} "
+                    f"changed={changed_count} support_add={add_count} "
+                    f"support_remove={remove_count} source={transition.get('source', 'unknown')} "
+                    "path=local_patch full_rebuild=0"
+                )
+                return True
+        except Exception as local_exc:
+            print(
+                "SURFACE_LOCAL_PATCH decision=FALLBACK_EXACT "
+                f"reason={type(local_exc).__name__}: {local_exc}"
+            )
+
+        # Fallback for spatially huge/unsupported edits: preserve the existing
+        # exact asynchronous global rebuild path.
+        timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+        timer_active = bool(
+            timer is not None and getattr(timer, "isActive", lambda: False)()
+        )
+        async_worker = getattr(app, "_surface_async_worker", None)
+        try:
+            async_active = async_worker is not None and bool(async_worker.isRunning())
+        except Exception:
+            async_active = async_worker is not None
+        topology_pending = bool(
+            getattr(app, "_surface_needs_rebuild_after_classification", False)
+            or timer_active
+            or async_active
+        )
+
+        if (
+            transaction_token is not None
+            and transaction_token == getattr(app, "_surface_last_topology_token", None)
+            and topology_pending
+        ):
+            print(
+                "SURFACE_EDIT_PLAN decision=TOPOLOGY_CHANGE duplicate=coalesced "
+                f"operation={str(operation or 'classification')} "
+                f"changed={changed_count} support_add={add_count} "
+                f"support_remove={remove_count} source={transition.get('source', 'unknown')}"
+            )
+            return True
+
+        try:
+            app._surface_last_topology_token = transaction_token
+            app._surface_topology_generation = int(
+                getattr(app, "_surface_topology_generation", 0) or 0
+            ) + 1
+        except Exception:
+            pass
+
+        print(
+            "SURFACE_EDIT_PLAN decision=TOPOLOGY_CHANGE "
+            f"operation={str(operation or 'classification')} "
+            f"changed={changed_count} support_add={add_count} "
+            f"support_remove={remove_count} source={transition.get('source', 'unknown')} "
+            f"generation={int(getattr(app, '_surface_topology_generation', 0) or 0)}"
+        )
+    else:
+        # Unknown transitions stay on the safe exact path.  Use the bool-mask
+        # object identity as a fallback transaction token so two integration
+        # hooks carrying the very same edit do not queue duplicate global work.
+        fallback_token = ("mask", id(changed_mask)) if changed_mask is not None else None
+        timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+        timer_active = bool(
+            timer is not None and getattr(timer, "isActive", lambda: False)()
+        )
+        async_worker = getattr(app, "_surface_async_worker", None)
+        try:
+            async_active = async_worker is not None and bool(async_worker.isRunning())
+        except Exception:
+            async_active = async_worker is not None
+        topology_pending = bool(
+            getattr(app, "_surface_needs_rebuild_after_classification", False)
+            or timer_active
+            or async_active
+        )
+        if (
+            fallback_token is not None
+            and fallback_token == getattr(app, "_surface_last_topology_token", None)
+            and topology_pending
+        ):
+            print(
+                "SURFACE_EDIT_PLAN decision=UNKNOWN duplicate=coalesced "
+                f"operation={str(operation or 'classification')}"
+            )
+            return True
+        try:
+            app._surface_last_topology_token = fallback_token
+            app._surface_topology_generation = int(
+                getattr(app, "_surface_topology_generation", 0) or 0
+            ) + 1
+        except Exception:
+            pass
+
+    # From this point onward the existing exact Surface behavior is preserved.
+    # Unknown transitions also stay on the safe rebuild path.
+    try:
+        app._surface_needs_rebuild_after_classification = True
+    except Exception:
+        pass
+
+    operation_lc = str(operation or "").lower()
+
+    # Keep the historical direct local-bridge route only when no transaction
+    # semantics are available.  For a KNOWN support-membership change that
+    # bridge would be topologically stale, so use the exact rebuild path.
+    if int(delay_ms or 0) <= 0 and operation_lc not in {"undo", "redo"} and summary is None:
+        try:
+            ok = _apply_surface_bridge_update(app, changed_mask=changed_mask, operation=operation)
+            if ok:
+                app._surface_needs_rebuild_after_classification = False
+                app._surface_last_refresh_visual_change = True
+                app._surface_last_refresh_presented = True
+                print("⚡ Surface classification changed — updated Surface mesh in-place")
+            else:
+                print("🔁 Surface in-place update unavailable — rebuilding Surface mesh")
+                ok = render_surface_mode(app, silent=True)
+                app._surface_last_refresh_visual_change = bool(ok)
+                app._surface_last_refresh_presented = bool(ok)
+                if ok:
+                    print("✅ Surface rebuilt after classification")
+                else:
+                    print("⚠️ Surface rebuild after classification returned False")
+            return ok
+        except Exception as e:
+            print(f"⚠️ Surface rebuild after classification failed: {e}")
+            return False
+
+    if operation_lc in {"undo", "redo"}:
+        try:
+            from gui.surface_mode import mark_surface_filter_dirty
+            mark_surface_filter_dirty(app, reason=operation_lc)
+        except Exception:
+            pass
+        try:
+            # Undo/redo can change Surface membership just like a live
+            # classification.  Use the same exact non-modal rebuild so Ctrl+Z
+            # never freezes the GUI behind a 30M-point triangulation.
+            print(f"🔁 Surface {operation_lc} — exact background rebuild")
+            ok = _start_surface_async_exact_rebuild(app)
+            if ok:
+                app._surface_last_refresh_visual_change = False
+                app._surface_last_refresh_presented = False
+                return True
+
+            print(
+                f"⚠️ Surface async worker unavailable for {operation_lc} — "
+                "using synchronous exact rebuild"
+            )
+            ok = render_surface_mode(app, silent=True)
+            app._surface_needs_rebuild_after_classification = not bool(ok)
+            app._surface_last_refresh_visual_change = bool(ok)
+            app._surface_last_refresh_presented = bool(ok)
+            if ok:
+                print(f"✅ Surface rebuilt after {operation_lc}")
+            else:
+                print(f"⚠️ Surface rebuild after {operation_lc} returned False")
+            return ok
+        except Exception as e:
+            print(f"⚠️ Surface rebuild after {operation_lc} failed: {e}")
+            return False
+
+    try:
+        from PySide6.QtCore import QTimer
+    except Exception:
+        try:
+            print("🔁 Surface classification changed — rebuilding Surface mesh now")
+            ok = render_surface_mode(app, silent=True)
+            app._surface_last_refresh_visual_change = bool(ok)
+            app._surface_last_refresh_presented = bool(ok)
+            return ok
+        except Exception as e:
+            print(f"⚠️ Surface rebuild after classification failed: {e}")
+            return False
+
+    timer = getattr(app, "_surface_rebuild_after_classification_timer", None)
+
+    if timer is None:
+        timer = QTimer(app)
+        timer.setSingleShot(True)
+        app._surface_rebuild_after_classification_timer = timer
+
+        def _run_surface_rebuild():
+            try:
+                if str(getattr(app, "display_mode", "") or "").lower() != "surface":
+                    return
+
+                if not bool(getattr(app, "_surface_needs_rebuild_after_classification", False)):
+                    return
+
+                # Classification refresh is deliberately non-modal.  Keep the
+                # exact resident Surface visible, compute the replacement on a
+                # QThread, and atomically swap it when ready.  This removes the
+                # 20-50+ second GUI stall seen on 30M+ Slow surfaces.
+                print("🔁 Surface classification changed — exact background rebuild")
+                ok = _start_surface_async_exact_rebuild(app)
+                if not ok:
+                    # Compatibility fallback for environments where QThread is
+                    # unavailable.  Preserve the historical exact behavior.
+                    print("⚠️ Surface async worker unavailable — using synchronous exact rebuild")
+                    try:
+                        fresh_vis_mask = surface_visible_mask(app)
+                    except Exception:
+                        fresh_vis_mask = None
+                    ok = render_surface_mode(app, vis_mask=fresh_vis_mask, silent=True)
+                    app._surface_needs_rebuild_after_classification = not bool(ok)
+                    app._surface_last_refresh_visual_change = bool(ok)
+                    app._surface_last_refresh_presented = bool(ok)
+                    if ok:
+                        print("✅ Surface rebuilt after classification")
+                    else:
+                        print("⚠️ Surface rebuild after classification returned False")
+
+            except Exception as e:
+                app._surface_last_refresh_visual_change = False
+                app._surface_last_refresh_presented = False
+                print(f"⚠️ Surface rebuild after classification failed: {e}")
+
+        timer.timeout.connect(_run_surface_rebuild)
+
+    timer.start(int(delay_ms))
+    app._surface_last_refresh_visual_change = False
+    app._surface_last_refresh_presented = False
+    print("⏳ Surface topology changed — exact rebuild scheduled")
     return True
 
 

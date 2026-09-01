@@ -6,6 +6,13 @@ SHADING_QUALITY_CHOICES = (
     ("Slow – all points", "slow"),
 )
 
+SLOW_ALL_POINTS_CONFIRM_THRESHOLD = 25_000_000
+
+
+def slow_all_points_requires_confirmation(point_count):
+    """Return whether Slow all-points conversion should show the RAM warning."""
+    return int(point_count) >= SLOW_ALL_POINTS_CONFIRM_THRESHOLD
+
 
 def normalize_shading_preset_quality(value=None, legacy_speed=None):
     """Return a renderer quality key, including conversion of old 1-10 speeds."""

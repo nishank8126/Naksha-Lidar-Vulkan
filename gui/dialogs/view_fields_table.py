@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QVBoxLayout,
     QHBoxLayout,
+    QLayout,
     QTableView,
     QLabel,
     QListWidget,
@@ -43,6 +44,11 @@ from PySide6.QtWidgets import (
 
 from gui.icon_provider import get_icon
 from gui.theme_manager import ThemeColors, get_dialog_stylesheet
+from gui.dialogs.view_fields_dialog import (
+    IMAGE_FIELD_LABEL,
+    IMAGE_SOURCE_KEY,
+    find_image_dimension_name,
+)
 
 
 # ASPRS standard classification codes (0-18) plus a few extended values used
@@ -239,6 +245,7 @@ COLUMN_DEFS = [
     ("Class", K_CODE, "classification"),
     ("Description", K_DESC, "classification"),
     ("Line", K_RAW, "point_source_id"),
+    (IMAGE_FIELD_LABEL, K_RAW, IMAGE_SOURCE_KEY),
     ("Time", K_TIME, "gps_time"),
     ("Date", K_DATE, "gps_time"),
     ("Echo", K_RAW, "return_number"),
@@ -265,6 +272,7 @@ class PointTableModel(QAbstractTableModel):
         self._data = app_data or {}
         self._filename = filename
         self._order = np.arange(len(self._data.get("xyz", [])), dtype=np.int64)
+        self._visible_headers = None
         self._columns = self._build_columns()
 
     # -- column discovery -------------------------------------------------
@@ -272,6 +280,11 @@ class PointTableModel(QAbstractTableModel):
         cols = []
         present = set(self._data.keys())
         for header, kind, key in COLUMN_DEFS:
+            if key == IMAGE_SOURCE_KEY:
+                image_key = find_image_dimension_name(present)
+                if image_key is not None and self._data.get(image_key) is not None:
+                    cols.append((header, kind, image_key))
+                continue
             # x/y/z are always derived from xyz even if not separate keys
             if key in ("x", "y", "z"):
                 if "xyz" in self._data:
@@ -279,6 +292,11 @@ class PointTableModel(QAbstractTableModel):
                 continue
             if key in present and self._data[key] is not None:
                 cols.append((header, kind, key))
+        if self._visible_headers is not None:
+            cols = [
+                column for column in cols
+                if column[0] in self._visible_headers
+            ]
         return cols
 
     def refresh_columns(self):
@@ -293,10 +311,11 @@ class PointTableModel(QAbstractTableModel):
         Returns True if at least one column matched, False otherwise.
         """
         wanted = set(headers)
-        cols = [c for c in self._build_columns() if c[0] in wanted]
-        if not cols:
+        known_headers = {header for header, _kind, _key in COLUMN_DEFS}
+        if not wanted or not wanted.intersection(known_headers):
             return False
-        self._columns = cols
+        self._visible_headers = wanted
+        self._columns = self._build_columns()
         self.layoutChanged.emit()
         return True
 
@@ -548,13 +567,32 @@ class _ExtraFieldLoader(QThread):
                     getattr(las.header, "generating_software", "") or ""
                 ).strip()
 
-                dims = {str(d).lower() for d in las.header.point_format.dimension_names}
-                needed = [w for w in self._wanted if w in dims]
-                if needed:
+                dimension_names = [
+                    str(d) for d in las.header.point_format.dimension_names
+                ]
+                dimensions_by_lower = {
+                    name.casefold(): name for name in dimension_names
+                }
+                needed = [
+                    w for w in self._wanted
+                    if w != IMAGE_SOURCE_KEY and w in dimensions_by_lower
+                ]
+                image_dimension = None
+                if IMAGE_SOURCE_KEY in self._wanted:
+                    image_dimension = find_image_dimension_name(dimension_names)
+
+                if needed or image_dimension is not None:
                     points = las.read()
                     for w in needed:
                         try:
-                            result[w] = np.asarray(getattr(points, w))
+                            result[w] = np.asarray(points[dimensions_by_lower[w]])
+                        except Exception:
+                            pass
+                    if image_dimension is not None:
+                        try:
+                            result[str(image_dimension).casefold()] = np.asarray(
+                                points[str(image_dimension)]
+                            )
                         except Exception:
                             pass
         except Exception as exc:
@@ -595,11 +633,13 @@ class ViewFieldsTableDialog(QDialog):
         if not icon.isNull():
             self.setWindowIcon(icon)
         self.resize(1400, 720)
-        self.setMinimumSize(900, 420)
+        self.setMinimumSize(0, 0)
+        self.setSizeGripEnabled(True)
 
         self.setStyleSheet(get_dialog_stylesheet() + self._extra_stylesheet())
 
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SetNoConstraint)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -907,7 +947,11 @@ class ViewFieldsTableDialog(QDialog):
         """Open the original View Fields checklist and apply it to the table."""
         from gui.dialogs.view_fields_dialog import ViewFieldsDialog
 
-        dlg = ViewFieldsDialog(self.filename, parent=self)
+        dlg = ViewFieldsDialog(
+            self.filename,
+            parent=self,
+            available_dimensions=self.app_data.keys(),
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         selected = dlg.selected_fields()
@@ -974,8 +1018,14 @@ class ViewFieldsTableDialog(QDialog):
 
     # -- extra fields -----------------------------------------------------
     def _load_extra_fields(self):
-        wanted = [k for (_h, _kind, k) in COLUMN_DEFS
-                  if k not in self.app_data or self.app_data.get(k) is None]
+        wanted = []
+        for _header, _kind, key in COLUMN_DEFS:
+            if key == IMAGE_SOURCE_KEY:
+                image_key = find_image_dimension_name(self.app_data.keys())
+                if image_key is None or self.app_data.get(image_key) is None:
+                    wanted.append(key)
+            elif key not in self.app_data or self.app_data.get(key) is None:
+                wanted.append(key)
         wanted = [w for w in wanted if w not in ("x", "y", "z")]
         if not self.filename:
             return

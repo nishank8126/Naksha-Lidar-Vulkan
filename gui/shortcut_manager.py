@@ -68,6 +68,27 @@ def decode_classes(text):
         return None, None
 
 
+def shortcut_search_matches(search_text, modifier="", key="", tool="", classes=""):
+    """Return whether a shortcut row matches the search/capture text."""
+    query = str(search_text or "").casefold().strip()
+    if not query:
+        return True
+
+    fields = [modifier, key, tool, classes]
+    searchable_text = " ".join(str(value or "").casefold() for value in fields)
+    if query in searchable_text:
+        return True
+
+    # Keyboard capture produces values such as ``alt+f1``, while Modifier and
+    # Key are stored in separate table columns. Include their canonical
+    # combined form so captured and manually typed shortcut combinations match.
+    compact_query = "".join(query.split())
+    shortcut_combo = (
+        f"{str(modifier or '').casefold()}+{str(key or '').casefold()}"
+    ).replace(" ", "")
+    return compact_query in shortcut_combo
+
+
 def encode_line_mode_preset(payload: dict) -> str:
     classes = {
         str(int(code)): {"show": bool(info.get("show", True))}
@@ -3238,22 +3259,14 @@ class ShortcutManager(QWidget):
             tool_combo = self.table.cellWidget(row, self.COL_TOOL)
             classes_item = self.table.item(row, self.COL_CLASSES)
             
-            # Build searchable text from all columns
-            searchable_parts = []
-            
-            if mod_combo:
-                searchable_parts.append(mod_combo.currentText().lower())
-            if key_combo:
-                searchable_parts.append(key_combo.currentText().lower())
-            if tool_combo:
-                searchable_parts.append(tool_combo.currentText().lower())
-            if classes_item:
-                searchable_parts.append(classes_item.text().lower())
-            
-            searchable_text = " ".join(searchable_parts)
-            
             # Show/hide row based on search match
-            if search_text == "" or search_text in searchable_text:
+            if shortcut_search_matches(
+                search_text,
+                mod_combo.currentText() if mod_combo else "",
+                key_combo.currentText() if key_combo else "",
+                tool_combo.currentText() if tool_combo else "",
+                classes_item.text() if classes_item else "",
+            ):
                 self.table.setRowHidden(row, False)
                 visible_count += 1
             else:
@@ -3464,6 +3477,10 @@ class ShortcutManager(QWidget):
             key_combo.setCurrentText("F1")
 
     def on_add(self):
+        # A filtered table can hide the appended row. Adding starts a new edit,
+        # so return to the full list before revealing the row at the bottom.
+        self.search_box.clear()
+
         row = self.table.rowCount()
         self.table.insertRow(row)
         self._install_row_widgets(row)
@@ -3473,6 +3490,15 @@ class ShortcutManager(QWidget):
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         self.table.setItem(row, self.COL_CLASSES, item)
         self._set_current_row(row)
+
+        def _reveal_new_row():
+            self.table.scrollToBottom()
+            modifier_combo = self.table.cellWidget(row, self.COL_MODIFIER)
+            if modifier_combo is not None:
+                modifier_combo.setFocus()
+
+        # Wait for the inserted row's geometry and scrollbar range to update.
+        QTimer.singleShot(0, _reveal_new_row)
 
     @staticmethod
     def apply_shortcuts_from_settings(app_window):

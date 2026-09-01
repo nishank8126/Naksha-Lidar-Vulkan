@@ -5161,7 +5161,7 @@ class ByClassRibbon(QWidget):
         algo_section.add_button("Low Points", "⬇️", self.open_low_points_dialog,    toggleable=False)
         algo_section.add_button("Isolated",   "🔴", self.open_isolated_dialog,      toggleable=False)
         algo_section.add_button("Ground",     "🏔️", self.open_ground_dialog,        toggleable=False)
-        algo_section.add_button("Surface",    "📐", self.open_below_surface_dialog,  toggleable=False)
+        algo_section.add_button("BelowSurface",    "📐", self.open_below_surface_dialog,  toggleable=False)
         layout.addWidget(algo_section)
 
         # ℹ️ Info Display
