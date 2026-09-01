@@ -10,11 +10,19 @@ cutting line (the same buffer width already used to select the section's
 own point cloud), so it renders as solid, colored, filled geometry.
 
 This module reuses Main View's already-built shaded/surface mesh polydata
-(``app._shaded_mesh_polydata`` / ``app._surface_mesh_polydata``, built and
-owned entirely by gui/shading_display.py and gui/surface_mode.py). It only
-reads that cached polydata -- never rebuilds or mutates it, and never
-touches Main View's actors/plotter -- so Main View's own behavior is
-unaffected regardless of what mode Main View is currently showing.
+when available (``app._shaded_mesh_polydata`` / ``app._surface_mesh_polydata``,
+built and owned entirely by gui/shading_display.py and gui/surface_mode.py) --
+it only reads that cached polydata, never rebuilds or mutates it, and never
+touches Main View's actors/plotter.
+
+For "Shaded Classification" specifically, the section must also work when
+Main View is currently showing something else (Class/RGB/...), so when no
+cached mesh exists this falls back to calling Main View's own pure,
+actor-free geometry backend directly (``_compute_shading_geometry_backend``)
+to build an equivalent mesh in memory -- still without touching
+``app.vtk_widget``, ``app.display_mode``, or any Main View actor, so
+Main View's current display is left completely untouched either way.
+"Surface" still requires Main View to have built it first (staged rollout).
 """
 import numpy as np
 import pyvista as pv
@@ -38,8 +46,129 @@ def _section_half_width(app, view_idx, default=5.0):
 
 
 def _source_polydata(app, mode):
+    """Return Main View's already-built mesh for `mode` if present (fast
+    path, zero extra cost). Only "shaded" currently falls back to an
+    independent build when Main View isn't in that mode -- "surface" still
+    requires Main View to have built it first (staged rollout)."""
     attr = "_shaded_mesh_polydata" if mode == "shaded" else "_surface_mesh_polydata"
-    return getattr(app, attr, None)
+    mesh = getattr(app, attr, None)
+    if mesh is not None:
+        return mesh
+    if mode == "shaded":
+        return _build_independent_shaded_mesh(app)
+    return None
+
+
+def _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode):
+    try:
+        from gui.shading_display import _compute_xyz_hash
+        data_hash = _compute_xyz_hash(xyz_raw)
+    except Exception:
+        data_hash = None
+    return (data_hash, tuple(sorted(vc)), round(float(azimuth), 3),
+            round(float(angle), 3), round(float(ambient), 4), quality_mode)
+
+
+def _build_independent_shaded_mesh(app):
+    """Build a Shaded Classification mesh independent of Main View's own
+    display mode, so the section's Shaded Classification works even when
+    Main View is currently showing Class/RGB/etc. This calls the same
+    pure, actor-free geometry backend Main View itself uses
+    (gui/shading_display.py's ``_compute_shading_geometry_backend``) --
+    it never touches ``app.vtk_widget``, ``app.display_mode``, or any
+    Main View actor, so Main View's current display is left untouched.
+
+    Result is cached on `app` and only rebuilt when the underlying data,
+    visible classes, or light settings actually change.
+    """
+    try:
+        from gui.shading_display import (
+            _compute_shading_geometry_backend,
+            _get_shading_visibility,
+            normalize_shading_quality,
+        )
+        from gui.flight_line_filter import flight_line_visibility_mask
+    except Exception as exc:
+        print(f"   ⚠️ Section shaded mesh: import failed ({exc})")
+        return None
+
+    data = getattr(app, "data", None)
+    if not isinstance(data, dict):
+        return None
+    xyz_raw = data.get("xyz")
+    classes_raw = data.get("classification")
+    if xyz_raw is None or classes_raw is None:
+        return None
+
+    try:
+        line_mask = flight_line_visibility_mask(app, len(xyz_raw))
+    except Exception:
+        line_mask = None
+    if line_mask is not None:
+        if not np.any(line_mask):
+            return None
+        if not np.all(line_mask):
+            xyz_raw = xyz_raw[line_mask]
+            classes_raw = classes_raw[line_mask]
+
+    vc = _get_shading_visibility(app)
+    if not vc:
+        return None
+
+    azimuth = float(getattr(app, "last_shade_azimuth", 45.0))
+    angle = float(getattr(app, "last_shade_angle", 45.0))
+    ambient = float(getattr(app, "shade_ambient", 0.25))
+    quality_mode = normalize_shading_quality(getattr(app, "shading_quality", "normal"))
+
+    key = _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode)
+    cached = getattr(app, "_section_independent_shaded_cache", None)
+    if cached is not None and cached.get("key") == key:
+        return cached.get("mesh")
+
+    try:
+        from gui.shading_display import _compute_xyz_hash
+        res = _compute_shading_geometry_backend(
+            xyz_raw, classes_raw, vc, azimuth, angle, ambient,
+            3.0, None, _compute_xyz_hash(xyz_raw), quality_mode=quality_mode,
+        )
+    except Exception as exc:
+        print(f"   ⚠️ Section shaded mesh: independent build failed ({exc})")
+        return None
+
+    if res.get("empty", False):
+        return None
+
+    faces = np.asarray(res["faces"], dtype=np.int64)
+    if len(faces) == 0:
+        return None
+    xyz_final = np.asarray(res["xyz_final"], dtype=np.float64)
+    unique_indices = np.asarray(res["unique_indices"], dtype=np.int64)
+    shade = np.asarray(res["shade"], dtype=np.float32)
+
+    cm = classes_raw.astype(np.int32)[unique_indices]
+    palette = getattr(app, "class_palette", {}) or {}
+    mc = max(int(cm.max()) + 1, 256)
+    lut = np.zeros((mc, 3), dtype=np.float32)
+    for c, e in palette.items():
+        ci = int(c)
+        if ci < mc:
+            lut[ci] = e.get("color", (128, 128, 128))
+
+    face_class = cm[faces[:, 0]]
+    base_color = lut[face_class]
+    face_shade = shade if len(shade) == len(faces) else np.ones(len(faces), dtype=np.float32)
+    face_colors = np.clip(base_color * face_shade[:, None], 0, 255).astype(np.uint8)
+
+    fv = np.empty((len(faces), 4), dtype=np.int64)
+    fv[:, 0] = 3
+    fv[:, 1:] = faces
+    mesh = pv.PolyData(xyz_final, fv.ravel())
+    mesh.cell_data["RGB"] = face_colors
+
+    app._section_independent_shaded_cache = {"key": key, "mesh": mesh}
+    print(f"   🔨 Section: built independent shaded mesh "
+          f"({len(xyz_final):,} verts, {len(faces):,} faces, quality={quality_mode})")
+    return mesh
 
 
 def _mesh_faces_n3(mesh):
@@ -119,9 +248,12 @@ def build_section_shaded_surface_actor(app, view_idx, mode) -> bool:
 
     source_mesh = _source_polydata(app, mode)
     if source_mesh is None:
-        label = "Shaded Classification" if mode == "shaded" else "Surface"
-        print(f"   ⚠️ Section {view_idx+1}: Main View has no {label} mesh built yet — "
-              f"enable {label} in Main View first")
+        if mode == "shaded":
+            print(f"   ⚠️ Section {view_idx+1}: could not build a Shaded Classification "
+                  f"mesh (no point cloud loaded, or no classes currently visible)")
+        else:
+            print(f"   ⚠️ Section {view_idx+1}: Main View has no Surface mesh built yet — "
+                  f"enable Surface in Main View first")
         return False
 
     half_width = _section_half_width(app, view_idx)
