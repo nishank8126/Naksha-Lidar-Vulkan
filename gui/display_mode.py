@@ -1576,10 +1576,10 @@ class DisplayModeDialog(QDialog):
 
             self._quality_mode_context = mode_idx
 
-            # Class(0) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) are the only
-            # modes wired up for cross-section views (View 1-4). Cut Section
+            # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
+            # Surface(6) are wired up for cross-section views (View 1-4). Cut Section
             # (slot 5) keeps its original classification-only restriction.
-            _SECTION_ALLOWED_MODES = (0, 2, 3, 4, 5)
+            _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6)
             if self.current_slot == 5 and self.color_mode.currentIndex() != 0:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
@@ -1744,9 +1744,9 @@ class DisplayModeDialog(QDialog):
 
         # Restore this slot's own remembered color mode.
         #   Slot 0 (Main View): any mode.
-        #   Slots 1-4 (cross-sections): Class/Depth/Intensity/RGB/Elevation only.
+        #   Slots 1-4 (cross-sections): Class/Shaded/Depth/Intensity/RGB/Elevation/Surface.
         #   Slot 5 (Cut Section): classification-only, unchanged.
-        _SECTION_ALLOWED_MODES = (0, 2, 3, 4, 5)
+        _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6)
         restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
             self.color_mode.setEnabled(True)
@@ -2871,14 +2871,31 @@ class DisplayModeDialog(QDialog):
             if self.current_slot <= 4:
                 view_idx = self.current_slot - 1
                 border   = float(self.view_borders.get(self.current_slot, 0))
-                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
-                section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
-                ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
-                if ok:
-                    fast_path_handled = True
-                    print(f"Section {view_idx + 1} display mode -> {section_mode}")
+                if idx in (1, 6):
+                    from gui.cross_section.section_shaded_surface import (
+                        build_section_shaded_surface_actor,
+                        remove_section_shaded_surface_actor,
+                    )
+                    mesh_mode = "shaded" if idx == 1 else "surface"
+                    ok = build_section_shaded_surface_actor(app, view_idx, mesh_mode)
+                    if ok:
+                        fast_path_handled = True
+                        print(f"Section {view_idx + 1} display mode -> {mesh_mode} (mesh cut)")
+                    else:
+                        print(f"WARNING: Section {view_idx + 1} {mesh_mode} mesh-cut unavailable")
                 else:
-                    print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
+                    from gui.cross_section.section_shaded_surface import (
+                        remove_section_shaded_surface_actor,
+                    )
+                    remove_section_shaded_surface_actor(app, view_idx)
+                    _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                    section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
+                    ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
+                    if ok:
+                        fast_path_handled = True
+                        print(f"Section {view_idx + 1} display mode -> {section_mode}")
+                    else:
+                        print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
             elif self.current_slot == 5:
                 if hasattr(app, 'cut_section_controller'):
                     ctrl = app.cut_section_controller

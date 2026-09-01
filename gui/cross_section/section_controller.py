@@ -2646,19 +2646,30 @@ class SectionController:
                 remembered_modes = getattr(dlg, 'view_color_modes', None) if dlg is not None else None
                 if isinstance(remembered_modes, dict):
                     _reapply_idx = remembered_modes.get(_reapply_slot_idx, 0)
-                    _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
-                    remembered_mode = _SECTION_MODE_BY_IDX.get(_reapply_idx)
-                    if remembered_mode:
-                        _reapply_border = float(
-                            (self.app.view_borders.get(_reapply_slot_idx, 0) or 0.0)
-                            if hasattr(self.app, "view_borders") else 0.0
+                    if _reapply_idx in (1, 6):
+                        from gui.cross_section.section_shaded_surface import (
+                            build_section_shaded_surface_actor,
                         )
-                        from gui.unified_actor_manager import refresh_section_after_weight_change
-                        reapplied = refresh_section_after_weight_change(
-                            self.app, view_index, view_palette, _reapply_border, remembered_mode
+                        _mesh_mode = "shaded" if _reapply_idx == 1 else "surface"
+                        reapplied = build_section_shaded_surface_actor(
+                            self.app, view_index, _mesh_mode
                         )
                         if reapplied:
-                            print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {remembered_mode}")
+                            print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {_mesh_mode} (mesh cut)")
+                    else:
+                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                        remembered_mode = _SECTION_MODE_BY_IDX.get(_reapply_idx)
+                        if remembered_mode:
+                            _reapply_border = float(
+                                (self.app.view_borders.get(_reapply_slot_idx, 0) or 0.0)
+                                if hasattr(self.app, "view_borders") else 0.0
+                            )
+                            from gui.unified_actor_manager import refresh_section_after_weight_change
+                            reapplied = refresh_section_after_weight_change(
+                                self.app, view_index, view_palette, _reapply_border, remembered_mode
+                            )
+                            if reapplied:
+                                print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {remembered_mode}")
             except Exception as _mode_reapply_err:
                 print(f"   ⚠️ Re-applying View {view_index + 1}'s display mode skipped: {_mode_reapply_err}")
 
