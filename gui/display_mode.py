@@ -1723,6 +1723,12 @@ class DisplayModeDialog(QDialog):
             self.table.blockSignals(False)
 
     def on_slot_changed(self, idx: int) -> None:
+        # The flight-line selector belongs to the slot that was active when it
+        # was opened. Close it before changing slots so it cannot appear to
+        # control the newly selected Main/Cross Section view. The user can
+        # reopen it from the Lines button after the switch.
+        self._close_lines_dialog()
+
         # Bug-10 fix: single save + single load (was 4 separate table scans).
         # Bug-3/Signal: table.blockSignals handled inside _load_slot_state.
         self._save_slot_state(self.current_slot)   # 1 pass: checks + weights
@@ -2235,6 +2241,19 @@ class DisplayModeDialog(QDialog):
         return ((lid * 67 + 53) % 256,
                 (lid * 131 + 97) % 256,
                 (lid * 193 + 181) % 256)
+
+    def _close_lines_dialog(self):
+        """Close the flight-line selector and forget its stale slot context."""
+        popup = getattr(self, "_lines_popup", None)
+        self._lines_popup = None
+        if popup is None:
+            return
+        try:
+            popup.close()
+        except RuntimeError:
+            # Qt may already have deleted a WA_DeleteOnClose popup while a
+            # queued slot-change signal is still being delivered.
+            pass
 
     def _open_lines_dialog(self):
         """Open a persistent selector; changes commit only when OK is clicked."""
@@ -3011,6 +3030,51 @@ class DisplayModeDialog(QDialog):
                 self._owner_minimized_me = False
                 self._was_visible_before_owner_minimize = False
 
+    def _raise_visible_window_family(self):
+        """Bring Display Mode and its currently open child popups forward."""
+        try:
+            if not self.isVisible() or self.windowState() & Qt.WindowMinimized:
+                return
+        except RuntimeError:
+            return
+
+        windows = [self]
+        try:
+            for child in self.findChildren(QWidget):
+                if not child.isWindow() or not child.isVisible():
+                    continue
+                if child.windowState() & Qt.WindowMinimized:
+                    continue
+                windows.append(child)
+        except RuntimeError:
+            pass
+
+        active_window = None
+        for window in windows:
+            try:
+                window.raise_()
+                active_window = window
+            except RuntimeError:
+                continue
+
+        if active_window is not None:
+            try:
+                active_window.activateWindow()
+            except RuntimeError:
+                pass
+
+    def _schedule_window_family_restore(self):
+        """Defer foreground restoration until Naksha owns the native focus."""
+        if self._user_minimized:
+            return
+        try:
+            if not self.isVisible():
+                return
+        except RuntimeError:
+            return
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._raise_visible_window_family)
+
     def eventFilter(self, obj, event):
         owner = self._get_app_window()
         if obj is owner and event is not None:
@@ -3018,6 +3082,8 @@ class DisplayModeDialog(QDialog):
                 event_type = event.type()
                 if event_type == QEvent.WindowStateChange:
                     self._sync_with_owner_window_state()
+                elif event_type == QEvent.WindowActivate:
+                    self._schedule_window_family_restore()
                 elif event_type == QEvent.Close:
                     # App shutdown owns the true native close. Normal user X on
                     # Display Mode itself is still handled by closeEvent below.

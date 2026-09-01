@@ -35,7 +35,6 @@ def normalize_shading_preset_quality(value=None, legacy_speed=None):
 
     return "normal"
 
-
 def shading_quality_label(value):
     """Return the exact user-facing label used by Display Mode."""
     quality = normalize_shading_preset_quality(value)

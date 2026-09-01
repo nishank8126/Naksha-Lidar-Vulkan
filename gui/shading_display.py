@@ -41,6 +41,7 @@ _ADAPTIVE_SHADING_VERSION = 1
 _ADAPTIVE_DEFAULT_TARGET = 3_000_000
 _SHADING_FAST_TARGET = 1_000_000
 _FEATURE_AWARE_VERSION = 1
+_SHADING_LINE_FILTER_VERSION = 2
 
 # Multi-class classification refresh must keep the enormous base shaded mesh
 # immutable.  Local class edits are displayed through one tiny exact-face
@@ -267,7 +268,10 @@ class _ShadingComputationWorker(QThread):
     finished_signal = Signal(dict)
     error_signal = Signal(str)
 
-    def __init__(self, xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None, quality_mode="normal"):
+    def __init__(self, xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
+                 max_edge_factor, single_class_max_edge, data_hash,
+                 representative_seed=None, boundary_flags=None, quality_mode="normal",
+                 source_global_indices=None, line_filter_active=False):
         super().__init__()
         self.xyz_raw = xyz_raw
         self.classes_raw = classes_raw
@@ -281,6 +285,8 @@ class _ShadingComputationWorker(QThread):
         self.representative_seed = representative_seed
         self.boundary_flags = boundary_flags
         self.quality_mode = quality_mode
+        self.source_global_indices = source_global_indices
+        self.line_filter_active = bool(line_filter_active)
 
     def run(self):
         try:
@@ -290,7 +296,9 @@ class _ShadingComputationWorker(QThread):
                 self.max_edge_factor, self.single_class_max_edge, self.data_hash,
                 representative_seed=self.representative_seed,
                 boundary_flags=self.boundary_flags,
-                quality_mode=self.quality_mode
+                quality_mode=self.quality_mode,
+                source_global_indices=self.source_global_indices,
+                line_filter_active=self.line_filter_active,
             )
             self.finished_signal.emit(res)
         except Exception:
@@ -457,7 +465,11 @@ def _feature_aware_filter_faces(faces, xyz_unique, representative_boundary, spac
     )
     return filtered, meta
 
-def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient, max_edge_factor, single_class_max_edge, data_hash, representative_seed=None, boundary_flags=None, quality_mode="normal"):
+def _compute_shading_geometry_backend(
+        xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
+        max_edge_factor, single_class_max_edge, data_hash,
+        representative_seed=None, boundary_flags=None, quality_mode="normal",
+        source_global_indices=None, line_filter_active=False):
     profile_start = time.perf_counter()
     stage_start = profile_start
     timings = OrderedDict()
@@ -666,7 +678,21 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
         checkpoint("adaptive_refinement")
 
         xyz_unique = xyz[unique_local]
-        unique_indices_global = vi[unique_local]
+        selected_input_indices = vi[unique_local]
+        if source_global_indices is not None:
+            source_global_indices = np.asarray(
+                source_global_indices, dtype=np.int64
+            ).reshape(-1)
+            if len(source_global_indices) != len(xyz_raw):
+                raise ValueError(
+                    "flight-line source/global index map length mismatch: "
+                    f"{len(source_global_indices)} != {len(xyz_raw)}"
+                )
+            unique_indices_global = source_global_indices[selected_input_indices]
+        else:
+            unique_indices_global = np.asarray(
+                selected_input_indices, dtype=np.int64
+            )
         if visible_boundary is not None:
             representative_boundary = np.asarray(visible_boundary[unique_local], dtype=bool)
 
@@ -725,7 +751,37 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
             faces = _filter_edges_by_absolute(faces, xy, me)
         else:
             mea = data_extent * 0.10
-            faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
+            if bool(line_filter_active):
+                # A selected subset of LAS Point Source IDs can leave large XY
+                # gaps between swaths.  A global Delaunay otherwise bridges those
+                # gaps with long/steep triangles, which appears as black scan-line
+                # hatching in Shaded Classification.  Tighten ONLY this filtered
+                # mesh; the normal all-lines Shading threshold is unchanged.
+                line_edge_factor = max(
+                    2.0,
+                    float(os.environ.get(
+                        "NAKSHA_SHADING_LINE_MAX_EDGE_FACTOR", "12.0"
+                    )),
+                )
+                line_min_edge = max(
+                    0.25,
+                    float(os.environ.get(
+                        "NAKSHA_SHADING_LINE_MIN_EDGE", "1.5"
+                    )),
+                )
+                guarded_edge = max(spacing * line_edge_factor, line_min_edge)
+                mea = min(mea, guarded_edge)
+                before_line_edge = len(faces)
+                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
+                print(
+                    "SHADING_LINE_EDGE_GUARD "
+                    f"status=enabled max_edge={mea:.3f} spacing={spacing:.4f} "
+                    f"factor={line_edge_factor:.2f} "
+                    f"faces_before={before_line_edge} faces_after={len(faces)} "
+                    f"removed={before_line_edge-len(faces)}"
+                )
+            else:
+                faces = _filter_edges_3d_abs(faces, xyz_unique, mea)
             max_edge_factor = mea / max(spacing, 1e-9)
     checkpoint("edge_filter")
 
@@ -834,6 +890,9 @@ def _compute_shading_geometry_backend(xyz_raw, classes_raw, visible_classes, azi
         "representative_boundary": representative_boundary,
         "feature_meta": feature_meta,
         "feature_version": _FEATURE_AWARE_VERSION,
+        "source_index_space": "canonical_global",
+        "line_filter_active": bool(line_filter_active),
+        "line_filter_version": _SHADING_LINE_FILTER_VERSION,
         "profile_timings": timings,
     }
 
@@ -1573,11 +1632,20 @@ def _display_color_key_lut(app, vertex_classes, visible_classes):
 def _crisp_mixed_face_budget(total_faces):
     """Return the safe mixed-face budget for the crisp barycentric overlay.
 
-    Large all-class tiles commonly have more than eight million mixed faces.
-    Falling back to full-vertex blending at that point reintroduces visible
-    scan-line hatching on otherwise pure ground facets. Scale the default with
-    topology size while retaining a bounded upper limit and the existing
-    environment override.
+    IMPORTANT: this is a MEMORY/GPU safety ceiling, not a percentage of TIN
+    topology.  A topology-relative threshold created an unstable presentation
+    boundary: the 13,065,557-point production tile has 26,096,170 faces and
+    13,049,356 mixed faces.  A 50%% budget evaluated to 13,048,085, so only
+    1,271 extra mixed faces (0.0097%%) changed the entire renderer from the
+    correct ``crisp_hybrid`` presentation to ``full_vertex_blend``.  That
+    fallback is what appears as contour/scan-line shading on the low ground.
+
+    The mixed overlay is already materialized in bounded 250k-face chunks, and
+    production has successfully rendered ~14.9M mixed faces.  Use the existing
+    20M absolute safety ceiling directly so normal flight-line transitions do
+    not change presentation merely because the mixed/pure ratio crosses 50%%.
+    The environment override remains available for machines with different GPU
+    memory limits.
     """
     configured = os.environ.get('NAKSHA_SHADING_CRISP_MAX_MIXED_FACES')
     if configured is not None:
@@ -1585,12 +1653,12 @@ def _crisp_mixed_face_budget(total_faces):
             return max(0, int(configured))
         except (TypeError, ValueError):
             pass
-    try:
-        face_count = max(0, int(total_faces))
-    except (TypeError, ValueError):
-        face_count = 0
-    scaled = int(np.ceil(face_count * 0.25))
-    return min(20_000_000, max(12_000_000, scaled))
+
+    # This is deliberately independent of total_faces.  It is a capacity cap,
+    # not a visual-policy threshold.  No triangles are added and Delaunay is
+    # unchanged; it only decides whether the already-detected mixed faces may
+    # keep using the established crisp overlay path.
+    return 20_000_000
 
 
 def _collect_mixed_display_faces(app, cache, vertex_classes, visible_classes):
@@ -3009,6 +3077,8 @@ class ShadingGeometryCache:
         self._pending_fast_rgb = None
         self._vtk_mesh = None
         self._needs_compaction = False
+        self.source_index_space = "canonical_global"
+        self.line_filter_active = False
     def clear(self, reason=""):
         if reason: print(f"   🗑️ Cache cleared: {reason}")
         self._vtk_colors_ptr = None
@@ -3206,6 +3276,79 @@ def _get_shading_visibility(app):
     vc = {int(c) for c, e in app.class_palette.items() if e.get("show", True)}
     if vc: print(f"   📍 Shading visibility from class_palette: {sorted(vc)}")
     return vc
+
+def _main_visible_flight_line_index_mask(app, global_indices):
+    """Return an O(k) mask for changed points visible in Main View line filter.
+
+    Classification deltas are always expressed in canonical LAS/global indices.
+    This helper intentionally examines only those changed indices; it never
+    materializes another N-point flight-line mask during interactive classify.
+    Unknown/missing Point Source IDs preserve historical visible behavior.
+    """
+    gi = np.asarray(global_indices, dtype=np.int64).ravel()
+    if gi.size == 0:
+        return np.empty(0, dtype=bool), False
+
+    data = getattr(app, "data", None)
+    if not isinstance(data, dict):
+        return np.ones(gi.size, dtype=bool), False
+    source_ids = data.get("point_source_id")
+    xyz = data.get("xyz")
+    if source_ids is None or xyz is None or len(source_ids) != len(xyz):
+        return np.ones(gi.size, dtype=bool), False
+
+    by_slot = getattr(app, "flight_line_visibility_by_slot", None)
+    visibility = None
+    if isinstance(by_slot, dict):
+        candidate = by_slot.get(0)
+        if isinstance(candidate, dict):
+            visibility = candidate
+    if not isinstance(visibility, dict):
+        candidate = getattr(app, "flight_line_visibility", None)
+        visibility = candidate if isinstance(candidate, dict) else None
+    if not visibility or all(bool(v) for v in visibility.values()):
+        return np.ones(gi.size, dtype=bool), False
+
+    valid = (gi >= 0) & (gi < len(source_ids))
+    keep = np.ones(gi.size, dtype=bool)
+    if not np.any(valid):
+        return keep, True
+
+    # LAS Point Source ID is uint16. Cache a tiny 64K bool LUT by visibility
+    # signature so each classify commit is O(changed_points), not O(all_points).
+    try:
+        signature = tuple(sorted(
+            (int(k), bool(v)) for k, v in visibility.items()
+        ))
+    except Exception:
+        signature = None
+    lut = getattr(app, "_shading_main_line_visibility_lut", None)
+    if (
+        not isinstance(lut, np.ndarray)
+        or lut.dtype != np.bool_
+        or lut.shape != (65536,)
+        or getattr(app, "_shading_main_line_visibility_lut_sig", None) != signature
+    ):
+        lut = np.ones(65536, dtype=np.bool_)
+        for raw_id, shown in visibility.items():
+            try:
+                line_id = int(raw_id)
+                if 0 <= line_id <= 65535:
+                    lut[line_id] = bool(shown)
+            except Exception:
+                continue
+        app._shading_main_line_visibility_lut = lut
+        app._shading_main_line_visibility_lut_sig = signature
+
+    src = np.asarray(source_ids)[gi[valid]]
+    src_i = np.asarray(src, dtype=np.int64)
+    src_valid = (src_i >= 0) & (src_i <= 65535)
+    visible_valid = np.ones(src_i.size, dtype=bool)
+    if np.any(src_valid):
+        visible_valid[src_valid] = lut[src_i[src_valid]]
+    keep[valid] = visible_valid
+    return keep, True
+
 
 def _save_camera(app):
     try:
@@ -3420,11 +3563,24 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
     # edge actors or raw point actors competing in the depth buffer.
     _prepare_scene_for_shading(app)
 
-    # Flight-line selection is a global geometry filter.  Shading works on a
-    # compacted input so unchecked source IDs cannot contribute vertices or
-    # triangles. Force a rebuild because older cache keys predate this mask.
+    # Flight-line selection is a geometry filter, but the shading cache MUST
+    # continue to speak canonical LAS/global point indices.  The old compacted
+    # path lost that identity map, so Cross Section classification deltas could
+    # no longer find their shaded vertices and mesh colours were read from the
+    # wrong rows of the full classification array.
     from gui.flight_line_filter import flight_line_visibility_mask
-    _line_mask = flight_line_visibility_mask(app, len(xyz_raw))
+    _full_xyz_raw = xyz_raw
+    _full_classes_raw = classes_raw
+    _line_mask = np.asarray(
+        flight_line_visibility_mask(app, len(_full_xyz_raw)), dtype=bool
+    ).reshape(-1)
+    if len(_line_mask) != len(_full_xyz_raw):
+        print(
+            "SHADING_LINE_FILTER status=fallback reason=mask_length_mismatch "
+            f"mask={len(_line_mask)} points={len(_full_xyz_raw)}"
+        )
+        _line_mask = np.ones(len(_full_xyz_raw), dtype=bool)
+
     if not np.any(_line_mask):
         try:
             app.vtk_widget.remove_actor("shaded_mesh", render=False)
@@ -3435,10 +3591,47 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
             pass
         print("ℹ️ All flight lines are off — shaded point cloud hidden")
         return
-    if not np.all(_line_mask):
-        xyz_raw = xyz_raw[_line_mask]
-        classes_raw = classes_raw[_line_mask]
+
+    _source_global_indices = None
+    _boundary_flags_override = None
+    _line_filter_active = not bool(np.all(_line_mask))
+    if _line_filter_active:
+        _source_global_indices = np.flatnonzero(_line_mask).astype(
+            np.int64, copy=False
+        )
+        # BoundaryFlag belongs to the full canonical cloud. Preserve the same
+        # selected rows so feature-aware filtering does not silently switch off
+        # merely because flight lines were filtered.
+        try:
+            _full_boundary = _extract_boundary_flags_for_shading(
+                app, len(_full_xyz_raw)
+            )
+            if _full_boundary is not None:
+                _boundary_flags_override = np.asarray(
+                    _full_boundary[_source_global_indices], dtype=bool
+                )
+        except Exception:
+            _boundary_flags_override = None
+
+        xyz_raw = _full_xyz_raw[_source_global_indices]
+        classes_raw = _full_classes_raw[_source_global_indices]
+        # Keep the established one-build-on-line-selection contract.  Display
+        # Mode clears the shading cache when line visibility changes; forcing
+        # this build also protects older pre-fix caches from being reused.
         force_rebuild = True
+        print(
+            "SHADING_LINE_FILTER status=enabled "
+            f"selected_points={len(_source_global_indices):,} "
+            f"total_points={len(_full_xyz_raw):,} "
+            "index_space=canonical_global mapping_preserved=1"
+        )
+    else:
+        print(
+            "SHADING_LINE_FILTER status=all_lines "
+            f"selected_points={len(_full_xyz_raw):,} "
+            f"total_points={len(_full_xyz_raw):,} "
+            "index_space=canonical_global mapping_preserved=1"
+        )
 
     azimuth = getattr(app, 'last_shade_azimuth', azimuth)
     ambient = getattr(app, 'shade_ambient', ambient)
@@ -3474,6 +3667,20 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
     requested_cache_key = _build_cache_key(
         xyz_raw, vc, single_class_max_edge, quality_mode
     ) if vc else None
+    if requested_cache_key is not None and _source_global_indices is not None:
+        # The legacy XYZ hash is intentionally lightweight.  Two different
+        # flight-line subsets can theoretically share length/endpoint samples,
+        # so bind filtered caches and representative seeds to the exact canonical
+        # Point Source selection.  All-lines cache keys remain byte-for-byte
+        # unchanged.
+        _line_index_digest = hashlib.blake2b(
+            np.ascontiguousarray(_source_global_indices).view(np.uint8),
+            digest_size=8,
+        ).hexdigest()
+        requested_cache_key = requested_cache_key + ((
+            'flight_line_filter', _SHADING_LINE_FILTER_VERSION,
+            len(_source_global_indices), _line_index_digest,
+        ),)
     cache = get_cache(requested_cache_key) if vc else get_cache()
     rendered_cache_key = _get_rendered_cache_key(app)
 
@@ -3499,7 +3706,14 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
     if not force_rebuild and cache.is_cached_subset_of(vc, xyz_raw):
         try:
             ec = vc - cache.visible_classes_set
-            ei = np.where(np.isin(classes_raw.astype(np.int32), list(ec)))[0]
+            ei_local = np.where(
+                np.isin(classes_raw.astype(np.int32), list(ec))
+            )[0]
+            ei = (
+                _source_global_indices[ei_local]
+                if _source_global_indices is not None
+                else ei_local
+            )
             if len(ei) > 0 and _fast_incremental_add_points(app, ei):
                 cache.visible_classes_hash = cache.get_visible_hash(vc)
                 cache.visible_classes_set = vc.copy(); cache.n_visible_classes = len(vc)
@@ -3518,7 +3732,13 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
     if cache.is_valid(xyz_raw, vc) and not force_rebuild:
         _refresh_from_cache(app, cache, azimuth, angle, ambient)
     else:
-        _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle, ambient, max_edge_factor, cache, vc, single_class_max_edge)
+        _build_visible_geometry(
+            app, xyz_raw, classes_raw, azimuth, angle, ambient,
+            max_edge_factor, cache, vc, single_class_max_edge,
+            source_global_indices=_source_global_indices,
+            boundary_flags_override=_boundary_flags_override,
+            line_filter_active=_line_filter_active,
+        )
 
 
 def _grid_unique_count_at_precision(xyz, precision):
@@ -3646,7 +3866,10 @@ def _grid_dedup_at_precision(xyz, precision):
 
 def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
                             ambient, max_edge_factor, cache, visible_classes,
-                            single_class_max_edge=None):
+                            single_class_max_edge=None,
+                            source_global_indices=None,
+                            boundary_flags_override=None,
+                            line_filter_active=False):
     nv = len(visible_classes)
     is_sc = (nv == 1)
     print(f"\n{'='*60}")
@@ -3685,14 +3908,23 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
 
         boundary_flags = None
         if representative_seed is None:
-            boundary_flags = _extract_boundary_flags_for_shading(app, len(xyz_raw))
+            if boundary_flags_override is not None:
+                boundary_flags = np.asarray(
+                    boundary_flags_override, dtype=bool
+                ).reshape(-1)
+            else:
+                boundary_flags = _extract_boundary_flags_for_shading(
+                    app, len(xyz_raw)
+                )
 
         worker = _ShadingComputationWorker(
             xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
             max_edge_factor, single_class_max_edge, _compute_xyz_hash(xyz_raw),
             representative_seed=representative_seed,
             boundary_flags=boundary_flags,
-            quality_mode=normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
+            quality_mode=normalize_shading_quality(getattr(app, 'shading_quality', 'normal')),
+            source_global_indices=source_global_indices,
+            line_filter_active=line_filter_active,
         )
         
         loop = QEventLoop()
@@ -3781,9 +4013,24 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
         cache._global_to_unique = None
         cache._cached_face_class = None
         cache._tri_lod_factor = res["lod_factor"]
+        cache.source_index_space = res.get(
+            "source_index_space", "canonical_global"
+        )
+        cache.line_filter_active = bool(
+            res.get("line_filter_active", line_filter_active)
+        )
 
         # ── PHASE 5: Render ──
-        _render_mesh(app, cache, classes_raw, saved_camera)
+        # cache.unique_indices are canonical LAS indices, so all colour/class
+        # lookups must use the canonical full classification array.
+        canonical_classes = None
+        try:
+            canonical_classes = app.data.get("classification")
+        except Exception:
+            canonical_classes = None
+        if canonical_classes is None:
+            canonical_classes = classes_raw
+        _render_mesh(app, cache, canonical_classes, saved_camera)
         print(f"   ✅ COMPLETE: {time.time()-t_total:.1f}s")
         print(f"{'='*60}\n")
     except Exception as e:
@@ -4719,14 +4966,57 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
     # LAS classification is already integer data; do not copy 13M+ entries
     # to int32 just to inspect a few hundred changed points.
     cls = np.asarray(cls_raw)
-    ci = np.flatnonzero(changed_mask)
+    ci_all = np.flatnonzero(changed_mask).astype(np.int64, copy=False)
+
+    if delta is None:
+        delta = _recover_classification_delta(app, ci_all)
+
+    line_keep, line_filter_active = _main_visible_flight_line_index_mask(
+        app, ci_all
+    )
+    ci = ci_all[line_keep]
+    hidden_line_changed = int(len(ci_all) - len(ci))
+    if line_filter_active:
+        print(
+            "SHADING_LINE_FILTER_REFRESH "
+            f"changed_global={len(ci_all)} changed_visible={len(ci)} "
+            f"hidden_changed={hidden_line_changed} "
+            "cache_index_space=canonical_global"
+        )
+    if ci.size == 0:
+        if line_filter_active:
+            print(
+                "SHADING_LINE_FILTER_REFRESH decision=noop_hidden_lines"
+            )
+        return True
+
+    # Keep explicit old/new transition data aligned with the same visible
+    # Point Source IDs. This is required for single-class local add/remove and
+    # for undo/redo when a section edit spans both visible and hidden lines.
+    if delta is not None:
+        try:
+            dci_all = np.asarray(delta.changed_indices, dtype=np.int64).ravel()
+            dold_all = np.asarray(delta.old_classes).ravel()
+            dnew_all = np.asarray(delta.new_classes).ravel()
+            if dci_all.size == dold_all.size == dnew_all.size:
+                dkeep, _ = _main_visible_flight_line_index_mask(app, dci_all)
+                delta = ClassificationDelta(
+                    changed_indices=dci_all[dkeep],
+                    old_classes=dold_all[dkeep],
+                    new_classes=dnew_all[dkeep],
+                    operation=getattr(delta, "operation", "classification"),
+                    origin_view=getattr(delta, "origin_view", "unknown"),
+                    is_final_commit=bool(
+                        getattr(delta, "is_final_commit", True)
+                    ),
+                )
+        except Exception:
+            pass
+
     cc = cls[ci]
     nh = ~np.isin(cc, va)  # Points now hidden (classified away from visible class)
     nvis = np.isin(cc, va)  # Points now visible
     g2u = cache.build_global_to_unique(len(xyz_raw))
-
-    if delta is None:
-        delta = _recover_classification_delta(app, ci)
 
     # Prefer the explicit transition contract.  Legacy callers remain
     # supported by the existing current-state inference below.
@@ -4750,6 +5040,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
                 return _update_colors_gpu_fast(
                     app, cache, changed_mask=changed_mask,
                     _visible_classes=vc, _defer_render=True,
+                    _changed_indices=dci,
                 )
             if decision is ShadingEditKind.LOCAL_ADD:
                 added = dci[(dold != sci) & (dnew == sci)]
@@ -4899,7 +5190,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
             if len(_cu_valid) > 0:
                 _has_orphaned_cls = bool(np.any(~_uv_cls[_cu_valid]))
             if not _has_orphaned_cls:
-                if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+                if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True, _changed_indices=ci):
                     return True
         nvg = ci[nvis]
         mg = nvg[g2u[nvg] < 0]
@@ -4920,9 +5211,9 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
             if _fast_incremental_add_points(app, mg):
                 return True
             _queue_deferred_rebuild(app, "cls new vis", newly_visible_indices=mg)
-            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True)
+            _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True, _changed_indices=ci)
             return True
-        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True):
+        if _update_colors_gpu_fast(app, cache, changed_mask=changed_mask, _visible_classes=vc, _defer_render=True, _changed_indices=ci):
             return True
     
     voided = None
@@ -4957,7 +5248,7 @@ def refresh_shaded_after_classification_fast(app, changed_mask=None, delta=None)
                     numpy_support.vtk_to_numpy(pc)[hu] = [0,0,0]
                     pc.Modified()
     
-    if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True):
+    if _update_colors_gpu_fast(app, cache, changed_mask, _visible_classes=vc, _defer_render=True, _changed_indices=ci):
         if voided is not None and len(voided) > 0:
             _queue_deferred_rebuild(app, "void cleanup")
         return True
