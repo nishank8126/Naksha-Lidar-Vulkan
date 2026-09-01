@@ -83,9 +83,9 @@ def _uam_sync(app, slot_idx, palette=None, border=None, render=True):
     """General sync for any slot."""
     return _uam.sync_palette_to_gpu(app, slot_idx, palette, border, render)
 
-def _uam_refresh_section(app, view_idx, palette=None, border=0.0):
+def _uam_refresh_section(app, view_idx, palette=None, border=0.0, mode="class"):
     """Used for Cross-Sections (Slots 1-4)."""
-    return _uam.refresh_section_after_weight_change(app, view_idx, palette, border)
+    return _uam.refresh_section_after_weight_change(app, view_idx, palette, border, mode)
 
 def _uam_fast_refresh(app, palette=None, border=0.0):
     """Used for Main View (Slot 0)."""
@@ -1541,7 +1541,10 @@ class DisplayModeDialog(QDialog):
                     self._surface_quality_value = current_value
 
             self.color_mode.setVisible(True)
-            self.color_mode.setEnabled(self.current_slot == 0)
+            # Cross-sections (slots 1-4) support Class/Depth/Intensity/RGB/
+            # Elevation; Main View (slot 0) supports everything; Cut Section
+            # (slot 5) stays classification-only, unchanged.
+            self.color_mode.setEnabled(self.current_slot in (0, 1, 2, 3, 4))
             mode_idx = int(self.color_mode.currentIndex())
             mesh_speed_visible = self.current_slot == 0 and mode_idx in (1, 6)
 
@@ -1573,7 +1576,18 @@ class DisplayModeDialog(QDialog):
 
             self._quality_mode_context = mode_idx
 
-            if self.current_slot != 0 and self.color_mode.currentIndex() != 0:
+            # Class(0) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) are the only
+            # modes wired up for cross-section views (View 1-4). Cut Section
+            # (slot 5) keeps its original classification-only restriction.
+            _SECTION_ALLOWED_MODES = (0, 2, 3, 4, 5)
+            if self.current_slot == 5 and self.color_mode.currentIndex() != 0:
+                self.color_mode.blockSignals(True)
+                self.color_mode.setCurrentIndex(0)
+                self.color_mode.blockSignals(False)
+            elif (
+                1 <= self.current_slot <= 4
+                and self.color_mode.currentIndex() not in _SECTION_ALLOWED_MODES
+            ):
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
                 self.color_mode.blockSignals(False)
@@ -1713,6 +1727,13 @@ class DisplayModeDialog(QDialog):
         # Bug-3/Signal: table.blockSignals handled inside _load_slot_state.
         self._save_slot_state(self.current_slot)   # 1 pass: checks + weights
         self._save_border_mode(self.current_slot)  # save border type for outgoing slot
+
+        # Remember the outgoing slot's own color-mode choice (View 1-4 can
+        # each stay on their own mode independently, same pattern as palettes).
+        if not hasattr(self, 'view_color_modes'):
+            self.view_color_modes = {}
+        self.view_color_modes[self.current_slot] = int(self.color_mode.currentIndex())
+
         self.current_slot = idx
         self._load_slot_state(idx)                 # 1 pass: checks + weights, signals blocked
         self.update_border_display()
@@ -1720,14 +1741,26 @@ class DisplayModeDialog(QDialog):
         self._load_border_mode(idx)
         if idx == 5:
             self.on_view_switched_to_cut_section()
-        # Lock color_mode to "By Classification" for all views except Main View (slot 0)
+
+        # Restore this slot's own remembered color mode.
+        #   Slot 0 (Main View): any mode.
+        #   Slots 1-4 (cross-sections): Class/Depth/Intensity/RGB/Elevation only.
+        #   Slot 5 (Cut Section): classification-only, unchanged.
+        _SECTION_ALLOWED_MODES = (0, 2, 3, 4, 5)
+        restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
             self.color_mode.setEnabled(True)
+        elif 1 <= idx <= 4:
+            if restore_idx not in _SECTION_ALLOWED_MODES:
+                restore_idx = 0
+            self.color_mode.setEnabled(True)
         else:
-            self.color_mode.blockSignals(True)
-            self.color_mode.setCurrentIndex(0)
-            self.color_mode.blockSignals(False)
+            restore_idx = 0
             self.color_mode.setEnabled(False)
+
+        self.color_mode.blockSignals(True)
+        self.color_mode.setCurrentIndex(restore_idx)
+        self.color_mode.blockSignals(False)
         self._sync_color_mode_state()
 
     def on_view_selection_changed(self, idx):
@@ -2445,9 +2478,11 @@ class DisplayModeDialog(QDialog):
         }
         target_idx = _MODE_TO_IDX.get(current_mode, 0)
 
-        # Sync color_mode combo box index
+        # Sync color_mode combo box index. app.display_mode is the Main View's
+        # own mode flag — only apply it while Main View (slot 0) is selected,
+        # or this stomps a cross-section view's independently-remembered mode.
         if hasattr(self, "color_mode") and self.color_mode is not None:
-            if self.color_mode.currentIndex() != target_idx:
+            if self.current_slot == 0 and self.color_mode.currentIndex() != target_idx:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(target_idx)
                 self.color_mode.blockSignals(False)
@@ -2572,6 +2607,15 @@ class DisplayModeDialog(QDialog):
 
         idx          = self.color_mode.currentIndex()
         is_class_mode = (idx == 0)  # Only By Classification is a true class mode
+
+        # Remember this slot's chosen mode immediately on Apply — not just on
+        # slot-switch (on_slot_changed). Without this, drawing a brand-new
+        # cross-section right after Apply (without ever switching the
+        # dialog's target-view dropdown away and back) reads a stale
+        # view_color_modes entry and silently loses the mode just applied.
+        if not hasattr(self, 'view_color_modes'):
+            self.view_color_modes = {}
+        self.view_color_modes[self.current_slot] = idx
 
         class_map = {}
         for row in range(self.table.rowCount()):
@@ -2827,11 +2871,14 @@ class DisplayModeDialog(QDialog):
             if self.current_slot <= 4:
                 view_idx = self.current_slot - 1
                 border   = float(self.view_borders.get(self.current_slot, 0))
-                ok       = _uam_refresh_section(app, view_idx, class_map, border)
+                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
+                ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
                 if ok:
                     fast_path_handled = True
+                    print(f"Section {view_idx + 1} display mode -> {section_mode}")
                 else:
-                    print(f"âš ï¸ Section {view_idx + 1} fast-refresh failed â€” may need rebuild")
+                    print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
             elif self.current_slot == 5:
                 if hasattr(app, 'cut_section_controller'):
                     ctrl = app.cut_section_controller
