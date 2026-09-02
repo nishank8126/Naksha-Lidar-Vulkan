@@ -1919,6 +1919,43 @@ class ClassVisibilityPicker(QDialog):
             live_mode_idx if live_mode_idx >= 0 else 0
         )
         controls_row.addWidget(self.display_mode_selector)
+
+        # Speed (Fast/Normal/Slow) and Lines... sit inline on this SAME row,
+        # right after Display Mode -- exactly like the live Display Mode
+        # dialog (gui/display_mode.py ~1094-1136: color_mode, then
+        # shading_quality, then lines_button, all on one controls_layout).
+        # Each is independently shown/hidden by mode (Speed for Shaded/
+        # Surface, Lines for Line) via setVisible(), which Qt collapses to
+        # zero width when hidden -- so only the relevant one ever occupies
+        # space, on one line, instead of reserving a whole extra row.
+        self.shading_quality_label = QLabel("Speed")
+        controls_row.addWidget(self.shading_quality_label)
+        self.shading_quality_selector = QComboBox()
+        self.shading_quality_selector.setObjectName("displayShadingQuality")
+        self.shading_quality_selector.setMinimumWidth(150)
+        self.shading_quality_selector.addItem("Fast", "fast")
+        self.shading_quality_selector.addItem("Normal", "normal")
+        self.shading_quality_selector.addItem("Slow – all points", "slow")
+        self.shading_quality_selector.setCurrentIndex(1)
+        controls_row.addWidget(self.shading_quality_selector)
+
+        self.lines_button = QPushButton("Lines…")
+        self.lines_button.setObjectName("displayLinesButton")
+        self.lines_button.clicked.connect(self._open_line_selection)
+        controls_row.addWidget(self.lines_button)
+
+        def _sync_mode_extra_controls():
+            _mode = str(self.display_mode_selector.currentData() or "class")
+            _speed_visible = _mode in ("shaded_class", "surface")
+            self.shading_quality_label.setVisible(_speed_visible)
+            self.shading_quality_selector.setVisible(_speed_visible)
+            self.lines_button.setVisible(_mode == "line")
+
+        self.display_mode_selector.currentIndexChanged.connect(
+            lambda _idx: _sync_mode_extra_controls()
+        )
+        _sync_mode_extra_controls()
+
         controls_row.addStretch()
         controls_card_layout.addLayout(controls_row)
 
@@ -1974,66 +2011,7 @@ class ClassVisibilityPicker(QDialog):
             )
         )
 
-        # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
-        # Classification and Surface, matching the live Display Mode
-        # dialog's own "Speed" control (gui/display_mode.py:1095-1123).
-        # Previously the shortcut editor had no way to set this at all, so
-        # a Shaded/Surface shortcut always used whatever quality happened
-        # to be the current global setting rather than one saved with the
-        # shortcut itself. Kept on its own row (rather than crammed into
-        # controls_row above) so it can't push that already-full row wider
-        # than intended.
-        quality_row = QHBoxLayout()
-        quality_row.setSpacing(10)
-        self.shading_quality_label = QLabel("Speed")
-        quality_row.addWidget(self.shading_quality_label)
-        self.shading_quality_selector = QComboBox()
-        self.shading_quality_selector.setObjectName("displayShadingQuality")
-        self.shading_quality_selector.setMinimumWidth(150)
-        self.shading_quality_selector.addItem("Fast", "fast")
-        self.shading_quality_selector.addItem("Normal", "normal")
-        self.shading_quality_selector.addItem("Slow – all points", "slow")
-        self.shading_quality_selector.setCurrentIndex(1)
-        quality_row.addWidget(self.shading_quality_selector)
-        quality_row.addStretch()
-        controls_card_layout.addLayout(quality_row)
-
-        def _sync_quality_visibility():
-            _mode = str(self.display_mode_selector.currentData() or "class")
-            _visible = _mode in ("shaded_class", "surface")
-            self.shading_quality_label.setVisible(_visible)
-            self.shading_quality_selector.setVisible(_visible)
-
-        self.display_mode_selector.currentIndexChanged.connect(
-            lambda _idx: _sync_quality_visibility()
-        )
-        _sync_quality_visibility()
-
-        # Flight-line selection -- only meaningful for Line mode. Reuses
-        # the same "Lines" button / picker dialog / self.line_visibility
-        # storage already built for the standalone Line tool's own picker
-        # (mode="line"; see _open_line_selection/set_line_visibility/
-        # get_line_visibility below, all mode-agnostic class methods) --
-        # previously the DisplayMode editor's Line option had no way to
-        # choose which flight lines to show, unlike the standalone tool.
-        lines_row = QHBoxLayout()
-        lines_row.setSpacing(10)
-        self.lines_button = QPushButton("Lines…")
-        self.lines_button.setObjectName("displayLinesButton")
-        self.lines_button.clicked.connect(self._open_line_selection)
-        lines_row.addWidget(self.lines_button)
-        lines_row.addStretch()
-        controls_card_layout.addLayout(lines_row)
         layout.addWidget(controls_card)
-
-        def _sync_lines_visibility():
-            _mode = str(self.display_mode_selector.currentData() or "class")
-            self.lines_button.setVisible(_mode == "line")
-
-        self.display_mode_selector.currentIndexChanged.connect(
-            lambda _idx: _sync_lines_visibility()
-        )
-        _sync_lines_visibility()
 
         table_note = QLabel("Choose which classes this preset should display:")
         table_note.setObjectName("dialogInlineNote")
