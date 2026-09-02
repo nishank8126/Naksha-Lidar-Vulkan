@@ -1852,31 +1852,38 @@ class GlobalShortcutFilter(QObject):
                     # Elevation selection is not silently discarded.
                     # ============================================================
                     if hasattr(dlg, 'color_mode'):
-                        if target_view == 0:
-                            _MODE_TO_IDX_LOCAL = {
-                                'class': 0, 'shaded_class': 1,
-                                'depth': 2, 'intensity': 3,
-                                'rgb': 4, 'elevation': 5,
-                                'surface': 6, 'line': 7,
-                            }
-                            _combo_idx = _MODE_TO_IDX_LOCAL.get(
-                                target_display_mode, 0
-                            )
-                        else:
-                            _MODE_TO_IDX_LOCAL = {
-                                'class': 0, 'shaded_class': 1,
-                                'depth': 2, 'intensity': 3,
-                                'rgb': 4, 'elevation': 5,
-                                'surface': 6, 'line': 7,
-                            }
-                            _cur_mode = getattr(
-                                self.app_window, 'display_mode', 'class'
-                            )
-                            _combo_idx = _MODE_TO_IDX_LOCAL.get(_cur_mode, 0)
+                        # Same fix as STEP 5 below: the combo must reflect
+                        # THIS preset's own target_display_mode regardless of
+                        # target_view -- it previously borrowed Main View's
+                        # live mode for any section target, so opening the
+                        # Display Mode dialog after a section-targeted
+                        # Elevation/Depth/... shortcut still showed
+                        # "By Classification" instead of the mode actually
+                        # applied.
+                        _MODE_TO_IDX_LOCAL = {
+                            'class': 0, 'shaded_class': 1,
+                            'depth': 2, 'intensity': 3,
+                            'rgb': 4, 'elevation': 5,
+                            'surface': 6, 'line': 7,
+                        }
+                        _combo_idx = _MODE_TO_IDX_LOCAL.get(
+                            target_display_mode, 0
+                        )
                         dlg.color_mode.blockSignals(True)
                         dlg.color_mode.setCurrentIndex(_combo_idx)
                         dlg.color_mode.blockSignals(False)
                         print(f"   ✅ color_mode combo set to index {_combo_idx}")
+
+                        # Remember this view's mode the same way the Display
+                        # Mode dialog's own Apply button does (display_mode.py
+                        # on_apply/on_slot_changed), so drawing a NEW section
+                        # afterward re-applies the mode this shortcut actually
+                        # set instead of whatever mode was last applied via
+                        # the dialog's Apply button (e.g. Shaded Classification
+                        # set manually before this shortcut ran).
+                        if not hasattr(dlg, 'view_color_modes'):
+                            dlg.view_color_modes = {}
+                        dlg.view_color_modes[target_view] = _combo_idx
 
                     # ============================================================
                     # STEP 4B: Sync class_palette — Main View only
