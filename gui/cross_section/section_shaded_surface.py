@@ -15,14 +15,13 @@ built and owned entirely by gui/shading_display.py and gui/surface_mode.py) --
 it only reads that cached polydata, never rebuilds or mutates it, and never
 touches Main View's actors/plotter.
 
-For "Shaded Classification" specifically, the section must also work when
-Main View is currently showing something else (Class/RGB/...), so when no
-cached mesh exists this falls back to calling Main View's own pure,
-actor-free geometry backend directly (``_compute_shading_geometry_backend``)
+Both modes must also work when Main View is currently showing something
+else (Class/RGB/...), so when no cached mesh exists each falls back to
+calling Main View's own pure, actor-free geometry backend directly
+(``_compute_shading_geometry_backend`` / ``_compute_surface_geometry_backend``)
 to build an equivalent mesh in memory -- still without touching
 ``app.vtk_widget``, ``app.display_mode``, or any Main View actor, so
 Main View's current display is left completely untouched either way.
-"Surface" still requires Main View to have built it first (staged rollout).
 """
 import numpy as np
 import pyvista as pv
@@ -47,16 +46,15 @@ def _section_half_width(app, view_idx, default=5.0):
 
 def _source_polydata(app, mode):
     """Return Main View's already-built mesh for `mode` if present (fast
-    path, zero extra cost). Only "shaded" currently falls back to an
-    independent build when Main View isn't in that mode -- "surface" still
-    requires Main View to have built it first (staged rollout)."""
+    path, zero extra cost); otherwise build an equivalent mesh independently
+    so the section works regardless of Main View's current display mode."""
     attr = "_shaded_mesh_polydata" if mode == "shaded" else "_surface_mesh_polydata"
     mesh = getattr(app, attr, None)
     if mesh is not None:
         return mesh
     if mode == "shaded":
         return _build_independent_shaded_mesh(app)
-    return None
+    return _build_independent_surface_mesh(app)
 
 
 def _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode):
@@ -171,6 +169,105 @@ def _build_independent_shaded_mesh(app):
     return mesh
 
 
+def _independent_surface_cache_key(app, xyz_all, global_idx, azimuth, angle, ambient, quality_mode):
+    try:
+        from gui.shading_display import _compute_xyz_hash
+        data_hash = _compute_xyz_hash(xyz_all[global_idx]) if len(global_idx) else None
+    except Exception:
+        data_hash = None
+    return (data_hash, int(global_idx.size), round(float(azimuth), 3),
+            round(float(angle), 3), round(float(ambient), 4), quality_mode)
+
+
+def _build_independent_surface_mesh(app):
+    """Build a Surface mesh independent of Main View's own display mode,
+    the same way _build_independent_shaded_mesh does for Shaded
+    Classification -- calls Main View's own pure, actor-free geometry
+    backend (gui/surface_mode.py's ``_compute_surface_geometry_backend``)
+    directly, never touching ``app.vtk_widget``/``app.display_mode``/any
+    Main View actor. Colors come straight from the backend's own result
+    (elevation-ramp + lighting), matching Main View's Surface exactly.
+    """
+    try:
+        from gui.surface_mode import (
+            _compute_surface_geometry_backend,
+            normalize_surface_quality,
+            _surface_quality_target,
+            _surface_z_bounds_cached,
+            _normalize_surface_ramp,
+            surface_visible_mask,
+        )
+    except Exception as exc:
+        print(f"   ⚠️ Section surface mesh: import failed ({exc})")
+        return None
+
+    data = getattr(app, "data", None)
+    if not isinstance(data, dict):
+        return None
+    xyz_all = data.get("xyz")
+    if xyz_all is None:
+        return None
+
+    try:
+        vis_mask = surface_visible_mask(app)
+    except Exception:
+        vis_mask = None
+    if vis_mask is None or len(vis_mask) != len(xyz_all):
+        vis_mask = np.ones(len(xyz_all), dtype=bool)
+    global_idx = np.flatnonzero(vis_mask)
+    if global_idx.size < 3:
+        return None
+
+    quality_mode = normalize_surface_quality(getattr(app, "surface_quality", "normal"))
+    precision = float(getattr(app, "surface_dedup_precision", 0.0) or 0.0)
+    target_max = _surface_quality_target(quality_mode, int(global_idx.size))
+    max_edge = float(getattr(app, "surface_max_edge", 0.0) or 0.0)
+    z_bounds = _surface_z_bounds_cached(app, xyz_all)
+    azimuth = float(getattr(app, "last_shade_azimuth", 45.0))
+    angle = float(getattr(app, "last_shade_angle", 45.0))
+    ambient = float(getattr(app, "shade_ambient", 0.22))
+    ramp = _normalize_surface_ramp(
+        getattr(app, "surface_color_ramp", None) or getattr(app, "elevation_color_ramp", None)
+    )
+
+    key = _independent_surface_cache_key(app, xyz_all, global_idx, azimuth, angle, ambient, quality_mode)
+    cached = getattr(app, "_section_independent_surface_cache", None)
+    if cached is not None and cached.get("key") == key:
+        return cached.get("mesh")
+
+    try:
+        res = _compute_surface_geometry_backend(
+            xyz_all, global_idx, precision, target_max, max_edge,
+            azimuth, angle, ambient, ramp, quality_mode=quality_mode, z_bounds=z_bounds,
+        )
+    except Exception as exc:
+        print(f"   ⚠️ Section surface mesh: independent build failed ({exc})")
+        return None
+
+    if res.get("empty", False):
+        return None
+
+    pts = np.asarray(res["points"], dtype=np.float64)
+    faces = np.asarray(res["faces"], dtype=np.int64)
+    colors = np.asarray(res["colors"], dtype=np.uint8)
+    if len(faces) == 0:
+        return None
+
+    fv = np.empty((len(faces), 4), dtype=np.int64)
+    fv[:, 0] = 3
+    fv[:, 1:] = faces
+    mesh = pv.PolyData(pts, fv.ravel())
+    if len(colors) == len(faces):
+        mesh.cell_data["RGB"] = colors
+    elif len(colors) == len(pts):
+        mesh.point_data["RGB"] = colors
+
+    app._section_independent_surface_cache = {"key": key, "mesh": mesh}
+    print(f"   🔨 Section: built independent surface mesh "
+          f"({len(pts):,} verts, {len(faces):,} faces, quality={quality_mode})")
+    return mesh
+
+
 def _mesh_faces_n3(mesh):
     faces = getattr(mesh, "regular_faces", None)
     if faces is not None and len(faces):
@@ -248,12 +345,9 @@ def build_section_shaded_surface_actor(app, view_idx, mode) -> bool:
 
     source_mesh = _source_polydata(app, mode)
     if source_mesh is None:
-        if mode == "shaded":
-            print(f"   ⚠️ Section {view_idx+1}: could not build a Shaded Classification "
-                  f"mesh (no point cloud loaded, or no classes currently visible)")
-        else:
-            print(f"   ⚠️ Section {view_idx+1}: Main View has no Surface mesh built yet — "
-                  f"enable Surface in Main View first")
+        label = "Shaded Classification" if mode == "shaded" else "Surface"
+        print(f"   ⚠️ Section {view_idx+1}: could not build a {label} mesh "
+              f"(no point cloud loaded, or no classes currently visible)")
         return False
 
     half_width = _section_half_width(app, view_idx)
@@ -273,13 +367,19 @@ def build_section_shaded_surface_actor(app, view_idx, mode) -> bool:
     elif cell_rgb is not None:
         profile.cell_data["RGB"] = cell_rgb
 
-    actor_name = _profile_actor_name(view_idx, mode)
-    try:
-        if hasattr(vtk_widget, "actors") and actor_name in vtk_widget.actors:
-            vtk_widget.remove_actor(actor_name, render=False)
-    except Exception:
-        pass
+    # Remove BOTH modes' profile actors first -- only one of Shaded/Surface
+    # should ever be visible at once. Removing just the same-name actor
+    # left the previous mode's actor behind when switching Surface<->Shaded,
+    # showing both overlapping at the same time.
+    for other_mode in ("shaded", "surface"):
+        other_name = _profile_actor_name(view_idx, other_mode)
+        try:
+            if hasattr(vtk_widget, "actors") and other_name in vtk_widget.actors:
+                vtk_widget.remove_actor(other_name, render=False)
+        except Exception:
+            pass
 
+    actor_name = _profile_actor_name(view_idx, mode)
     has_rgb = point_rgb is not None or cell_rgb is not None
     new_actor = vtk_widget.add_mesh(
         profile,
