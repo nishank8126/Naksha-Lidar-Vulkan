@@ -7108,7 +7108,21 @@ def fast_cross_section_update(
 
     n_changed = int(changed_idx.size)
 
-    if n_changed > 0:
+    # Only repaint with classification-palette colors when this section is
+    # actually showing Class/Shaded Classification -- mirrors Main View's
+    # own guard in fast_classify_update ("Only update slot-0 RGB/class
+    # buffers when main view is in class/shaded_class"). Without this,
+    # reclassifying points always overwrote a section's RGB buffer with
+    # classification colors regardless of its active mode, silently
+    # reverting Line/Depth/RGB/Intensity/Elevation back to Class colors
+    # after any classify action -- Main View never had this problem
+    # because it already had this exact check.
+    dlg_for_mode = getattr(app, 'display_mode_dialog', None)
+    _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
+    section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
+    section_is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+
+    if n_changed > 0 and section_is_class_like:
         if changed_idx.max(initial=-1) >= len(rgb_ptr):
             keep = changed_idx < len(rgb_ptr)
             changed_idx = changed_idx[keep]
@@ -7311,9 +7325,24 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
         if local_indices.size == 0:
             return
 
-    # Guard slot-0 RGB/class-buffer patching when main view is not class/shaded_class.
-    display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-    if slot_idx > 0 or display_mode in ("class", "shaded_class"):
+    # Guard RGB/class-buffer patching when the target view isn't showing
+    # Class/Shaded Classification. Previously this only checked Main View's
+    # own display_mode (`slot_idx > 0 or ...` let every section through
+    # unconditionally) -- so undo and partial-classify updates always
+    # repainted a section's RGB buffer with classification colors even
+    # while that section was showing Line/Depth/RGB/Intensity/Elevation,
+    # silently reverting those modes back to Class colors. Now checks each
+    # section's own remembered mode (dlg.view_color_modes[slot_idx]), same
+    # source of truth used everywhere else this session.
+    if slot_idx == 0:
+        display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+        is_class_like = display_mode in ("class", "shaded_class")
+    else:
+        dlg_for_mode = getattr(app, 'display_mode_dialog', None)
+        _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
+        section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
+        is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    if is_class_like:
         if hasattr(actor, "_naksha_section_class"):
             actor._naksha_section_class[local_indices] = reverted_cls
 
