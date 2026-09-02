@@ -1460,8 +1460,37 @@ class GlobalShortcutFilter(QObject):
                                             _state_ok = False
                                             break
                             elif _state_ok and target_view != 0:
+                                # Same gap as the target_view == 0 branch above
+                                # used to have: verify the section's own
+                                # CURRENTLY APPLIED mode still matches this
+                                # shortcut's mode, not just class visibility/
+                                # weights. Without this, manually switching
+                                # that section's mode via the Display Mode
+                                # dialog (or a different shortcut) and then
+                                # re-pressing THIS shortcut could see
+                                # unchanged classes/weights, wrongly treat it
+                                # as "already applied", and skip -- leaving
+                                # the section stuck on the wrong mode.
+                                _dlg_for_check = getattr(
+                                    self.app_window, 'display_mode_dialog', None
+                                )
+                                _view_modes = getattr(
+                                    _dlg_for_check, 'view_color_modes', {}
+                                ) if _dlg_for_check else {}
+                                _MODE_TO_IDX_CHECK = {
+                                    'class': 0, 'shaded_class': 1,
+                                    'depth': 2, 'intensity': 3,
+                                    'rgb': 4, 'elevation': 5,
+                                    'surface': 6, 'line': 7,
+                                }
+                                if _view_modes.get(target_view, 0) != \
+                                        _MODE_TO_IDX_CHECK.get(target_display_mode, 0):
+                                    _state_ok = False
+
                                 _vp = getattr(self.app_window, 'view_palettes', {}).get(target_view)
-                                if not _vp:
+                                if not _state_ok:
+                                    pass
+                                elif not _vp:
                                     _state_ok = False
                                 else:
                                     view_key = str(target_view) if str(target_view) in views \
