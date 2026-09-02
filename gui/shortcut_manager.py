@@ -1869,7 +1869,19 @@ class ClassVisibilityPicker(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # ── controls row ─────────────────────────────────────────────
+        # ── controls card ────────────────────────────────────────────
+        # Matches the live Display Mode dialog's own rounded/bordered
+        # "displayControlsCard" container (gui/display_mode.py ~1057-1061)
+        # -- previously these rows sat directly on the dialog background
+        # with no card, so even with matching per-widget object names the
+        # overall look didn't match the live dialog's grouped, pill-style
+        # control bar.
+        controls_card = QFrame()
+        controls_card.setObjectName("displayControlsCard")
+        controls_card_layout = QVBoxLayout(controls_card)
+        controls_card_layout.setContentsMargins(10, 8, 10, 8)
+        controls_card_layout.setSpacing(8)
+
         controls_row = QHBoxLayout()
         controls_row.setSpacing(10)
 
@@ -1960,7 +1972,7 @@ class ClassVisibilityPicker(QDialog):
         controls_row.addWidget(self.border_setting_btn)
         
         controls_row.addStretch()
-        layout.addLayout(controls_row)
+        controls_card_layout.addLayout(controls_row)
 
         # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
         # Classification and Surface, matching the live Display Mode
@@ -1984,7 +1996,7 @@ class ClassVisibilityPicker(QDialog):
         self.shading_quality_selector.setCurrentIndex(1)
         quality_row.addWidget(self.shading_quality_selector)
         quality_row.addStretch()
-        layout.addLayout(quality_row)
+        controls_card_layout.addLayout(quality_row)
 
         def _sync_quality_visibility():
             _mode = str(self.display_mode_selector.currentData() or "class")
@@ -2011,7 +2023,8 @@ class ClassVisibilityPicker(QDialog):
         self.lines_button.clicked.connect(self._open_line_selection)
         lines_row.addWidget(self.lines_button)
         lines_row.addStretch()
-        layout.addLayout(lines_row)
+        controls_card_layout.addLayout(lines_row)
+        layout.addWidget(controls_card)
 
         def _sync_lines_visibility():
             _mode = str(self.display_mode_selector.currentData() or "class")
@@ -2026,9 +2039,20 @@ class ClassVisibilityPicker(QDialog):
         table_note.setObjectName("dialogInlineNote")
         layout.addWidget(table_note)
 
-        # ── table + buttons ───────────────────────────────────────────
-        table_and_btns = QHBoxLayout()
-        table_and_btns.setSpacing(8)
+        # ── table card ───────────────────────────────────────────────
+        # Matches the live Display Mode dialog's own "displayTableCard"
+        # container: table on top, a horizontal row of action buttons
+        # ("displayActionRail") below it -- previously this picker put the
+        # buttons in a vertical column beside the table instead, so even
+        # with matching per-button object names the overall arrangement
+        # didn't line up with the live dialog's look. Same 3 buttons
+        # (Refresh/Select All/Clear All), same click handlers -- only the
+        # container/arrangement changes.
+        table_card = QFrame()
+        table_card.setObjectName("displayTableCard")
+        table_card_layout = QVBoxLayout(table_card)
+        table_card_layout.setContentsMargins(12, 12, 12, 12)
+        table_card_layout.setSpacing(12)
 
         self.class_table = QTableWidget(0, 6)
         self.class_table.setObjectName("displayClassTable")
@@ -2061,28 +2085,28 @@ class ClassVisibilityPicker(QDialog):
         print(f"✅ Column widths restored: {widths}")
 
         hdr.sectionResized.connect(self._on_column_resized)
-        table_and_btns.addWidget(self.class_table, stretch=1)
+        table_card_layout.addWidget(self.class_table, stretch=1)
 
-        # ── action buttons ────────────────────────────────────────────
-        action_col = QVBoxLayout()
-        action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(6)
+        # ── action buttons (horizontal rail below the table, matching the
+        #    live dialog's displayActionRail) ──────────────────────────
+        action_rail = QFrame()
+        action_rail.setObjectName("displayActionRail")
+        action_row = QHBoxLayout(action_rail)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(8)
 
         self.refresh_btn    = QPushButton("Refresh")
         self.select_all_btn = QPushButton("Select All")
         self.clear_all_btn  = QPushButton("Clear All")
         for btn in (self.refresh_btn, self.select_all_btn, self.clear_all_btn):
             btn.setObjectName("displayActionButton")
-            btn.setMinimumHeight(30)
-            btn.setFixedWidth(80)
             btn.setAutoDefault(False)
             btn.setDefault(False)
             btn.setFocusPolicy(Qt.NoFocus)
-            action_col.addWidget(btn)
-        action_col.addStretch()
-        table_and_btns.addLayout(action_col)
+            action_row.addWidget(btn, stretch=1)
+        table_card_layout.addWidget(action_rail)
 
-        layout.addLayout(table_and_btns, stretch=1)
+        layout.addWidget(table_card, stretch=1)
 
         # ── OK / Cancel ───────────────────────────────────────────────
         btn_layout = QHBoxLayout()
