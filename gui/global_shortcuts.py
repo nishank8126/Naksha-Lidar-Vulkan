@@ -1442,12 +1442,16 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     # STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
                     # ============================================================
-                    # Identity includes target_display_mode/target_view, not just
-                    # the key combo -- otherwise editing an already-"last applied"
-                    # shortcut's mode (e.g. Class -> Depth) and pressing the same
-                    # key again matched the old identity and was skipped as a
-                    # no-op, silently keeping the stale mode applied.
-                    _current_shortcut_id = (combo, target_display_mode, target_view)
+                    # Identity includes target_display_mode/target_view/
+                    # target_quality_mode, not just the key combo -- otherwise
+                    # editing an already-"last applied" shortcut's mode (e.g.
+                    # Class -> Depth) OR its Speed (e.g. Normal -> Fast, same
+                    # mode) and pressing the same key again matched the old
+                    # identity and was skipped as a no-op, silently keeping
+                    # the stale mode/quality applied.
+                    _current_shortcut_id = (
+                        combo, target_display_mode, target_view, target_quality_mode
+                    )
                     _last_applied_id = getattr(
                         self.app_window, '_last_display_shortcut_id', None
                     )
@@ -1933,6 +1937,25 @@ class GlobalShortcutFilter(QObject):
                         if not hasattr(dlg, 'view_color_modes'):
                             dlg.view_color_modes = {}
                         dlg.view_color_modes[target_view] = _combo_idx
+
+                        # Same gap, one more control: the live dialog's own
+                        # "Speed" combo (dlg.shading_quality) wasn't synced
+                        # either, so opening Display Mode after a
+                        # shortcut-applied Shaded/Surface with a different
+                        # quality than whatever the combo last showed would
+                        # display a stale Speed value.
+                        if hasattr(dlg, 'shading_quality'):
+                            _quality_idx = dlg.shading_quality.findData(
+                                target_quality_mode
+                            )
+                            if _quality_idx >= 0:
+                                dlg.shading_quality.blockSignals(True)
+                                dlg.shading_quality.setCurrentIndex(_quality_idx)
+                                dlg.shading_quality.blockSignals(False)
+                                if target_display_mode == "shaded_class":
+                                    dlg._shading_quality_value = target_quality_mode
+                                elif target_display_mode == "surface":
+                                    dlg._surface_quality_value = target_quality_mode
 
                     # ============================================================
                     # STEP 4B: Sync class_palette — Main View only
