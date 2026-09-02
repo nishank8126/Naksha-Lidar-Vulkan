@@ -2144,6 +2144,7 @@ class GlobalShortcutFilter(QObject):
                                 _SECTION_WEIGHT_MODE = {
                                     "depth": "depth", "intensity": "intensity",
                                     "rgb": "rgb", "elevation": "elevation",
+                                    "line": "line",
                                 }
                                 if target_display_mode in ("shaded_class", "surface"):
                                     from gui.cross_section.section_shaded_surface import \

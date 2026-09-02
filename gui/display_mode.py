@@ -1577,9 +1577,9 @@ class DisplayModeDialog(QDialog):
             self._quality_mode_context = mode_idx
 
             # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
-            # Surface(6) are wired up for cross-section views (View 1-4). Cut Section
-            # (slot 5) keeps its original classification-only restriction.
-            _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6)
+            # Surface(6) / Line(7) are wired up for cross-section views (View 1-4).
+            # Cut Section (slot 5) keeps its original classification-only restriction.
+            _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
             if self.current_slot == 5 and self.color_mode.currentIndex() != 0:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
@@ -1750,9 +1750,9 @@ class DisplayModeDialog(QDialog):
 
         # Restore this slot's own remembered color mode.
         #   Slot 0 (Main View): any mode.
-        #   Slots 1-4 (cross-sections): Class/Shaded/Depth/Intensity/RGB/Elevation/Surface.
+        #   Slots 1-4 (cross-sections): Class/Shaded/Depth/Intensity/RGB/Elevation/Surface/Line.
         #   Slot 5 (Cut Section): classification-only, unchanged.
-        _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6)
+        _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
         restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
             self.color_mode.setEnabled(True)
@@ -2967,7 +2967,7 @@ class DisplayModeDialog(QDialog):
                     remove_section_shaded_surface_actor,
                 )
                 remove_section_shaded_surface_actor(app, view_idx)
-                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation", 7: "line"}
                 section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
                 ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
                 if ok:

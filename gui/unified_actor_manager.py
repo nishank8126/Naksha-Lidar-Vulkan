@@ -4141,6 +4141,69 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
                     color_scheme=getattr(app, "depth_color_scheme", "grayscale"),
                     gamma=getattr(app, "depth_gamma", 1.0),
                 )
+        elif mode == "line":
+            # Same LUT-by-Point-Source-ID coloring as Main View's own Line
+            # mode (gui/app_window.py set_display_mode, mode == "line") --
+            # reuses (and, if absent, builds) the exact same cached LUT
+            # (app._line_mode_rgb_lut), a pure function of
+            # app.flight_line_colors, so sections match Main View's Line
+            # coloring exactly and repeat calls for either view are free.
+            source_ids = data.get("point_source_id")
+            if source_ids is not None and len(source_ids) == len(data.get("xyz", [])):
+                line_colors = dict(getattr(app, "flight_line_colors", {}) or {})
+                try:
+                    line_color_sig = tuple(sorted(
+                        (int(raw_id), tuple(int(c) for c in color[:3]))
+                        for raw_id, color in line_colors.items()
+                    ))
+                except Exception:
+                    line_color_sig = tuple()
+
+                line_lut = getattr(app, "_line_mode_rgb_lut", None)
+                if (
+                    not isinstance(line_lut, np.ndarray)
+                    or line_lut.shape != (65536, 3)
+                    or line_lut.dtype != np.uint8
+                    or getattr(app, "_line_mode_rgb_lut_sig", None) != line_color_sig
+                ):
+                    ids = np.arange(65536, dtype=np.uint32)
+                    line_lut = np.empty((65536, 3), dtype=np.uint8)
+                    line_lut[:, 0] = ((ids * 67 + 53) & 255).astype(np.uint8)
+                    line_lut[:, 1] = ((ids * 131 + 97) & 255).astype(np.uint8)
+                    line_lut[:, 2] = ((ids * 193 + 181) & 255).astype(np.uint8)
+                    for raw_line_id, color in line_colors.items():
+                        try:
+                            line_id = int(raw_line_id)
+                            if 0 <= line_id <= 65535:
+                                line_lut[line_id] = tuple(int(c) for c in color[:3])
+                        except Exception:
+                            continue
+                    app._line_mode_rgb_lut = line_lut
+                    app._line_mode_rgb_lut_sig = line_color_sig
+
+                vis_lines = np.asarray(source_ids[global_indices])
+                line_ids = np.asarray(vis_lines, dtype=np.intp)
+                if (
+                    line_ids.size == len(rgb_ptr)
+                    and (line_ids.size == 0 or (line_ids.min() >= 0 and line_ids.max() <= 65535))
+                ):
+                    colors = np.take(line_lut, line_ids, axis=0)
+                else:
+                    unique_lines, inverse = np.unique(vis_lines, return_inverse=True)
+                    compact_lut = np.empty((len(unique_lines), 3), dtype=np.uint8)
+                    for lut_idx, raw_line_id in enumerate(unique_lines):
+                        line_id = int(raw_line_id)
+                        compact_lut[lut_idx] = line_colors.get(
+                            line_id,
+                            (
+                                (line_id * 67 + 53) % 256,
+                                (line_id * 131 + 97) % 256,
+                                (line_id * 193 + 181) % 256,
+                            ),
+                        )
+                    colors = compact_lut[inverse]
+            else:
+                print("   ℹ️ Section: no Point Source ID data — showing flat gray, same as Main View")
     except Exception as e:
         print(f"   ⚠️ Section recolor ({mode}) failed: {e}")
         return False
@@ -5115,7 +5178,7 @@ def refresh_section_after_weight_change(
 ) -> bool:
     slot_idx = view_idx + 1
     palette  = palette or _get_slot_palette(app, slot_idx)
-    non_class_mode = mode in ("rgb", "intensity", "elevation", "depth")
+    non_class_mode = mode in ("rgb", "intensity", "elevation", "depth", "line")
 
     if hasattr(app, 'view_borders') and slot_idx in app.view_borders:
         border_percent = float(app.view_borders[slot_idx])

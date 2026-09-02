@@ -2657,7 +2657,7 @@ class SectionController:
                         if reapplied:
                             print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {_mesh_mode} (mesh cut)")
                     else:
-                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation", 7: "line"}
                         remembered_mode = _SECTION_MODE_BY_IDX.get(_reapply_idx)
                         if remembered_mode:
                             _reapply_border = float(
