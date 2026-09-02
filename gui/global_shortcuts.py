@@ -226,7 +226,8 @@ class GlobalShortcutFilter(QObject):
             if focus_widget is None:
                 # Dialog visible but nothing focused inside it — keep shortcuts
                 # suppressed so typed class names can't trigger viewport tools.
-                return True
+                # A visible non-modal dialog is not a shortcut suspension state.
+                return False
 
             if isinstance(focus_widget, QLineEdit):
                 try:
@@ -235,8 +236,8 @@ class GlobalShortcutFilter(QObject):
                 except Exception:
                     return True
 
-            if dm_dlg.isAncestorOf(focus_widget):
-                return True
+            # Non-text Display Mode controls must not disable global shortcuts.
+            return False
         except Exception:
             return False
 

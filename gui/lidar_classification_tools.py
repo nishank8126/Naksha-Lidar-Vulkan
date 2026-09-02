@@ -2602,7 +2602,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
                         fence_mask=None, search_mode="groups",
                         max_count=6, more_than=0.50, within=5.0,
                         progress_cb=None, abort_check=None,
-                        batch_size=10_000):
+                        batch_size=10_000, use_gpu=None):
     """
     Classify source points/groups that form the lowest local elevation tier.
 
@@ -2707,6 +2707,43 @@ def classify_low_points(xyz, classification, from_classes, to_class,
             "stop_reason": "fewer than 2 source points",
         }
 
+    if use_gpu is not False:
+        try:
+            from gui.gpu_neighborhood_classification import cuda_low_point_tiers
+            gpu_result = cuda_low_point_tiers(
+                xyz=xyz, candidate_idx=candidate_idx, source_idx=source_idx,
+                candidate_allowed=cand_mask, radius=radius, separation=dz,
+                group_limit=group_limit, mode=mode,
+                batch_size=chunk, abort_check=abort_check,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            print(f"[LowPts GPU] {exc}; using CPU KD-tree", flush=True)
+            gpu_result = None
+        if gpu_result is not None:
+            detected = np.asarray(gpu_result["detected"], dtype=np.intp)
+            flagged = detected[classification[detected] != int(to_class)]
+            classification[flagged] = to_class
+            evaluated = int(gpu_result["evaluated"])
+            no_surrounding = int(gpu_result["no_surrounding"])
+            aborted = bool(gpu_result["aborted"])
+            _log(100, f"Done - {len(flagged):,} low points -> class {to_class} "
+                      f"[CUDA {gpu_result['seconds']:.2f}s]")
+            return {
+                "routine": "low_points", "changed": int(len(flagged)),
+                "indices": flagged, "low_candidates": int(len(candidate_idx)),
+                "evaluated_with_surrounding": evaluated,
+                "low_accepted": int(len(flagged)),
+                "low_detected": int(len(detected)),
+                "rejected_no_surrounding": no_surrounding,
+                "rejected_not_low": int(max(0, evaluated - len(detected))),
+                "search_mode": mode, "max_count": group_limit,
+                "more_than": dz, "within": radius,
+                "stop_reason": "aborted" if aborted else "completed one lowest-tier pass",
+                "compute_backend": gpu_result["backend"],
+                "gpu_seconds": float(gpu_result["seconds"]),
+                "gpu_batch_size": int(gpu_result["batch_size"]),
+            }
     _log(5, f"Building 2D source KD-tree ({len(source_idx):,} pts) …")
     t0 = _t.time()
     tree = cKDTree(xyz[source_idx, :2])
@@ -2849,6 +2886,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
         "more_than": dz,
         "within": radius,
         "stop_reason": stop_reason,
+        "compute_backend": "cpu_kdtree",
     }
 
 
@@ -2863,7 +2901,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
                              height_from_ground=None,
                              ground_classes=None,
                              progress_cb=None, abort_check=None,
-                             batch_size=500_000):
+                             batch_size=500_000, use_gpu=None):
     """
     Classify points with fewer than the requested other points in a 3D sphere.
 
@@ -2998,6 +3036,38 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             detected_count=len(detected),
         )
 
+    if use_gpu is not False:
+        try:
+            from gui.gpu_neighborhood_classification import cuda_radius_counts
+            gpu_result = cuda_radius_counts(
+                xyz=xyz, candidate_idx=candidate_idx, reference_idx=in_idx,
+                dimensions=3, candidate_is_reference=in_mask, radius=radius,
+                batch_size=chunk, abort_check=abort_check,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            print(f"[Isolated GPU] {exc}; using CPU KD-tree", flush=True)
+            gpu_result = None
+        if gpu_result is not None:
+            all_counts = np.asarray(gpu_result["counts"], dtype=np.intp)
+            processed = int(gpu_result["processed"])
+            detected = candidate_idx[:processed][all_counts < limit]
+            detected = detected.astype(np.intp, copy=False)
+            flagged = detected[classification[detected] != int(to_class)]
+            classification[flagged] = to_class
+            aborted = bool(gpu_result["aborted"])
+            stop_reason = "aborted" if aborted else "completed one 3D count pass"
+            if progress_cb:
+                progress_cb(100, f"Done - {len(flagged):,} pts -> class {to_class} "
+                                  f"[CUDA {gpu_result['seconds']:.2f}s]")
+            result = _result(flagged, all_counts, stop_reason,
+                             detected_count=len(detected))
+            result.update({
+                "compute_backend": gpu_result["backend"],
+                "gpu_seconds": float(gpu_result["seconds"]),
+                "gpu_batch_size": int(gpu_result["batch_size"]),
+            })
+            return result
     if progress_cb:
         progress_cb(
             5,
@@ -3046,12 +3116,14 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
     stop_reason = "aborted" if aborted else "completed one 3D count pass"
     if progress_cb:
         progress_cb(100, f"Done - {len(flagged):,} pts -> class {to_class}")
-    return _result(
+    result = _result(
         flagged,
         all_counts,
         stop_reason,
         detected_count=len(detected),
     )
+    result["compute_backend"] = "cpu_kdtree"
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -2967,16 +2967,6 @@ class SectionController:
         from gui.unified_actor_manager import build_section_unified_actor
         build_section_unified_actor(self.app, view_idx, view=view)
 
-        # [CS-MESH-DISPLAY] section geometry reapply
-        try:
-            from .section_mesh_display import reapply_section_mesh_mode_after_geometry
-            reapply_section_mesh_mode_after_geometry(self.app, view_idx)
-        except Exception as _cs_mesh_reapply_err:
-            print(
-                f"SECTION_MESH view={view_idx + 1} status=geometry_reapply_failed "
-                f"reason={_cs_mesh_reapply_err}"
-            )
-
     # Other methods remain unchanged...
 
     # ---------------- DOCK ---------------

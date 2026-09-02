@@ -1546,7 +1546,7 @@ class DisplayModeDialog(QDialog):
             # (slot 5) stays classification-only, unchanged.
             self.color_mode.setEnabled(self.current_slot in (0, 1, 2, 3, 4))
             mode_idx = int(self.color_mode.currentIndex())
-            mesh_speed_visible = self.current_slot in (0, 1, 2, 3, 4) and mode_idx in (1, 6)
+            mesh_speed_visible = self.current_slot == 0 and mode_idx in (1, 6)
 
             if hasattr(self, "shading_quality_label"):
                 self.shading_quality_label.setVisible(mesh_speed_visible)
@@ -2696,33 +2696,12 @@ class DisplayModeDialog(QDialog):
 
         if self.current_slot == 0:
             app.class_palette = clone_palette(class_map)
-
-            # ============================================================
-            # ACTIVE PTC FOR AI
-            # ============================================================
-            # Opening/loading a PTC does NOT activate it for AI.
-            # Only clicking Display Mode -> Apply activates the PTC.
-            if self.current_ptc_path:
-                app.active_ptc_schema = clone_palette(class_map)
-                app.active_ptc_path = str(self.current_ptc_path)
-
-                print(
-                    f"[PTC] AI schema activated by Apply: "
-                    f"{app.active_ptc_path} "
-                    f"({len(app.active_ptc_schema)} classes)",
-                    flush=True,
-                )
-
             if is_class_mode:
-                app._main_view_borders_active = (
-                    self.view_borders.get(0, 0) > 0
-                )
-                app.point_border_percent = float(
-                    self.view_borders.get(0, 0)
-                )
+                app._main_view_borders_active = (self.view_borders.get(0, 0) > 0)
+                app.point_border_percent = float(self.view_borders.get(0, 0))
             else:
                 app._main_view_borders_active = False
-                app.point_border_percent = 0
+                app.point_border_percent      = 0
 
         # â”€â”€ Track that this slot was explicitly Applied by the user â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if not hasattr(app, '_slot_weights_applied'):
@@ -2907,45 +2886,9 @@ class DisplayModeDialog(QDialog):
                             print(f"   âœ… Border {border}% applied after rebuild")
                 fast_path_handled = True
 
-        # [CS-MESH-DISPLAY] display-mode apply
-        elif self.current_slot in (1, 2, 3, 4) and idx in (1, 6):
-            view_idx = self.current_slot - 1
-            target_mode = "shaded_class" if idx == 1 else "surface"
-            try:
-                from gui.cross_section.section_mesh_display import apply_section_display_mode
-                ok = apply_section_display_mode(
-                    app,
-                    view_idx,
-                    target_mode,
-                    quality_mode=quality_mode,
-                    palette=class_map,
-                    force=False,
-                    reason="display_mode_apply",
-                )
-                fast_path_handled = bool(ok)
-                if not ok:
-                    print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_failed")
-            except Exception as _cs_mesh_err:
-                print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_exception reason={_cs_mesh_err}")
-                import traceback as _traceback
-                _traceback.print_exc()
-
         elif self.current_slot >= 1:
             if self.current_slot <= 4:
                 view_idx = self.current_slot - 1
-                # [CS-MESH-DISPLAY] leave mesh before existing section renderer
-                try:
-                    from gui.cross_section.section_mesh_display import leave_section_mesh_mode
-                    _section_mode_map = {
-                        0: "class", 2: "depth", 3: "intensity", 4: "rgb",
-                        5: "elevation", 7: "line",
-                    }
-                    _next_section_mode = _section_mode_map.get(idx, "class")
-                    leave_section_mesh_mode(
-                        app, view_idx, next_mode=_next_section_mode, render=False
-                    )
-                except Exception as _cs_leave_err:
-                    print(f"SECTION_MESH view={view_idx + 1} status=leave_failed reason={_cs_leave_err}")
                 border   = float(self.view_borders.get(self.current_slot, 0))
                 _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
                 section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")

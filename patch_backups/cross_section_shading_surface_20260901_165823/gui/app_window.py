@@ -17678,24 +17678,6 @@ class NakshaApp(QMainWindow):
 
             if hasattr(self, 'section_vtks') and self.section_vtks:
                 for view_idx in self.section_vtks.keys():
-
-                    # [CS-MESH-DISPLAY] classification dispatcher
-                    try:
-                        from gui.cross_section.section_mesh_display import (
-                            refresh_section_display_after_classification,
-                        )
-                        if refresh_section_display_after_classification(
-                            self,
-                            view_idx,
-                            changed_mask,
-                            operation=str(getattr(self, "_classification_refresh_operation", "classification") or "classification"),
-                        ):
-                            continue
-                    except Exception as _cs_mesh_refresh_err:
-                        print(
-                            f"SECTION_MESH view={view_idx + 1} status=classification_refresh_failed "
-                            f"reason={_cs_mesh_refresh_err}"
-                        )
                     if (changed_mask is not None
                             and isinstance(changed_mask, np.ndarray)
                             and changed_mask.dtype == bool):
