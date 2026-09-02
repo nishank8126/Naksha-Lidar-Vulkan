@@ -1895,6 +1895,7 @@ class ClassVisibilityPicker(QDialog):
             ("RGB", "rgb"),
             ("Elevation", "elevation"),
             ("Surface", "surface"),
+            ("Line", "line"),
         ):
             self.display_mode_selector.addItem(label, mode_key)
         live_mode = str(
@@ -1905,6 +1906,34 @@ class ClassVisibilityPicker(QDialog):
             live_mode_idx if live_mode_idx >= 0 else 0
         )
         controls_row.addWidget(self.display_mode_selector)
+
+        # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
+        # Classification and Surface, matching the live Display Mode
+        # dialog's own "Speed" control (gui/display_mode.py:1095-1123).
+        # Previously the shortcut editor had no way to set this at all, so
+        # a Shaded/Surface shortcut always used whatever quality happened
+        # to be the current global setting rather than one saved with the
+        # shortcut itself.
+        self.shading_quality_label = QLabel("Speed")
+        controls_row.addWidget(self.shading_quality_label)
+        self.shading_quality_selector = QComboBox()
+        self.shading_quality_selector.setMinimumWidth(120)
+        self.shading_quality_selector.addItem("Fast", "fast")
+        self.shading_quality_selector.addItem("Normal", "normal")
+        self.shading_quality_selector.addItem("Slow – all points", "slow")
+        self.shading_quality_selector.setCurrentIndex(1)
+        controls_row.addWidget(self.shading_quality_selector)
+
+        def _sync_quality_visibility():
+            _mode = str(self.display_mode_selector.currentData() or "class")
+            _visible = _mode in ("shaded_class", "surface")
+            self.shading_quality_label.setVisible(_visible)
+            self.shading_quality_selector.setVisible(_visible)
+
+        self.display_mode_selector.currentIndexChanged.connect(
+            lambda _idx: _sync_quality_visibility()
+        )
+        _sync_quality_visibility()
 
         controls_row.addSpacing(12)
         controls_row.addWidget(QLabel("Border %:"))
@@ -2485,6 +2514,10 @@ class ClassVisibilityPicker(QDialog):
             "display_mode": (
                 str(self.display_mode_selector.currentData() or "class")
                 if hasattr(self, "display_mode_selector") else "class"
+            ),
+            "quality_mode": (
+                str(self.shading_quality_selector.currentData() or "normal")
+                if hasattr(self, "shading_quality_selector") else "normal"
             ),
             "border_percent": self.border_spin.value() if hasattr(self, 'border_spin') else 0,
             "border_type": self.get_border_logic_mode(),
@@ -4032,6 +4065,14 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
+                if hasattr(picker, "shading_quality_selector"):
+                    preset_quality = str(
+                        existing_preset.get("quality_mode", "normal") or "normal"
+                    )
+                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
+                    picker.shading_quality_selector.setCurrentIndex(
+                        quality_idx if quality_idx >= 0 else 1
+                    )
                 picker.set_border_logic_mode(border_type)
                 picker.view_selector.blockSignals(True)
                 picker.view_selector.setCurrentIndex(first_view_idx)
@@ -4060,6 +4101,14 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
+                if hasattr(picker, "shading_quality_selector"):
+                    preset_quality = str(
+                        existing_preset.get("quality_mode", "normal") or "normal"
+                    )
+                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
+                    picker.shading_quality_selector.setCurrentIndex(
+                        quality_idx if quality_idx >= 0 else 1
+                    )
                 picker.set_border_logic_mode(border_type)
                 print(f"📋 Preset has no views configured")
                 picker._populate_classes()
@@ -4107,6 +4156,7 @@ class ShortcutManager(QWidget):
 
             preset = {
                 "display_mode": all_configs.get("display_mode", "class"),
+                "quality_mode": all_configs.get("quality_mode", "normal"),
                 "border_percent": border_percent,
                 "border_type": border_type,
                 "views": {view_idx: view_classes},

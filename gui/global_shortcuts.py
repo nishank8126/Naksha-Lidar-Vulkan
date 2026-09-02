@@ -1415,9 +1415,29 @@ class GlobalShortcutFilter(QObject):
                     target_display_mode = str(
                         preset.get("display_mode", "class") or "class"
                     ).lower()
-                    
+                    target_quality_mode = str(
+                        preset.get("quality_mode", "normal") or "normal"
+                    ).lower()
+                    if target_quality_mode not in ("fast", "normal", "slow"):
+                        target_quality_mode = "normal"
+
+                    # Shaded Classification / Surface both read their quality
+                    # (Fast/Normal/Slow) from a global app attribute -- the
+                    # same one the live Display Mode dialog's own "Speed"
+                    # combo writes to (gui/display_mode.py:2681-2686). Set it
+                    # from THIS shortcut's own saved quality before applying,
+                    # so a shortcut with a different Speed than whatever was
+                    # last used actually takes effect (previously the
+                    # shortcut editor had no quality control at all, so this
+                    # was always whatever the global setting happened to be).
+                    if target_display_mode == "shaded_class":
+                        self.app_window.shading_quality = target_quality_mode
+                    elif target_display_mode == "surface":
+                        self.app_window.surface_quality = target_quality_mode
+
                     target_view = int(list(views.keys())[0]) if views else 0
-                    print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
+                    print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view} "
+                        f"mode={target_display_mode} quality={target_quality_mode}")
 
                     # ============================================================
                     # STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
