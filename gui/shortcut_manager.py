@@ -1907,34 +1907,6 @@ class ClassVisibilityPicker(QDialog):
         )
         controls_row.addWidget(self.display_mode_selector)
 
-        # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
-        # Classification and Surface, matching the live Display Mode
-        # dialog's own "Speed" control (gui/display_mode.py:1095-1123).
-        # Previously the shortcut editor had no way to set this at all, so
-        # a Shaded/Surface shortcut always used whatever quality happened
-        # to be the current global setting rather than one saved with the
-        # shortcut itself.
-        self.shading_quality_label = QLabel("Speed")
-        controls_row.addWidget(self.shading_quality_label)
-        self.shading_quality_selector = QComboBox()
-        self.shading_quality_selector.setMinimumWidth(120)
-        self.shading_quality_selector.addItem("Fast", "fast")
-        self.shading_quality_selector.addItem("Normal", "normal")
-        self.shading_quality_selector.addItem("Slow – all points", "slow")
-        self.shading_quality_selector.setCurrentIndex(1)
-        controls_row.addWidget(self.shading_quality_selector)
-
-        def _sync_quality_visibility():
-            _mode = str(self.display_mode_selector.currentData() or "class")
-            _visible = _mode in ("shaded_class", "surface")
-            self.shading_quality_label.setVisible(_visible)
-            self.shading_quality_selector.setVisible(_visible)
-
-        self.display_mode_selector.currentIndexChanged.connect(
-            lambda _idx: _sync_quality_visibility()
-        )
-        _sync_quality_visibility()
-
         controls_row.addSpacing(12)
         controls_row.addWidget(QLabel("Border %:"))
 
@@ -1988,6 +1960,40 @@ class ClassVisibilityPicker(QDialog):
         
         controls_row.addStretch()
         layout.addLayout(controls_row)
+
+        # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
+        # Classification and Surface, matching the live Display Mode
+        # dialog's own "Speed" control (gui/display_mode.py:1095-1123).
+        # Previously the shortcut editor had no way to set this at all, so
+        # a Shaded/Surface shortcut always used whatever quality happened
+        # to be the current global setting rather than one saved with the
+        # shortcut itself. Kept on its own row (rather than crammed into
+        # controls_row above) so it can't push that already-full row wider
+        # than intended.
+        quality_row = QHBoxLayout()
+        quality_row.setSpacing(10)
+        self.shading_quality_label = QLabel("Speed")
+        quality_row.addWidget(self.shading_quality_label)
+        self.shading_quality_selector = QComboBox()
+        self.shading_quality_selector.setMinimumWidth(150)
+        self.shading_quality_selector.addItem("Fast", "fast")
+        self.shading_quality_selector.addItem("Normal", "normal")
+        self.shading_quality_selector.addItem("Slow – all points", "slow")
+        self.shading_quality_selector.setCurrentIndex(1)
+        quality_row.addWidget(self.shading_quality_selector)
+        quality_row.addStretch()
+        layout.addLayout(quality_row)
+
+        def _sync_quality_visibility():
+            _mode = str(self.display_mode_selector.currentData() or "class")
+            _visible = _mode in ("shaded_class", "surface")
+            self.shading_quality_label.setVisible(_visible)
+            self.shading_quality_selector.setVisible(_visible)
+
+        self.display_mode_selector.currentIndexChanged.connect(
+            lambda _idx: _sync_quality_visibility()
+        )
+        _sync_quality_visibility()
 
         table_note = QLabel("Choose which classes this preset should display:")
         table_note.setObjectName("dialogInlineNote")
