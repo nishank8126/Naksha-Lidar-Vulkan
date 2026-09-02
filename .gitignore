@@ -9,12 +9,19 @@ __pycache__/
 chiru/
 .venv/
 venv/
+env/
 
 # Generated packaging output
 build/
 dist/
 installer_output/
 *.spec.bak
+
+# Standalone app-plugin development/build output (installed manually in NakshaAI)
+/plugin_build/
+
+# Proprietary local converter payload; install it before building the app.
+/snt_v2-1.0.2-cp310-cp310-win_amd64.whl
 
 # Local point-cloud test/customer data and automatic backups
 TESTIGN _FILES/

@@ -351,11 +351,13 @@ hidden_imports = [
 
     # -- App GUI modules -------------------------------------------------------
     "gui",
+    "gui.naksha_plugin_api",
     "gui.ai_dialog",
     "gui.ai_inference",
     "gui.app_window",
     "gui.backup_settings_dialog",
     "gui.crash_reporter",
+    "gui.crs_manager",
     "gui.cross_section",
     "gui.cross_section.backup_settings_dialog",
     "gui.cross_section.cut_section_controller",

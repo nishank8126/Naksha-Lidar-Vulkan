@@ -25210,6 +25210,56 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 })
         return out
 
+    def _resolve_snt_crs_from_adjacent_prj(self, fpath):
+        """Resolve this SNT/DGN's source CRS and establish/confirm the ONE
+        authoritative canvas CRS (gui.crs_manager: first trustworthy dataset
+        wins - a later SNT in a different CRS never silently replaces an
+        already-established canvas). Without a resolved CRS here, location
+        -aware code (the basemap plugin) has nothing to align tiles against.
+
+        Delegates the actual resolution chain (adjacent OGC WKT .prj ->
+        TerraScan .prj ProjectionSystem=<EPSG> -> TerraScan block-referenced
+        LAZ/LAS WKT VLR / GeoKey Directory) to gui.crs_manager.resolve_snt_crs
+        so there is exactly one implementation of that chain in the app.
+
+        Returns True when this SNT's source CRS was resolved (regardless of
+        whether it matched/established the canvas CRS). Safe to call
+        repeatedly - gui.crs_manager.ensure_canvas_crs() is idempotent.
+        """
+        try:
+            from gui.crs_manager import (resolve_snt_crs, ensure_canvas_crs,
+                                         get_canvas_crs, log_dataset_crs)
+        except Exception as e:
+            print(f"[SNT CRS] gui.crs_manager unavailable: {e}")
+            return False
+
+        crs, label = resolve_snt_crs(fpath)
+        filename = os.path.basename(str(fpath))
+        if crs is None:
+            log_dataset_crs(filename, "SNT", None, None)
+            return False
+
+        prev_canvas = get_canvas_crs(self.app)
+        ensure_canvas_crs(self.app, crs, source=label, dataset=fpath)
+        canvas = get_canvas_crs(self.app)
+        log_dataset_crs(filename, "SNT", crs, label, canvas_crs=canvas)
+
+        if prev_canvas is not None and canvas is not None:
+            try:
+                if crs.to_epsg() != canvas.to_epsg():
+                    print(
+                        f"[SNT CRS] WARNING: '{filename}' source CRS "
+                        f"EPSG:{crs.to_epsg() or 'n/a'} differs from the canvas CRS "
+                        f"EPSG:{canvas.to_epsg() or 'n/a'} already established by an "
+                        f"earlier dataset. Canvas CRS is kept (not overwritten); SNT "
+                        f"block/entity geometry is currently rendered in its own "
+                        f"source coordinates and is not yet reprojected into the "
+                        f"canvas CRS, so it may not align with other layers."
+                    )
+            except Exception:
+                pass
+        return True
+
     def _render_snt_in_vtk(self, attachment: Dict) -> None:
         try:
             import vtk
@@ -25848,6 +25898,15 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 pass
 
             attachment["actors"] = actors
+
+            # Resolve this SNT's source CRS and establish/confirm the canvas
+            # CRS via gui.crs_manager (first trustworthy dataset wins). This
+            # also notifies plugins (basemap) and updates the status bar - see
+            # _resolve_snt_crs_from_adjacent_prj().
+            try:
+                self._resolve_snt_crs_from_adjacent_prj(fpath)
+            except Exception as e:
+                print(f"[SNT CRS] resolution failed: {e}")
 
             if not getattr(renderer, "_skip_camera_reset", False):
                 camera_xy_bounds = fit_bounds or actor_entry.get("bounds")
