@@ -1893,10 +1893,14 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     # STEP 5: Check current display mode / adjust borders
                     # ============================================================
-                    current_display_mode = (
-                        target_display_mode if target_view == 0 else
-                        getattr(self.app_window, 'display_mode', 'class')
-                    )
+                    # The preset's own chosen mode (target_display_mode) applies
+                    # regardless of target view -- previously a section target
+                    # (target_view != 0) silently discarded the mode picked in
+                    # the editor's dropdown and borrowed Main View's current live
+                    # mode instead, so every section-targeted DisplayMode
+                    # shortcut behaved like whatever Main View happened to be
+                    # showing (usually Class), never the mode actually saved.
+                    current_display_mode = target_display_mode
                     print(f"\n   🎨 DISPLAY MODE NOW: {current_display_mode}")
 
                     if current_display_mode in ['depth', 'rgb', 'intensity']:
@@ -2037,6 +2041,56 @@ class GlobalShortcutFilter(QObject):
                                 else:
                                     print(f"      ⚠️ View {view_idx}: "
                                         f"build returned None")
+
+                                # Apply the preset's own chosen display mode to
+                                # this section. Previously only the class-color
+                                # point actor above was ever built here, so a
+                                # section-targeted Shaded/Surface/Depth/
+                                # Intensity/RGB/Elevation shortcut silently
+                                # behaved like Class.
+                                _SECTION_WEIGHT_MODE = {
+                                    "depth": "depth", "intensity": "intensity",
+                                    "rgb": "rgb", "elevation": "elevation",
+                                }
+                                if target_display_mode in ("shaded_class", "surface"):
+                                    from gui.cross_section.section_shaded_surface import \
+                                        build_section_shaded_surface_actor
+                                    _mesh_mode = (
+                                        "shaded" if target_display_mode == "shaded_class"
+                                        else "surface"
+                                    )
+                                    _mesh_ok = build_section_shaded_surface_actor(
+                                        self.app_window, view_index, _mesh_mode
+                                    )
+                                    print(f"      🎨 View {view_idx}: "
+                                        f"{target_display_mode} "
+                                        f"{'applied' if _mesh_ok else 'unavailable'} "
+                                        f"(mesh cut)")
+                                elif target_display_mode in _SECTION_WEIGHT_MODE:
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
+                                    from gui.unified_actor_manager import \
+                                        refresh_section_after_weight_change
+                                    _palette = dlg.view_palettes.get(view_idx, {})
+                                    _mode_ok = refresh_section_after_weight_change(
+                                        self.app_window, view_index, _palette,
+                                        0.0, _SECTION_WEIGHT_MODE[target_display_mode],
+                                    )
+                                    print(f"      🎨 View {view_idx}: "
+                                        f"{target_display_mode} "
+                                        f"{'applied' if _mode_ok else 'unavailable'}")
+                                else:
+                                    # Class (or Line, handled elsewhere) -- clear
+                                    # any leftover Shaded/Surface mesh actor from
+                                    # a previously-applied mode on this section.
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
 
                             except Exception as e:
                                 print(f"      ⚠️ View {view_idx} sync failed: {e}")
