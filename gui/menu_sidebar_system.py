@@ -8251,7 +8251,7 @@ class ByClassHeightDialog(QDialog):
             self.setStyleSheet(get_dialog_stylesheet())
         except Exception:
             pass
-        self.setGeometry(200, 200, 460, 580)
+        self.setGeometry(200, 200, 460, 620)
         
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -8626,6 +8626,23 @@ class ByClassHeightDialog(QDialog):
         )
         self.ref_class_combo.currentIndexChanged.connect(self.on_ref_class_changed)
         body.addWidget(self.ref_class_combo)
+        triangle_row = QHBoxLayout()
+        triangle_row.addWidget(QLabel("Max triangle:"))
+        self.max_triangle_spin = QDoubleSpinBox()
+        self.max_triangle_spin.setRange(0.01, 999999.0)
+        self.max_triangle_spin.setDecimals(2)
+        self.max_triangle_spin.setSingleStep(1.0)
+        self.max_triangle_spin.setValue(100.0)
+        self.max_triangle_spin.setSuffix(" m")
+        self.max_triangle_spin.setToolTip(
+            "Maximum XY edge length allowed in the temporary reference TIN. "
+            "Points over longer gap-spanning triangles are not classified."
+        )
+        self.max_triangle_spin.valueChanged.connect(
+            self.on_class_selection_changed
+        )
+        triangle_row.addWidget(self.max_triangle_spin)
+        body.addLayout(triangle_row)
 
         ref_info = QLabel("Min = 0 m means at reference class level.")
         ref_info.setObjectName("dialogCaption")
@@ -9161,19 +9178,26 @@ class ByClassHeightDialog(QDialog):
             ground_xyz = xyz[ground_mask]
             fence_label_text = ""
         
-        # Build KDTree
-        ground_xy = ground_xyz[:, :2]
-        tree = cKDTree(ground_xy)
-        
-        # Query From class points
-        from_class_xy = from_class_xyz[:, :2]
-        distances, indices = tree.query(from_class_xy, k=1)
-        
-        # Calculate heights
-        from_class_z = from_class_xyz[:, 2]
-        nearest_ground_z = ground_xyz[indices, 2]
-        heights = from_class_z - nearest_ground_z
-        
+        from gui.height_reference_surface import (
+            ReferenceSurfaceError, heights_above_reference_tin,
+        )
+        max_triangle = self.max_triangle_spin.value()
+        try:
+            all_heights, supported, surface_info = heights_above_reference_tin(
+                ground_xyz, from_class_xyz, max_triangle,
+            )
+        except ReferenceSurfaceError as exc:
+            QMessageBox.warning(self, "Reference Surface Failed", str(exc))
+            return
+        unsupported_count = int(np.count_nonzero(~supported))
+        heights = all_heights[supported]
+        if not len(heights):
+            QMessageBox.warning(
+                self, "No Supported Points",
+                "No source points fall on a valid reference triangle. "
+                "Increase Max triangle or inspect gaps in the reference class.",
+            )
+            return
         min_h = np.min(heights)
         max_h = np.max(heights)
         mean_h = np.mean(heights)
@@ -9195,7 +9219,10 @@ class ByClassHeightDialog(QDialog):
                 'count': count, 'percentage': percentage
             })
         
-        print(f"   Points analyzed: {len(from_class_xyz):,}{fence_label_text}")
+        print(f"   Points analyzed: {len(heights):,}{fence_label_text}")
+        print(f"   Reference TIN: {surface_info['usable_triangles']:,}/"
+              f"{surface_info['triangles']:,} triangles usable; "
+              f"{unsupported_count:,} source points unsupported")
         print(f"   Min: {min_h:.3f}m, Max: {max_h:.3f}m, Mean: {mean_h:.3f}m")
         print(f"{'='*60}\n")
         
@@ -9242,13 +9269,13 @@ class ByClassHeightDialog(QDialog):
         self.max_height_spin.setValue(round(float(max_h), 3))
         
         self.height_info_label.setText(
-            f"Analyzed {len(from_class_xyz):,} points{fence_label_text} | "
+            f"Analyzed {len(heights):,} supported points{fence_label_text} | "
             f"Ref: [{ref_class_text}] | Min: {min_h:.3f}m | Max: {max_h:.3f}m"
         )
         self.height_info_label.setStyleSheet("color: #4caf50; font-size: 9px; font-weight: bold;")
         
         QMessageBox.information(self, "Height Analysis Complete", 
-            f"Analyzed {len(from_class_xyz):,} points{fence_label_text}\n"
+            f"Analyzed {len(heights):,} supported points{fence_label_text}\n"
             f"Reference class: {ref_class_text}\n"
             f"Min: {min_h:.3f}m, Max: {max_h:.3f}m above reference\n"
             f"Select a height range from dropdown")
@@ -9544,23 +9571,23 @@ class ByClassHeightDialog(QDialog):
         else:
             ground_xyz = xyz[ground_mask]
         
-        # Build KDTree
-        ground_xy = ground_xyz[:, :2]
-        tree = cKDTree(ground_xy)
-        
-        # Query From class points
-        from_class_xy = from_class_xyz[:, :2]
-        
-        distances, indices = tree.query(from_class_xy, k=1)
-        
-        # Calculate heights
-        from_class_z = from_class_xyz[:, 2]
-        nearest_ground_z = ground_xyz[indices, 2]
-        heights = from_class_z - nearest_ground_z
-        
+        from gui.height_reference_surface import (
+            ReferenceSurfaceError, heights_above_reference_tin,
+        )
+        max_triangle = self.max_triangle_spin.value()
+        try:
+            heights, supported, surface_info = heights_above_reference_tin(
+                ground_xyz, from_class_xyz, max_triangle,
+            )
+        except ReferenceSurfaceError as exc:
+            QMessageBox.warning(self, "Reference Surface Failed", str(exc))
+            return None
+        print(f"   Reference TIN: {surface_info['usable_triangles']:,}/"
+              f"{surface_info['triangles']:,} triangles usable; "
+              f"{np.count_nonzero(~supported):,} source points unsupported")
         # Points within height range
         # Points within height range
-        height_mask = (heights >= min_height) & (heights <= max_height)
+        height_mask = supported & (heights >= min_height) & (heights <= max_height)
         in_range_count = np.sum(height_mask)
         
         print(f"   Points in range: {in_range_count:,}")
