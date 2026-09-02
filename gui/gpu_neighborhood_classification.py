@@ -14,6 +14,7 @@ import numpy as np
 
 
 _MAX_GPU_PAIRS = 2_000_000_000
+_MAX_RADIUS_GPU_PAIRS = 250_000_000
 _TARGET_DISTANCE_BYTES = 384 * 1024 * 1024
 
 
@@ -59,7 +60,7 @@ def cuda_radius_counts(
         torch is None
         or not len(candidates)
         or not len(references)
-        or pair_count > _MAX_GPU_PAIRS
+        or pair_count > _MAX_RADIUS_GPU_PAIRS
     ):
         return None
 
