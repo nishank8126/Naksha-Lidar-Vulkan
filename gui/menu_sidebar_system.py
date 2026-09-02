@@ -12791,6 +12791,7 @@ class PluginsRibbon(QWidget):
                 item = layout.takeAt(0)
                 widget = item.widget()
                 if widget is not None:
+                    widget.setParent(None)
                     widget.deleteLater()
 
         # Re-add core plugins section with Manage button only
@@ -12826,6 +12827,8 @@ class PluginsRibbon(QWidget):
                         print(f"Warning: Failed to add button for plugin '{name}': {e}")
 
         layout.addStretch()
+        layout.invalidate()
+        self.updateGeometry()
 
     def _manage_plugins(self):
         try:

@@ -55,6 +55,8 @@ Source: "{#DistDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversi
 ; builds where the wheel is copied beside the .iss independently of PyInstaller.
 Source: "snt_core-1.3.1-cp310-cp310-win_amd64.whl"; DestDir: "{app}\_internal\wheels"; Flags: ignoreversion skipifsourcedoesntexist
 
+; The manually installed converter plugin carries its own DGN backend.
+
 ; ── Visual C++ 2015-2022 Redistributable (x64) ───────────────────
 ; OPTIONAL: Download VC_redist.x64.exe from https://aka.ms/vs/17/release/vc_redist.x64.exe
 ;           and place it in a redist\ subfolder next to this .iss file.

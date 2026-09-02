@@ -4050,6 +4050,14 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
                     crs = CRS.from_wkt(prj_content)
                     item.set_crs(crs)
                     print(f"  ✅ CRS: {crs.name}")
+                    try:
+                        from gui.crs_manager import ensure_canvas_crs, get_canvas_crs, log_dataset_crs
+                        ensure_canvas_crs(self.app, crs, source="DXF adjacent WKT .prj",
+                                          dataset=str(item.dxf_path))
+                        log_dataset_crs(item.dxf_path.name, "DXF", crs, "DXF adjacent WKT .prj",
+                                        canvas_crs=get_canvas_crs(self.app))
+                    except Exception as ce:
+                        print(f"  ⚠️ canvas CRS update failed: {ce}")
                 except Exception as e:
                     print(f"  ⚠️ PRJ parse failed: {e}")
             
@@ -4254,9 +4262,17 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
             self.file_count_label.setStyleSheet(f"color:{ThemeColors.get('accent')}; font-size:10px; font-weight:bold; padding:5px;")
     
     def detect_project_crs(self):
-        """Detect the project's coordinate system (silent detection)"""
-        if hasattr(self.app, 'crs') and self.app.crs:
-            self.project_crs = self.app.crs
+        """Refresh self.project_crs from the ONE authoritative canvas CRS
+        (gui.crs_manager) so DXF entities get reprojected into whatever CRS
+        SNT/LAZ/GIS already established - not whatever app.crs happened to
+        hold when this dialog was opened."""
+        try:
+            from gui.crs_manager import get_canvas_crs
+            crs = get_canvas_crs(self.app)
+        except Exception:
+            crs = getattr(self.app, 'crs', None)
+        if crs is not None:
+            self.project_crs = crs
             print(f"✅ Project CRS: {self.project_crs.name}")
         else:
             self.project_crs = None
@@ -4614,6 +4630,10 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
         Process geometry only once during attachment
         """
         try:
+            # Refresh from the authoritative canvas CRS right before use (not
+            # just once when the dialog opened) - SNT/LAZ/GIS loaded after
+            # this dialog was constructed must still be reprojected against.
+            self.detect_project_crs()
             # ✅ Check if we already processed this file
             if item.cached_entities:
                 print(f"  ⚡ Using cached entities for {item.dxf_path.name}")
