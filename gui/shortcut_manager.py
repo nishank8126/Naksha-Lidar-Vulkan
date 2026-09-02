@@ -1919,9 +1919,14 @@ class ClassVisibilityPicker(QDialog):
             live_mode_idx if live_mode_idx >= 0 else 0
         )
         controls_row.addWidget(self.display_mode_selector)
+        controls_row.addStretch()
+        controls_card_layout.addLayout(controls_row)
 
-        controls_row.addSpacing(12)
-        controls_row.addWidget(QLabel("Border %:"))
+        # Border widgets are created here but placed in the bottom row
+        # (next to OK/Cancel), matching the live Display Mode dialog's own
+        # layout -- Border sits beside Apply/Close there, not up in the
+        # top controls card.
+        self.border_pct_label = QLabel("Border %:")
 
         self.border_spin = QDoubleSpinBox()
         self.border_spin.setRange(0, 100)
@@ -1929,8 +1934,7 @@ class ClassVisibilityPicker(QDialog):
         self.border_spin.setValue(0)
         self.border_spin.setSingleStep(5.0)
         self.border_spin.setFixedWidth(85)
-        controls_row.addWidget(self.border_spin)
-        
+
         self.border_setting_btn = QPushButton()
         self.border_setting_btn.setObjectName("displayBorderButton")
         from gui.icon_provider import get_icon
@@ -1969,10 +1973,6 @@ class ClassVisibilityPicker(QDialog):
                 )
             )
         )
-        controls_row.addWidget(self.border_setting_btn)
-        
-        controls_row.addStretch()
-        controls_card_layout.addLayout(controls_row)
 
         # Speed/Quality (Fast/Normal/Slow) -- only meaningful for Shaded
         # Classification and Surface, matching the live Display Mode
@@ -2108,9 +2108,14 @@ class ClassVisibilityPicker(QDialog):
 
         layout.addWidget(table_card, stretch=1)
 
-        # ── OK / Cancel ───────────────────────────────────────────────
+        # ── Border + OK / Cancel (one row, matching the live dialog's own
+        #    Border-beside-Apply/Close bottom row) ─────────────────────
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        btn_layout.addWidget(self.border_pct_label)
+        btn_layout.addWidget(self.border_spin)
+        btn_layout.addWidget(self.border_setting_btn)
+        btn_layout.addSpacing(8)
         self.ok_btn     = QPushButton("OK")
         self.ok_btn.setObjectName("primaryBtn")
         self.cancel_btn = QPushButton("Cancel")
