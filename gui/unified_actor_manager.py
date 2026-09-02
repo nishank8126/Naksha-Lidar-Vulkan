@@ -4141,6 +4141,69 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
                     color_scheme=getattr(app, "depth_color_scheme", "grayscale"),
                     gamma=getattr(app, "depth_gamma", 1.0),
                 )
+        elif mode == "line":
+            # Same LUT-by-Point-Source-ID coloring as Main View's own Line
+            # mode (gui/app_window.py set_display_mode, mode == "line") --
+            # reuses (and, if absent, builds) the exact same cached LUT
+            # (app._line_mode_rgb_lut), a pure function of
+            # app.flight_line_colors, so sections match Main View's Line
+            # coloring exactly and repeat calls for either view are free.
+            source_ids = data.get("point_source_id")
+            if source_ids is not None and len(source_ids) == len(data.get("xyz", [])):
+                line_colors = dict(getattr(app, "flight_line_colors", {}) or {})
+                try:
+                    line_color_sig = tuple(sorted(
+                        (int(raw_id), tuple(int(c) for c in color[:3]))
+                        for raw_id, color in line_colors.items()
+                    ))
+                except Exception:
+                    line_color_sig = tuple()
+
+                line_lut = getattr(app, "_line_mode_rgb_lut", None)
+                if (
+                    not isinstance(line_lut, np.ndarray)
+                    or line_lut.shape != (65536, 3)
+                    or line_lut.dtype != np.uint8
+                    or getattr(app, "_line_mode_rgb_lut_sig", None) != line_color_sig
+                ):
+                    ids = np.arange(65536, dtype=np.uint32)
+                    line_lut = np.empty((65536, 3), dtype=np.uint8)
+                    line_lut[:, 0] = ((ids * 67 + 53) & 255).astype(np.uint8)
+                    line_lut[:, 1] = ((ids * 131 + 97) & 255).astype(np.uint8)
+                    line_lut[:, 2] = ((ids * 193 + 181) & 255).astype(np.uint8)
+                    for raw_line_id, color in line_colors.items():
+                        try:
+                            line_id = int(raw_line_id)
+                            if 0 <= line_id <= 65535:
+                                line_lut[line_id] = tuple(int(c) for c in color[:3])
+                        except Exception:
+                            continue
+                    app._line_mode_rgb_lut = line_lut
+                    app._line_mode_rgb_lut_sig = line_color_sig
+
+                vis_lines = np.asarray(source_ids[global_indices])
+                line_ids = np.asarray(vis_lines, dtype=np.intp)
+                if (
+                    line_ids.size == len(rgb_ptr)
+                    and (line_ids.size == 0 or (line_ids.min() >= 0 and line_ids.max() <= 65535))
+                ):
+                    colors = np.take(line_lut, line_ids, axis=0)
+                else:
+                    unique_lines, inverse = np.unique(vis_lines, return_inverse=True)
+                    compact_lut = np.empty((len(unique_lines), 3), dtype=np.uint8)
+                    for lut_idx, raw_line_id in enumerate(unique_lines):
+                        line_id = int(raw_line_id)
+                        compact_lut[lut_idx] = line_colors.get(
+                            line_id,
+                            (
+                                (line_id * 67 + 53) % 256,
+                                (line_id * 131 + 97) % 256,
+                                (line_id * 193 + 181) % 256,
+                            ),
+                        )
+                    colors = compact_lut[inverse]
+            else:
+                print("   ℹ️ Section: no Point Source ID data — showing flat gray, same as Main View")
     except Exception as e:
         print(f"   ⚠️ Section recolor ({mode}) failed: {e}")
         return False
@@ -5115,7 +5178,7 @@ def refresh_section_after_weight_change(
 ) -> bool:
     slot_idx = view_idx + 1
     palette  = palette or _get_slot_palette(app, slot_idx)
-    non_class_mode = mode in ("rgb", "intensity", "elevation", "depth")
+    non_class_mode = mode in ("rgb", "intensity", "elevation", "depth", "line")
 
     if hasattr(app, 'view_borders') and slot_idx in app.view_borders:
         border_percent = float(app.view_borders[slot_idx])
@@ -7045,7 +7108,21 @@ def fast_cross_section_update(
 
     n_changed = int(changed_idx.size)
 
-    if n_changed > 0:
+    # Only repaint with classification-palette colors when this section is
+    # actually showing Class/Shaded Classification -- mirrors Main View's
+    # own guard in fast_classify_update ("Only update slot-0 RGB/class
+    # buffers when main view is in class/shaded_class"). Without this,
+    # reclassifying points always overwrote a section's RGB buffer with
+    # classification colors regardless of its active mode, silently
+    # reverting Line/Depth/RGB/Intensity/Elevation back to Class colors
+    # after any classify action -- Main View never had this problem
+    # because it already had this exact check.
+    dlg_for_mode = getattr(app, 'display_mode_dialog', None)
+    _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
+    section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
+    section_is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+
+    if n_changed > 0 and section_is_class_like:
         if changed_idx.max(initial=-1) >= len(rgb_ptr):
             keep = changed_idx < len(rgb_ptr)
             changed_idx = changed_idx[keep]
@@ -7248,9 +7325,24 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
         if local_indices.size == 0:
             return
 
-    # Guard slot-0 RGB/class-buffer patching when main view is not class/shaded_class.
-    display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-    if slot_idx > 0 or display_mode in ("class", "shaded_class"):
+    # Guard RGB/class-buffer patching when the target view isn't showing
+    # Class/Shaded Classification. Previously this only checked Main View's
+    # own display_mode (`slot_idx > 0 or ...` let every section through
+    # unconditionally) -- so undo and partial-classify updates always
+    # repainted a section's RGB buffer with classification colors even
+    # while that section was showing Line/Depth/RGB/Intensity/Elevation,
+    # silently reverting those modes back to Class colors. Now checks each
+    # section's own remembered mode (dlg.view_color_modes[slot_idx]), same
+    # source of truth used everywhere else this session.
+    if slot_idx == 0:
+        display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
+        is_class_like = display_mode in ("class", "shaded_class")
+    else:
+        dlg_for_mode = getattr(app, 'display_mode_dialog', None)
+        _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
+        section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
+        is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    if is_class_like:
         if hasattr(actor, "_naksha_section_class"):
             actor._naksha_section_class[local_indices] = reverted_cls
 

@@ -1566,6 +1566,7 @@ class ClassVisibilityPicker(QDialog):
             self.display_mode_selector.setMinimumWidth(150)
             line_header.addWidget(self.display_mode_selector)
             self.lines_button = QPushButton("Lines")
+            self.lines_button.setObjectName("displayLinesButton")
             self.lines_button.clicked.connect(self._open_line_selection)
             line_header.addWidget(self.lines_button)
             line_header.addStretch()
@@ -1868,7 +1869,19 @@ class ClassVisibilityPicker(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # ── controls row ─────────────────────────────────────────────
+        # ── controls card ────────────────────────────────────────────
+        # Matches the live Display Mode dialog's own rounded/bordered
+        # "displayControlsCard" container (gui/display_mode.py ~1057-1061)
+        # -- previously these rows sat directly on the dialog background
+        # with no card, so even with matching per-widget object names the
+        # overall look didn't match the live dialog's grouped, pill-style
+        # control bar.
+        controls_card = QFrame()
+        controls_card.setObjectName("displayControlsCard")
+        controls_card_layout = QVBoxLayout(controls_card)
+        controls_card_layout.setContentsMargins(10, 8, 10, 8)
+        controls_card_layout.setSpacing(8)
+
         controls_row = QHBoxLayout()
         controls_row.setSpacing(10)
 
@@ -1895,6 +1908,7 @@ class ClassVisibilityPicker(QDialog):
             ("RGB", "rgb"),
             ("Elevation", "elevation"),
             ("Surface", "surface"),
+            ("Line", "line"),
         ):
             self.display_mode_selector.addItem(label, mode_key)
         live_mode = str(
@@ -1906,8 +1920,50 @@ class ClassVisibilityPicker(QDialog):
         )
         controls_row.addWidget(self.display_mode_selector)
 
-        controls_row.addSpacing(12)
-        controls_row.addWidget(QLabel("Border %:"))
+        # Speed (Fast/Normal/Slow) and Lines... sit inline on this SAME row,
+        # right after Display Mode -- exactly like the live Display Mode
+        # dialog (gui/display_mode.py ~1094-1136: color_mode, then
+        # shading_quality, then lines_button, all on one controls_layout).
+        # Each is independently shown/hidden by mode (Speed for Shaded/
+        # Surface, Lines for Line) via setVisible(), which Qt collapses to
+        # zero width when hidden -- so only the relevant one ever occupies
+        # space, on one line, instead of reserving a whole extra row.
+        self.shading_quality_label = QLabel("Speed")
+        controls_row.addWidget(self.shading_quality_label)
+        self.shading_quality_selector = QComboBox()
+        self.shading_quality_selector.setObjectName("displayShadingQuality")
+        self.shading_quality_selector.setMinimumWidth(150)
+        self.shading_quality_selector.addItem("Fast", "fast")
+        self.shading_quality_selector.addItem("Normal", "normal")
+        self.shading_quality_selector.addItem("Slow – all points", "slow")
+        self.shading_quality_selector.setCurrentIndex(1)
+        controls_row.addWidget(self.shading_quality_selector)
+
+        self.lines_button = QPushButton("Lines…")
+        self.lines_button.setObjectName("displayLinesButton")
+        self.lines_button.clicked.connect(self._open_line_selection)
+        controls_row.addWidget(self.lines_button)
+
+        def _sync_mode_extra_controls():
+            _mode = str(self.display_mode_selector.currentData() or "class")
+            _speed_visible = _mode in ("shaded_class", "surface")
+            self.shading_quality_label.setVisible(_speed_visible)
+            self.shading_quality_selector.setVisible(_speed_visible)
+            self.lines_button.setVisible(_mode == "line")
+
+        self.display_mode_selector.currentIndexChanged.connect(
+            lambda _idx: _sync_mode_extra_controls()
+        )
+        _sync_mode_extra_controls()
+
+        controls_row.addStretch()
+        controls_card_layout.addLayout(controls_row)
+
+        # Border widgets are created here but placed in the bottom row
+        # (next to OK/Cancel), matching the live Display Mode dialog's own
+        # layout -- Border sits beside Apply/Close there, not up in the
+        # top controls card.
+        self.border_pct_label = QLabel("Border %:")
 
         self.border_spin = QDoubleSpinBox()
         self.border_spin.setRange(0, 100)
@@ -1915,8 +1971,7 @@ class ClassVisibilityPicker(QDialog):
         self.border_spin.setValue(0)
         self.border_spin.setSingleStep(5.0)
         self.border_spin.setFixedWidth(85)
-        controls_row.addWidget(self.border_spin)
-        
+
         self.border_setting_btn = QPushButton()
         self.border_setting_btn.setObjectName("displayBorderButton")
         from gui.icon_provider import get_icon
@@ -1955,18 +2010,27 @@ class ClassVisibilityPicker(QDialog):
                 )
             )
         )
-        controls_row.addWidget(self.border_setting_btn)
-        
-        controls_row.addStretch()
-        layout.addLayout(controls_row)
+
+        layout.addWidget(controls_card)
 
         table_note = QLabel("Choose which classes this preset should display:")
         table_note.setObjectName("dialogInlineNote")
         layout.addWidget(table_note)
 
-        # ── table + buttons ───────────────────────────────────────────
-        table_and_btns = QHBoxLayout()
-        table_and_btns.setSpacing(8)
+        # ── table card ───────────────────────────────────────────────
+        # Matches the live Display Mode dialog's own "displayTableCard"
+        # container: table on top, a horizontal row of action buttons
+        # ("displayActionRail") below it -- previously this picker put the
+        # buttons in a vertical column beside the table instead, so even
+        # with matching per-button object names the overall arrangement
+        # didn't line up with the live dialog's look. Same 3 buttons
+        # (Refresh/Select All/Clear All), same click handlers -- only the
+        # container/arrangement changes.
+        table_card = QFrame()
+        table_card.setObjectName("displayTableCard")
+        table_card_layout = QVBoxLayout(table_card)
+        table_card_layout.setContentsMargins(12, 12, 12, 12)
+        table_card_layout.setSpacing(12)
 
         self.class_table = QTableWidget(0, 6)
         self.class_table.setObjectName("displayClassTable")
@@ -1999,32 +2063,37 @@ class ClassVisibilityPicker(QDialog):
         print(f"✅ Column widths restored: {widths}")
 
         hdr.sectionResized.connect(self._on_column_resized)
-        table_and_btns.addWidget(self.class_table, stretch=1)
+        table_card_layout.addWidget(self.class_table, stretch=1)
 
-        # ── action buttons ────────────────────────────────────────────
-        action_col = QVBoxLayout()
-        action_col.setContentsMargins(0, 0, 0, 0)
-        action_col.setSpacing(6)
+        # ── action buttons (horizontal rail below the table, matching the
+        #    live dialog's displayActionRail) ──────────────────────────
+        action_rail = QFrame()
+        action_rail.setObjectName("displayActionRail")
+        action_row = QHBoxLayout(action_rail)
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(8)
 
         self.refresh_btn    = QPushButton("Refresh")
         self.select_all_btn = QPushButton("Select All")
         self.clear_all_btn  = QPushButton("Clear All")
         for btn in (self.refresh_btn, self.select_all_btn, self.clear_all_btn):
             btn.setObjectName("displayActionButton")
-            btn.setMinimumHeight(30)
-            btn.setFixedWidth(80)
             btn.setAutoDefault(False)
             btn.setDefault(False)
             btn.setFocusPolicy(Qt.NoFocus)
-            action_col.addWidget(btn)
-        action_col.addStretch()
-        table_and_btns.addLayout(action_col)
+            action_row.addWidget(btn, stretch=1)
+        table_card_layout.addWidget(action_rail)
 
-        layout.addLayout(table_and_btns, stretch=1)
+        layout.addWidget(table_card, stretch=1)
 
-        # ── OK / Cancel ───────────────────────────────────────────────
+        # ── Border + OK / Cancel (one row, matching the live dialog's own
+        #    Border-beside-Apply/Close bottom row) ─────────────────────
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+        btn_layout.addWidget(self.border_pct_label)
+        btn_layout.addWidget(self.border_spin)
+        btn_layout.addWidget(self.border_setting_btn)
+        btn_layout.addSpacing(8)
         self.ok_btn     = QPushButton("OK")
         self.ok_btn.setObjectName("primaryBtn")
         self.cancel_btn = QPushButton("Cancel")
@@ -2486,6 +2555,11 @@ class ClassVisibilityPicker(QDialog):
                 str(self.display_mode_selector.currentData() or "class")
                 if hasattr(self, "display_mode_selector") else "class"
             ),
+            "quality_mode": (
+                str(self.shading_quality_selector.currentData() or "normal")
+                if hasattr(self, "shading_quality_selector") else "normal"
+            ),
+            "flight_lines": self.get_line_visibility(),
             "border_percent": self.border_spin.value() if hasattr(self, 'border_spin') else 0,
             "border_type": self.get_border_logic_mode(),
             "views": {}
@@ -4032,6 +4106,15 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
+                if hasattr(picker, "shading_quality_selector"):
+                    preset_quality = str(
+                        existing_preset.get("quality_mode", "normal") or "normal"
+                    )
+                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
+                    picker.shading_quality_selector.setCurrentIndex(
+                        quality_idx if quality_idx >= 0 else 1
+                    )
+                picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 picker.view_selector.blockSignals(True)
                 picker.view_selector.setCurrentIndex(first_view_idx)
@@ -4060,6 +4143,15 @@ class ShortcutManager(QWidget):
                 picker.display_mode_selector.setCurrentIndex(
                     mode_idx if mode_idx >= 0 else 0
                 )
+                if hasattr(picker, "shading_quality_selector"):
+                    preset_quality = str(
+                        existing_preset.get("quality_mode", "normal") or "normal"
+                    )
+                    quality_idx = picker.shading_quality_selector.findData(preset_quality)
+                    picker.shading_quality_selector.setCurrentIndex(
+                        quality_idx if quality_idx >= 0 else 1
+                    )
+                picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 print(f"📋 Preset has no views configured")
                 picker._populate_classes()
@@ -4106,6 +4198,9 @@ class ShortcutManager(QWidget):
             view_classes = view_configs[view_idx]
 
             preset = {
+                "display_mode": all_configs.get("display_mode", "class"),
+                "quality_mode": all_configs.get("quality_mode", "normal"),
+                "flight_lines": all_configs.get("flight_lines", {}),
                 "border_percent": border_percent,
                 "border_type": border_type,
                 "views": {view_idx: view_classes},
