@@ -4106,6 +4106,7 @@ class ShortcutManager(QWidget):
             view_classes = view_configs[view_idx]
 
             preset = {
+                "display_mode": all_configs.get("display_mode", "class"),
                 "border_percent": border_percent,
                 "border_type": border_type,
                 "views": {view_idx: view_classes},
