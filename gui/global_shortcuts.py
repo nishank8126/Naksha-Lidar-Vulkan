@@ -2007,6 +2007,15 @@ class GlobalShortcutFilter(QObject):
                             try:
                                 from gui.unified_actor_manager import \
                                     build_section_unified_actor
+                                try:
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
+                                except Exception as _cs_mesh_clear_err:
+                                    print(f"      ⚠️ Shaded/Surface mesh cleanup "
+                                        f"skipped for View {view_idx}: {_cs_mesh_clear_err}")
 
                                 if view_idx not in dlg.view_palettes or \
                                         not dlg.view_palettes[view_idx]:
