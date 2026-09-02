@@ -2911,6 +2911,7 @@ class DisplayModeDialog(QDialog):
         elif self.current_slot in (1, 2, 3, 4) and idx in (1, 6):
             view_idx = self.current_slot - 1
             target_mode = "shaded_class" if idx == 1 else "surface"
+            ok = False
             try:
                 from gui.cross_section.section_mesh_display import apply_section_display_mode
                 ok = apply_section_display_mode(
@@ -2922,13 +2923,25 @@ class DisplayModeDialog(QDialog):
                     force=False,
                     reason="display_mode_apply",
                 )
-                fast_path_handled = bool(ok)
                 if not ok:
                     print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_failed")
             except Exception as _cs_mesh_err:
                 print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_exception reason={_cs_mesh_err}")
-                import traceback as _traceback
-                _traceback.print_exc()
+                ok = False
+            fast_path_handled = bool(ok)
+            if not ok:
+                # Fallback: gui.cross_section.section_mesh_display isn't
+                # available/working yet -- use our own mesh-slab-clip
+                # implementation (gui.cross_section.section_shaded_surface)
+                # instead, so Shaded/Surface still works for sections today.
+                from gui.cross_section.section_shaded_surface import build_section_shaded_surface_actor
+                mesh_mode = "shaded" if idx == 1 else "surface"
+                ok2 = build_section_shaded_surface_actor(app, view_idx, mesh_mode)
+                if ok2:
+                    fast_path_handled = True
+                    print(f"Section {view_idx + 1} display mode -> {mesh_mode} (mesh cut, fallback)")
+                else:
+                    print(f"WARNING: Section {view_idx + 1} {mesh_mode} mesh-cut unavailable (fallback also failed)")
 
         elif self.current_slot >= 1:
             if self.current_slot <= 4:
@@ -2947,31 +2960,21 @@ class DisplayModeDialog(QDialog):
                 except Exception as _cs_leave_err:
                     print(f"SECTION_MESH view={view_idx + 1} status=leave_failed reason={_cs_leave_err}")
                 border   = float(self.view_borders.get(self.current_slot, 0))
-                if idx in (1, 6):
-                    from gui.cross_section.section_shaded_surface import (
-                        build_section_shaded_surface_actor,
-                        remove_section_shaded_surface_actor,
-                    )
-                    mesh_mode = "shaded" if idx == 1 else "surface"
-                    ok = build_section_shaded_surface_actor(app, view_idx, mesh_mode)
-                    if ok:
-                        fast_path_handled = True
-                        print(f"Section {view_idx + 1} display mode -> {mesh_mode} (mesh cut)")
-                    else:
-                        print(f"WARNING: Section {view_idx + 1} {mesh_mode} mesh-cut unavailable")
+                # idx in (1, 6) (Shaded/Surface) for slots 1-4 is handled by
+                # the "[CS-MESH-DISPLAY] display-mode apply" elif above --
+                # this branch only ever sees the remaining section modes.
+                from gui.cross_section.section_shaded_surface import (
+                    remove_section_shaded_surface_actor,
+                )
+                remove_section_shaded_surface_actor(app, view_idx)
+                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
+                ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
+                if ok:
+                    fast_path_handled = True
+                    print(f"Section {view_idx + 1} display mode -> {section_mode}")
                 else:
-                    from gui.cross_section.section_shaded_surface import (
-                        remove_section_shaded_surface_actor,
-                    )
-                    remove_section_shaded_surface_actor(app, view_idx)
-                    _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
-                    section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
-                    ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
-                    if ok:
-                        fast_path_handled = True
-                        print(f"Section {view_idx + 1} display mode -> {section_mode}")
-                    else:
-                        print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
+                    print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
             elif self.current_slot == 5:
                 if hasattr(app, 'cut_section_controller'):
                     ctrl = app.cut_section_controller
