@@ -2177,9 +2177,9 @@ class GlobalShortcutFilter(QObject):
                                         f"{target_display_mode} "
                                         f"{'applied' if _mode_ok else 'unavailable'}")
                                 else:
-                                    # Class (or Line, handled elsewhere) -- clear
-                                    # any leftover Shaded/Surface mesh actor from
-                                    # a previously-applied mode on this section.
+                                    # Class -- clear any leftover Shaded/Surface
+                                    # mesh actor from a previously-applied mode
+                                    # on this section.
                                     from gui.cross_section.section_shaded_surface import \
                                         remove_section_shaded_surface_actor
                                     remove_section_shaded_surface_actor(
