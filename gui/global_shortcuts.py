@@ -1422,7 +1422,12 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     # STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
                     # ============================================================
-                    _current_shortcut_id = combo
+                    # Identity includes target_display_mode/target_view, not just
+                    # the key combo -- otherwise editing an already-"last applied"
+                    # shortcut's mode (e.g. Class -> Depth) and pressing the same
+                    # key again matched the old identity and was skipped as a
+                    # no-op, silently keeping the stale mode applied.
+                    _current_shortcut_id = (combo, target_display_mode, target_view)
                     _last_applied_id = getattr(
                         self.app_window, '_last_display_shortcut_id', None
                     )
