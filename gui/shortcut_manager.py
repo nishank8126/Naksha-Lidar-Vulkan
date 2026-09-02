@@ -1995,6 +1995,30 @@ class ClassVisibilityPicker(QDialog):
         )
         _sync_quality_visibility()
 
+        # Flight-line selection -- only meaningful for Line mode. Reuses
+        # the same "Lines" button / picker dialog / self.line_visibility
+        # storage already built for the standalone Line tool's own picker
+        # (mode="line"; see _open_line_selection/set_line_visibility/
+        # get_line_visibility below, all mode-agnostic class methods) --
+        # previously the DisplayMode editor's Line option had no way to
+        # choose which flight lines to show, unlike the standalone tool.
+        lines_row = QHBoxLayout()
+        lines_row.setSpacing(10)
+        self.lines_button = QPushButton("Lines…")
+        self.lines_button.clicked.connect(self._open_line_selection)
+        lines_row.addWidget(self.lines_button)
+        lines_row.addStretch()
+        layout.addLayout(lines_row)
+
+        def _sync_lines_visibility():
+            _mode = str(self.display_mode_selector.currentData() or "class")
+            self.lines_button.setVisible(_mode == "line")
+
+        self.display_mode_selector.currentIndexChanged.connect(
+            lambda _idx: _sync_lines_visibility()
+        )
+        _sync_lines_visibility()
+
         table_note = QLabel("Choose which classes this preset should display:")
         table_note.setObjectName("dialogInlineNote")
         layout.addWidget(table_note)
@@ -2525,6 +2549,7 @@ class ClassVisibilityPicker(QDialog):
                 str(self.shading_quality_selector.currentData() or "normal")
                 if hasattr(self, "shading_quality_selector") else "normal"
             ),
+            "flight_lines": self.get_line_visibility(),
             "border_percent": self.border_spin.value() if hasattr(self, 'border_spin') else 0,
             "border_type": self.get_border_logic_mode(),
             "views": {}
@@ -4079,6 +4104,7 @@ class ShortcutManager(QWidget):
                     picker.shading_quality_selector.setCurrentIndex(
                         quality_idx if quality_idx >= 0 else 1
                     )
+                picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 picker.view_selector.blockSignals(True)
                 picker.view_selector.setCurrentIndex(first_view_idx)
@@ -4115,6 +4141,7 @@ class ShortcutManager(QWidget):
                     picker.shading_quality_selector.setCurrentIndex(
                         quality_idx if quality_idx >= 0 else 1
                     )
+                picker.set_line_visibility(existing_preset.get("flight_lines", {}))
                 picker.set_border_logic_mode(border_type)
                 print(f"📋 Preset has no views configured")
                 picker._populate_classes()
@@ -4163,6 +4190,7 @@ class ShortcutManager(QWidget):
             preset = {
                 "display_mode": all_configs.get("display_mode", "class"),
                 "quality_mode": all_configs.get("quality_mode", "normal"),
+                "flight_lines": all_configs.get("flight_lines", {}),
                 "border_percent": border_percent,
                 "border_type": border_type,
                 "views": {view_idx: view_classes},

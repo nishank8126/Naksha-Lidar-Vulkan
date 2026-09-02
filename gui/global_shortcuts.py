@@ -1436,6 +1436,29 @@ class GlobalShortcutFilter(QObject):
                         self.app_window.surface_quality = target_quality_mode
 
                     target_view = int(list(views.keys())[0]) if views else 0
+
+                    # Line mode's flight-line selection, saved with this
+                    # shortcut (gui/shortcut_manager.py's "Lines…" button,
+                    # DisplayMode editor). Write it into the SAME shared,
+                    # per-slot store gui/flight_line_filter.py already reads
+                    # everywhere (flight_line_visibility_by_slot[slot]) --
+                    # so both Main View's and this section's flight-line
+                    # filtering pick it up on their next rebuild.
+                    target_flight_lines = {}
+                    if target_display_mode == "line":
+                        raw_lines = preset.get("flight_lines", {}) or {}
+                        try:
+                            target_flight_lines = {
+                                int(k): bool(v) for k, v in raw_lines.items()
+                            }
+                        except Exception:
+                            target_flight_lines = {}
+                        if not hasattr(self.app_window, "flight_line_visibility_by_slot"):
+                            self.app_window.flight_line_visibility_by_slot = {}
+                        self.app_window.flight_line_visibility_by_slot[target_view] = (
+                            target_flight_lines
+                        )
+
                     print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view} "
                         f"mode={target_display_mode} quality={target_quality_mode}")
 
@@ -1446,11 +1469,14 @@ class GlobalShortcutFilter(QObject):
                     # target_quality_mode, not just the key combo -- otherwise
                     # editing an already-"last applied" shortcut's mode (e.g.
                     # Class -> Depth) OR its Speed (e.g. Normal -> Fast, same
-                    # mode) and pressing the same key again matched the old
-                    # identity and was skipped as a no-op, silently keeping
-                    # the stale mode/quality applied.
+                    # mode) OR its flight-line selection (Line mode) and
+                    # pressing the same key again matched the old identity
+                    # and was skipped as a no-op, silently keeping the stale
+                    # mode/quality/lines applied.
+                    _flight_lines_sig = tuple(sorted(target_flight_lines.items()))
                     _current_shortcut_id = (
-                        combo, target_display_mode, target_view, target_quality_mode
+                        combo, target_display_mode, target_view, target_quality_mode,
+                        _flight_lines_sig,
                     )
                     _last_applied_id = getattr(
                         self.app_window, '_last_display_shortcut_id', None
@@ -2021,6 +2047,28 @@ class GlobalShortcutFilter(QObject):
                                     f"   STEP 6: Main view switched live to "
                                     f"{target_display_mode}"
                                 )
+                                if target_display_mode == "line":
+                                    # set_display_mode("line") only recolors
+                                    # points by flight line -- it deliberately
+                                    # never touches which points are hidden
+                                    # ("FlightVisible shader array handles
+                                    # show/hide independently", app_window.py
+                                    # ~7896). Refresh that array now from the
+                                    # flight_lines this shortcut just wrote to
+                                    # flight_line_visibility_by_slot[0], or a
+                                    # Line shortcut's saved line selection
+                                    # would color correctly but never actually
+                                    # hide/show the lines it configured.
+                                    try:
+                                        from gui.unified_actor_manager import (
+                                            fast_main_flight_line_visibility_update,
+                                        )
+                                        fast_main_flight_line_visibility_update(
+                                            self.app_window
+                                        )
+                                    except Exception as _line_vis_err:
+                                        print(f"   ⚠️ Line visibility refresh "
+                                            f"failed: {_line_vis_err}")
                             else:
                                 # Palette sync alone does not leave Line mode.
                                 if str(getattr(
