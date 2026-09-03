@@ -708,12 +708,20 @@ class GlobalShortcutFilter(QObject):
                 # tab (no actual main-view measuring in progress), which would
                 # otherwise swallow Ctrl+Z/Y here with "nothing to undo" and
                 # cross-section measurement's own undo would never be reached.
-                # While cross-section measuring is toggled on, it exclusively
-                # owns Ctrl+Z/Y — undo/redo segments measured inside
-                # cross-section views (and their mirrored main-view labels).
+                # While cross-section measuring is toggled on, OR it still has
+                # a finalized segment to undo/redo (Escape deactivates the
+                # tool but must not strand that history — a segment you just
+                # finished stays undo-able after Escape, same as the main
+                # view's own finalized measurements do), it exclusively owns
+                # Ctrl+Z/Y for undo/redo of cross-section segments (and their
+                # mirrored main-view labels).
                 # =================================================================
                 _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
-                if _cs_measure is not None and getattr(_cs_measure, 'active', False):
+                _cs_measure_claims_undo = _cs_measure is not None and (
+                    getattr(_cs_measure, 'active', False)
+                    or _cs_measure.has_history()
+                )
+                if _cs_measure_claims_undo:
                     if event.key() == Qt.Key_Z:
                         print("📏 Ctrl+Z → Cross-Section Measurement Undo (EXCLUSIVE)")
                         try:

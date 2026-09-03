@@ -9259,6 +9259,63 @@ def safe_query_ball_point(tree, pts, r, return_length=False):
             return result
 
 
+def batched_neighbor_class_ratios(tree_all, pts_idx, xyz, predictions, radius,
+                                   min_neighbors, building_code, highveg_code,
+                                   veg_codes):
+    """
+    Vectorized replacement for the "for pt, nb in zip(pts_idx, nlist): ..."
+    Python loops used by the fence roof/wall-rescue and building-footprint-
+    completion post-processing passes. For every point in `pts_idx`, finds
+    its neighbors within `radius` (via `tree_all`) and computes, among those
+    neighbors, the fraction currently classified as Building, as HighVeg,
+    and as any vegetation class.
+
+    This reads `predictions` exactly once, up front — matching the original
+    per-point loop's semantics exactly, since that loop only ever *read*
+    predictions while iterating and applied all resulting label changes in
+    one batch afterward (`predictions[to_building] = BUILDING`), so there is
+    no ordering dependency between points to preserve. The per-point Python
+    loop (with several numpy calls made 10,000-45,000+ times, once per
+    candidate point) was the dominant cost of these two post-processing
+    passes; this replaces it with a handful of whole-array numpy operations.
+
+    Returns:
+        valid_pts             : pts_idx filtered to points with >= min_neighbors
+                                 neighbors (points below that are dropped, same
+                                 as the original loop's `continue`)
+        b_ratio, high_ratio, veg_ratio : float32 arrays aligned with valid_pts
+    """
+    nlist = safe_query_ball_point(tree_all, xyz[pts_idx], r=radius)
+    counts = np.fromiter((len(nb) for nb in nlist), dtype=np.int64, count=len(nlist))
+
+    keep = counts >= min_neighbors
+    if not np.any(keep):
+        empty = np.empty(0, dtype=np.float32)
+        return pts_idx[:0], empty, empty, empty
+
+    valid_pts = pts_idx[keep]
+    keep_positions = np.flatnonzero(keep)
+    valid_nlist = [nlist[i] for i in keep_positions]
+    valid_counts = counts[keep].astype(np.float32)
+
+    neighbor_counts = np.fromiter((len(nb) for nb in valid_nlist), dtype=np.int64,
+                                   count=len(valid_nlist))
+    owner = np.repeat(np.arange(len(valid_nlist)), neighbor_counts)
+    flat_nb = np.concatenate(valid_nlist).astype(np.int64)
+    nb_pred = predictions[flat_nb]
+
+    n_valid = len(valid_pts)
+    b_counts = np.bincount(owner, weights=(nb_pred == building_code), minlength=n_valid)
+    high_counts = np.bincount(owner, weights=(nb_pred == highveg_code), minlength=n_valid)
+    veg_counts = np.bincount(owner, weights=np.isin(nb_pred, veg_codes), minlength=n_valid)
+
+    b_ratio = (b_counts / valid_counts).astype(np.float32)
+    high_ratio = (high_counts / valid_counts).astype(np.float32)
+    veg_ratio = (veg_counts / valid_counts).astype(np.float32)
+
+    return valid_pts, b_ratio, high_ratio, veg_ratio
+
+
 def safe_clear(device: torch.device):
     gc.collect()
     if device.type == "cuda":
@@ -16621,37 +16678,39 @@ def classify_laz(input_path, output_path, output_dir,
                                 if 'tree_all' not in locals() or tree_all is None:
                                     tree_all = cKDTree(xyz)
 
-                                nlist = safe_query_ball_point(tree_all, xyz[rescue_idx], r=1.45)
-                                to_building = []
+                                # Vectorized (was a per-point Python loop with several
+                                # numpy calls per iteration — the dominant cost of this
+                                # pass for large rescue_idx sets). Same thresholds, same
+                                # resulting point set: each of the three branches below
+                                # independently qualifies a point (the original if/elif
+                                # chain only short-circuited redundant checks, it did not
+                                # change which points end up added).
+                                valid_pts, b_ratio, high_ratio, veg_ratio = batched_neighbor_class_ratios(
+                                    tree_all, rescue_idx, xyz, predictions, radius=1.45,
+                                    min_neighbors=10, building_code=BUILDING,
+                                    highveg_code=HIGHVEG, veg_codes=[LOWVEG, MIDVEG, HIGHVEG],
+                                )
 
-                                for pt, nb in zip(rescue_idx, nlist):
-                                    nb = np.asarray(nb, dtype=np.int64)
-                                    if len(nb) < 10:
-                                        continue
+                                if len(valid_pts) > 0:
+                                    h_pt = hag[valid_pts]
+                                    p_pt = planarity_05_raw[valid_pts]
+                                    v_pt = verticality_05_raw[valid_pts]
 
-                                    nb_pred = predictions[nb]
-                                    b_ratio = float(np.count_nonzero(nb_pred == BUILDING)) / float(len(nb))
-                                    high_ratio = float(np.count_nonzero(nb_pred == HIGHVEG)) / float(len(nb))
-                                    veg_ratio = float(np.count_nonzero(np.isin(nb_pred, [LOWVEG, MIDVEG, HIGHVEG]))) / float(len(nb))
-
-                                    h_pt = float(hag[pt])
-                                    p_pt = float(planarity_05_raw[pt])
-                                    v_pt = float(verticality_05_raw[pt])
-
-                                    is_roof = (h_pt > 0.45 and p_pt > 0.105 and v_pt < 0.88)
-                                    is_low_deck_roof = (h_pt > -0.20 and h_pt < 1.55 and p_pt > 0.165 and v_pt < 0.72)
-                                    is_wall = (h_pt > 0.12 and h_pt < 4.60 and v_pt > 0.22 and p_pt > 0.040)
+                                    is_roof = (h_pt > 0.45) & (p_pt > 0.105) & (v_pt < 0.88)
+                                    is_low_deck_roof = (h_pt > -0.20) & (h_pt < 1.55) & (p_pt > 0.165) & (v_pt < 0.72)
+                                    is_wall = (h_pt > 0.12) & (h_pt < 4.60) & (v_pt > 0.22) & (p_pt > 0.040)
 
                                     # Need real Building support, otherwise this becomes tree growth.
-                                    if is_roof and b_ratio >= 0.28 and (high_ratio < 0.68 or b_ratio >= 0.48):
-                                        to_building.append(pt)
-                                    elif is_low_deck_roof and b_ratio >= 0.36 and veg_ratio < 0.72:
-                                        to_building.append(pt)
-                                    elif is_wall and b_ratio >= 0.42 and high_ratio < 0.44:
-                                        to_building.append(pt)
+                                    to_building_mask = (
+                                        (is_roof & (b_ratio >= 0.28) & ((high_ratio < 0.68) | (b_ratio >= 0.48))) |
+                                        (is_low_deck_roof & (b_ratio >= 0.36) & (veg_ratio < 0.72)) |
+                                        (is_wall & (b_ratio >= 0.42) & (high_ratio < 0.44))
+                                    )
+                                    to_building = valid_pts[to_building_mask]
+                                else:
+                                    to_building = valid_pts
 
-                                if to_building:
-                                    to_building = np.asarray(to_building, dtype=np.int64)
+                                if len(to_building) > 0:
                                     predictions[to_building] = BUILDING
                                     roof_wall_rescue_count = int(len(to_building))
 
@@ -16768,53 +16827,53 @@ def classify_laz(input_path, output_path, output_dir,
                                     )
                                     fp_candidates = fp_candidates[np.argsort(-score)[:45_000]]
 
-                                nlist = safe_query_ball_point(tree_all, xyz[fp_candidates], r=2.10)
-                                to_building = []
+                                # Vectorized (was a per-point Python loop with several
+                                # numpy calls per iteration — this was the single largest
+                                # cost in fence post-processing, since fp_candidates can
+                                # reach 45,000 points per pass). Same thresholds, same
+                                # resulting point set: the original's "continue" calls
+                                # only skipped now-redundant checks once a point already
+                                # qualified, they never changed which points end up
+                                # added, so this is the union of the same three branches
+                                # gated by the same tree-rejection check.
+                                valid_pts, b_ratio, high_ratio, veg_ratio = batched_neighbor_class_ratios(
+                                    tree_all, fp_candidates, xyz, predictions, radius=2.10,
+                                    min_neighbors=12, building_code=BUILDING,
+                                    highveg_code=HIGHVEG, veg_codes=[LOWVEG, MIDVEG, HIGHVEG],
+                                )
 
-                                for pt, nb in zip(fp_candidates, nlist):
-                                    nb = np.asarray(nb, dtype=np.int64)
-                                    if len(nb) < 12:
-                                        continue
+                                if len(valid_pts) > 0:
+                                    h_pt = hag[valid_pts]
+                                    p_pt = planarity_05_raw[valid_pts]
+                                    v_pt = verticality_05_raw[valid_pts]
+                                    cls_pt = predictions[valid_pts]
 
-                                    nb_pred = predictions[nb]
-                                    b_ratio = float(np.count_nonzero(nb_pred == BUILDING)) / float(len(nb))
-                                    high_ratio = float(np.count_nonzero(nb_pred == HIGHVEG)) / float(len(nb))
-                                    veg_ratio = float(np.count_nonzero(np.isin(nb_pred, [LOWVEG, MIDVEG, HIGHVEG]))) / float(len(nb))
-
-                                    h_pt = float(hag[pt])
-                                    p_pt = float(planarity_05_raw[pt])
-                                    v_pt = float(verticality_05_raw[pt])
-                                    cls_pt = int(predictions[pt])
-
-                                    roof_like = (h_pt > 0.28 and p_pt > 0.080 and v_pt < 0.88)
-                                    low_deck_like = (h_pt > -0.25 and h_pt < 1.65 and p_pt > 0.150 and v_pt < 0.72)
-                                    wall_like = (h_pt > 0.10 and v_pt > 0.18 and p_pt > 0.035)
+                                    roof_like = (h_pt > 0.28) & (p_pt > 0.080) & (v_pt < 0.88)
+                                    low_deck_like = (h_pt > -0.25) & (h_pt < 1.65) & (p_pt > 0.150) & (v_pt < 0.72)
+                                    wall_like = (h_pt > 0.10) & (v_pt > 0.18) & (p_pt > 0.035)
 
                                     # Tree/canopy rejection. HighVeg can be a roof in bad raw output,
                                     # but only keep it if it is planar or has strong building support.
                                     tree_like = (
-                                        (high_ratio > 0.62 and b_ratio < 0.32 and p_pt < 0.145) or
-                                        (veg_ratio > 0.82 and b_ratio < 0.24 and p_pt < 0.130)
+                                        ((high_ratio > 0.62) & (b_ratio < 0.32) & (p_pt < 0.145)) |
+                                        ((veg_ratio > 0.82) & (b_ratio < 0.24) & (p_pt < 0.130))
                                     )
-                                    if tree_like:
-                                        continue
 
-                                    if roof_like and b_ratio >= 0.18:
-                                        if cls_pt != HIGHVEG or p_pt > 0.120 or b_ratio >= 0.30:
-                                            to_building.append(pt)
-                                            continue
+                                    roof_full = (
+                                        roof_like & (b_ratio >= 0.18) &
+                                        ((cls_pt != HIGHVEG) | (p_pt > 0.120) | (b_ratio >= 0.30))
+                                    )
+                                    low_deck_full = low_deck_like & (b_ratio >= 0.30) & (veg_ratio < 0.76)
+                                    wall_full = wall_like & (b_ratio >= 0.30) & (high_ratio < 0.55)
 
-                                    if low_deck_like and b_ratio >= 0.30 and veg_ratio < 0.76:
-                                        to_building.append(pt)
-                                        continue
+                                    to_building_mask = (~tree_like) & (roof_full | low_deck_full | wall_full)
+                                    to_building = valid_pts[to_building_mask]
+                                else:
+                                    to_building = valid_pts
 
-                                    if wall_like and b_ratio >= 0.30 and high_ratio < 0.55:
-                                        to_building.append(pt)
-
-                                if not to_building:
+                                if len(to_building) == 0:
                                     break
 
-                                to_building = np.asarray(to_building, dtype=np.int64)
                                 predictions[to_building] = BUILDING
                                 footprint_fix_count += int(len(to_building))
 

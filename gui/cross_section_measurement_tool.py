@@ -48,6 +48,8 @@ import time
 import numpy as np
 import vtk
 
+from gui.measure_settings_dialog import load_measure_settings
+
 
 class CrossSectionMeasurementTool:
     """Click-to-measure tool scoped to cross-section (side) views."""
@@ -64,6 +66,9 @@ class CrossSectionMeasurementTool:
         self._last_move_time = {}       # view_index -> monotonic seconds
         self._picker = vtk.vtkCellPicker()
         self._picker.SetTolerance(0.01)
+        # Same user-configured label style (unit, font size) the main-view
+        # measurement tool uses, so cross-section labels match it exactly.
+        self._measure_style = load_measure_settings()
         # LIFO history for Ctrl+Z/Ctrl+Y — each entry keeps enough to redraw
         # (view_index, local_p1, local_p2) plus the live handles to remove.
         self._undo_stack = []
@@ -155,6 +160,15 @@ class CrossSectionMeasurementTool:
     def deactivate_all_sections(self):
         for view_index in list(self._section_observers.keys()):
             self.deactivate_for_section(view_index)
+
+    def has_history(self):
+        """True while there is a finalized segment left to undo or redo.
+
+        Deactivating (Escape, or unchecking the footer toggle) does not
+        clear this — a finalized measurement stays undo-able afterward, the
+        same way the main-view tool's own finalized measurements do.
+        """
+        return bool(self._undo_stack or self._redo_stack)
 
     # ------------------------------------------------------------------
     # Picking helpers
@@ -504,6 +518,19 @@ class CrossSectionMeasurementTool:
             except Exception:
                 pass
 
+    @staticmethod
+    def _remove_segment_actor(renderer, actor):
+        """Remove one segment prop, using the 2D API for the boxed label (vtkActor2D)."""
+        if actor is None:
+            return
+        try:
+            if actor.IsA("vtkActor2D"):
+                renderer.RemoveActor2D(actor)
+            else:
+                renderer.RemoveActor(actor)
+        except Exception:
+            pass
+
     def _remove_segment(self, view_index, segment):
         """Remove one segment's actors from its section view."""
         segments = self._segment_actors.get(view_index, [])
@@ -514,12 +541,7 @@ class CrossSectionMeasurementTool:
         if widget is None:
             return
         for key in ("line", "label"):
-            actor = segment.get(key)
-            if actor is not None:
-                try:
-                    widget.renderer.RemoveActor(actor)
-                except Exception:
-                    pass
+            self._remove_segment_actor(widget.renderer, segment.get(key))
         self._force_section_render(view_index, widget)
 
     # ------------------------------------------------------------------
@@ -564,16 +586,41 @@ class CrossSectionMeasurementTool:
         return actor, pts, polydata
 
     def _make_label_actor(self, position, distance):
-        text_actor = vtk.vtkBillboardTextActor3D()
-        text_actor.SetInput(f"↔ {distance:.2f}m")
-        text_actor.SetPosition(float(position[0]), float(position[1]), float(position[2]))
+        """
+        Same boxed label style the main-view measurement tool uses for its
+        own finalized distance labels (black box, white border, white bold
+        text) — see MeasurementTool._create_distance_label() /
+        _create_world_text_label(). Uses vtkTextActor anchored to a world
+        position (a vtkActor2D), unlike the plain vtkBillboardTextActor3D
+        used elsewhere in this file, so it must be added/removed via the
+        renderer's *2D* API (AddActor2D/RemoveActor2D), not AddActor.
+        """
+        style = self._measure_style or {}
+        sec = style.get('line', {})
+        font_size = sec.get('label_font_size', 16)
+        unit = sec.get('unit', 'm')
+        text = f"{distance/1000.0:.3f} km" if unit == 'km' else f"{distance:.2f} m"
+
+        text_actor = vtk.vtkTextActor()
+        text_actor.SetInput(text)
+
         prop = text_actor.GetTextProperty()
         prop.SetColor(1.0, 1.0, 1.0)
-        prop.SetFontSize(14)
+        prop.SetFontSize(font_size)
         prop.BoldOn()
-        prop.SetBackgroundOpacity(0.0)
         prop.SetJustificationToCentered()
         prop.SetVerticalJustificationToCentered()
+        prop.SetBackgroundColor(0.0, 0.0, 0.0)
+        prop.SetBackgroundOpacity(0.75)
+        prop.SetFrame(True)
+        prop.SetFrameColor(1.0, 1.0, 1.0)
+        prop.SetFrameWidth(2)
+
+        coord = text_actor.GetActualPositionCoordinate()
+        coord.SetCoordinateSystemToWorld()
+        coord.SetValue(float(position[0]), float(position[1]), float(position[2]))
+
+        text_actor.GetProperty().SetDisplayLocationToForeground()
         text_actor.PickableOff()
         return text_actor
 
@@ -584,7 +631,7 @@ class CrossSectionMeasurementTool:
 
         mid = tuple((a + b) / 2.0 for a, b in zip(local_p1, local_p2))
         label_actor = self._make_label_actor(mid, distance)
-        renderer.AddActor(label_actor)
+        renderer.AddActor2D(label_actor)
 
         segment = {
             "line": line_actor,
@@ -648,12 +695,7 @@ class CrossSectionMeasurementTool:
             return
         for seg in segments:
             for key in ("line", "label"):
-                actor = seg.get(key)
-                if actor is not None:
-                    try:
-                        widget.renderer.RemoveActor(actor)
-                    except Exception:
-                        pass
+                self._remove_segment_actor(widget.renderer, seg.get(key))
         self._force_section_render(view_index, widget)
 
     def clear_all(self):
