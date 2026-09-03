@@ -1,0 +1,3 @@
+# untitled.ucf - Minimal user configuration file
+_UCF_LEVEL_ = 4
+_MS_USERPREF : $(_USTN_WORKSPACEROOT)prefs/untitled.upf

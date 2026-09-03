@@ -502,6 +502,12 @@ class SectionController:
                 self._locate_rb_actor = None
         except Exception:
             pass
+        try:
+            cut_controller = getattr(self.app, "cut_section_controller", None)
+            if cut_controller is not None and hasattr(cut_controller, "clear_cut_locate_rubber_band"):
+                cut_controller.clear_cut_locate_rubber_band()
+        except Exception:
+            pass
         self.app._section_locate_display = None
         self.app._section_locate_view = None
 

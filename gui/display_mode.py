@@ -3102,6 +3102,20 @@ class DisplayModeDialog(QDialog):
                 self._owner_state_sync = True
                 try:
                     self.showMinimized()
+                    # Same fix as the restore branch below: showMinimized()
+                    # only changes this dialog's own window state, it does
+                    # not guarantee Qt's keyboard-focus target moves off of
+                    # whatever widget inside this dialog last held it -- if
+                    # nothing else claims focus, shortcuts like Ctrl+Z can
+                    # go nowhere (not even reach the global event filter)
+                    # until the user manually clicks the viewport. Hand
+                    # focus back to Main View's own render widget here too.
+                    try:
+                        vtk_widget = getattr(owner, "vtk_widget", None)
+                        if vtk_widget is not None:
+                            vtk_widget.setFocus()
+                    except Exception:
+                        pass
                 finally:
                     self._owner_state_sync = False
                 print("DISPLAY_MODE_WINDOW owner=minimized action=minimize_dialog")
@@ -3118,6 +3132,19 @@ class DisplayModeDialog(QDialog):
                     # Do not steal focus from the just-restored NakshaAI window.
                     # A later explicit Display Mode command may raise it again.
                     self.lower()
+                    # showNormal()/lower() only change stacking order, not Qt's
+                    # internal keyboard-focus target. If some widget inside
+                    # this dialog still held focus, Ctrl+Z/Ctrl+Y (and other
+                    # main-window shortcuts) silently went nowhere until the
+                    # user clicked the viewport manually -- explicitly hand
+                    # focus back to Main View's own render widget so shortcuts
+                    # keep working right after the owner window is restored.
+                    try:
+                        vtk_widget = getattr(owner, "vtk_widget", None)
+                        if vtk_widget is not None:
+                            vtk_widget.setFocus()
+                    except Exception:
+                        pass
                 finally:
                     self._owner_state_sync = False
                 print("DISPLAY_MODE_WINDOW owner=restored action=restore_dialog_background")

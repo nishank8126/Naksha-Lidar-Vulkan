@@ -7,6 +7,7 @@ from gui.shortcut_manager import (
     encode_display_visibility_preset,
     encode_line_mode_preset,
     line_mode_to_display_visibility_preset,
+    shortcut_search_matches,
 )
 
 
@@ -91,3 +92,15 @@ def test_nested_flight_line_dialog_is_owned_by_line_preset_dialog():
     assert _is_owned_qt_object(line_preset_dialog, flight_line_dialog)
     assert _is_owned_qt_object(line_preset_dialog, nested_widget)
     assert not _is_owned_qt_object(line_preset_dialog, unrelated_dialog)
+
+
+def test_shortcut_search_matches_captured_modifier_and_key_combination():
+    assert shortcut_search_matches("alt+f1", "alt", "F1", "DisplayMode", "V1: 22vis")
+    assert shortcut_search_matches(" ALT + F1 ", "alt", "F1", "DisplayMode")
+    assert not shortcut_search_matches("alt+f2", "alt", "F1", "DisplayMode")
+
+
+def test_shortcut_search_keeps_individual_column_matching():
+    assert shortcut_search_matches("alt", "alt", "F1", "DisplayMode", "V1: 22vis")
+    assert shortcut_search_matches("displaymode", "alt", "F1", "DisplayMode")
+    assert shortcut_search_matches("22vis", "alt", "F1", "DisplayMode", "V1: 22vis")
