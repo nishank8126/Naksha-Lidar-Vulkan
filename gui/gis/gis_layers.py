@@ -2928,13 +2928,24 @@ def _import_geojson_via_digitizer(app, path: str) -> bool:
         print(f"   ❌ Could not read GeoJSON: {exc}")
         return False
 
-    # Reproject to project CRS if different
-    target_crs_code = getattr(app, "project_crs_epsg", None)
-    if target_crs_code and gdf.crs is not None:
+    # Establish/confirm the ONE authoritative canvas CRS from this GeoJSON's
+    # own CRS (first trustworthy dataset wins), then reproject into whatever
+    # canvas CRS is authoritative. Reading app.project_crs_epsg directly (the
+    # old behaviour) missed the case where THIS import is the first
+    # georeferenced dataset: the canvas CRS would never get established, and
+    # every later SNT/LAZ/basemap load would have nothing to align against.
+    target_crs = None
+    try:
+        from gui.crs_manager import ensure_canvas_crs, get_canvas_crs
+        if gdf.crs is not None:
+            ensure_canvas_crs(app, gdf.crs, source="GeoJSON CRS", dataset=path)
+        target_crs = get_canvas_crs(app)
+    except Exception as e:
+        print(f"   ⚠️ canvas CRS unavailable: {e}")
+    if target_crs is not None and gdf.crs is not None:
         try:
-            target_crs = f"EPSG:{target_crs_code}"
-            if gdf.crs.to_string() != target_crs:
-                print(f"   🔄 Reprojecting GeoJSON from {gdf.crs.to_string()} to project CRS {target_crs}")
+            if not gdf.crs.equals(target_crs):
+                print(f"   🔄 Reprojecting GeoJSON from {gdf.crs} to canvas CRS {target_crs}")
                 gdf = gdf.to_crs(target_crs)
         except Exception as e:
             print(f"   ⚠️ Could not reproject GeoJSON: {e}")

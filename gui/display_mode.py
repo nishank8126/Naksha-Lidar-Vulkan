@@ -4,7 +4,7 @@ import os as _os
 import copy as _copy
 
 from PySide6.QtGui import QColor, QFont, QIcon, QAction, QActionGroup
-from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker
+from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker, QEvent
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -83,9 +83,9 @@ def _uam_sync(app, slot_idx, palette=None, border=None, render=True):
     """General sync for any slot."""
     return _uam.sync_palette_to_gpu(app, slot_idx, palette, border, render)
 
-def _uam_refresh_section(app, view_idx, palette=None, border=0.0):
+def _uam_refresh_section(app, view_idx, palette=None, border=0.0, mode="class"):
     """Used for Cross-Sections (Slots 1-4)."""
-    return _uam.refresh_section_after_weight_change(app, view_idx, palette, border)
+    return _uam.refresh_section_after_weight_change(app, view_idx, palette, border, mode)
 
 def _uam_fast_refresh(app, palette=None, border=0.0):
     """Used for Main View (Slot 0)."""
@@ -673,7 +673,7 @@ class _WeightBulkPopup(QDialog):
 
     def __init__(self, parent_dialog):
         super().__init__(parent_dialog,
-                         Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+                         Qt.Tool | Qt.FramelessWindowHint)
         self.setObjectName("weightBulkPopup")
         self._dialog = parent_dialog
         self._anchor_global = None
@@ -936,13 +936,32 @@ class DisplayModeDialog(QDialog):
         ##
         self.view_borders = {i: 0 for i in range(6)}
         ##
+        # Display Mode is a normal non-modal NakshaAI utility window.
+        # It must NEVER be globally always-on-top: clicking the main NakshaAI
+        # window or another application should naturally move that window in
+        # front.  We keep it as a real top-level Qt.Window (rather than
+        # Qt.Tool/owned-window) so it is also allowed to move behind the main
+        # window when the user changes focus.
         self.setWindowFlags(
             Qt.Window |
-            Qt.WindowStaysOnTopHint |
             Qt.WindowMinimizeButtonHint |
             Qt.WindowMaximizeButtonHint |
             Qt.WindowCloseButtonHint
         )
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+
+        # Owner-state synchronization is observational only.  The dialog stays
+        # open after Apply and after focus changes.  It is minimized/restored
+        # with NakshaAI without stealing focus on restore.
+        self._owner_state_sync = False
+        self._owner_minimized_me = False
+        self._was_visible_before_owner_minimize = False
+        self._user_minimized = False
+        if parent is not None:
+            try:
+                parent.installEventFilter(self)
+            except Exception:
+                pass
 
 
         from PySide6.QtCore import QSettings
@@ -1522,9 +1541,12 @@ class DisplayModeDialog(QDialog):
                     self._surface_quality_value = current_value
 
             self.color_mode.setVisible(True)
-            self.color_mode.setEnabled(self.current_slot == 0)
+            # Cross-sections (slots 1-4) support Class/Depth/Intensity/RGB/
+            # Elevation; Main View (slot 0) supports everything; Cut Section
+            # (slot 5) stays classification-only, unchanged.
+            self.color_mode.setEnabled(self.current_slot in (0, 1, 2, 3, 4))
             mode_idx = int(self.color_mode.currentIndex())
-            mesh_speed_visible = self.current_slot == 0 and mode_idx in (1, 6)
+            mesh_speed_visible = self.current_slot in (0, 1, 2, 3, 4) and mode_idx in (1, 6)
 
             if hasattr(self, "shading_quality_label"):
                 self.shading_quality_label.setVisible(mesh_speed_visible)
@@ -1554,7 +1576,18 @@ class DisplayModeDialog(QDialog):
 
             self._quality_mode_context = mode_idx
 
-            if self.current_slot != 0 and self.color_mode.currentIndex() != 0:
+            # Class(0) / Shaded(1) / Depth(2) / Intensity(3) / RGB(4) / Elevation(5) /
+            # Surface(6) / Line(7) are wired up for cross-section views (View 1-4).
+            # Cut Section (slot 5) keeps its original classification-only restriction.
+            _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
+            if self.current_slot == 5 and self.color_mode.currentIndex() != 0:
+                self.color_mode.blockSignals(True)
+                self.color_mode.setCurrentIndex(0)
+                self.color_mode.blockSignals(False)
+            elif (
+                1 <= self.current_slot <= 4
+                and self.color_mode.currentIndex() not in _SECTION_ALLOWED_MODES
+            ):
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(0)
                 self.color_mode.blockSignals(False)
@@ -1690,10 +1723,23 @@ class DisplayModeDialog(QDialog):
             self.table.blockSignals(False)
 
     def on_slot_changed(self, idx: int) -> None:
+        # The flight-line selector belongs to the slot that was active when it
+        # was opened. Close it before changing slots so it cannot appear to
+        # control the newly selected Main/Cross Section view. The user can
+        # reopen it from the Lines button after the switch.
+        self._close_lines_dialog()
+
         # Bug-10 fix: single save + single load (was 4 separate table scans).
         # Bug-3/Signal: table.blockSignals handled inside _load_slot_state.
         self._save_slot_state(self.current_slot)   # 1 pass: checks + weights
         self._save_border_mode(self.current_slot)  # save border type for outgoing slot
+
+        # Remember the outgoing slot's own color-mode choice (View 1-4 can
+        # each stay on their own mode independently, same pattern as palettes).
+        if not hasattr(self, 'view_color_modes'):
+            self.view_color_modes = {}
+        self.view_color_modes[self.current_slot] = int(self.color_mode.currentIndex())
+
         self.current_slot = idx
         self._load_slot_state(idx)                 # 1 pass: checks + weights, signals blocked
         self.update_border_display()
@@ -1701,14 +1747,26 @@ class DisplayModeDialog(QDialog):
         self._load_border_mode(idx)
         if idx == 5:
             self.on_view_switched_to_cut_section()
-        # Lock color_mode to "By Classification" for all views except Main View (slot 0)
+
+        # Restore this slot's own remembered color mode.
+        #   Slot 0 (Main View): any mode.
+        #   Slots 1-4 (cross-sections): Class/Shaded/Depth/Intensity/RGB/Elevation/Surface/Line.
+        #   Slot 5 (Cut Section): classification-only, unchanged.
+        _SECTION_ALLOWED_MODES = (0, 1, 2, 3, 4, 5, 6, 7)
+        restore_idx = int(self.view_color_modes.get(idx, 0))
         if idx == 0:
             self.color_mode.setEnabled(True)
+        elif 1 <= idx <= 4:
+            if restore_idx not in _SECTION_ALLOWED_MODES:
+                restore_idx = 0
+            self.color_mode.setEnabled(True)
         else:
-            self.color_mode.blockSignals(True)
-            self.color_mode.setCurrentIndex(0)
-            self.color_mode.blockSignals(False)
+            restore_idx = 0
             self.color_mode.setEnabled(False)
+
+        self.color_mode.blockSignals(True)
+        self.color_mode.setCurrentIndex(restore_idx)
+        self.color_mode.blockSignals(False)
         self._sync_color_mode_state()
 
     def on_view_selection_changed(self, idx):
@@ -2184,6 +2242,19 @@ class DisplayModeDialog(QDialog):
                 (lid * 131 + 97) % 256,
                 (lid * 193 + 181) % 256)
 
+    def _close_lines_dialog(self):
+        """Close the flight-line selector and forget its stale slot context."""
+        popup = getattr(self, "_lines_popup", None)
+        self._lines_popup = None
+        if popup is None:
+            return
+        try:
+            popup.close()
+        except RuntimeError:
+            # Qt may already have deleted a WA_DeleteOnClose popup while a
+            # queued slot-change signal is still being delivered.
+            pass
+
     def _open_lines_dialog(self):
         """Open a persistent selector; changes commit only when OK is clicked."""
         existing_popup = getattr(self, "_lines_popup", None)
@@ -2426,9 +2497,11 @@ class DisplayModeDialog(QDialog):
         }
         target_idx = _MODE_TO_IDX.get(current_mode, 0)
 
-        # Sync color_mode combo box index
+        # Sync color_mode combo box index. app.display_mode is the Main View's
+        # own mode flag — only apply it while Main View (slot 0) is selected,
+        # or this stomps a cross-section view's independently-remembered mode.
         if hasattr(self, "color_mode") and self.color_mode is not None:
-            if self.color_mode.currentIndex() != target_idx:
+            if self.current_slot == 0 and self.color_mode.currentIndex() != target_idx:
                 self.color_mode.blockSignals(True)
                 self.color_mode.setCurrentIndex(target_idx)
                 self.color_mode.blockSignals(False)
@@ -2554,6 +2627,15 @@ class DisplayModeDialog(QDialog):
         idx          = self.color_mode.currentIndex()
         is_class_mode = (idx == 0)  # Only By Classification is a true class mode
 
+        # Remember this slot's chosen mode immediately on Apply — not just on
+        # slot-switch (on_slot_changed). Without this, drawing a brand-new
+        # cross-section right after Apply (without ever switching the
+        # dialog's target-view dropdown away and back) reads a stale
+        # view_color_modes entry and silently loses the mode just applied.
+        if not hasattr(self, 'view_color_modes'):
+            self.view_color_modes = {}
+        self.view_color_modes[self.current_slot] = idx
+
         class_map = {}
         for row in range(self.table.rowCount()):
             try:
@@ -2583,7 +2665,7 @@ class DisplayModeDialog(QDialog):
         quality_mode = str(self.shading_quality.currentData() or "normal").lower()
         if self.current_slot == 0 and idx in (1, 6) and quality_mode == "slow":
             total_points = len(app.data.get("xyz", [])) if isinstance(getattr(app, "data", None), dict) else 0
-            if total_points > 5_000_000:
+            if total_points > 25_000_000:
                 mode_name = "Shading" if idx == 1 else "Surface"
                 answer = QMessageBox.question(
                     self,
@@ -2614,12 +2696,33 @@ class DisplayModeDialog(QDialog):
 
         if self.current_slot == 0:
             app.class_palette = clone_palette(class_map)
+
+            # ============================================================
+            # ACTIVE PTC FOR AI
+            # ============================================================
+            # Opening/loading a PTC does NOT activate it for AI.
+            # Only clicking Display Mode -> Apply activates the PTC.
+            if self.current_ptc_path:
+                app.active_ptc_schema = clone_palette(class_map)
+                app.active_ptc_path = str(self.current_ptc_path)
+
+                print(
+                    f"[PTC] AI schema activated by Apply: "
+                    f"{app.active_ptc_path} "
+                    f"({len(app.active_ptc_schema)} classes)",
+                    flush=True,
+                )
+
             if is_class_mode:
-                app._main_view_borders_active = (self.view_borders.get(0, 0) > 0)
-                app.point_border_percent = float(self.view_borders.get(0, 0))
+                app._main_view_borders_active = (
+                    self.view_borders.get(0, 0) > 0
+                )
+                app.point_border_percent = float(
+                    self.view_borders.get(0, 0)
+                )
             else:
                 app._main_view_borders_active = False
-                app.point_border_percent      = 0
+                app.point_border_percent = 0
 
         # â”€â”€ Track that this slot was explicitly Applied by the user â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if not hasattr(app, '_slot_weights_applied'):
@@ -2629,14 +2732,11 @@ class DisplayModeDialog(QDialog):
         fast_path_handled = False
 
         if self.current_slot == 0 and idx == 1:
-            # Shaded Classification — trigger shading backend.
-            # Remove Surface first because this fast path bypasses app.set_display_mode().
-            try:
-                from gui.surface_mode import detach_surface_before_non_surface_mode
-                detach_surface_before_non_surface_mode(app, requested_mode="shaded_class")
-            except Exception as _surface_cleanup_err:
-                print(f"⚠️ Surface cleanup before Display Mode shading skipped: {_surface_cleanup_err}")
-
+            # Shaded Classification — trigger the shading backend.
+            # Scene ownership (Surface parking, stale edge cleanup and point
+            # actor suppression) is centralized in update_shaded_class().
+            # Keeping it there makes View-menu Apply, shortcuts, cached restore
+            # and programmatic mode switches follow one identical entry path.
             app.display_mode = "shaded_class"
             print("🔳 Borders DISABLED for shaded_class mode (forced to 0%)")
             print("🎨 Display mode → shaded_class")
@@ -2645,8 +2745,16 @@ class DisplayModeDialog(QDialog):
                     update_shaded_class, has_cached_geometry
                 )
                 azimuth = getattr(app, 'last_shade_azimuth', 45.0)
-                angle   = getattr(app, 'last_shade_angle',   45.0)
-                ambient = getattr(app, 'shade_ambient',       0.25)
+                # IMPORTANT: this argument is the USER-facing facet Sharpness
+                # (0..999) in multi-class shading. last_shade_angle stores the
+                # internal physical light elevation and must not be fed back as
+                # Sharpness when Display Mode re-enters Shading.
+                sharpness = getattr(
+                    app,
+                    'shading_sharpness_angle',
+                    getattr(app, 'last_shade_angle', 45.0),
+                )
+                ambient = getattr(app, 'shade_ambient', 0.25)
                 new_vis = set(
                     int(c) for c, e in class_map.items() if e.get("show", True)
                 )
@@ -2658,10 +2766,10 @@ class DisplayModeDialog(QDialog):
 
                 if _xyz is not None and has_cached_geometry(_xyz, new_vis, quality_mode=quality_mode):
                     print("   âš¡ Geometry cached â€” skipping rebuild")
-                    update_shaded_class(app, azimuth, angle, ambient,
+                    update_shaded_class(app, azimuth, sharpness, ambient,
                                         force_rebuild=False)
                 else:
-                    update_shaded_class(app, azimuth, angle, ambient,
+                    update_shaded_class(app, azimuth, sharpness, ambient,
                                         force_rebuild=True)
             except Exception as _se:
                 print(f"âš ï¸ Shading backend failed: {_se}")
@@ -2799,15 +2907,74 @@ class DisplayModeDialog(QDialog):
                             print(f"   âœ… Border {border}% applied after rebuild")
                 fast_path_handled = True
 
+        # [CS-MESH-DISPLAY] display-mode apply
+        elif self.current_slot in (1, 2, 3, 4) and idx in (1, 6):
+            view_idx = self.current_slot - 1
+            target_mode = "shaded_class" if idx == 1 else "surface"
+            ok = False
+            try:
+                from gui.cross_section.section_mesh_display import apply_section_display_mode
+                ok = apply_section_display_mode(
+                    app,
+                    view_idx,
+                    target_mode,
+                    quality_mode=quality_mode,
+                    palette=class_map,
+                    force=False,
+                    reason="display_mode_apply",
+                )
+                if not ok:
+                    print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_failed")
+            except Exception as _cs_mesh_err:
+                print(f"SECTION_MESH view={view_idx + 1} mode={target_mode} status=apply_exception reason={_cs_mesh_err}")
+                ok = False
+            fast_path_handled = bool(ok)
+            if not ok:
+                # Fallback: gui.cross_section.section_mesh_display isn't
+                # available/working yet -- use our own mesh-slab-clip
+                # implementation (gui.cross_section.section_shaded_surface)
+                # instead, so Shaded/Surface still works for sections today.
+                from gui.cross_section.section_shaded_surface import build_section_shaded_surface_actor
+                mesh_mode = "shaded" if idx == 1 else "surface"
+                ok2 = build_section_shaded_surface_actor(app, view_idx, mesh_mode)
+                if ok2:
+                    fast_path_handled = True
+                    print(f"Section {view_idx + 1} display mode -> {mesh_mode} (mesh cut, fallback)")
+                else:
+                    print(f"WARNING: Section {view_idx + 1} {mesh_mode} mesh-cut unavailable (fallback also failed)")
+
         elif self.current_slot >= 1:
             if self.current_slot <= 4:
                 view_idx = self.current_slot - 1
+                # [CS-MESH-DISPLAY] leave mesh before existing section renderer
+                try:
+                    from gui.cross_section.section_mesh_display import leave_section_mesh_mode
+                    _section_mode_map = {
+                        0: "class", 2: "depth", 3: "intensity", 4: "rgb",
+                        5: "elevation", 7: "line",
+                    }
+                    _next_section_mode = _section_mode_map.get(idx, "class")
+                    leave_section_mesh_mode(
+                        app, view_idx, next_mode=_next_section_mode, render=False
+                    )
+                except Exception as _cs_leave_err:
+                    print(f"SECTION_MESH view={view_idx + 1} status=leave_failed reason={_cs_leave_err}")
                 border   = float(self.view_borders.get(self.current_slot, 0))
-                ok       = _uam_refresh_section(app, view_idx, class_map, border)
+                # idx in (1, 6) (Shaded/Surface) for slots 1-4 is handled by
+                # the "[CS-MESH-DISPLAY] display-mode apply" elif above --
+                # this branch only ever sees the remaining section modes.
+                from gui.cross_section.section_shaded_surface import (
+                    remove_section_shaded_surface_actor,
+                )
+                remove_section_shaded_surface_actor(app, view_idx)
+                _SECTION_IDX_TO_MODE = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation", 7: "line"}
+                section_mode = _SECTION_IDX_TO_MODE.get(idx, "class")
+                ok = _uam_refresh_section(app, view_idx, class_map, border, section_mode)
                 if ok:
                     fast_path_handled = True
+                    print(f"Section {view_idx + 1} display mode -> {section_mode}")
                 else:
-                    print(f"âš ï¸ Section {view_idx + 1} fast-refresh failed â€” may need rebuild")
+                    print(f"WARNING: Section {view_idx + 1} fast-refresh failed -- may need rebuild")
             elif self.current_slot == 5:
                 if hasattr(app, 'cut_section_controller'):
                     ctrl = app.cut_section_controller
@@ -2882,27 +3049,174 @@ class DisplayModeDialog(QDialog):
         self.save_global_settings()
         self.hide()
 
+    def _sync_with_owner_window_state(self):
+        """Mirror NakshaAI minimize/restore without changing dialog lifetime.
+
+        Important ownership rules:
+          * clicking another window/app never hides or closes Display Mode;
+          * minimizing NakshaAI minimizes an open Display Mode window;
+          * restoring NakshaAI restores only a dialog that NakshaAI minimized;
+          * a dialog manually minimized by the user stays minimized;
+          * owner restore never raises/activates Display Mode.
+        """
+        owner = self._get_app_window()
+        if owner is None:
+            return
+
+        try:
+            owner_minimized = bool(owner.windowState() & Qt.WindowMinimized)
+        except Exception:
+            return
+
+        if owner_minimized:
+            try:
+                if not self.isVisible():
+                    return
+                # If the user had already minimized Display Mode manually, do
+                # not claim ownership of that state and do not auto-restore it.
+                if self.windowState() & Qt.WindowMinimized:
+                    return
+
+                self._was_visible_before_owner_minimize = True
+                self._owner_minimized_me = True
+                self._owner_state_sync = True
+                try:
+                    self.showMinimized()
+                finally:
+                    self._owner_state_sync = False
+                print("DISPLAY_MODE_WINDOW owner=minimized action=minimize_dialog")
+            except Exception:
+                self._owner_state_sync = False
+            return
+
+        # Owner returned to normal. Restore only an owner-forced minimize.
+        if self._owner_minimized_me and self._was_visible_before_owner_minimize:
+            try:
+                self._owner_state_sync = True
+                try:
+                    self.showNormal()
+                    # Do not steal focus from the just-restored NakshaAI window.
+                    # A later explicit Display Mode command may raise it again.
+                    self.lower()
+                finally:
+                    self._owner_state_sync = False
+                print("DISPLAY_MODE_WINDOW owner=restored action=restore_dialog_background")
+            except Exception:
+                self._owner_state_sync = False
+            finally:
+                self._owner_minimized_me = False
+                self._was_visible_before_owner_minimize = False
+
+    def _raise_visible_window_family(self):
+        """Bring Display Mode and its currently open child popups forward."""
+        try:
+            if not self.isVisible() or self.windowState() & Qt.WindowMinimized:
+                return
+        except RuntimeError:
+            return
+
+        windows = [self]
+        try:
+            for child in self.findChildren(QWidget):
+                if not child.isWindow() or not child.isVisible():
+                    continue
+                if child.windowState() & Qt.WindowMinimized:
+                    continue
+                windows.append(child)
+        except RuntimeError:
+            pass
+
+        active_window = None
+        for window in windows:
+            try:
+                window.raise_()
+                active_window = window
+            except RuntimeError:
+                continue
+
+        if active_window is not None:
+            try:
+                active_window.activateWindow()
+            except RuntimeError:
+                pass
+
+    def _schedule_window_family_restore(self):
+        """Defer foreground restoration until Naksha owns the native focus."""
+        if self._user_minimized:
+            return
+        try:
+            if not self.isVisible():
+                return
+        except RuntimeError:
+            return
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._raise_visible_window_family)
+
+    def eventFilter(self, obj, event):
+        owner = self._get_app_window()
+        if obj is owner and event is not None:
+            try:
+                event_type = event.type()
+                if event_type == QEvent.WindowStateChange:
+                    self._sync_with_owner_window_state()
+                elif event_type == QEvent.WindowActivate:
+                    self._schedule_window_family_restore()
+                elif event_type == QEvent.Close:
+                    # App shutdown owns the true native close. Normal user X on
+                    # Display Mode itself is still handled by closeEvent below.
+                    self._allow_native_close = True
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
     def show_safely(self):
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        """Show only on an explicit Display Mode request.
+
+        This is the ONLY place we intentionally raise/activate the dialog.
+        Apply, shortcuts and focus changes never call hide/close here.
+        """
+        try:
+            if self.windowFlags() & Qt.WindowStaysOnTopHint:
+                self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        except Exception:
+            pass
         self.setWindowFlag(Qt.Tool, False)
+
         if self.windowState() & Qt.WindowMinimized:
             self.showNormal()
         else:
             self.show()
+
+        self._user_minimized = False
+        self._owner_minimized_me = False
+        self._was_visible_before_owner_minimize = False
         self._sync_color_mode_state()
+
+        # Explicit open should come to the front; after this, native OS z-order
+        # is respected and any clicked window is free to move above it.
         self.raise_()
         self.activateWindow()
         try:
             self.setFocus(Qt.ActiveWindowFocusReason)
         except Exception:
             pass
+        print("DISPLAY_MODE_WINDOW action=explicit_show topmost=0")
 
     def changeEvent(self, event):
-        """
-        Preserve native minimize behavior so the dialog lives in the taskbar
-        while minimized instead of being force-hidden.
-        """
+        """Track manual minimize separately from owner-forced minimize."""
         super().changeEvent(event)
+        try:
+            if event.type() == QEvent.WindowStateChange:
+                minimized = bool(self.windowState() & Qt.WindowMinimized)
+                if not self._owner_state_sync:
+                    self._user_minimized = minimized
+                    if minimized:
+                        # Manual minimize must never be auto-restored by NakshaAI.
+                        self._owner_minimized_me = False
+                        self._was_visible_before_owner_minimize = False
+                        print("DISPLAY_MODE_WINDOW action=user_minimized")
+        except Exception:
+            pass
 
     
 

@@ -2634,6 +2634,45 @@ class SectionController:
             print(f" 🔒 Palette locked for View {view_index + 1} (prevents sync overwrite)")
             print(f" ✅ View {view_index + 1} re-rendered via GPU uniform (ISOLATED)")
 
+            # ✅ Re-apply this view's own previously-selected display mode
+            # (Depth/Intensity/RGB/Elevation), if it had one. The sync above
+            # only pushes classification colors — without this, drawing a
+            # new section for a view that was e.g. on Elevation would
+            # silently fall back to classification colors, losing the mode
+            # the user had explicitly chosen for that view.
+            try:
+                _reapply_slot_idx = view_index + 1
+                dlg = getattr(self.app, 'display_mode_dialog', None)
+                remembered_modes = getattr(dlg, 'view_color_modes', None) if dlg is not None else None
+                if isinstance(remembered_modes, dict):
+                    _reapply_idx = remembered_modes.get(_reapply_slot_idx, 0)
+                    if _reapply_idx in (1, 6):
+                        from gui.cross_section.section_shaded_surface import (
+                            build_section_shaded_surface_actor,
+                        )
+                        _mesh_mode = "shaded" if _reapply_idx == 1 else "surface"
+                        reapplied = build_section_shaded_surface_actor(
+                            self.app, view_index, _mesh_mode
+                        )
+                        if reapplied:
+                            print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {_mesh_mode} (mesh cut)")
+                    else:
+                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation", 7: "line"}
+                        remembered_mode = _SECTION_MODE_BY_IDX.get(_reapply_idx)
+                        if remembered_mode:
+                            _reapply_border = float(
+                                (self.app.view_borders.get(_reapply_slot_idx, 0) or 0.0)
+                                if hasattr(self.app, "view_borders") else 0.0
+                            )
+                            from gui.unified_actor_manager import refresh_section_after_weight_change
+                            reapplied = refresh_section_after_weight_change(
+                                self.app, view_index, view_palette, _reapply_border, remembered_mode
+                            )
+                            if reapplied:
+                                print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {remembered_mode}")
+            except Exception as _mode_reapply_err:
+                print(f"   ⚠️ Re-applying View {view_index + 1}'s display mode skipped: {_mode_reapply_err}")
+
             # ═══════════════════════════════════════════════════════════════════
             # ✅ CRITICAL FIX: Refit camera based on SOURCE view's visibility when synced
             # ═══════════════════════════════════════════════════════════════════
@@ -2938,6 +2977,16 @@ class SectionController:
 
         from gui.unified_actor_manager import build_section_unified_actor
         build_section_unified_actor(self.app, view_idx, view=view)
+
+        # [CS-MESH-DISPLAY] section geometry reapply
+        try:
+            from .section_mesh_display import reapply_section_mesh_mode_after_geometry
+            reapply_section_mesh_mode_after_geometry(self.app, view_idx)
+        except Exception as _cs_mesh_reapply_err:
+            print(
+                f"SECTION_MESH view={view_idx + 1} status=geometry_reapply_failed "
+                f"reason={_cs_mesh_reapply_err}"
+            )
 
     # Other methods remain unchanged...
 

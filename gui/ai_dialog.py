@@ -1,4 +1,4 @@
-﻿from PySide6.QtWidgets import (
+from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QProgressBar, QPushButton, QMessageBox,
     QSpinBox, QDoubleSpinBox, QCheckBox,
@@ -12,9 +12,18 @@ from PySide6.QtGui import QFont
 from pathlib import Path
 import numpy as np
 
-from gui.ai_inference import (
+from gui.AI.basic.inference import (
     InferenceConfig,
     DEFAULT_POWER_MAPPING,
+)
+from gui.AI.common.class_codes import (
+    DEFAULT_BASE_MAPPING,
+    POWER_LINE_WIRE,
+    POWER_LINE_POLE,
+)
+
+from gui.AI.common.ptc_mapping import (
+    spin_codes_from_ptc_schema,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -128,7 +137,7 @@ _DEFAULTS = {
 # ═══════════════════════════════════════════════════════════════
 # AI FENCE + MODEL SELECTION POPUP
 # Shows digitizer fences, supports hover highlight, multi-select,
-# Basic / Advanced model choice, and Basic-only power-line option.
+# Basic / Advanced / Premium model choice with optional power-line post-pass.
 # ═══════════════════════════════════════════════════════════════
 
 class AIFenceRunDialog(QDialog):
@@ -226,20 +235,24 @@ class AIFenceRunDialog(QDialog):
 
         self.advanced_radio = QRadioButton("Advanced AI")
         self.advanced_radio.setMinimumHeight(26)
+        self.premium_radio = QRadioButton("Premium AI")
+        self.premium_radio.setMinimumHeight(26)
 
         self.power_cb = QCheckBox("Enable Power Line Detection")
         self.power_cb.setChecked(False)
         self.power_cb.setMinimumHeight(26)
         self.power_cb.setToolTip(
-            "Power line detection runs only with Basic AI.\n"
-            "Advanced AI will keep this disabled."
+            "Optional post-pass for Basic, Advanced, or Premium AI.\n"
+            "Detects Wire / Bare Conductor and Pole after the selected engine finishes."
         )
 
         self.basic_radio.toggled.connect(self._sync_model_state)
         self.advanced_radio.toggled.connect(self._sync_model_state)
+        self.premium_radio.toggled.connect(self._sync_model_state)
 
         model_layout.addWidget(self.basic_radio)
         model_layout.addWidget(self.advanced_radio)
+        model_layout.addWidget(self.premium_radio)
         model_layout.addWidget(self.power_cb)
 
         # Advanced AI target class filter
@@ -361,10 +374,28 @@ class AIFenceRunDialog(QDialog):
         self._sync_model_state()
 
     def _sync_model_state(self):
-        if self.advanced_radio.isChecked():
+
+        # Premium AI
+        if hasattr(self, "premium_radio") and self.premium_radio.isChecked():
+
+            self.ai_mode = "premium"
+
+            self.power_cb.setEnabled(True)
+
+            if self._adv_target_box is not None:
+                self._adv_target_box.setVisible(False)
+
+            if hasattr(self, "_model_box") and self._model_box is not None:
+                self._model_box.setMinimumHeight(170)
+                self._model_box.setMaximumHeight(190)
+
+
+        # Advanced AI
+        elif self.advanced_radio.isChecked():
+
             self.ai_mode = "advanced"
-            self.power_cb.setChecked(False)
-            self.power_cb.setEnabled(False)
+
+            self.power_cb.setEnabled(True)
 
             if self._adv_target_box is not None:
                 self._adv_target_box.setVisible(True)
@@ -373,10 +404,16 @@ class AIFenceRunDialog(QDialog):
                 self._model_box.setMinimumHeight(440)
                 self._model_box.setMaximumHeight(440)
 
-            self.advanced_target_classes = self._get_selected_advanced_classes()
+            self.advanced_target_classes = (
+                self._get_selected_advanced_classes()
+            )
 
+
+        # Basic AI
         else:
+
             self.ai_mode = "basic"
+
             self.power_cb.setEnabled(True)
 
             if self._adv_target_box is not None:
@@ -388,10 +425,13 @@ class AIFenceRunDialog(QDialog):
 
             self.advanced_target_classes = {4}
 
+
         try:
             if hasattr(self, "_content_widget") and self._content_widget is not None:
                 self._content_widget.adjustSize()
+
             self.updateGeometry()
+
         except Exception:
             pass
 
@@ -985,7 +1025,7 @@ class AIFenceRunDialog(QDialog):
         if not self._validate_advanced_target_classes():
             return
 
-        self.enable_power_lines = bool(self.power_cb.isChecked()) if self.ai_mode == "basic" else False
+        self.enable_power_lines = bool(self.power_cb.isChecked())
         self.target_indices = None
         self.selected_fence_count = 0
         self.selected_fence_drawings = []
@@ -999,7 +1039,7 @@ class AIFenceRunDialog(QDialog):
         if not self._validate_advanced_target_classes():
             return
 
-        self.enable_power_lines = bool(self.power_cb.isChecked()) if self.ai_mode == "basic" else False
+        self.enable_power_lines = bool(self.power_cb.isChecked())
         fences = self._selected_fences()
 
         if not fences:
@@ -1060,18 +1100,25 @@ class AIFenceRunDialog(QDialog):
 class ClassMappingDialog(QDialog):
 
     _CLASSES = [
-        (0,      "Ground",            1),
-        (1,      "Low Vegetation",    2),
-        (2,      "Medium Vegetation", 3),
-        (3,      "High Vegetation",   4),
-        (4,      "Building",          5),
-        ('wire', "Power Line Wire",  14),
-        ('pole', "Power Line Pole",  15),
+        (0,      "Ground",            DEFAULT_BASE_MAPPING[0]),
+        (1,      "Low Vegetation",    DEFAULT_BASE_MAPPING[1]),
+        (2,      "Medium Vegetation", DEFAULT_BASE_MAPPING[2]),
+        (3,      "High Vegetation",   DEFAULT_BASE_MAPPING[3]),
+        (4,      "Building",          DEFAULT_BASE_MAPPING[4]),
+        ('wire', "Power Line Wire",  POWER_LINE_WIRE),
+        ('pole', "Power Line Pole",  POWER_LINE_POLE),
     ]
 
     def __init__(self, parent=None, existing_classes=None, app=None):
         super().__init__(parent)
         self._app                       = app if app is not None else parent
+
+        # PTC state for this AI dialog.
+        # False = no PTC was explicitly Applied in Display Mode.
+        self._ptc_active = False
+        self._ptc_missing_core = []
+        self._ptc_semantic_codes = {}
+
         self.existing_classes           = existing_classes or set()
         self.accepted_class_mapping     = None
         self.accepted_power_mapping     = None
@@ -1079,6 +1126,11 @@ class ClassMappingDialog(QDialog):
         self.accepted_target_indices    = None
         self.accepted_enable_power_lines = False
         self.accepted_ai_mode           = "basic"
+        # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_STATE_START
+        self.accepted_ground_uncategorized_ratio = 0.50
+        self._ground_uncat_ratio_box = None
+        self._ground_uncat_ratio_spin = None
+        # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_STATE_END
         self.accepted_advanced_target_classes = {4}
         self._adv_target_checks        = {}
         self._adv_all_cb               = None
@@ -1088,6 +1140,7 @@ class ClassMappingDialog(QDialog):
         self._adv                       = {}
         self._enable_power_cb           = None
         self._advanced_model_cb         = None
+        self._premium_model_cb          = None
 
         # CL corridor option in first AI popup
         self._use_cl_corridor_cb        = None
@@ -1100,6 +1153,104 @@ class ClassMappingDialog(QDialog):
         self.accepted_selected_fence_drawings = []
 
         self._setup_ui()
+
+        # Load class codes from the PTC that was explicitly
+        # Applied in Display Mode.
+        self._apply_active_ptc_mapping()
+
+    def _apply_active_ptc_mapping(self):
+        """
+        Fill AI output-code boxes from the PTC that the user
+        explicitly Applied in Display Mode.
+
+        Loading another PTC without pressing Apply does not
+        change this mapping.
+        """
+
+        app = self._app
+
+        # Reset every time this dialog initializes.
+        self._ptc_active = False
+        self._ptc_missing_core = []
+        self._ptc_semantic_codes = {}
+
+        if app is None:
+            return
+
+        schema = getattr(
+            app,
+            "active_ptc_schema",
+            None
+        )
+
+        if not schema:
+            print(
+                "[PTC] No Applied PTC schema. "
+                "AI keeps existing/default output codes.",
+                flush=True,
+            )
+            return
+
+        # A schema exists only because Display Mode -> Apply
+        # explicitly activated it.
+        self._ptc_active = True
+
+        codes = spin_codes_from_ptc_schema(
+            schema
+        )
+        self._ptc_semantic_codes = dict(codes)
+
+        for key, code in codes.items():
+
+            if key not in self._code_spins:
+                continue
+
+            self._code_spins[key].setValue(
+                int(code)
+            )
+
+        names = {
+            0: "Ground",
+            1: "Low Vegetation",
+            2: "Medium Vegetation",
+            3: "High Vegetation",
+            4: "Building",
+            "wire": "Power Line Wire",
+            "pole": "Power Line Pole",
+        }
+
+        print("")
+        print("=" * 60)
+        print("ACTIVE PTC -> AI CLASS MAPPING")
+        print("=" * 60)
+
+        for key in (0, 1, 2, 3, 4, "wire", "pole"):
+
+            if key in codes:
+                print(
+                    f"  {names[key]:20s} -> class {codes[key]}"
+                )
+
+        missing = [
+            names[key]
+            for key in (0, 1, 2, 3, 4)
+            if key not in codes
+        ]
+
+        self._ptc_missing_core = list(missing)
+
+        if missing:
+            print(
+                "  WARNING: PTC semantic classes not found: "
+                + ", ".join(missing)
+            )
+            print(
+                "  Existing/default AI values remain for "
+                "those missing classes."
+            )
+
+        print("=" * 60)
+        print("")
 
     # ── UI ────────────────────────────────────────────────────
 
@@ -1223,7 +1374,7 @@ class ClassMappingDialog(QDialog):
                 self._use_cl_corridor_cb.setChecked(False)
                 self._use_cl_corridor_cb.setEnabled(False)
                 self._use_cl_corridor_cb.setToolTip(
-                    "When enabled, Basic AI still classifies all normal classes.\n"
+                    "When enabled, the selected AI engine still keeps its normal classes.\n"
                     "The CL center line is used only as a corridor guide for Wire/Pole detection."
                 )
                 self._use_cl_corridor_cb.toggled.connect(self._on_cl_corridor_toggle)
@@ -1301,14 +1452,19 @@ class ClassMappingDialog(QDialog):
         self._advanced_model_cb = QCheckBox("Use Advanced AI Model")
         self._advanced_model_cb.setChecked(False)
         self._advanced_model_cb.toggled.connect(self._on_advanced_ai_toggle)
+
+        self._premium_model_cb = QCheckBox("Use Premium AI Model")
+        self._premium_model_cb.setChecked(False)
+        self._premium_model_cb.toggled.connect(self._on_premium_ai_toggle)
         self._advanced_model_cb.setToolTip(
             "OFF: use current stable Basic AI model.\n"
-            "ON: use Advanced AI model from Advance_Model folder with 68 features.\n\n"
-            "Note: Advanced AI supports only 5 classes, so Power Line Detection "
-            "will be disabled automatically."
+            "ON: use isolated Advanced AI model (68 features).\n\n"
+            "Wire/Pole and Advanced QC run as post-passes after the 5-class model, "
+            "so the trained model itself is not changed."
         )
 
         engine_layout.addWidget(self._advanced_model_cb)
+        engine_layout.addWidget(self._premium_model_cb)
 
         # Advanced AI target class filter
         # Advanced AI target class filter
@@ -1354,13 +1510,52 @@ class ClassMappingDialog(QDialog):
         self._sync_adv_target_box_visible()
 
         layout.addWidget(self._engine_box)
+        # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_START
+        self._ground_uncat_ratio_box = QGroupBox("Ground -> Uncategorized")
+        self._ground_uncat_ratio_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        _ratio_layout = QVBoxLayout(self._ground_uncat_ratio_box)
+        _ratio_layout.setContentsMargins(18, 18, 18, 14)
+        _ratio_layout.setSpacing(7)
+        
+        _ratio_row = QHBoxLayout()
+        _ratio_row.setSpacing(10)
+        _ratio_label = QLabel("Final Ground to Uncategorized:")
+        _ratio_label.setMinimumWidth(190)
+        self._ground_uncat_ratio_spin = QSpinBox()
+        self._ground_uncat_ratio_spin.setRange(0, 100)
+        self._ground_uncat_ratio_spin.setSingleStep(1)
+        self._ground_uncat_ratio_spin.setSuffix(" %")
+        self._ground_uncat_ratio_spin.setValue(50)
+        self._ground_uncat_ratio_spin.setMinimumWidth(100)
+        self._ground_uncat_ratio_spin.setAlignment(Qt.AlignCenter)
+        self._ground_uncat_ratio_spin.setToolTip(
+            "Applies to Advanced and Premium AI.\n"
+            "0% keeps every eligible final Ground point as Ground.\n"
+            "10% converts exactly 10% of eligible final Ground to the active PTC Uncategorized class.\n"
+            "Only final Ground is eligible; vegetation, Building, power, noise and existing Uncategorized are protected."
+        )
+        _ratio_row.addWidget(_ratio_label, 1)
+        _ratio_row.addWidget(self._ground_uncat_ratio_spin, 0)
+        _ratio_layout.addLayout(_ratio_row)
+        
+        _ratio_hint = QLabel(
+            "Advanced + Premium. Destination code comes from the active PTC. "
+            "The selected percentage is shared by both models and is shown again before classification starts."
+        )
+        _ratio_hint.setWordWrap(True)
+        _ratio_hint.setStyleSheet("color:#777; font-size:10px;")
+        _ratio_layout.addWidget(_ratio_hint)
+        self._ground_uncat_ratio_box.setVisible(False)
+        self._ground_uncat_ratio_box.setEnabled(False)
+        layout.addWidget(self._ground_uncat_ratio_box)
+        # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_END
 
         # Presets
         preset_row = QHBoxLayout()
         preset_row.setSpacing(10)
         asprs_btn  = QPushButton("ASPRS Preset")
         asprs_btn.setToolTip(
-            "Ground=1  LowVeg=2  MidVeg=3  HighVeg=4  Building=5  Wire=14  Pole=15"
+            "Ground=2  LowVeg=3  MidVeg=4  HighVeg=5  Building=6  Wire=14  Pole=15"
         )
         asprs_btn.clicked.connect(self._apply_asprs)
         preset_row.addWidget(asprs_btn, 1)
@@ -1427,7 +1622,7 @@ class ClassMappingDialog(QDialog):
 
         if self._use_cl_corridor_cb is not None and self._use_cl_corridor_cb.isChecked():
             self._cl_status_label.setText(
-                "CL corridor selected. Basic AI will classify all classes; CL will guide Wire/Pole detection."
+                "CL corridor selected. The selected AI engine keeps its normal classes; CL guides only Wire/Pole detection."
             )
         else:
             self._cl_status_label.setText(
@@ -2072,30 +2267,91 @@ class ClassMappingDialog(QDialog):
         return selected
 
 
+    def _set_basic_power_controls_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if self._enable_power_cb is not None:
+            if not enabled:
+                self._enable_power_cb.setChecked(False)
+            self._enable_power_cb.setEnabled(enabled)
+
+        if self._use_cl_corridor_cb is not None:
+            if not enabled:
+                self._use_cl_corridor_cb.setChecked(False)
+            self._use_cl_corridor_cb.setEnabled(
+                enabled and self._enable_power_cb is not None and self._enable_power_cb.isChecked()
+            )
+
+        if 'power_corridor_width' in self._adv:
+            self._adv['power_corridor_width'].setEnabled(
+                enabled
+                and self._enable_power_cb is not None
+                and self._enable_power_cb.isChecked()
+                and self._use_cl_corridor_cb is not None
+                and self._use_cl_corridor_cb.isChecked()
+            )
+
+        for key in ('wire', 'pole'):
+            if key in self._code_spins:
+                self._code_spins[key].setEnabled(
+                    enabled and self._enable_power_cb is not None and self._enable_power_cb.isChecked()
+                )
+            if key in self._code_labels:
+                self._code_labels[key].setEnabled(
+                    enabled and self._enable_power_cb is not None and self._enable_power_cb.isChecked()
+                )
+
+        if enabled and self._enable_power_cb is not None:
+            self._on_power_toggle(self._enable_power_cb.isChecked())
+
+    # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_ENABLE_HELPER_START
+    def _sync_ground_uncat_ratio_enabled(self):
+        enabled = bool(
+            (self._advanced_model_cb is not None and self._advanced_model_cb.isChecked())
+            or (self._premium_model_cb is not None and self._premium_model_cb.isChecked())
+        )
+        if self._ground_uncat_ratio_box is not None:
+            self._ground_uncat_ratio_box.setVisible(enabled)
+            self._ground_uncat_ratio_box.setEnabled(enabled)
+        if self._ground_uncat_ratio_spin is not None:
+            self._ground_uncat_ratio_spin.setEnabled(enabled)
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
+    # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_ENABLE_HELPER_END
+    def _on_premium_ai_toggle(self, checked: bool):
+        if checked:
+            if self._advanced_model_cb is not None:
+                self._advanced_model_cb.blockSignals(True)
+                self._advanced_model_cb.setChecked(False)
+                self._advanced_model_cb.blockSignals(False)
+            self._set_basic_power_controls_enabled(True)
+        else:
+            advanced_on = bool(
+                self._advanced_model_cb is not None and self._advanced_model_cb.isChecked()
+            )
+            if not advanced_on:
+                self._set_basic_power_controls_enabled(True)
+        self._sync_adv_target_box_visible()
+        self._sync_ground_uncat_ratio_enabled()
+
+
     def _on_advanced_ai_toggle(self, checked: bool):
         if checked:
-            if self._enable_power_cb is not None:
-                self._enable_power_cb.setChecked(False)
-                self._enable_power_cb.setEnabled(False)
-
-            if self._use_cl_corridor_cb is not None:
-                self._use_cl_corridor_cb.setChecked(False)
-                self._use_cl_corridor_cb.setEnabled(False)
-
-            if 'power_corridor_width' in self._adv:
-                self._adv['power_corridor_width'].setEnabled(False)
-
-            for key in ('wire', 'pole'):
-                if key in self._code_spins:
-                    self._code_spins[key].setEnabled(False)
-                if key in self._code_labels:
-                    self._code_labels[key].setEnabled(False)
+            if self._premium_model_cb is not None:
+                self._premium_model_cb.blockSignals(True)
+                self._premium_model_cb.setChecked(False)
+                self._premium_model_cb.blockSignals(False)
+            self._set_basic_power_controls_enabled(True)
         else:
-            if self._enable_power_cb is not None:
-                self._enable_power_cb.setEnabled(True)
-                self._on_power_toggle(self._enable_power_cb.isChecked())
+            premium_on = bool(
+                self._premium_model_cb is not None and self._premium_model_cb.isChecked()
+            )
+            if not premium_on:
+                self._set_basic_power_controls_enabled(True)
 
         self._sync_adv_target_box_visible()
+        self._sync_ground_uncat_ratio_enabled()
 
     # ── TAB 2: ADVANCED (2-column grid) ──────────────────────
 
@@ -2135,7 +2391,7 @@ class ClassMappingDialog(QDialog):
     #     # self._advanced_model_cb.toggled.connect(self._on_advanced_ai_toggle)
     #     # self._advanced_model_cb.setToolTip(
     #     #     "OFF: use current stable 5-class AI model.\n"
-    #     #     "ON: use advanced model from Advance_Model folder with 68 features."
+    #     #     "ON: use isolated Advanced AI model (68 features)."
     #     # )
 
     #     # engine_layout.addWidget(self._advanced_model_cb)
@@ -2453,7 +2709,9 @@ class ClassMappingDialog(QDialog):
     # ── PRESETS ───────────────────────────────────────────────
 
     def _apply_asprs(self):
-        for k, v in {0:1, 1:2, 2:3, 3:4, 4:5, 'wire':14, 'pole':15}.items():
+        values = dict(DEFAULT_BASE_MAPPING)
+        values.update({'wire': POWER_LINE_WIRE, 'pole': POWER_LINE_POLE})
+        for k, v in values.items():
             self._code_spins[k].setValue(v)
 
     def _apply_zero(self):
@@ -2621,7 +2879,63 @@ class ClassMappingDialog(QDialog):
     def _validate_and_accept(self):
         enable_power = self._enable_power_cb.isChecked()
         use_advanced_ai = self._advanced_model_cb.isChecked()
+        use_premium_ai = bool(
+            self._premium_model_cb is not None and self._premium_model_cb.isChecked()
+        )
         selected_advanced_classes = {0, 1, 2, 3, 4}
+
+        if use_advanced_ai and use_premium_ai:
+            QMessageBox.warning(
+                self,
+                "AI Mode Conflict",
+                "Advanced AI and Premium AI cannot run together. Select exactly one engine."
+            )
+            return
+
+        # ============================================================
+        # APPLIED PTC VALIDATION
+        # ============================================================
+        # If a PTC is active, all five core AI semantic classes
+        # must exist. Never silently fall back to default class codes.
+        if self._ptc_active and self._ptc_missing_core:
+            QMessageBox.critical(
+                self,
+                "Incomplete PTC for AI",
+                "The Applied PTC does not contain all required AI classes.\n\n"
+                "Missing:\n"
+                + "\n".join(
+                    f"  - {name}"
+                    for name in self._ptc_missing_core
+                )
+                + "\n\nPlease correct/load the PTC in Display Mode, "
+                  "click Apply, and run AI again."
+            )
+            return
+
+        # ============================================================
+        # STRICT POWER PTC VALIDATION V2
+        # ============================================================
+        # When an Applied PTC is active and Power detection is enabled, Wire
+        # and Pole/Pylon must both exist semantically. Never silently fall back
+        # to a default class number.
+        if self._ptc_active and enable_power:
+            schema = getattr(self._app, "active_ptc_schema", None) or {}
+            power_codes = spin_codes_from_ptc_schema(schema)
+            missing_power = []
+            if "wire" not in power_codes:
+                missing_power.append("Power Line Wire / Bare Conductors")
+            if "pole" not in power_codes:
+                missing_power.append("Power Line Pole / Pylons or Poles")
+
+            if missing_power:
+                QMessageBox.critical(
+                    self,
+                    "Incomplete PTC for Power AI",
+                    "Power Line Detection is enabled, but the Applied PTC is missing:\n\n"
+                    + "\n".join(f"  - {name}" for name in missing_power)
+                    + "\n\nLoad/correct the PTC in Display Mode, click Apply, and run AI again."
+                )
+                return
 
         use_cl_corridor = (
             enable_power
@@ -2644,28 +2958,7 @@ class ClassMappingDialog(QDialog):
                 )
                 return
 
-        if use_advanced_ai and enable_power:
-            self.tabs.setCurrentIndex(0)
-            QMessageBox.warning(
-                self,
-                "Advanced AI Limitation",
-                "Advanced AI supports only 5 classes:\n\n"
-                "Ground / Low Vegetation / Medium Vegetation / High Vegetation / Building\n\n"
-                "Disable Power Line Detection to use Advanced AI."
-            )
-            return
-        
         if use_cl_corridor:
-            if use_advanced_ai:
-                self.tabs.setCurrentIndex(0)
-                QMessageBox.warning(
-                    self,
-                    "CL Corridor Limitation",
-                    "CL corridor power-line detection must run with Basic AI.\n\n"
-                    "Disable Advanced AI and try again."
-                )
-                return
-
             try:
                 cl_corridor_prior = self._calculate_cl_corridor_prior()
             except Exception as e:
@@ -2741,10 +3034,19 @@ class ClassMappingDialog(QDialog):
             InferenceConfig.WIRE_INTERNAL_CODE: wire_code,
             InferenceConfig.POLE_INTERNAL_CODE: pole_code,
         }
-        self.accepted_ai_mode = (
-            "advanced" if self._advanced_model_cb.isChecked() else "basic"
-        )
+        if use_premium_ai:
+            self.accepted_ai_mode = "premium"
+        elif self._advanced_model_cb.isChecked():
+            self.accepted_ai_mode = "advanced"
+        else:
+            self.accepted_ai_mode = "basic"
         self.accepted_advanced_target_classes = set(selected_advanced_classes)
+        # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_ACCEPT_START
+        _ratio_percent = 0
+        if self._ground_uncat_ratio_spin is not None:
+            _ratio_percent = int(self._ground_uncat_ratio_spin.value())
+        self.accepted_ground_uncategorized_ratio = min(max(_ratio_percent / 100.0, 0.0), 1.0)
+        # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_ACCEPT_END
 
         cl_coords = None
         cl_point_count = 0
@@ -2761,7 +3063,27 @@ class ClassMappingDialog(QDialog):
 
         self.accepted_advanced = {
             'ai_mode': self.accepted_ai_mode,
+
+            # True ONLY when a PTC was explicitly Applied in Display Mode.
+            '_ptc_active': bool(self._ptc_active),
+
+            # Optional PTC classes used by Advanced/Premium post-passes.
+            # If absent in the PTC, standard LAS 0/7/18 are preserved.
+            '_ptc_optional_semantic_codes': {
+                key: int(self._ptc_semantic_codes[key])
+                for key in ("uncategorized", "low_point", "high_noise")
+                if key in self._ptc_semantic_codes
+            },
+
+            # Advanced QC uses conservative post-processing. 10% is a maximum
+            # cap for eligible Ground-only Uncategorized points, never a forced ratio.
+            'advanced_qc_enabled': True,
+            'advanced_uncat_max_ratio': 0.10,
+
             'advanced_target_classes': sorted(self.accepted_advanced_target_classes),
+            # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_CONFIG
+            'ground_to_uncategorized_ratio': float(self.accepted_ground_uncategorized_ratio),
+            'ground_to_uncategorized_percent': float(self.accepted_ground_uncategorized_ratio * 100.0),
             'csf_cloth_resolution':  self._adv['csf_cloth_resolution'].value(),
             'csf_rigidness':         self._adv['csf_rigidness'].value(),
             'csf_class_threshold':   self._adv['csf_class_threshold'].value(),
@@ -2801,6 +3123,9 @@ class ClassMappingDialog(QDialog):
     def get_advanced_config(self):      return self.accepted_advanced
     def get_enable_power_lines(self):   return self.accepted_enable_power_lines
     def get_ai_mode(self):              return self.accepted_ai_mode
+    # NAKSHA_GROUND_UNCAT_USER_RATIO_V3_21_UI_GETTER
+    def get_ground_uncategorized_ratio(self):
+        return float(self.accepted_ground_uncategorized_ratio)
     def get_advanced_target_classes(self):
         return set(self.accepted_advanced_target_classes or {4})
     def get_target_indices(self):       return self.accepted_target_indices
@@ -2829,6 +3154,14 @@ class AIClassificationDialog(QDialog):
         self.class_mapping      = class_mapping
         self.power_mapping      = power_mapping
         self.advanced_config    = advanced_config or {}
+        # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_PROGRESS
+        try:
+            self.ground_uncategorized_ratio = float(
+                self.advanced_config.get("ground_to_uncategorized_ratio", 0.0)
+            )
+        except Exception:
+            self.ground_uncategorized_ratio = 0.0
+        self.ground_uncategorized_ratio = min(max(self.ground_uncategorized_ratio, 0.0), 1.0)
         self.enable_power_lines = bool(enable_power_lines)
         self.ai_mode            = ai_mode
         self.advanced_target_classes = set(
@@ -2871,7 +3204,12 @@ class AIClassificationDialog(QDialog):
         self.setWindowModality(Qt.NonModal)
         layout = QVBoxLayout(self)
 
-        model_txt = "Advanced AI" if self.ai_mode == "advanced" else "Basic AI"
+        if self.ai_mode == "premium":
+            model_txt = "Premium AI"
+        elif self.ai_mode == "advanced":
+            model_txt = "Advanced AI"
+        else:
+            model_txt = "Basic AI"
         mode = "with Power Lines" if self.enable_power_lines else "5-class mode"
 
         if self.ai_mode == "advanced":
@@ -3148,6 +3486,38 @@ class AIClassificationDialog(QDialog):
         self._classification_started = True
         self._finish_handled = False
         self._snapshot_ai_undo_before(data_dict)
+        # NAKSHA_COMMON_SEMANTICS_V3_SNAPSHOT_START
+        try:
+            from gui.AI.common.ptc_semantics import (
+                apply_resolution_to_worker_mappings,
+                format_resolution,
+                resolve_semantic_mapping_from_app,
+            )
+            self._ai_common_semantic_resolution = resolve_semantic_mapping_from_app(
+                self.app,
+                class_mapping=self.class_mapping,
+                power_mapping=self.power_mapping,
+            )
+            self.class_mapping, self.power_mapping, _ptc_changes = \
+                apply_resolution_to_worker_mappings(
+                    self._ai_common_semantic_resolution,
+                    self.class_mapping,
+                    self.power_mapping,
+                )
+            print("=" * 68)
+            print(format_resolution(self._ai_common_semantic_resolution))
+            if _ptc_changes:
+                print("PTC-authoritative worker mapping updates:")
+                for _change in _ptc_changes:
+                    print(f"  {_change}")
+            print("=" * 68)
+        except Exception as _semantic_exc:
+            self._ai_common_semantic_resolution = None
+            print(
+                "[COMMON AI] WARNING: PTC semantic snapshot failed; "
+                f"existing worker mappings preserved: {_semantic_exc}"
+            )
+        # NAKSHA_COMMON_SEMANTICS_V3_SNAPSHOT_END
 
         try:
             if self.target_indices is not None:
@@ -3162,19 +3532,45 @@ class AIClassificationDialog(QDialog):
             print(f"Could not snapshot original classification for fence mode: {e}")
             self._original_classification_for_fence = None
 
-        if self.ai_mode == "advanced":
-            from gui.advance_ai_inference import AdvancedInferenceWorker
+        if self.ai_mode == "premium":
+
+            from gui.AI.premium.premium_worker import PremiumInferenceWorker as PremiumAIWorker
+            from gui.AI.premium.premium_controller import PremiumAIController
+
+            premium_controller = PremiumAIController()
+
+            self.worker = PremiumAIWorker(
+                data_dict=data_dict,
+                class_mapping=self.class_mapping,
+                power_mapping=self.power_mapping,
+                premium_controller=premium_controller,
+                target_indices=self.target_indices,
+                advanced_config=self.advanced_config,
+                enable_power_lines=self.enable_power_lines,
+                ptc_active=bool(
+                    self.advanced_config.get("_ptc_active", False)
+                ),
+            )
+
+            self.worker.ai_mode = "premium"
+
+
+        elif self.ai_mode == "advanced":
+
+            from gui.AI.advanced.inference import AdvancedInferenceWorker
 
             self.worker = AdvancedInferenceWorker(
                 data_dict=data_dict,
                 class_mapping=self.class_mapping,
                 power_mapping=self.power_mapping,
                 advanced_config=self.advanced_config,
-                enable_power_lines=False,
+                enable_power_lines=self.enable_power_lines,
                 target_indices=self.target_indices,
             )
+
+            self.worker.ai_mode = "advanced"
         else:
-            from gui.ai_inference import InferenceWorker
+            from gui.AI.basic.inference import InferenceWorker
 
             self.worker = InferenceWorker(
                 data_dict,
@@ -3258,6 +3654,21 @@ class AIClassificationDialog(QDialog):
             for internal_cls in selected:
                 if internal_cls in self.class_mapping:
                     allowed_output_codes.add(int(self.class_mapping[internal_cls]))
+
+            # Power is a separate post-pass. If enabled, do not let the
+            # Advanced target-class filter erase correctly detected Wire/Pole.
+            if self.enable_power_lines:
+                for code in (self.power_mapping or {}).values():
+                    allowed_output_codes.add(int(code))
+
+            # QC is also a separate post-pass. Preserve standard LAS 0/7/18,
+            # or their optional PTC equivalents when present.
+            optional_qc = dict(
+                self.advanced_config.get("_ptc_optional_semantic_codes", {}) or {}
+            )
+            allowed_output_codes.add(int(optional_qc.get("uncategorized", 0)))
+            allowed_output_codes.add(int(optional_qc.get("low_point", 7)))
+            allowed_output_codes.add(int(optional_qc.get("high_noise", 18)))
 
             if not allowed_output_codes:
                 print("Advanced target filter skipped: no allowed output codes.")
@@ -3370,6 +3781,34 @@ class AIClassificationDialog(QDialog):
 
         self._apply_fence_output_guard()
         self._apply_advanced_target_class_filter()
+        # NAKSHA_COMMON_SEMANTICS_V3_POSTPROCESS_START
+        try:
+            from gui.AI.common.semantic_postprocess import apply_common_semantic_postprocess
+            self._ai_common_postprocess_report = apply_common_semantic_postprocess(
+                self.app,
+                ai_mode=self.ai_mode,
+                class_mapping=self.class_mapping,
+                power_mapping=self.power_mapping,
+                target_indices=self.target_indices,
+                semantic_resolution=getattr(self, "_ai_common_semantic_resolution", None),
+                # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_POSTCONFIG
+                ground_uncategorized_config={
+                    "ground_to_uncategorized_ratio": float(self.ground_uncategorized_ratio)
+                },
+        before_classes=getattr(self, "_ai_undo_before_classes", None),
+            )
+        except Exception as _common_exc:
+            self._ai_common_postprocess_report = {
+                "status": "ERROR_FAIL_OPEN",
+                "error": str(_common_exc),
+            }
+            print(
+                "[COMMON AI] WARNING: production post-process failed open; "
+                f"model output preserved: {_common_exc}"
+            )
+        # Re-assert exact fence isolation after all common semantic writes.
+        self._apply_fence_output_guard()
+        # NAKSHA_COMMON_SEMANTICS_V3_POSTPROCESS_END
         changed_mask = self._compute_ai_changed_mask_after(restrict_to_fence=False)
         ai_changed_count, _ = self._push_ai_undo_after()
         ai_changed_count = int(ai_changed_count or 0)
@@ -3394,7 +3833,7 @@ class AIClassificationDialog(QDialog):
             print(f"Display error:\n{traceback.format_exc()}")
 
     def _build_result_summary(self, processed_points=None):
-        from gui.ai_inference import InferenceConfig
+        from gui.AI.basic.inference import InferenceConfig
         model_names = {0:'Ground', 1:'Low Vegetation', 2:'Medium Vegetation',
                        3:'High Vegetation', 4:'Building'}
         code_to_name = {v: model_names[k] for k, v in self.class_mapping.items()}
@@ -3567,7 +4006,7 @@ def _activate_existing_ai_dialog(app):
 
 
 def show_ai_classification_dialog(app):
-    from gui.ai_inference import HAS_JAKTERISTICS, HAS_CSF
+    from gui.AI.basic.inference import HAS_JAKTERISTICS, HAS_CSF
 
     try:
         if _activate_existing_ai_dialog(app):
@@ -3612,31 +4051,105 @@ def show_ai_classification_dialog(app):
         else:
             print("  WARNING: Source LAZ/LAS file not found!")
 
-        has_rn = (
-            "return_number" in app.data
-            and app.data["return_number"] is not None
-            and len(app.data["return_number"]) == n_points
-            and np.max(app.data["return_number"]) > 0
-        )
+        # ============================================================
+        # REAL RETURN ATTRIBUTES V2
+        # ============================================================
+        # Do not invent return_number=1 / number_of_returns=1.  If the viewer
+        # cache is missing returns (or contains suspicious all-1/all-1 data),
+        # recover the real attributes from the source LAS/LAZ in streaming mode.
+        def _return_array_valid(name):
+            arr = app.data.get(name)
+            if arr is None:
+                return False
+            try:
+                arr = np.asarray(arr)
+                return len(arr) == n_points and arr.size > 0 and np.max(arr) > 0
+            except Exception:
+                return False
 
-        has_nr = (
-            "number_of_returns" in app.data
-            and app.data["number_of_returns"] is not None
-            and len(app.data["number_of_returns"]) == n_points
-            and np.max(app.data["number_of_returns"]) > 0
-        )
+        has_rn = _return_array_valid("return_number")
+        has_nr = _return_array_valid("number_of_returns")
+        app.data["_return_fields_from_source"] = False
 
-        if not has_rn:
-            print("  Return number missing in viewer cache — using safe default.")
-            app.data["return_number"] = np.ones(n_points, dtype=np.float32)
-            has_rn = True
+        viewer_all_single = False
+        if has_rn and has_nr:
+            try:
+                rn_view = np.asarray(app.data["return_number"])
+                nr_view = np.asarray(app.data["number_of_returns"])
+                viewer_all_single = bool(
+                    np.min(rn_view) == 1 and np.max(rn_view) == 1 and
+                    np.min(nr_view) == 1 and np.max(nr_view) == 1
+                )
+            except Exception:
+                viewer_all_single = False
 
-        if not has_nr:
-            print("  Number of returns missing in viewer cache — using safe default.")
-            app.data["number_of_returns"] = np.ones(n_points, dtype=np.float32)
-            has_nr = True
+        need_source_returns = (not has_rn) or (not has_nr) or viewer_all_single
 
-        print("  Return fields ready. Skipping slow UI-thread source-file reread.")
+        if need_source_returns and source_file:
+            try:
+                import laspy
+
+                print("  Reading REAL return attributes from source LAS/LAZ...")
+                with laspy.open(str(source_file), mode="r") as reader:
+                    source_count = int(reader.header.point_count)
+                    if source_count != n_points:
+                        raise RuntimeError(
+                            f"Source/viewer point count mismatch: "
+                            f"source={source_count:,}, viewer={n_points:,}"
+                        )
+
+                    dims = {str(d) for d in reader.header.point_format.dimension_names}
+                    if "return_number" not in dims or "number_of_returns" not in dims:
+                        raise RuntimeError("Source point format does not contain LiDAR return fields.")
+
+                    rn_real = np.empty(n_points, dtype=np.uint8)
+                    nr_real = np.empty(n_points, dtype=np.uint8)
+                    pos = 0
+                    for points in reader.chunk_iterator(1_000_000):
+                        count = len(points)
+                        end = pos + count
+                        rn_real[pos:end] = np.asarray(points.return_number, dtype=np.uint8)
+                        nr_real[pos:end] = np.asarray(points.number_of_returns, dtype=np.uint8)
+                        pos = end
+
+                if pos != n_points:
+                    raise RuntimeError(
+                        f"Return-field read incomplete: {pos:,}/{n_points:,} points"
+                    )
+                if np.max(rn_real) <= 0 or np.max(nr_real) <= 0:
+                    raise RuntimeError("Source return fields contain no valid positive values.")
+
+                app.data["return_number"] = rn_real
+                app.data["number_of_returns"] = nr_real
+                app.data["_return_fields_from_source"] = True
+                has_rn = True
+                has_nr = True
+
+                multi = int(np.count_nonzero(nr_real > 1))
+                print(
+                    f"  REAL returns loaded: {n_points:,} pts | "
+                    f"multi-return points={multi:,} | "
+                    f"max return={int(np.max(rn_real))}/{int(np.max(nr_real))}"
+                )
+
+            except Exception as e:
+                print(f"  WARNING: Could not recover real return fields: {e}")
+                # Never create fake all-1 arrays for production inference.
+                if not has_rn or viewer_all_single:
+                    app.data["return_number"] = None
+                    has_rn = False
+                if not has_nr or viewer_all_single:
+                    app.data["number_of_returns"] = None
+                    has_nr = False
+                app.data["_return_fields_from_source"] = False
+
+        if has_rn and has_nr:
+            if app.data.get("_return_fields_from_source", False):
+                print("  Return fields ready: source-verified.")
+            else:
+                print("  Return fields ready from viewer cache.")
+        else:
+            print("  WARNING: Real return fields unavailable; Basic/Advanced will zero-fill returns.")
 
         has_intensity = (
             "intensity" in app.data
@@ -3700,6 +4213,11 @@ def show_ai_classification_dialog(app):
             selected_fence_drawings=None,
         ):
             advanced_config = dict(advanced_config or {})
+            # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_RUNTIME
+            if str(ai_mode).lower() in ("advanced", "premium"):
+                _gr = float(advanced_config.get("ground_to_uncategorized_ratio", 0.0))
+                _gr = min(max(_gr, 0.0), 1.0)
+                print(f"[GroundRatio UI V3.24] mode={str(ai_mode).upper()} selected={_gr * 100.0:.2f}%")
 
             if ai_mode == "advanced":
                 # Advanced AI fence mode must not silently force Building-only.
@@ -3763,6 +4281,12 @@ def show_ai_classification_dialog(app):
                 class_mapping = mapping_dialog.get_class_mapping()
                 power_mapping = mapping_dialog.get_power_mapping()
                 advanced_config = mapping_dialog.get_advanced_config()
+                # NAKSHA_GROUND_RATIO_SHARED_UI_V3_24_ROUTE
+                _ground_ratio = float(mapping_dialog.get_ground_uncategorized_ratio())
+                _ground_ratio = min(max(_ground_ratio, 0.0), 1.0)
+                advanced_config = dict(advanced_config or {})
+                advanced_config["ground_to_uncategorized_ratio"] = _ground_ratio
+                advanced_config["ground_to_uncategorized_percent"] = _ground_ratio * 100.0
                 enable_power_lines = mapping_dialog.get_enable_power_lines()
                 ai_mode = mapping_dialog.get_ai_mode()
                 advanced_target_classes = mapping_dialog.get_advanced_target_classes()
@@ -3780,16 +4304,21 @@ def show_ai_classification_dialog(app):
                     fence_dialog.setModal(False)
                     fence_dialog.setWindowModality(Qt.NonModal)
 
-                    # Carry first-popup AI choice AND Advanced target classes into optional fence popup.
+                    # Carry first-popup AI choice, power option, and Advanced
+                    # target classes into the optional fence popup.
                     try:
-                        if ai_mode == "advanced":
+                        if ai_mode == "premium":
+                            fence_dialog.premium_radio.setChecked(True)
+                        elif ai_mode == "advanced":
                             fence_dialog.advanced_radio.setChecked(True)
-                            fence_dialog._sync_model_state()
-                            fence_dialog.set_advanced_target_classes(advanced_target_classes)
                         else:
                             fence_dialog.basic_radio.setChecked(True)
-                            fence_dialog.power_cb.setChecked(bool(enable_power_lines))
-                            fence_dialog._sync_model_state()
+
+                        fence_dialog._sync_model_state()
+                        fence_dialog.power_cb.setChecked(bool(enable_power_lines))
+
+                        if ai_mode == "advanced":
+                            fence_dialog.set_advanced_target_classes(advanced_target_classes)
                     except Exception as e:
                         print(f"Could not sync AI fence popup settings: {e}")
 

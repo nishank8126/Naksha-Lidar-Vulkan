@@ -178,6 +178,29 @@ class MainWheelZoomEventFilter(QObject):
             return False
         event_type = event.type()
 
+        # VTK can consume a canvas key press before the application-wide
+        # shortcut filter sees it. Keep Escape reliable for click-identify
+        # modes at the canvas boundary, while leaving every other Escape
+        # action untouched when no such mode is active.
+        if event_type == QEvent.KeyPress:
+            try:
+                is_plain_escape = (
+                    event.key() == Qt.Key_Escape
+                    and event.modifiers() == Qt.NoModifier
+                )
+            except Exception:
+                is_plain_escape = False
+            if is_plain_escape:
+                deactivate = getattr(
+                    app,
+                    "_deactivate_active_identification_tools_for_escape",
+                    None,
+                )
+                if callable(deactivate) and deactivate():
+                    event.accept()
+                    return True
+            return False
+
         # Main 2D middle-pan is owned at the Qt boundary. This prevents the
         # same physical drag from reaching both the digitizer's manual camera
         # path and VTK's interactor style.
@@ -917,6 +940,11 @@ class NakshaApp(QMainWindow):
         self._suppress_main_view_updates = False  #-----------------------------------------------code added by bala--------
         
         # CRS & Classification state
+        # ``canvas_crs`` is the ONE authoritative CRS describing VTK world XY.
+        # ``project_crs_*`` / ``crs`` are kept for backwards compatibility and
+        # are kept in sync by gui.crs_manager - they are NOT authoritative.
+        self.canvas_crs = None
+        self.canvas_crs_info = {}
         self.project_crs_epsg = None
         self.project_crs_wkt = None
         self.crs = None
@@ -925,6 +953,7 @@ class NakshaApp(QMainWindow):
         self.to_class = None
         self.last_shade_azimuth = 45.0
         self.last_shade_angle = 45.0
+        self.shading_sharpness_angle = 45.0
         self.shade_coverage_target = 0.70
         self.shading_dock = None
         self.shading_panel = None
@@ -2375,8 +2404,15 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ UAM reset failed: {e}")
 
             app.data = None
-            app.project_crs_epsg = None
-            app.project_crs_wkt = None
+            # Reset the authoritative canvas CRS and every compatibility field
+            # so a previous project's CRS can never leak into the next one.
+            try:
+                from gui.crs_manager import clear_canvas_crs
+                clear_canvas_crs(app)
+            except Exception as e:
+                print(f"[CRS] clear_canvas_crs failed: {e}")
+                app.project_crs_epsg = None
+                app.project_crs_wkt = None
             app.loaded_file = None
             app.last_save_path = None
             app.class_palette = {}
@@ -2466,26 +2502,26 @@ class NakshaApp(QMainWindow):
     def update_epsg_display(self):
         if not hasattr(self, "epsg_label"):
             return
-        
-        # 1. Check project EPSG
+
+        # Show the AUTHORITATIVE CANVAS CRS.
+        # A GIS layer's own source CRS must NOT masquerade as the canvas CRS -
+        # that created a false impression that the project/canvas CRS was known
+        # (and silently misreported it for mixed-CRS projects).
         epsg = None
-        if getattr(self, "project_crs_epsg", None):
+        try:
+            from gui.crs_manager import get_canvas_crs
+            canvas = get_canvas_crs(self)
+            if canvas is not None:
+                code = canvas.to_epsg()
+                epsg = str(code) if code else None
+        except Exception:
+            epsg = None
+
+        # Backwards compatibility only: if no canvas CRS object is available,
+        # fall back to the legacy project field (never to a GIS layer).
+        if not epsg and getattr(self, "project_crs_epsg", None):
             epsg = str(self.project_crs_epsg)
-            
-        # 2. Check registered GIS layers if project EPSG not set
-        if not epsg:
-            for entry in getattr(self, "gis_layers", []) or []:
-                if entry.get("visible", True) and entry.get("epsg"):
-                    val = entry["epsg"]
-                    epsg = val.split(":")[-1] if ":" in val else val
-                    break
-            if not epsg:
-                for entry in getattr(self, "gis_layers", []) or []:
-                    if entry.get("epsg"):
-                        val = entry["epsg"]
-                        epsg = val.split(":")[-1] if ":" in val else val
-                        break
-                        
+
         if epsg:
             self.epsg_label.setText(epsg)
             self.epsg_label.show()
@@ -6777,18 +6813,31 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Spatial index failed: {e}")
                 self.spatial_index = None
        
-        # Set CRS
+        # Set CRS - route through the authoritative canvas CRS manager so the
+        # FIRST trustworthy georeferenced dataset establishes the canvas CRS and
+        # later datasets are reprojected into it rather than replacing it.
         if lidar_data.get("crs_epsg"):
-            self.project_crs_epsg = lidar_data["crs_epsg"]
-            self.project_crs_wkt = lidar_data.get("crs_wkt")
-           
-            if not hasattr(self, 'crs') or self.crs is None:
+            try:
+                from pyproj import CRS as _CRS
+                from gui.crs_manager import ensure_canvas_crs
+                _crs_obj = None
                 try:
-                    from pyproj import CRS
-                    self.crs = CRS.from_epsg(self.project_crs_epsg)
-                    print(f"✅ Project CRS set: {self.crs.name}")
-                except Exception as e:
-                    print(f"⚠️ Could not create CRS object: {e}")
+                    _crs_obj = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
+                except Exception:
+                    if lidar_data.get("crs_wkt"):
+                        try:
+                            _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
+                        except Exception:
+                            _crs_obj = None
+                if _crs_obj is not None:
+                    ensure_canvas_crs(self, _crs_obj,
+                                      source="LAZ/LAS header",
+                                      dataset=filename)
+                    print(f"Project CRS: {_crs_obj.name}")
+                else:
+                    print("Could not create CRS object from lidar metadata")
+            except Exception as e:
+                print(f"Could not set canvas CRS: {e}")
        
         self.loaded_file = filename
         self.last_save_path = filename
@@ -7591,19 +7640,15 @@ class NakshaApp(QMainWindow):
                 mode = "class"
                 self.display_mode = "class"
             else:
-                # Surface and Shading are both mesh-based display modes.
-                # Remove Surface actor before building/restoring Shading mesh.
-                try:
-                    from gui.surface_mode import detach_surface_before_non_surface_mode
-                    detach_surface_before_non_surface_mode(self, requested_mode="shaded_class")
-                except Exception as _surface_cleanup_err:
-                    print(f"  ⚠️ Surface cleanup before shaded_class skipped: {_surface_cleanup_err}")
-
+                # Shading owns all scene cleanup centrally inside
+                # update_shaded_class().  Do not park Surface here as well;
+                # duplicate caller cleanup caused the same Surface actor to be
+                # processed twice on one mode switch.
                 from .shading_display import update_shaded_class
                 update_shaded_class(
                     self,
                     getattr(self, "last_shade_azimuth", 45.0),
-                    getattr(self, "last_shade_angle", 45.0),
+                    getattr(self, "shading_sharpness_angle", 45.0),
                     getattr(self, "shade_ambient", 0.2),
                 )
                 dock = self._ensure_shading_controls_dock()
@@ -9628,7 +9673,7 @@ class NakshaApp(QMainWindow):
                     from gui.shading_display import update_shaded_class
                     
                     azimuth = getattr(self, "last_shade_azimuth", 45.0)
-                    angle = getattr(self, "last_shade_angle", 45.0)
+                    angle = getattr(self, "shading_sharpness_angle", 45.0)
                     ambient = getattr(self, "shade_ambient", 0.2)
                     
                     update_shaded_class(self, azimuth, angle, ambient)
@@ -11160,7 +11205,7 @@ class NakshaApp(QMainWindow):
                 update_shaded_class(
                     self,
                     getattr(self, "last_shade_azimuth", 45.0),
-                    getattr(self, "last_shade_angle", 45.0),
+                    getattr(self, "shading_sharpness_angle", 45.0),
                     getattr(self, "shade_ambient", 0.2),
                 )
                 print("✅ Main view rebuilt (shaded)")
@@ -11405,7 +11450,7 @@ class NakshaApp(QMainWindow):
                     update_shaded_class(
                         self,
                         getattr(self, "last_shade_azimuth", 45.0),
-                        getattr(self, "last_shade_angle", 45.0),
+                        getattr(self, "shading_sharpness_angle", 45.0),
                         getattr(self, "shade_ambient", 0.2)
                     )
                     print(f"   ✅ Main View refreshed (shaded_class mode)")
@@ -13900,7 +13945,7 @@ class NakshaApp(QMainWindow):
         update_shaded_class(
             self,
             azimuth=getattr(self, "last_shade_azimuth", 45.0),
-            angle=getattr(self, "last_shade_angle", 45.0),
+            angle=getattr(self, "shading_sharpness_angle", 45.0),
             ambient=ambient,
             percentile_filter=getattr(self, "shade_quality", 99.0),
             downsample=getattr(self, "shade_speed", 1)
@@ -13930,7 +13975,7 @@ class NakshaApp(QMainWindow):
         update_shaded_class(
             self,
             azimuth=getattr(self, "last_shade_azimuth", 45.0),
-            angle=getattr(self, "last_shade_angle", 45.0),
+            angle=getattr(self, "shading_sharpness_angle", 45.0),
             ambient=getattr(self, "shade_ambient", 0.2),
             percentile_filter=getattr(self, "shade_quality", 99.0),
             downsample=getattr(self, "shade_speed", 1)
@@ -14168,7 +14213,7 @@ class NakshaApp(QMainWindow):
             elif self.display_mode == "shaded_class":
                 from .shading_display import update_shaded_class
                 update_shaded_class(self, getattr(self, "last_shade_azimuth", 45.0),
-                                    getattr(self, "last_shade_angle", 45.0),
+                                    getattr(self, "shading_sharpness_angle", 45.0),
                                     getattr(self, "shade_ambient", 0.2))
             else:
                 from .pointcloud_display import update_pointcloud
@@ -15233,8 +15278,8 @@ class NakshaApp(QMainWindow):
 
     def open_display_mode(self):
             """
-            Open Display Mode dialog with MAXIMUM visibility enforceme
-            Works on all platforms (Windows, Linux, macOS).
+            Open Display Mode as a normal non-modal NakshaAI utility window.
+            Explicit open raises it once; subsequent focus follows native OS z-order.
             """
             from PySide6.QtCore import Qt
 
@@ -15252,7 +15297,10 @@ class NakshaApp(QMainWindow):
                     dialog.sync_with_app_state()
                 except Exception as e:
                     print(f"⚠️ Dialog sync failed on open: {e}")
-            dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            # Display Mode is intentionally NOT globally always-on-top.
+            # show_safely() raises it only for this explicit user request;
+            # afterwards native Windows z-order is respected.
+            dialog.setWindowFlag(Qt.WindowStaysOnTopHint, False)
             if hasattr(dialog, 'show_safely'):
                 dialog.show_safely()
             else:
@@ -17655,6 +17703,24 @@ class NakshaApp(QMainWindow):
 
             if hasattr(self, 'section_vtks') and self.section_vtks:
                 for view_idx in self.section_vtks.keys():
+
+                    # [CS-MESH-DISPLAY] classification dispatcher
+                    try:
+                        from gui.cross_section.section_mesh_display import (
+                            refresh_section_display_after_classification,
+                        )
+                        if refresh_section_display_after_classification(
+                            self,
+                            view_idx,
+                            changed_mask,
+                            operation=str(getattr(self, "_classification_refresh_operation", "classification") or "classification"),
+                        ):
+                            continue
+                    except Exception as _cs_mesh_refresh_err:
+                        print(
+                            f"SECTION_MESH view={view_idx + 1} status=classification_refresh_failed "
+                            f"reason={_cs_mesh_refresh_err}"
+                        )
                     if (changed_mask is not None
                             and isinstance(changed_mask, np.ndarray)
                             and changed_mask.dtype == bool):

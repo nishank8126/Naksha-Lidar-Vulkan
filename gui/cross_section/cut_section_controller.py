@@ -2342,7 +2342,26 @@ class CutSectionController:
         except Exception as e:
             print(f"  ⚠️ Previous cut ClassificationInteractor cleanup failed: {e}")
 
-        # ✅ NEW: Mark source as cross-section
+
+        # ================================================================
+        # FIX:
+        # CutFromCross must own the cross-section left click exclusively.
+        #
+        # The normal activate() path already disables classification,
+        # but the REUSE path was skipping it.
+        #
+        # Save the active classification state and remove its interactors
+        # BEFORE CutFromCross observers are installed.
+        # ================================================================
+        self._temporarily_disable_classification()
+
+        print(
+            "  🔒 CUT_CLASSIFICATION_GUARD status=armed "
+            "source=cross reuse=1 classification_suspended=1"
+        )
+
+
+        # ✅ Mark source as cross-section
         self._cut_source = 'cross'
         self._suspend_cross_section_left_pan()
 

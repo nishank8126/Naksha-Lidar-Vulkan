@@ -75,6 +75,120 @@ def _safe_populate_inside_fence(dlg):
     except Exception:
         pass
 
+def _commit_sparse_classification_change(
+    app,
+    changed_mask,
+    old_classes,
+    new_classes,
+    *,
+    operation="classification",
+    origin="by_class_tool",
+):
+    """Commit one classification edit through the canonical sparse refresh bus.
+
+    This is the same contract used by the normal Rectangle/Circle/Polygon/
+    Freehand classification tools.  In all-class shading, classification is
+    metadata only: the existing 34M-point/69M-face topology remains resident
+    and only the incident dirty faces are repainted with the current
+    Azimuth/Sharpness/Ambient presentation.
+
+    If a class-visibility boundary really changes (visible -> hidden or hidden
+    -> visible), ClassificationDelta lets shading_display choose its existing
+    topology-aware fallback.  The dialog itself never guesses and never clears
+    the full shading cache merely because "Any class" was selected.
+    """
+    if app is None or not isinstance(getattr(app, "data", None), dict):
+        return False
+
+    classification = app.data.get("classification")
+    if classification is None or changed_mask is None:
+        return False
+
+    mask = np.asarray(changed_mask)
+    if mask.dtype != bool or mask.ndim != 1 or len(mask) != len(classification):
+        return False
+
+    changed_indices = np.flatnonzero(mask).astype(np.intp, copy=False)
+    if changed_indices.size == 0:
+        return False
+
+    old_arr = np.asarray(old_classes).ravel() if old_classes is not None else None
+    new_arr = np.asarray(new_classes).ravel() if new_classes is not None else None
+    if new_arr is not None and new_arr.size == 1 and changed_indices.size != 1:
+        new_arr = np.full(
+            changed_indices.size,
+            new_arr[0],
+            dtype=np.asarray(classification).dtype,
+        )
+
+    transition_valid = (
+        old_arr is not None
+        and new_arr is not None
+        and old_arr.size == changed_indices.size
+        and new_arr.size == changed_indices.size
+    )
+
+    app._last_changed_mask = mask
+    app._last_changed_indices = changed_indices.copy()
+
+    if (
+        str(getattr(app, "display_mode", "") or "").lower() == "shaded_class"
+        and transition_valid
+    ):
+        try:
+            from gui.shading_display import ClassificationDelta
+
+            app._pending_shading_delta = ClassificationDelta(
+                changed_indices=changed_indices.copy(),
+                old_classes=old_arr.copy(),
+                new_classes=new_arr.copy(),
+                operation=str(operation or "classification"),
+                origin_view=str(origin or "by_class_tool"),
+            )
+        except Exception as exc:
+            app._pending_shading_delta = None
+            print(f"   ⚠️ Shading delta setup skipped: {exc}")
+
+    signal = getattr(app, "classification_finished", None)
+    emit = getattr(signal, "emit", None)
+    if callable(emit):
+        try:
+            emit(mask)
+            print(
+                "CLASSIFICATION_SPARSE_COMMIT "
+                f"operation={operation} origin={origin} "
+                f"changed={changed_indices.size:,} "
+                "full_shading_rebuild=0"
+            )
+            return True
+        except Exception as exc:
+            print(f"   ⚠️ Sparse classification signal failed: {exc}")
+
+    # Emergency fallback only.  Preserve the same exact transition contract so
+    # the shading backend can still decide color-only/local-topology/full-rebuild.
+    try:
+        from gui.unified_actor_manager import guarantee_main_view_visual_refresh
+
+        ok = guarantee_main_view_visual_refresh(
+            app,
+            changed_mask=mask,
+            reason=str(operation or "classification"),
+            old_classes=old_arr if transition_valid else None,
+            new_classes=new_arr if transition_valid else None,
+            origin_view=str(origin or "by_class_tool"),
+        )
+        if ok:
+            print(
+                "CLASSIFICATION_SPARSE_COMMIT "
+                f"operation={operation} origin={origin} "
+                f"changed={changed_indices.size:,} fallback=main_guarantee"
+            )
+            return True
+    except Exception as exc:
+        print(f"   ⚠️ Sparse main-view fallback failed: {exc}")
+
+    return False
+
 RIBBON_TOOLTIP_META = {
     ("FileRibbon", "File", "Open"): {
         "title": "Open File",
@@ -5047,7 +5161,7 @@ class ByClassRibbon(QWidget):
         algo_section.add_button("Low Points", "⬇️", self.open_low_points_dialog,    toggleable=False)
         algo_section.add_button("Isolated",   "🔴", self.open_isolated_dialog,      toggleable=False)
         algo_section.add_button("Ground",     "🏔️", self.open_ground_dialog,        toggleable=False)
-        algo_section.add_button("Surface",    "📐", self.open_below_surface_dialog,  toggleable=False)
+        algo_section.add_button("BelowSurface",    "📐", self.open_below_surface_dialog,  toggleable=False)
         layout.addWidget(algo_section)
 
         # ℹ️ Info Display
@@ -5634,44 +5748,11 @@ class ByClassDialog(QDialog):
                 display_mode = getattr(self.app, 'display_mode', 'class')
                 
                 if display_mode == 'shaded_class':
-                    print(f"   🌓 Shading mode — redo refresh needs shading rebuild")
-                    try:
-                        # ✅ FIX: Save shading visibility BEFORE any palette restore
-                        from gui.shading_display import get_cache, update_shaded_class, clear_shading_cache
-                        cache = get_cache()
-                        saved_vis = getattr(cache, 'visible_classes_set', None)
-                        if saved_vis is not None:
-                            saved_vis = saved_vis.copy()
-                        else:
-                            saved_vis = {
-                                int(c) for c, e in self.app.class_palette.items()
-                                if e.get("show", True)
-                            }
-                        
-                        print(f"   📍 Preserved shading visibility: {sorted(saved_vis)}")
-                        
-                        # ✅ DON'T call _restore_main_view_palette_for_refresh() — 
-                        #    it overrides single-class visibility with slot 0!
-                        
-                        # ✅ Force class_palette to match saved shading visibility
-                        for c in self.app.class_palette:
-                            self.app.class_palette[c]["show"] = (int(c) in saved_vis)
-                        
-                        clear_shading_cache("redo classification in shading mode")
-                        update_shaded_class(
-                            self.app,
-                            getattr(self.app, "last_shade_azimuth", 45.0),
-                            getattr(self.app, "last_shade_angle", 45.0),
-                            getattr(self.app, "shade_ambient", 0.2),
-                            force_rebuild=True
-                        )
-                        print(f"   ✅ Shading mesh rebuilt after redo "
-                              f"({'single' if len(saved_vis) == 1 else 'multi'}-class preserved)")
-                    except Exception as e:
-                        print(f"   ⚠️ Shading rebuild failed, falling back to class mode: {e}")
-                        from gui.class_display import update_class_mode
-                        update_class_mode(self.app, force_refresh=True)
-                        
+                    # NakshaApp.redo_classification() already executes
+                    # refresh_shaded_after_history_fast() with the original
+                    # old/new transition and current shading settings.
+                    print("   🌓 Shading mode — sparse redo refresh already handled")
+
                 elif display_mode == 'class':
                     from gui.class_display import update_class_mode
                     update_class_mode(self.app, force_refresh=True)
@@ -5911,110 +5992,54 @@ class ByClassDialog(QDialog):
 
             # Apply conversion
             classification[mask] = to_class
-            
-            # ✅ Store conversion info for targeted refresh
-            if from_classes:
-                self._last_conversion_info = {
-                    'from_classes': from_classes,
-                    'to_class': to_class,
-                    'count': converted_count
-                }
+
+            # Preserve the exact transition for the same sparse shading path
+            # used by normal interactive classification.
+            self._last_conversion_info = {
+                'from_classes': from_classes,
+                'to_class': to_class,
+                'count': converted_count,
+                'converted_indices': np.flatnonzero(mask).astype(np.intp, copy=False),
+            }
+            sparse_refresh_ok = _commit_sparse_classification_change(
+                self.app,
+                mask,
+                old_classes,
+                new_classes,
+                operation='by_class_conversion',
+                origin='ByClassDialog',
+            )
             
             print(f"\n{'='*60}")
             print(f"✅ Converted {converted_count:,} points: {from_classes} → {to_class}")
             print(f"{'='*60}")
 
             display_mode = getattr(self.app, 'display_mode', 'class')
-            print(f"   📍 Current display mode: {display_mode}")          
-            
-            if display_mode == "shaded_class":
-                print(f"   🔺 Rebuilding SHADING mesh after classification...")
-                
-                # ✅ FIX: Save current shading visibility BEFORE any palette manipulation
-                # This preserves single-class mode — don't let slot 0 override it!
-                from gui.shading_display import get_cache, update_shaded_class, clear_shading_cache
-                cache = get_cache()
-                saved_shading_visibility = getattr(cache, 'visible_classes_set', None)
-                
-                if saved_shading_visibility is None:
-                    # Fallback: use current class_palette (before any restore overwrites it)
-                    saved_shading_visibility = {
-                        int(c) for c, e in self.app.class_palette.items()
-                        if e.get("show", True)
-                    }
-                
-                saved_shading_visibility = saved_shading_visibility.copy()
-                is_single = len(saved_shading_visibility) == 1
-                print(f"   📍 Saved shading visibility: {sorted(saved_shading_visibility)} "
-                      f"({'single-class' if is_single else 'multi-class'})")
-                
-                # ✅ DON'T call _restore_main_view_palette_for_refresh() — 
-                #    it would override single-class visibility with slot 0 (all 26 classes)!
-                
-                # ✅ Force class_palette to match SAVED shading visibility (not slot 0!)
-                for c in self.app.class_palette:
-                    self.app.class_palette[c]["show"] = (int(c) in saved_shading_visibility)
-                
-                # Debug: show what will be visible after conversion
-                visible_with_points = []
-                for c, e in sorted(self.app.class_palette.items()):
-                    if e.get("show", True):
-                        pts = np.sum(classification == c)
-                        if pts > 0:
-                            visible_with_points.append(c)
-                            print(f"      Class {c}: VISIBLE, {pts:,} points")
-                
-                if not visible_with_points:
-                    print(f"   ⚠️ No visible classes have points after conversion")
-                    print(f"      (All points moved to hidden class {to_class})")
-                    print(f"      View will be empty — user can switch visibility")
-                
-                clear_shading_cache("class conversion changed visible point set")
-                update_shaded_class(
-                    self.app,
-                    getattr(self.app, "last_shade_azimuth", 45.0),
-                    getattr(self.app, "last_shade_angle", 45.0),
-                    getattr(self.app, "shade_ambient", 0.2),
-                    force_rebuild=True
+            print(f"   📍 Current display mode: {display_mode}")
+
+            if sparse_refresh_ok:
+                print(
+                    "   ⚡ Canonical sparse classification refresh committed — "
+                    "full shading/main actor rebuild skipped"
                 )
-                print(f"   ✅ Shaded mesh rebuilt (visibility preserved: "
-                      f"{'single' if is_single else 'multi'}-class)")
-                
-            elif display_mode == "class":
-                # Standard class-colored point actors
-                print(f"   🎨 Refreshing CLASS mode...")
-                from gui.class_display import update_class_mode
-                update_class_mode(self.app, force_refresh=True)
-                print(f"   ✅ Class mode refreshed")
-                
             else:
-                # (depth) or corrupting the raw data array in-place (rgb/brush).
-                # The cross-section views carry the classification result; the
-                # main view stays in its current non-class display as-is.
-                print(f"   ℹ️ {display_mode} mode — skipping main view repaint "
-                      f"(classification stored; visible in section views)")
+                # Emergency safety net only.  Normal operation must never enter
+                # this branch because NakshaApp exposes classification_finished.
+                print("   ⚠️ Sparse commit unavailable — using legacy safety refresh")
+                if display_mode == "shaded_class":
+                    from gui.shading_display import update_shaded_class
+                    update_shaded_class(
+                        self.app,
+                        getattr(self.app, "last_shade_azimuth", 45.0),
+                        getattr(self.app, "last_shade_angle", 45.0),
+                        getattr(self.app, "shade_ambient", 0.2),
+                        force_rebuild=True,
+                    )
+                elif display_mode == "class":
+                    from gui.class_display import update_class_mode
+                    update_class_mode(self.app, force_refresh=True)
 
-            # Refresh cross-sections if needed
-            if hasattr(self.app, 'section_vtks') and self.app.section_vtks:
-                for view_idx in list(self.app.section_vtks.keys()):
-                    try:
-                        if hasattr(self.app, '_refresh_single_section_view'):
-                            self.app._refresh_single_section_view(view_idx)
-                    except Exception as e:
-                        print(f"   ⚠️ Section {view_idx+1} refresh failed: {e}")
-
-            # Refresh Cut Section view if active
-            try:
-                ctrl = getattr(self.app, 'cut_section_controller', None)
-                if ctrl and getattr(ctrl, 'is_cut_view_active', False):
-                    if hasattr(ctrl, '_refresh_cut_colors_fast'):
-                            ctrl._refresh_cut_colors_fast()
-            except Exception as e:
-                print(f"   ⚠️ Cut Section refresh failed: {e}")
-
-            # Update point count widget
-            if hasattr(self.app, 'point_count_widget'):
-                self.app.point_count_widget.schedule_update()
+            # classification_finished owns section/cut/statistics synchronization.
 
             
             # Update UI
@@ -8226,7 +8251,7 @@ class ByClassHeightDialog(QDialog):
             self.setStyleSheet(get_dialog_stylesheet())
         except Exception:
             pass
-        self.setGeometry(200, 200, 460, 580)
+        self.setGeometry(200, 200, 460, 620)
         
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -8601,6 +8626,23 @@ class ByClassHeightDialog(QDialog):
         )
         self.ref_class_combo.currentIndexChanged.connect(self.on_ref_class_changed)
         body.addWidget(self.ref_class_combo)
+        triangle_row = QHBoxLayout()
+        triangle_row.addWidget(QLabel("Max triangle:"))
+        self.max_triangle_spin = QDoubleSpinBox()
+        self.max_triangle_spin.setRange(0.01, 999999.0)
+        self.max_triangle_spin.setDecimals(2)
+        self.max_triangle_spin.setSingleStep(1.0)
+        self.max_triangle_spin.setValue(100.0)
+        self.max_triangle_spin.setSuffix(" m")
+        self.max_triangle_spin.setToolTip(
+            "Maximum XY edge length allowed in the temporary reference TIN. "
+            "Points over longer gap-spanning triangles are not classified."
+        )
+        self.max_triangle_spin.valueChanged.connect(
+            self.on_class_selection_changed
+        )
+        triangle_row.addWidget(self.max_triangle_spin)
+        body.addLayout(triangle_row)
 
         ref_info = QLabel("Min = 0 m means at reference class level.")
         ref_info.setObjectName("dialogCaption")
@@ -9136,19 +9178,26 @@ class ByClassHeightDialog(QDialog):
             ground_xyz = xyz[ground_mask]
             fence_label_text = ""
         
-        # Build KDTree
-        ground_xy = ground_xyz[:, :2]
-        tree = cKDTree(ground_xy)
-        
-        # Query From class points
-        from_class_xy = from_class_xyz[:, :2]
-        distances, indices = tree.query(from_class_xy, k=1)
-        
-        # Calculate heights
-        from_class_z = from_class_xyz[:, 2]
-        nearest_ground_z = ground_xyz[indices, 2]
-        heights = from_class_z - nearest_ground_z
-        
+        from gui.height_reference_surface import (
+            ReferenceSurfaceError, heights_above_reference_tin,
+        )
+        max_triangle = self.max_triangle_spin.value()
+        try:
+            all_heights, supported, surface_info = heights_above_reference_tin(
+                ground_xyz, from_class_xyz, max_triangle,
+            )
+        except ReferenceSurfaceError as exc:
+            QMessageBox.warning(self, "Reference Surface Failed", str(exc))
+            return
+        unsupported_count = int(np.count_nonzero(~supported))
+        heights = all_heights[supported]
+        if not len(heights):
+            QMessageBox.warning(
+                self, "No Supported Points",
+                "No source points fall on a valid reference triangle. "
+                "Increase Max triangle or inspect gaps in the reference class.",
+            )
+            return
         min_h = np.min(heights)
         max_h = np.max(heights)
         mean_h = np.mean(heights)
@@ -9170,7 +9219,10 @@ class ByClassHeightDialog(QDialog):
                 'count': count, 'percentage': percentage
             })
         
-        print(f"   Points analyzed: {len(from_class_xyz):,}{fence_label_text}")
+        print(f"   Points analyzed: {len(heights):,}{fence_label_text}")
+        print(f"   Reference TIN: {surface_info['usable_triangles']:,}/"
+              f"{surface_info['triangles']:,} triangles usable; "
+              f"{unsupported_count:,} source points unsupported")
         print(f"   Min: {min_h:.3f}m, Max: {max_h:.3f}m, Mean: {mean_h:.3f}m")
         print(f"{'='*60}\n")
         
@@ -9217,13 +9269,13 @@ class ByClassHeightDialog(QDialog):
         self.max_height_spin.setValue(round(float(max_h), 3))
         
         self.height_info_label.setText(
-            f"Analyzed {len(from_class_xyz):,} points{fence_label_text} | "
+            f"Analyzed {len(heights):,} supported points{fence_label_text} | "
             f"Ref: [{ref_class_text}] | Min: {min_h:.3f}m | Max: {max_h:.3f}m"
         )
         self.height_info_label.setStyleSheet("color: #4caf50; font-size: 9px; font-weight: bold;")
         
         QMessageBox.information(self, "Height Analysis Complete", 
-            f"Analyzed {len(from_class_xyz):,} points{fence_label_text}\n"
+            f"Analyzed {len(heights):,} supported points{fence_label_text}\n"
             f"Reference class: {ref_class_text}\n"
             f"Min: {min_h:.3f}m, Max: {max_h:.3f}m above reference\n"
             f"Select a height range from dropdown")
@@ -9519,23 +9571,23 @@ class ByClassHeightDialog(QDialog):
         else:
             ground_xyz = xyz[ground_mask]
         
-        # Build KDTree
-        ground_xy = ground_xyz[:, :2]
-        tree = cKDTree(ground_xy)
-        
-        # Query From class points
-        from_class_xy = from_class_xyz[:, :2]
-        
-        distances, indices = tree.query(from_class_xy, k=1)
-        
-        # Calculate heights
-        from_class_z = from_class_xyz[:, 2]
-        nearest_ground_z = ground_xyz[indices, 2]
-        heights = from_class_z - nearest_ground_z
-        
+        from gui.height_reference_surface import (
+            ReferenceSurfaceError, heights_above_reference_tin,
+        )
+        max_triangle = self.max_triangle_spin.value()
+        try:
+            heights, supported, surface_info = heights_above_reference_tin(
+                ground_xyz, from_class_xyz, max_triangle,
+            )
+        except ReferenceSurfaceError as exc:
+            QMessageBox.warning(self, "Reference Surface Failed", str(exc))
+            return None
+        print(f"   Reference TIN: {surface_info['usable_triangles']:,}/"
+              f"{surface_info['triangles']:,} triangles usable; "
+              f"{np.count_nonzero(~supported):,} source points unsupported")
         # Points within height range
         # Points within height range
-        height_mask = (heights >= min_height) & (heights <= max_height)
+        height_mask = supported & (heights >= min_height) & (heights <= max_height)
         in_range_count = np.sum(height_mask)
         
         print(f"   Points in range: {in_range_count:,}")
@@ -11701,20 +11753,17 @@ class InsideFenceDialog(QDialog):
         from gui.memory_manager import trim_undo_stack
         trim_undo_stack(self.app)
         
-        # One canonical sparse commit.  classification_finished updates the
-        # changed main-view GPU buffers, section mirrors/actors, cut view, and
-        # statistics.  Avoid a preceding fast_classify_update() because that
-        # would patch/render the same main-view data twice.
-        self.app._last_changed_mask = final_mask
-        self.app._last_changed_indices = final_convert_indices.astype(np.intp, copy=False)
-        try:
-            self.app.classification_finished.emit(final_mask)
-        except Exception as _emit_err:
-            # Emergency fallback only if the application signal bus is absent.
-            from gui.unified_actor_manager import fast_classify_update
-            fast_classify_update(self.app, final_mask, int(to_class))
-            print(f"   ⚠️ Sparse signal refresh fallback used: {_emit_err}")
-            
+        # One canonical sparse commit.  Keep the old/new transition so
+        # shaded_class can prove whether geometry membership changed.
+        self._last_sparse_commit_ok = _commit_sparse_classification_change(
+            self.app,
+            final_mask,
+            old_classes,
+            new_classes_arr,
+            operation='inside_fence_conversion',
+            origin='InsideFenceDialog',
+        )
+
         return converted_count, final_mask
 
     def add_fences_from_selection(self, fence_shapes):
@@ -12192,97 +12241,29 @@ class InsideFenceDialog(QDialog):
 
             # ════════════════════════════════════════════════════════════
             # REFRESH LOGIC
-            # ════════════════════════════════════════════════════════════
+            # _calculate_conversion() already emitted one canonical sparse
+            # classification_finished commit.  Do not run a second shading
+            # update and, critically, do not rebuild just because From=Any.
             display_mode = getattr(self.app, 'display_mode', None)
-            
-            if display_mode == "shaded_class" and final_mask is not None:
-                import time
-                t0 = time.perf_counter()
-                
-                # ✅ Get ACTUAL shading visibility (what the mesh was built with)
-                shading_vis = None
-                try:
-                    from gui.shading_display import get_cache
-                    cache = get_cache()
-                    shading_vis = getattr(cache, 'visible_classes_set', None)
-                    if shading_vis is not None and len(shading_vis) > 0:
-                        shading_vis = shading_vis.copy()
-                except Exception:
-                    pass
-                
-                if shading_vis is None or len(shading_vis) == 0:
-                    shading_vis = getattr(self.app, '_shading_visible_classes', None)
-                    if shading_vis is not None and len(shading_vis) > 0:
-                        shading_vis = shading_vis.copy()
-                
-                if shading_vis is None or len(shading_vis) == 0:
-                    shading_vis = {
-                        int(c) for c, e in self.app.class_palette.items()
-                        if e.get("show", True)
-                    }
-                
-                target_visible = int(to_class) in shading_vis
-                source_visible = (
-                    any(int(fc) in shading_vis for fc in from_classes)
-                    if from_classes is not None else None
-                )
-                
-                print(f"⚡ SHADING MODE: target={to_class} visible={target_visible}, "
-                    f"source visible={source_visible}")
-                
-                if from_classes is None:
-                    print("🔄 Any Class selected — rebuilding shaded mesh")
-                    self._shading_force_rebuild(shading_vis)
+            sparse_ok = bool(getattr(self, '_last_sparse_commit_ok', False))
 
-                elif target_visible and source_visible:
-                    # ══════════════════════════════════════════════════
-                    # FAST PATH: Both source and target in mesh → color swap only
-                    # ══════════════════════════════════════════════════
-                    try:
-                        from gui.shading_display import refresh_shaded_after_classification_fast
-                        refresh_shaded_after_classification_fast(self.app, changed_mask=final_mask)
-                        elapsed = (time.perf_counter() - t0) * 1000
-                        print(f"⚡ Fast GPU injection: {elapsed:.0f}ms")
-                    except Exception as e:
-                        print(f"⚠️ Fast injection failed ({e}), rebuilding...")
-                        self._shading_force_rebuild(shading_vis)
-                
-                elif not target_visible and source_visible:
-                    # ══════════════════════════════════════════════════
-                    # REBUILD: Source was visible, target is hidden
-                    # Points must be REMOVED from mesh geometry
-                    # ══════════════════════════════════════════════════
-                    print(f"🙈 Target class {to_class} HIDDEN — must rebuild to remove geometry")
-                    self._shading_force_rebuild(shading_vis)
-                
-                elif target_visible and not source_visible:
-                    # ══════════════════════════════════════════════════
-                    # REBUILD: Source was hidden, target is visible
-                    # Points must be ADDED to mesh geometry
-                    # ══════════════════════════════════════════════════
-                    print(f"🙈 Source classes hidden, target visible — must rebuild to add geometry")
-                    self._shading_force_rebuild(shading_vis)
-                
+            if display_mode == "shaded_class" and final_mask is not None:
+                if sparse_ok:
+                    print(
+                        "⚡ SHADING MODE: canonical sparse fence refresh already "
+                        "committed — full mesh rebuild skipped"
+                    )
                 else:
-                    # ══════════════════════════════════════════════════
-                    # SKIP: Both hidden — mesh unchanged visually
-                    # ══════════════════════════════════════════════════
-                    print(f"⏭️ Both source and target hidden — no visual change needed")
-            
-            elif display_mode == "shaded_class" and final_mask is None:
-                print("⚠️ No change mask — forcing rebuild")
+                    print("⚠️ Sparse fence refresh unavailable — emergency rebuild")
+                    self._shading_force_rebuild(None)
+            elif sparse_ok:
+                print("   ⚡ Sparse classification refresh already committed")
+            elif display_mode == "shaded_class":
+                print("⚠️ No valid change mask — emergency shading rebuild")
                 self._shading_force_rebuild(None)
-            
             else:
-                # CLASS MODE IS ALREADY UPDATED BY _calculate_conversion().
-                # That method emits classification_finished(final_mask), whose
-                # canonical handler patches only the changed GPU class/RGB
-                # entries and refreshes open section views.  Calling
-                # update_class_mode(force_refresh=True) here rebuilt the entire
-                # 13M+ point unified actor for a tiny fence edit.
                 print("   ⚡ Sparse class refresh already committed — full actor rebuild skipped")
 
-            # ════════════════════════════════════════════════════════════
             # CLEANUP
             # ════════════════════════════════════════════════════════════
             self.preview_label.setText(f"✅ Converted {converted_count:,} points")
@@ -12837,6 +12818,7 @@ class PluginsRibbon(QWidget):
                 item = layout.takeAt(0)
                 widget = item.widget()
                 if widget is not None:
+                    widget.setParent(None)
                     widget.deleteLater()
 
         # Re-add core plugins section with Manage button only
@@ -12872,6 +12854,8 @@ class PluginsRibbon(QWidget):
                         print(f"Warning: Failed to add button for plugin '{name}': {e}")
 
         layout.addStretch()
+        layout.invalidate()
+        self.updateGeometry()
 
     def _manage_plugins(self):
         try:

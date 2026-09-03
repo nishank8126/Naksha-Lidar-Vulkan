@@ -226,7 +226,8 @@ class GlobalShortcutFilter(QObject):
             if focus_widget is None:
                 # Dialog visible but nothing focused inside it — keep shortcuts
                 # suppressed so typed class names can't trigger viewport tools.
-                return True
+                # A visible non-modal dialog is not a shortcut suspension state.
+                return False
 
             if isinstance(focus_widget, QLineEdit):
                 try:
@@ -235,8 +236,8 @@ class GlobalShortcutFilter(QObject):
                 except Exception:
                     return True
 
-            if dm_dlg.isAncestorOf(focus_widget):
-                return True
+            # Non-text Display Mode controls must not disable global shortcuts.
+            return False
         except Exception:
             return False
 
@@ -1414,14 +1415,69 @@ class GlobalShortcutFilter(QObject):
                     target_display_mode = str(
                         preset.get("display_mode", "class") or "class"
                     ).lower()
-                    
+                    target_quality_mode = str(
+                        preset.get("quality_mode", "normal") or "normal"
+                    ).lower()
+                    if target_quality_mode not in ("fast", "normal", "slow"):
+                        target_quality_mode = "normal"
+
+                    # Shaded Classification / Surface both read their quality
+                    # (Fast/Normal/Slow) from a global app attribute -- the
+                    # same one the live Display Mode dialog's own "Speed"
+                    # combo writes to (gui/display_mode.py:2681-2686). Set it
+                    # from THIS shortcut's own saved quality before applying,
+                    # so a shortcut with a different Speed than whatever was
+                    # last used actually takes effect (previously the
+                    # shortcut editor had no quality control at all, so this
+                    # was always whatever the global setting happened to be).
+                    if target_display_mode == "shaded_class":
+                        self.app_window.shading_quality = target_quality_mode
+                    elif target_display_mode == "surface":
+                        self.app_window.surface_quality = target_quality_mode
+
                     target_view = int(list(views.keys())[0]) if views else 0
-                    print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view}")
+
+                    # Line mode's flight-line selection, saved with this
+                    # shortcut (gui/shortcut_manager.py's "Lines…" button,
+                    # DisplayMode editor). Write it into the SAME shared,
+                    # per-slot store gui/flight_line_filter.py already reads
+                    # everywhere (flight_line_visibility_by_slot[slot]) --
+                    # so both Main View's and this section's flight-line
+                    # filtering pick it up on their next rebuild.
+                    target_flight_lines = {}
+                    if target_display_mode == "line":
+                        raw_lines = preset.get("flight_lines", {}) or {}
+                        try:
+                            target_flight_lines = {
+                                int(k): bool(v) for k, v in raw_lines.items()
+                            }
+                        except Exception:
+                            target_flight_lines = {}
+                        if not hasattr(self.app_window, "flight_line_visibility_by_slot"):
+                            self.app_window.flight_line_visibility_by_slot = {}
+                        self.app_window.flight_line_visibility_by_slot[target_view] = (
+                            target_flight_lines
+                        )
+
+                    print(f"   🎯 TARGET VIEW FROM SHORTCUT: {target_view} "
+                        f"mode={target_display_mode} quality={target_quality_mode}")
 
                     # ============================================================
                     # STEP 0: CHECK IF SAME SHORTCUT ALREADY APPLIED — skip rebuild
                     # ============================================================
-                    _current_shortcut_id = combo
+                    # Identity includes target_display_mode/target_view/
+                    # target_quality_mode, not just the key combo -- otherwise
+                    # editing an already-"last applied" shortcut's mode (e.g.
+                    # Class -> Depth) OR its Speed (e.g. Normal -> Fast, same
+                    # mode) OR its flight-line selection (Line mode) and
+                    # pressing the same key again matched the old identity
+                    # and was skipped as a no-op, silently keeping the stale
+                    # mode/quality/lines applied.
+                    _flight_lines_sig = tuple(sorted(target_flight_lines.items()))
+                    _current_shortcut_id = (
+                        combo, target_display_mode, target_view, target_quality_mode,
+                        _flight_lines_sig,
+                    )
                     _last_applied_id = getattr(
                         self.app_window, '_last_display_shortcut_id', None
                     )
@@ -1454,8 +1510,37 @@ class GlobalShortcutFilter(QObject):
                                             _state_ok = False
                                             break
                             elif _state_ok and target_view != 0:
+                                # Same gap as the target_view == 0 branch above
+                                # used to have: verify the section's own
+                                # CURRENTLY APPLIED mode still matches this
+                                # shortcut's mode, not just class visibility/
+                                # weights. Without this, manually switching
+                                # that section's mode via the Display Mode
+                                # dialog (or a different shortcut) and then
+                                # re-pressing THIS shortcut could see
+                                # unchanged classes/weights, wrongly treat it
+                                # as "already applied", and skip -- leaving
+                                # the section stuck on the wrong mode.
+                                _dlg_for_check = getattr(
+                                    self.app_window, 'display_mode_dialog', None
+                                )
+                                _view_modes = getattr(
+                                    _dlg_for_check, 'view_color_modes', {}
+                                ) if _dlg_for_check else {}
+                                _MODE_TO_IDX_CHECK = {
+                                    'class': 0, 'shaded_class': 1,
+                                    'depth': 2, 'intensity': 3,
+                                    'rgb': 4, 'elevation': 5,
+                                    'surface': 6, 'line': 7,
+                                }
+                                if _view_modes.get(target_view, 0) != \
+                                        _MODE_TO_IDX_CHECK.get(target_display_mode, 0):
+                                    _state_ok = False
+
                                 _vp = getattr(self.app_window, 'view_palettes', {}).get(target_view)
-                                if not _vp:
+                                if not _state_ok:
+                                    pass
+                                elif not _vp:
                                     _state_ok = False
                                 else:
                                     view_key = str(target_view) if str(target_view) in views \
@@ -1846,31 +1931,57 @@ class GlobalShortcutFilter(QObject):
                     # Elevation selection is not silently discarded.
                     # ============================================================
                     if hasattr(dlg, 'color_mode'):
-                        if target_view == 0:
-                            _MODE_TO_IDX_LOCAL = {
-                                'class': 0, 'shaded_class': 1,
-                                'depth': 2, 'intensity': 3,
-                                'rgb': 4, 'elevation': 5,
-                                'surface': 6, 'line': 7,
-                            }
-                            _combo_idx = _MODE_TO_IDX_LOCAL.get(
-                                target_display_mode, 0
-                            )
-                        else:
-                            _MODE_TO_IDX_LOCAL = {
-                                'class': 0, 'shaded_class': 1,
-                                'depth': 2, 'intensity': 3,
-                                'rgb': 4, 'elevation': 5,
-                                'surface': 6, 'line': 7,
-                            }
-                            _cur_mode = getattr(
-                                self.app_window, 'display_mode', 'class'
-                            )
-                            _combo_idx = _MODE_TO_IDX_LOCAL.get(_cur_mode, 0)
+                        # Same fix as STEP 5 below: the combo must reflect
+                        # THIS preset's own target_display_mode regardless of
+                        # target_view -- it previously borrowed Main View's
+                        # live mode for any section target, so opening the
+                        # Display Mode dialog after a section-targeted
+                        # Elevation/Depth/... shortcut still showed
+                        # "By Classification" instead of the mode actually
+                        # applied.
+                        _MODE_TO_IDX_LOCAL = {
+                            'class': 0, 'shaded_class': 1,
+                            'depth': 2, 'intensity': 3,
+                            'rgb': 4, 'elevation': 5,
+                            'surface': 6, 'line': 7,
+                        }
+                        _combo_idx = _MODE_TO_IDX_LOCAL.get(
+                            target_display_mode, 0
+                        )
                         dlg.color_mode.blockSignals(True)
                         dlg.color_mode.setCurrentIndex(_combo_idx)
                         dlg.color_mode.blockSignals(False)
                         print(f"   ✅ color_mode combo set to index {_combo_idx}")
+
+                        # Remember this view's mode the same way the Display
+                        # Mode dialog's own Apply button does (display_mode.py
+                        # on_apply/on_slot_changed), so drawing a NEW section
+                        # afterward re-applies the mode this shortcut actually
+                        # set instead of whatever mode was last applied via
+                        # the dialog's Apply button (e.g. Shaded Classification
+                        # set manually before this shortcut ran).
+                        if not hasattr(dlg, 'view_color_modes'):
+                            dlg.view_color_modes = {}
+                        dlg.view_color_modes[target_view] = _combo_idx
+
+                        # Same gap, one more control: the live dialog's own
+                        # "Speed" combo (dlg.shading_quality) wasn't synced
+                        # either, so opening Display Mode after a
+                        # shortcut-applied Shaded/Surface with a different
+                        # quality than whatever the combo last showed would
+                        # display a stale Speed value.
+                        if hasattr(dlg, 'shading_quality'):
+                            _quality_idx = dlg.shading_quality.findData(
+                                target_quality_mode
+                            )
+                            if _quality_idx >= 0:
+                                dlg.shading_quality.blockSignals(True)
+                                dlg.shading_quality.setCurrentIndex(_quality_idx)
+                                dlg.shading_quality.blockSignals(False)
+                                if target_display_mode == "shaded_class":
+                                    dlg._shading_quality_value = target_quality_mode
+                                elif target_display_mode == "surface":
+                                    dlg._surface_quality_value = target_quality_mode
 
                     # ============================================================
                     # STEP 4B: Sync class_palette — Main View only
@@ -1892,10 +2003,14 @@ class GlobalShortcutFilter(QObject):
                     # ============================================================
                     # STEP 5: Check current display mode / adjust borders
                     # ============================================================
-                    current_display_mode = (
-                        target_display_mode if target_view == 0 else
-                        getattr(self.app_window, 'display_mode', 'class')
-                    )
+                    # The preset's own chosen mode (target_display_mode) applies
+                    # regardless of target view -- previously a section target
+                    # (target_view != 0) silently discarded the mode picked in
+                    # the editor's dropdown and borrowed Main View's current live
+                    # mode instead, so every section-targeted DisplayMode
+                    # shortcut behaved like whatever Main View happened to be
+                    # showing (usually Class), never the mode actually saved.
+                    current_display_mode = target_display_mode
                     print(f"\n   🎨 DISPLAY MODE NOW: {current_display_mode}")
 
                     if current_display_mode in ['depth', 'rgb', 'intensity']:
@@ -1932,6 +2047,28 @@ class GlobalShortcutFilter(QObject):
                                     f"   STEP 6: Main view switched live to "
                                     f"{target_display_mode}"
                                 )
+                                if target_display_mode == "line":
+                                    # set_display_mode("line") only recolors
+                                    # points by flight line -- it deliberately
+                                    # never touches which points are hidden
+                                    # ("FlightVisible shader array handles
+                                    # show/hide independently", app_window.py
+                                    # ~7896). Refresh that array now from the
+                                    # flight_lines this shortcut just wrote to
+                                    # flight_line_visibility_by_slot[0], or a
+                                    # Line shortcut's saved line selection
+                                    # would color correctly but never actually
+                                    # hide/show the lines it configured.
+                                    try:
+                                        from gui.unified_actor_manager import (
+                                            fast_main_flight_line_visibility_update,
+                                        )
+                                        fast_main_flight_line_visibility_update(
+                                            self.app_window
+                                        )
+                                    except Exception as _line_vis_err:
+                                        print(f"   ⚠️ Line visibility refresh "
+                                            f"failed: {_line_vis_err}")
                             else:
                                 # Palette sync alone does not leave Line mode.
                                 if str(getattr(
@@ -2006,6 +2143,15 @@ class GlobalShortcutFilter(QObject):
                             try:
                                 from gui.unified_actor_manager import \
                                     build_section_unified_actor
+                                try:
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
+                                except Exception as _cs_mesh_clear_err:
+                                    print(f"      ⚠️ Shaded/Surface mesh cleanup "
+                                        f"skipped for View {view_idx}: {_cs_mesh_clear_err}")
 
                                 if view_idx not in dlg.view_palettes or \
                                         not dlg.view_palettes[view_idx]:
@@ -2036,6 +2182,57 @@ class GlobalShortcutFilter(QObject):
                                 else:
                                     print(f"      ⚠️ View {view_idx}: "
                                         f"build returned None")
+
+                                # Apply the preset's own chosen display mode to
+                                # this section. Previously only the class-color
+                                # point actor above was ever built here, so a
+                                # section-targeted Shaded/Surface/Depth/
+                                # Intensity/RGB/Elevation shortcut silently
+                                # behaved like Class.
+                                _SECTION_WEIGHT_MODE = {
+                                    "depth": "depth", "intensity": "intensity",
+                                    "rgb": "rgb", "elevation": "elevation",
+                                    "line": "line",
+                                }
+                                if target_display_mode in ("shaded_class", "surface"):
+                                    from gui.cross_section.section_shaded_surface import \
+                                        build_section_shaded_surface_actor
+                                    _mesh_mode = (
+                                        "shaded" if target_display_mode == "shaded_class"
+                                        else "surface"
+                                    )
+                                    _mesh_ok = build_section_shaded_surface_actor(
+                                        self.app_window, view_index, _mesh_mode
+                                    )
+                                    print(f"      🎨 View {view_idx}: "
+                                        f"{target_display_mode} "
+                                        f"{'applied' if _mesh_ok else 'unavailable'} "
+                                        f"(mesh cut)")
+                                elif target_display_mode in _SECTION_WEIGHT_MODE:
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
+                                    from gui.unified_actor_manager import \
+                                        refresh_section_after_weight_change
+                                    _palette = dlg.view_palettes.get(view_idx, {})
+                                    _mode_ok = refresh_section_after_weight_change(
+                                        self.app_window, view_index, _palette,
+                                        0.0, _SECTION_WEIGHT_MODE[target_display_mode],
+                                    )
+                                    print(f"      🎨 View {view_idx}: "
+                                        f"{target_display_mode} "
+                                        f"{'applied' if _mode_ok else 'unavailable'}")
+                                else:
+                                    # Class -- clear any leftover Shaded/Surface
+                                    # mesh actor from a previously-applied mode
+                                    # on this section.
+                                    from gui.cross_section.section_shaded_surface import \
+                                        remove_section_shaded_surface_actor
+                                    remove_section_shaded_surface_actor(
+                                        self.app_window, view_index
+                                    )
 
                             except Exception as e:
                                 print(f"      ⚠️ View {view_idx} sync failed: {e}")

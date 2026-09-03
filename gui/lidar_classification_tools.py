@@ -2602,7 +2602,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
                         fence_mask=None, search_mode="groups",
                         max_count=6, more_than=0.50, within=5.0,
                         progress_cb=None, abort_check=None,
-                        batch_size=10_000):
+                        batch_size=10_000, use_gpu=None):
     """
     Classify source points/groups that form the lowest local elevation tier.
 
@@ -2707,6 +2707,43 @@ def classify_low_points(xyz, classification, from_classes, to_class,
             "stop_reason": "fewer than 2 source points",
         }
 
+    if use_gpu is not False:
+        try:
+            from gui.gpu_neighborhood_classification import cuda_low_point_tiers
+            gpu_result = cuda_low_point_tiers(
+                xyz=xyz, candidate_idx=candidate_idx, source_idx=source_idx,
+                candidate_allowed=cand_mask, radius=radius, separation=dz,
+                group_limit=group_limit, mode=mode,
+                batch_size=chunk, abort_check=abort_check,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            print(f"[LowPts GPU] {exc}; using CPU KD-tree", flush=True)
+            gpu_result = None
+        if gpu_result is not None:
+            detected = np.asarray(gpu_result["detected"], dtype=np.intp)
+            flagged = detected[classification[detected] != int(to_class)]
+            classification[flagged] = to_class
+            evaluated = int(gpu_result["evaluated"])
+            no_surrounding = int(gpu_result["no_surrounding"])
+            aborted = bool(gpu_result["aborted"])
+            _log(100, f"Done - {len(flagged):,} low points -> class {to_class} "
+                      f"[CUDA {gpu_result['seconds']:.2f}s]")
+            return {
+                "routine": "low_points", "changed": int(len(flagged)),
+                "indices": flagged, "low_candidates": int(len(candidate_idx)),
+                "evaluated_with_surrounding": evaluated,
+                "low_accepted": int(len(flagged)),
+                "low_detected": int(len(detected)),
+                "rejected_no_surrounding": no_surrounding,
+                "rejected_not_low": int(max(0, evaluated - len(detected))),
+                "search_mode": mode, "max_count": group_limit,
+                "more_than": dz, "within": radius,
+                "stop_reason": "aborted" if aborted else "completed one lowest-tier pass",
+                "compute_backend": gpu_result["backend"],
+                "gpu_seconds": float(gpu_result["seconds"]),
+                "gpu_batch_size": int(gpu_result["batch_size"]),
+            }
     _log(5, f"Building 2D source KD-tree ({len(source_idx):,} pts) …")
     t0 = _t.time()
     tree = cKDTree(xyz[source_idx, :2])
@@ -2796,10 +2833,21 @@ def classify_low_points(xyz, classification, from_classes, to_class,
 
             # The first clear vertical gap above the lowest tier represents
             # the lowest point group found by this run.
-            order = np.argsort(
-                xyz[neighbor_global, 2],
-                kind="stable",
-            )
+            # Only the lowest group_limit + 1 elevations can affect the
+            # decision. Fully sorting dense neighborhoods was the dominant
+            # large-cloud cost.
+            keep = min(len(neighbor_global), group_limit + 1)
+            if keep < len(neighbor_global):
+                order = np.argpartition(
+                    xyz[neighbor_global, 2], keep - 1
+                )[:keep]
+                order = order[np.argsort(
+                    xyz[neighbor_global[order], 2], kind="stable"
+                )]
+            else:
+                order = np.argsort(
+                    xyz[neighbor_global, 2], kind="stable"
+                )
             sorted_global = neighbor_global[order]
             sorted_z = xyz[sorted_global, 2]
             gaps = np.diff(sorted_z)
@@ -2849,6 +2897,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
         "more_than": dz,
         "within": radius,
         "stop_reason": stop_reason,
+        "compute_backend": "cpu_kdtree",
     }
 
 
@@ -2863,7 +2912,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
                              height_from_ground=None,
                              ground_classes=None,
                              progress_cb=None, abort_check=None,
-                             batch_size=500_000):
+                             batch_size=500_000, use_gpu=None):
     """
     Classify points with fewer than the requested other points in a 3D sphere.
 
@@ -2998,6 +3047,38 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             detected_count=len(detected),
         )
 
+    if use_gpu is not False:
+        try:
+            from gui.gpu_neighborhood_classification import cuda_radius_counts
+            gpu_result = cuda_radius_counts(
+                xyz=xyz, candidate_idx=candidate_idx, reference_idx=in_idx,
+                dimensions=3, candidate_is_reference=in_mask, radius=radius,
+                batch_size=chunk, abort_check=abort_check,
+                progress_cb=progress_cb,
+            )
+        except Exception as exc:
+            print(f"[Isolated GPU] {exc}; using CPU KD-tree", flush=True)
+            gpu_result = None
+        if gpu_result is not None:
+            all_counts = np.asarray(gpu_result["counts"], dtype=np.intp)
+            processed = int(gpu_result["processed"])
+            detected = candidate_idx[:processed][all_counts < limit]
+            detected = detected.astype(np.intp, copy=False)
+            flagged = detected[classification[detected] != int(to_class)]
+            classification[flagged] = to_class
+            aborted = bool(gpu_result["aborted"])
+            stop_reason = "aborted" if aborted else "completed one 3D count pass"
+            if progress_cb:
+                progress_cb(100, f"Done - {len(flagged):,} pts -> class {to_class} "
+                                  f"[CUDA {gpu_result['seconds']:.2f}s]")
+            result = _result(flagged, all_counts, stop_reason,
+                             detected_count=len(detected))
+            result.update({
+                "compute_backend": gpu_result["backend"],
+                "gpu_seconds": float(gpu_result["seconds"]),
+                "gpu_batch_size": int(gpu_result["batch_size"]),
+            })
+            return result
     if progress_cb:
         progress_cb(
             5,
@@ -3015,18 +3096,25 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             break
         stop = min(start + chunk, len(candidate_idx))
         current = candidate_idx[start:stop]
-        counts = np.asarray(
-            tree3d.query_ball_point(
-                xyz[current, :3],
-                radius,
-                return_length=True,
-                workers=-1,
-            ),
-            dtype=np.intp,
+        # Classification only depends on whether the threshold is reached.
+        # Querying the nearest limit+1 references avoids enumerating every
+        # point in a dense sphere and bounds temporary memory independently
+        # of neighborhood density. One extra slot covers the candidate itself.
+        distances, _ = tree3d.query(
+            xyz[current, :3],
+            k=limit + 1,
+            distance_upper_bound=radius,
+            workers=-1,
         )
-        # If the candidate itself belongs to In class, it is returned by the
-        # sphere query but TerraScan's condition counts only "other" points.
+        counts = np.count_nonzero(
+            np.isfinite(distances), axis=1
+        ).astype(np.intp, copy=False)
+        # If the candidate itself belongs to In class, it occupies one slot
+        # but TerraScan's condition counts only other points.
         counts -= in_mask[current].astype(np.intp)
+        # Counts are intentionally capped at the decision threshold; values
+        # above it are equivalent for the isolated/not-isolated decision.
+        np.minimum(counts, limit, out=counts)
         all_counts[start:stop] = counts
         isolated_mask[start:stop] = counts < limit
         processed = stop
@@ -3046,12 +3134,14 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
     stop_reason = "aborted" if aborted else "completed one 3D count pass"
     if progress_cb:
         progress_cb(100, f"Done - {len(flagged):,} pts -> class {to_class}")
-    return _result(
+    result = _result(
         flagged,
         all_counts,
         stop_reason,
         detected_count=len(detected),
     )
+    result["compute_backend"] = "cpu_kdtree"
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -4751,6 +4841,23 @@ class _BaseClassifyDialog(QDialog):
             )
         live_refresh_dispatched = False
         if changed > 0 and mask is not None:
+            # Match the normal classification tools: preserve old/new classes
+            # until the main-view commit so all-class shading can take its
+            # color-only/crisp-overlay path without rebuilding the TIN.
+            if str(getattr(self.app, "display_mode", "") or "").lower() == "shaded_class":
+                try:
+                    from gui.shading_display import ClassificationDelta
+                    self.app._pending_shading_delta = ClassificationDelta(
+                        changed_indices=np.asarray(indices, dtype=np.int64).copy(),
+                        old_classes=np.asarray(old_c).copy(),
+                        new_classes=np.asarray(new_c).copy(),
+                        operation=str(result.get("routine", name) or "lidar_classification"),
+                        origin_view="lidar_classification_tool",
+                    )
+                except Exception as exc:
+                    self.app._pending_shading_delta = None
+                    print(f"   ⚠️ LiDAR shading delta setup skipped: {exc}")
+
             live_refresh_dispatched = self._notify_classification_views(
                 result,
                 mask,
@@ -4990,17 +5097,42 @@ class _BaseClassifyDialog(QDialog):
                 
             elif display_mode == "shaded_class":
                 try:
-                    from gui.shading_display import clear_shading_cache, update_shaded_class
-                    clear_shading_cache("classification changed")
-                    update_shaded_class(
-                        self.app,
-                        getattr(self.app, "last_shade_azimuth", 45.0),
-                        getattr(self.app, "last_shade_angle", 45.0),
-                        getattr(self.app, "shade_ambient", 0.2),
-                        force_rebuild=True
-                    )
-                except Exception:
-                    pass
+                    from gui.shading_display import refresh_shaded_after_classification_fast
+
+                    changed_mask = getattr(self.app, "_last_changed_mask", None)
+                    delta = getattr(self.app, "_pending_shading_delta", None)
+                    if changed_mask is not None and np.any(changed_mask):
+                        ok = refresh_shaded_after_classification_fast(
+                            self.app,
+                            changed_mask=changed_mask,
+                            delta=delta,
+                        )
+                        if ok:
+                            print(
+                                "   ⚡ LiDAR shaded sparse fallback used — "
+                                "full TIN rebuild skipped"
+                            )
+                        else:
+                            raise RuntimeError("sparse shading refresh declined")
+                    else:
+                        # No changed subset to patch; presentation is already current.
+                        self.app.vtk_widget.render()
+                except Exception as sparse_exc:
+                    # True emergency fallback only (stale/missing shading cache or
+                    # a topology transition that the local path cannot satisfy).
+                    print(f"   ⚠️ LiDAR sparse shading fallback failed: {sparse_exc}")
+                    try:
+                        from gui.shading_display import clear_shading_cache, update_shaded_class
+                        clear_shading_cache("classification sparse fallback failed")
+                        update_shaded_class(
+                            self.app,
+                            getattr(self.app, "last_shade_azimuth", 45.0),
+                            getattr(self.app, "last_shade_angle", 45.0),
+                            getattr(self.app, "shade_ambient", 0.2),
+                            force_rebuild=True
+                        )
+                    except Exception:
+                        pass
             
             # Force VTK render to be sure
             if hasattr(self.app, "vtk_widget"):
