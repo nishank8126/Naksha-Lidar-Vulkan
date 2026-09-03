@@ -258,6 +258,14 @@ class PointSyncTool(QObject):
             except Exception as e:
                 print(f"   ⚠️ Failed to deactivate cross-section tool for point sync: {e}")
 
+        for tool_name in ("snt_layer_pick_tool", "coordinate_pick_tool"):
+            tool = getattr(self.app, tool_name, None)
+            if tool is not None and getattr(tool, "active", False):
+                try:
+                    tool.deactivate()
+                except Exception:
+                    pass
+
     def activate_for_section(self, section_vtk_widget, view_index):
         """Attach the tool to one cross-section view."""
         if section_vtk_widget is None:

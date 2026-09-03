@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import vtk
 import time
@@ -2509,11 +2509,11 @@ class NakshaApp(QMainWindow):
         # (and silently misreported it for mixed-CRS projects).
         epsg = None
         try:
-            from gui.crs_manager import get_canvas_crs
+            from gui.crs_manager import get_canvas_crs, extract_epsg_code
             canvas = get_canvas_crs(self)
             if canvas is not None:
-                code = canvas.to_epsg()
-                epsg = str(code) if code else None
+                code = extract_epsg_code(canvas)
+                epsg = str(code) if code else (getattr(canvas, "name", None) or "custom")
         except Exception:
             epsg = None
 
@@ -6142,6 +6142,15 @@ class NakshaApp(QMainWindow):
         # if it holds the previous file's z_max the SNT grid appears at the wrong height.
         self.data_bounds    = None
 
+        # Reset canvas CRS if no SNT is preserved across file switch
+        has_snt = bool(snt_backup or getattr(self, "snt_attachments", None))
+        if not has_snt:
+            try:
+                from gui.crs_manager import clear_canvas_crs
+                clear_canvas_crs(self)
+            except Exception:
+                pass
+
         for attr in ("view_palettes", "layers"):
             obj = getattr(self, attr, None)
             if isinstance(obj, (dict, list)):
@@ -6341,15 +6350,61 @@ class NakshaApp(QMainWindow):
         print(f"   Memory used: {xyz_mb + cls_mb + rgb_mb:.1f} MB")
 
         # ── CRS ────────────────────────────────────────────────────────
-        if result.get("crs_epsg"):
-            self.project_crs_epsg = result["crs_epsg"]
-            self.project_crs_wkt  = result.get("crs_wkt")
-            try:
-                from pyproj import CRS
-                self.crs = CRS.from_epsg(self.project_crs_epsg)
-                print(f"   📐 CRS: {self.crs.name}")
-            except Exception:
-                pass
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import (
+                set_canvas_crs,
+                ensure_canvas_crs,
+                clear_canvas_crs,
+                resolve_point_cloud_crs,
+            )
+            source_crs = None
+            source_label = "LAZ/LAS header"
+
+            if result.get("crs_wkt"):
+                try:
+                    source_crs = _CRS.from_wkt(result["crs_wkt"])
+                    source_label = "LAZ/LAS header WKT"
+                except Exception:
+                    source_crs = None
+
+            if source_crs is None and result.get("crs_epsg"):
+                try:
+                    source_crs = _CRS.from_epsg(int(result["crs_epsg"]))
+                    source_label = "LAZ/LAS header EPSG"
+                except Exception:
+                    source_crs = None
+
+            if source_crs is None and first_file:
+                try:
+                    source_crs, source_label = resolve_point_cloud_crs(first_file)
+                except Exception:
+                    source_crs = None
+
+            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
+            if source_crs is not None:
+                if not has_snt:
+                    set_canvas_crs(
+                        self,
+                        source_crs,
+                        source=source_label or "LAZ/LAS metadata",
+                        dataset=first_file,
+                        force=True,
+                    )
+                else:
+                    ensure_canvas_crs(
+                        self,
+                        source_crs,
+                        source=source_label or "LAZ/LAS metadata",
+                        dataset=first_file,
+                    )
+                print(f"   📐 CRS: {source_crs.name} ({source_label})")
+            else:
+                if not has_snt:
+                    clear_canvas_crs(self)
+                print("   ⚠️ CRS unresolved: basemap alignment remains disabled")
+        except Exception as _crs_err:
+            print(f"   ⚠️ CRS registration failed: {_crs_err}")
 
         # ── Layers panel ───────────────────────────────────────────────
         for fi in result["layer_info_list"]:
@@ -6813,31 +6868,62 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Spatial index failed: {e}")
                 self.spatial_index = None
        
-        # Set CRS - route through the authoritative canvas CRS manager so the
-        # FIRST trustworthy georeferenced dataset establishes the canvas CRS and
-        # later datasets are reprojected into it rather than replacing it.
-        if lidar_data.get("crs_epsg"):
-            try:
-                from pyproj import CRS as _CRS
-                from gui.crs_manager import ensure_canvas_crs
-                _crs_obj = None
+        # Set CRS - route through the authoritative canvas CRS manager.
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import (
+                set_canvas_crs,
+                ensure_canvas_crs,
+                clear_canvas_crs,
+                resolve_point_cloud_crs,
+            )
+            _crs_obj = None
+            _crs_source = "LAZ/LAS header"
+
+            if lidar_data.get("crs_wkt"):
+                try:
+                    _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
+                    _crs_source = "LAZ/LAS header WKT"
+                except Exception:
+                    _crs_obj = None
+
+            if _crs_obj is None and lidar_data.get("crs_epsg"):
                 try:
                     _crs_obj = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
+                    _crs_source = "LAZ/LAS header EPSG"
                 except Exception:
-                    if lidar_data.get("crs_wkt"):
-                        try:
-                            _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
-                        except Exception:
-                            _crs_obj = None
-                if _crs_obj is not None:
-                    ensure_canvas_crs(self, _crs_obj,
-                                      source="LAZ/LAS header",
-                                      dataset=filename)
-                    print(f"Project CRS: {_crs_obj.name}")
+                    _crs_obj = None
+
+            if _crs_obj is None and filename:
+                try:
+                    _crs_obj, _crs_source = resolve_point_cloud_crs(filename)
+                except Exception:
+                    _crs_obj = None
+
+            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
+            if _crs_obj is not None:
+                if not has_snt:
+                    set_canvas_crs(
+                        self,
+                        _crs_obj,
+                        source=_crs_source or "LAZ/LAS metadata",
+                        dataset=filename,
+                        force=True,
+                    )
                 else:
-                    print("Could not create CRS object from lidar metadata")
-            except Exception as e:
-                print(f"Could not set canvas CRS: {e}")
+                    ensure_canvas_crs(
+                        self,
+                        _crs_obj,
+                        source=_crs_source or "LAZ/LAS metadata",
+                        dataset=filename,
+                    )
+                print(f"Project CRS: {_crs_obj.name} ({_crs_source})")
+            else:
+                if not has_snt:
+                    clear_canvas_crs(self)
+                print("Could not create CRS object from lidar metadata: basemap alignment disabled")
+        except Exception as e:
+            print(f"Could not set canvas CRS: {e}")
        
         self.loaded_file = filename
         self.last_save_path = filename

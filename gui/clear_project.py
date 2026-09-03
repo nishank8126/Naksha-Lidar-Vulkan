@@ -1723,12 +1723,30 @@ def clear_project(app):
         app.active_classify_tool = None
         if hasattr(app, "skip_main_view_refresh"):
             app.skip_main_view_refresh = False
-        
+
         # ✅ Keep display_mode as is (don't reset to "rgb")
         # User's preferred mode stays until next file loads
-        
+
+        # Footer click-tools (point sync ring, layer identify, coordinate
+        # pick) draw on-canvas overlays anchored to the cleared dataset -
+        # leaving one active would keep showing a stale pick after clear.
+        for tool_name in ("point_sync_tool", "snt_layer_pick_tool", "coordinate_pick_tool"):
+            tool = getattr(app, tool_name, None)
+            if tool is not None and getattr(tool, "active", False):
+                try:
+                    tool.deactivate()
+                except Exception:
+                    pass
+
         if hasattr(app, "spatial_index"):
             app.spatial_index = None
+
+        # Reset canvas CRS state
+        try:
+            from gui.crs_manager import clear_canvas_crs
+            clear_canvas_crs(app)
+        except Exception:
+            pass
 
         # ============================================================================
         # Update UI
@@ -2099,9 +2117,28 @@ def clear_point_cloud(app):
         app.active_classify_tool = None
         if hasattr(app, "skip_main_view_refresh"):
             app.skip_main_view_refresh = False
-        
+
+        # Footer click-tools (point sync ring, layer identify, coordinate
+        # pick) draw on-canvas overlays anchored to the cleared dataset -
+        # leaving one active would keep showing a stale pick after clear.
+        for tool_name in ("point_sync_tool", "snt_layer_pick_tool", "coordinate_pick_tool"):
+            tool = getattr(app, tool_name, None)
+            if tool is not None and getattr(tool, "active", False):
+                try:
+                    tool.deactivate()
+                except Exception:
+                    pass
+
         if hasattr(app, "spatial_index"):
             app.spatial_index = None
+
+        has_snt = bool(getattr(app, "snt_actors", None) or getattr(app, "snt_attachments", None))
+        if not has_snt:
+            try:
+                from gui.crs_manager import clear_canvas_crs
+                clear_canvas_crs(app)
+            except Exception:
+                pass
 
         # Update UI
         app._update_window_title(None, app.project_crs_epsg)
