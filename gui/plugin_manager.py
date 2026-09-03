@@ -9,6 +9,8 @@ import zipfile
 from pathlib import Path
 from typing import Tuple, Optional
 
+from PySide6.QtCore import QTimer
+
 
 def _get_plugins_dir() -> Path:
     """
@@ -132,7 +134,7 @@ class PluginManager:
             sys.modules.pop(name, None)
             return False, f"Failed: {e}"
 
-    def unload_plugin(self, name):
+    def unload_plugin(self, name, *, rebuild_ribbon=True):
         if name not in self.loaded_plugins:
             return False, f"'{name}' not loaded."
         try:
@@ -143,12 +145,30 @@ class PluginManager:
             dir_str = str(plugin_dir.resolve())
             if dir_str in sys.path:
                 sys.path.remove(dir_str)
-                
+
+            # Remove the entry module and every private submodule imported
+            # from this plugin directory. Otherwise a same-session reinstall
+            # can reuse modules whose files belonged to the deleted version.
+            plugin_root = plugin_dir.resolve()
+            for module_name, module in list(sys.modules.items()):
+                module_file = getattr(module, "__file__", None)
+                if not module_file:
+                    continue
+                try:
+                    module_path = Path(module_file).resolve()
+                    if (
+                        module_path == plugin_root
+                        or plugin_root in module_path.parents
+                    ):
+                        sys.modules.pop(module_name, None)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+
             del self.loaded_plugins[name]
             sys.modules.pop(name, None)
 
-            # Refresh plugins ribbon UI dynamically if available
-            self._rebuild_plugins_ribbon()
+            if rebuild_ribbon:
+                self._rebuild_plugins_ribbon()
             
             return True, f"'{name}' unloaded."
         except Exception as e:
@@ -159,7 +179,9 @@ class PluginManager:
         plugin_dir = None
         if name in self.loaded_plugins:
             plugin_dir = self.loaded_plugins[name]["dir"]
-            self.unload_plugin(name)
+            ok, msg = self.unload_plugin(name, rebuild_ribbon=False)
+            if not ok:
+                return False, msg
         else:
             # Search discovered plugins to locate the directory
             for manifest, pdir in self.discover_plugins():
@@ -225,7 +247,11 @@ class PluginManager:
 
                 # 4. Check if already loaded, unload if necessary
                 if plugin_name in self.loaded_plugins:
-                    self.unload_plugin(plugin_name)
+                    ok, msg = self.unload_plugin(
+                        plugin_name, rebuild_ribbon=False
+                    )
+                    if not ok:
+                        return False, msg
 
                 # Determine target directory under plugins/ (slugify name to make it safe)
                 slug = re.sub(r'[^a-zA-Z0-9_-]', '_', plugin_name).lower()
@@ -262,14 +288,37 @@ class PluginManager:
             return False, f"Plugin installation failed: {e}"
 
     def _rebuild_plugins_ribbon(self):
-        """Helper to trigger PluginsRibbon rebuild if instantiated."""
+        """Rebuild once, then resize after Qt has laid out the new sections."""
         try:
             if hasattr(self.app_window, "ribbon_manager"):
-                ribbon = self.app_window.ribbon_manager.ribbons.get("plugins")
+                manager = self.app_window.ribbon_manager
+                ribbon = manager.ribbons.get("plugins")
                 if ribbon and hasattr(ribbon, "rebuild_ribbon"):
+                    plugins_was_open = manager.current_ribbon == "plugins"
                     ribbon.rebuild_ribbon()
-                    if hasattr(self.app_window, "_update_ribbon_container_height"):
-                        self.app_window._update_ribbon_container_height()
+                    if plugins_was_open:
+                        ribbon.show()
+
+                    def finish_layout():
+                        try:
+                            layout = ribbon.layout()
+                            if layout is not None:
+                                layout.invalidate()
+                                layout.activate()
+                            ribbon.updateGeometry()
+                            if manager.current_ribbon == "plugins":
+                                ribbon.show()
+                            update_height = getattr(
+                                self.app_window,
+                                "_update_ribbon_container_height",
+                                None,
+                            )
+                            if callable(update_height):
+                                update_height()
+                        except RuntimeError:
+                            pass
+
+                    QTimer.singleShot(0, finish_layout)
         except Exception as e:
             print(f"Warning: Failed to rebuild plugins ribbon: {e}")
     

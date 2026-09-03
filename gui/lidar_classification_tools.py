@@ -2833,10 +2833,21 @@ def classify_low_points(xyz, classification, from_classes, to_class,
 
             # The first clear vertical gap above the lowest tier represents
             # the lowest point group found by this run.
-            order = np.argsort(
-                xyz[neighbor_global, 2],
-                kind="stable",
-            )
+            # Only the lowest group_limit + 1 elevations can affect the
+            # decision. Fully sorting dense neighborhoods was the dominant
+            # large-cloud cost.
+            keep = min(len(neighbor_global), group_limit + 1)
+            if keep < len(neighbor_global):
+                order = np.argpartition(
+                    xyz[neighbor_global, 2], keep - 1
+                )[:keep]
+                order = order[np.argsort(
+                    xyz[neighbor_global[order], 2], kind="stable"
+                )]
+            else:
+                order = np.argsort(
+                    xyz[neighbor_global, 2], kind="stable"
+                )
             sorted_global = neighbor_global[order]
             sorted_z = xyz[sorted_global, 2]
             gaps = np.diff(sorted_z)
@@ -3085,18 +3096,25 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             break
         stop = min(start + chunk, len(candidate_idx))
         current = candidate_idx[start:stop]
-        counts = np.asarray(
-            tree3d.query_ball_point(
-                xyz[current, :3],
-                radius,
-                return_length=True,
-                workers=-1,
-            ),
-            dtype=np.intp,
+        # Classification only depends on whether the threshold is reached.
+        # Querying the nearest limit+1 references avoids enumerating every
+        # point in a dense sphere and bounds temporary memory independently
+        # of neighborhood density. One extra slot covers the candidate itself.
+        distances, _ = tree3d.query(
+            xyz[current, :3],
+            k=limit + 1,
+            distance_upper_bound=radius,
+            workers=-1,
         )
-        # If the candidate itself belongs to In class, it is returned by the
-        # sphere query but TerraScan's condition counts only "other" points.
+        counts = np.count_nonzero(
+            np.isfinite(distances), axis=1
+        ).astype(np.intp, copy=False)
+        # If the candidate itself belongs to In class, it occupies one slot
+        # but TerraScan's condition counts only other points.
         counts -= in_mask[current].astype(np.intp)
+        # Counts are intentionally capped at the decision threshold; values
+        # above it are equivalent for the isolated/not-isolated decision.
+        np.minimum(counts, limit, out=counts)
         all_counts[start:stop] = counts
         isolated_mask[start:stop] = counts < limit
         processed = stop

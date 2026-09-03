@@ -69,9 +69,6 @@ pyinstaller>=6.0
 # cd NakshaAI_Lidar
 # git switch MAIN
 # git pull origin MAIN
-
-
-
 # FOR git commit changes 
 
 # git switch MAIN
@@ -80,14 +77,12 @@ pyinstaller>=6.0
 # git push origin MAIN
 
 
+
 # Since you intend to commit every listed change, run:
 # git add -A
-
 # git diff --cached --stat
 # git diff --cached
-
 # git commit -m "Update classification and display workflows"
-
 # git push origin MAIN
 
 

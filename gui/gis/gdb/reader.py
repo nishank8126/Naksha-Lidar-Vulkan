@@ -1106,7 +1106,8 @@ def _register_gdb_entry(app, gdb_path: str, layer_name: str, *,
                         kind: str, geom: str, actors: list | None = None,
                         color: str | None = None, sub_layer_info: dict | None = None,
                         placeholder: bool = False,
-                        placeholder_reason: str | None = None) -> dict | None:
+                        placeholder_reason: str | None = None,
+                        source_crs=None) -> dict | None:
     try:
         from gui.gis.gis_layers import register_gis_layer
         display_name = f"{Path(gdb_path).stem} · {layer_name}"
@@ -1133,6 +1134,36 @@ def _register_gdb_entry(app, gdb_path: str, layer_name: str, *,
             entry["epsg"] = get_layer_epsg(gdb_path, layer_name)
         except Exception:
             pass
+        # Preserve the layer's OWN source CRS separately from the canvas CRS.
+        # Prefer the CRS already resolved by import_gdb_layer() (it has a WKT
+        # fallback for compound/vertical CRS such as "UTM 43N + EGM2008
+        # height", which is common in real GDB deliveries and has no single
+        # OGR/GDAL authority code - get_layer_epsg() above returns None for
+        # those, so without this the registry would show an unknown source
+        # CRS for a layer whose geometry was in fact correctly transformed.
+        if source_crs is not None:
+            entry["source_crs"] = source_crs
+            try:
+                _code = source_crs.to_epsg()
+                if _code:
+                    entry["source_epsg"] = int(_code)
+                    if not entry.get("epsg"):
+                        entry["epsg"] = f"EPSG:{_code}"
+            except Exception:
+                pass
+            try:
+                entry["source_wkt"] = source_crs.to_wkt()
+            except Exception:
+                pass
+        else:
+            try:
+                if entry.get("source_crs") is None and entry.get("epsg"):
+                    from pyproj import CRS as _CRS
+                    _code = str(entry["epsg"]).split(":")[-1]
+                    entry["source_crs"] = _CRS.from_epsg(int(_code))
+                    entry["source_epsg"] = int(_code)
+            except Exception:
+                pass
     return entry
 
 
@@ -1173,6 +1204,83 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
         if defn is None:
             log.error("import_gdb_layer: layer '%s' has no definition", layer_name)
             return None
+
+        # ---- CRS: resolve this feature class's OWN source CRS ----------------
+        # Every feature class carries its own spatial reference; do NOT assume
+        # the whole GDB shares one CRS. The source CRS is preserved on the
+        # registry entry and geometries are transformed source_crs -> canvas_crs
+        # before they become VTK points.
+        src_srs = None
+        src_crs = None
+        try:
+            src_srs = lyr.GetSpatialRef()
+        except Exception:
+            src_srs = None
+        if src_srs is not None:
+            try:
+                src_srs = src_srs.Clone()
+            except Exception:
+                pass
+            try:
+                src_srs.AutoIdentifyEPSG()
+            except Exception:
+                pass
+            try:
+                from pyproj import CRS as _CRS
+                code = src_srs.GetAuthorityCode(None)
+                if code:
+                    src_crs = _CRS.from_epsg(int(code))
+                else:
+                    src_crs = _CRS.from_wkt(src_srs.ExportToWkt())
+            except Exception:
+                try:
+                    from pyproj import CRS as _CRS
+                    src_crs = _CRS.from_wkt(src_srs.ExportToWkt())
+                except Exception:
+                    src_crs = None
+
+        canvas_crs = None
+        ogr_ct = None
+        try:
+            from gui.crs_manager import (get_canvas_crs, ensure_canvas_crs,
+                                         log_dataset_crs)
+            # First trustworthy georeferenced dataset establishes the canvas CRS;
+            # later layers are reprojected INTO it (never replace it).
+            if src_crs is not None:
+                ensure_canvas_crs(app, src_crs, source="GDB feature class",
+                                  dataset=f"{os.path.basename(str(gdb_path))}:{layer_name}")
+            canvas_crs = get_canvas_crs(app)
+            if src_srs is not None and canvas_crs is not None:
+                try:
+                    # Compare CRS via pyproj equality, not raw authority codes.
+                    # Many real GDB deliveries use a COMPOUND CRS (e.g. "UTM
+                    # 43N + EGM2008 height") that has no single EPSG authority
+                    # code, so GetAuthorityCode() returns None for BOTH the
+                    # source and an identically-compound canvas CRS - comparing
+                    # "int(None or 0) != int(None or 0)" would then read as
+                    # "equal" by coincidence, or as "different" (forcing a
+                    # needless transform) the moment either side legitimately
+                    # differs. src_crs (pyproj, already resolved above with a
+                    # WKT fallback) gives a real equality check either way.
+                    same_crs = src_crs is not None and src_crs.equals(canvas_crs)
+                    if not same_crs:
+                        tgt = osr.SpatialReference()
+                        tgt.ImportFromWkt(canvas_crs.to_wkt())
+                        tgt.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                        ogr_ct = osr.CreateCoordinateTransformation(src_srs, tgt)
+                except Exception as e:
+                    log.warning("import_gdb_layer[%s]: CRS transform setup failed: %s",
+                                layer_name, e)
+                    ogr_ct = None
+        except Exception as e:
+            log.warning("import_gdb_layer[%s]: crs_manager unavailable: %s",
+                        layer_name, e)
+
+        try:
+            lyr.ResetReading()
+        except Exception:
+            pass
 
         try:
             geom_type = defn.GetGeomType()
@@ -1314,7 +1422,15 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
 
                 if sub_code not in geoms_by_subtype:
                     geoms_by_subtype[sub_code] = []
-                geoms_by_subtype[sub_code].append(g.Clone())   # Clone because feat is destroyed
+                _clone = g.Clone()   # Clone because feat is destroyed
+                # Reproject SOURCE CRS -> CANVAS CRS before the geometry ever
+                # reaches VTK. Source coordinates are never mutated on disk.
+                if ogr_ct is not None:
+                    try:
+                        _clone.Transform(ogr_ct)
+                    except Exception:
+                        pass
+                geoms_by_subtype[sub_code].append(_clone)
             feat = lyr.GetNextFeature()
             if max_features:
                 total_collected = sum(len(lst) for lst in geoms_by_subtype.values())
@@ -1347,6 +1463,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 color=base_color, sub_layer_info=sub_layer_info,
                 placeholder=True,
                 placeholder_reason=reason,
+                source_crs=src_crs,
             )
 
         # Build actors and polydata per subtype
@@ -1437,6 +1554,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 color=color, sub_layer_info=sub_layer_info,
                 placeholder=True,
                 placeholder_reason="no_renderable_actor",
+                source_crs=src_crs,
             )
 
         log.warning(
@@ -1453,7 +1571,19 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
             app, gdb_path, layer_name,
             kind="vector", geom=kind, actors=actors,
             color=color, sub_layer_info=sub_layer_info,
+            source_crs=src_crs,
         )
+        try:
+            from gui.crs_manager import log_dataset_crs, get_canvas_crs as _gcc
+            _raw = lyr.GetExtent()  # xmin, xmax, ymin, ymax (OGR order)
+            log_dataset_crs(
+                f"{os.path.basename(str(gdb_path))}:{layer_name}", "GDB",
+                src_crs, ("OGR SRS" if src_crs is not None else None),
+                raw_bounds=(_raw[0], _raw[2], _raw[1], _raw[3]) if _raw else None,
+                canvas_crs=_gcc(app),
+            )
+        except Exception:
+            pass
         log.warning("import_gdb_layer[%s]: TOTAL %.3fs", layer_name, time.perf_counter() - _t0)
         if entry is not None:
             try:
