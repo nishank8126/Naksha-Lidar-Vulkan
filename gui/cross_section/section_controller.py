@@ -1783,7 +1783,17 @@ class SectionController:
                     print("❌ Point cloud data is empty!")
                     self.finalize_rectangle()
                     return
-    
+
+                # New section geometry replaces the old one for this view — drop any
+                # stale cross-section measurement overlays drawn against the previous
+                # cut. No-op unless that (opt-in) tool has been used.
+                cs_measure = getattr(self.app, "cross_section_measurement_tool", None)
+                if cs_measure is not None:
+                    try:
+                        cs_measure.clear_view(self.active_view)
+                    except Exception:
+                        pass
+
                 # Apply line style before finalizing rectangle
                 style = getattr(self.app, "cross_line_style", "solid")
                 if style != "solid":

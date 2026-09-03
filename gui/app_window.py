@@ -1179,6 +1179,10 @@ class NakshaApp(QMainWindow):
         self.identification_tool = IdentificationTool(self)
         print("✅ Identification tool initialized")
 
+        from gui.cross_section_measurement_tool import CrossSectionMeasurementTool
+        self.cross_section_measurement_tool = CrossSectionMeasurementTool(self)
+        print("✅ Cross-section measurement tool initialized")
+
         from gui.point_sync_tool import PointSyncTool
         self.point_sync_tool = PointSyncTool(self)
         print("✅ Point sync tool initialized")
@@ -1329,6 +1333,37 @@ class NakshaApp(QMainWindow):
 
         self._update_snt_layer_pick_footer_icon()
         self._update_snt_layer_pick_footer_state_visual(False)
+
+        # 3b. Cross-section measurement toggle
+        self.cross_section_measure_footer_btn = QToolButton(self.status)
+        self.cross_section_measure_footer_btn.setObjectName("statusCrossSectionMeasureButton")
+        self.cross_section_measure_footer_btn.setCheckable(True)
+        self.cross_section_measure_footer_btn.setAutoRaise(True)
+        self.cross_section_measure_footer_btn.setFixedHeight(20)
+        self.cross_section_measure_footer_btn.setText("📏 XS")
+        self.cross_section_measure_footer_btn.setCursor(Qt.PointingHandCursor)
+        self.cross_section_measure_footer_btn.setFocusPolicy(Qt.NoFocus)
+        self.cross_section_measure_footer_btn.setToolTip(
+            "Measure distances inside cross-section views\n"
+            "(mirrored automatically into the main 3D view)"
+        )
+        self.cross_section_measure_footer_btn.setStyleSheet("""
+            QToolButton {
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 0 4px;
+                margin: 0 2px;
+            }
+            QToolButton:hover {
+                background: rgba(255, 255, 255, 0.08);
+            }
+            QToolButton:checked {
+                background: rgba(255, 255, 255, 0.14);
+                border-color: rgba(255, 255, 255, 0.18);
+            }
+        """)
+        self.cross_section_measure_footer_btn.toggled.connect(self._toggle_cross_section_measure_from_footer)
+        self.status.addPermanentWidget(self.cross_section_measure_footer_btn)
 
         # 4. Cursor-following axis guides
         axis_tooltip = "Show full-canvas X/Y guides that follow the cursor"
@@ -2894,6 +2929,19 @@ class NakshaApp(QMainWindow):
         else:
             self.point_sync_tool.deactivate()
             self.statusBar().showMessage("🎯 Point target sync disabled", 2000)
+
+    def _toggle_cross_section_measure_from_footer(self, enabled):
+        if not hasattr(self, "cross_section_measurement_tool") or self.cross_section_measurement_tool is None:
+            return
+
+        if enabled:
+            self.cross_section_measurement_tool.activate()
+            self.statusBar().showMessage(
+                "📏 Cross-section measurement enabled — click two points in a cross-section view", 4000
+            )
+        else:
+            self.cross_section_measurement_tool.deactivate()
+            self.statusBar().showMessage("📏 Cross-section measurement disabled", 2000)
 
     def _toggle_snt_layer_pick_from_footer(self, enabled):
         if not hasattr(self, "snt_layer_pick_tool") or self.snt_layer_pick_tool is None:
@@ -4509,6 +4557,13 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"   ⚠️ Point sync section observer cleanup warning: {e}")
 
+                try:
+                    cs_measure = getattr(self, "cross_section_measurement_tool", None)
+                    if cs_measure is not None and hasattr(cs_measure, "deactivate_for_section"):
+                        cs_measure.deactivate_for_section(view_index)
+                except Exception as e:
+                    print(f"   ⚠️ Cross-section measurement observer cleanup warning: {e}")
+
                 # ✅ CRITICAL: Stop all VTK rendering FIRST
                 try:
                     # 1. Clear the VTK widget completely
@@ -4730,6 +4785,10 @@ class NakshaApp(QMainWindow):
         if hasattr(self, 'identification_tool') and self.identification_tool.active:
             self.identification_tool.activate_for_section(vtk_widget, view_index)
             print(f"🔍 Auto-activated identification for view {view_index + 1}")
+
+        if hasattr(self, 'cross_section_measurement_tool') and self.cross_section_measurement_tool.active:
+            self.cross_section_measurement_tool.activate_for_section(vtk_widget, view_index)
+            print(f"📏 Auto-activated cross-section measurement for view {view_index + 1}")
 
         if hasattr(self, 'point_sync_tool') and self.point_sync_tool.active:
             self.point_sync_tool.activate_for_section(vtk_widget, view_index)

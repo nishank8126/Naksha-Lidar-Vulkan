@@ -2193,6 +2193,130 @@ class MeasurementTool:
         except Exception:
             pass
 
+    def add_cross_section_measurement(self, world_points, source_view=None, show_line=True):
+        """
+        Mirror a measurement taken in a cross-section view into this (main) view.
+
+        This is an additive, self-contained entry point used by
+        CrossSectionMeasurementTool: it reuses the same rendering building
+        blocks (_create_screen_line_actor, _create_distance_label,
+        _create_vertex_marker, _scene_add) that finalized main-view
+        measurements already use, so a mirrored measurement looks and behaves
+        like a normal one — but it never reads or mutates any interactive
+        drawing state (self.mode, self.measurement_points, undo/redo stacks,
+        snap cache), so it cannot interfere with an in-progress main-view
+        measurement or any other tool.
+
+        A cross-section measurement is a vertical/profile distance — its two
+        endpoints usually sit almost on top of each other in a top-down main
+        view, so drawing a full line between them there is misleading rather
+        than informative. With show_line=False (the default caller usage),
+        only a single value-only label is placed at the segment's world
+        midpoint; no line, no per-point vertex markers.
+        """
+        try:
+            pts = [tuple(float(v) for v in p[:3]) for p in world_points]
+        except Exception:
+            return None
+        if len(pts) < 2:
+            return None
+
+        color = (1.0, 0.55, 0.0)  # distinguish cross-section-sourced measurements
+        labels = []
+        total_distance = 0.0
+
+        for i in range(len(pts) - 1):
+            p1, p2 = pts[i], pts[i + 1]
+            distance = float(np.linalg.norm(np.asarray(p2) - np.asarray(p1)))
+            total_distance += distance
+
+            line_actor = None
+            if show_line:
+                line_actor = self._create_screen_line_actor([p1, p2], color=color, width=3)
+                if line_actor:
+                    self._scene_add(line_actor)
+
+            midpoint = tuple((a + b) / 2.0 for a, b in zip(p1, p2))
+            label_position = midpoint if not show_line else self._get_label_position_above_segment(p1, p2)
+            label_actor = self._create_distance_label(label_position, distance)
+            if label_actor:
+                self._scene_add(label_actor)
+
+            labels.append({
+                'line': line_actor,
+                'label': label_actor,
+                'p1': p1,
+                'p2': p2,
+                'distance': distance,
+            })
+
+        vertices = []
+        if show_line:
+            for p in pts:
+                marker = self._create_vertex_marker(p, color=color)
+                if marker:
+                    self._scene_add(marker)
+                    vertices.append(marker)
+
+        measurement_entry = {
+            'type': 'cross_section_line',
+            'points': pts,
+            'labels': labels,
+            'vertices': vertices,
+            'continuous_line': None,
+            'total_distance': total_distance,
+            'area': 0.0,
+            'source': 'cross_section',
+            'source_view': source_view,
+        }
+        self.measurements.append(measurement_entry)
+        self._invalidate_measure_snap_cache()
+        self._render_overlay_only()
+        print(f"📏 Cross-section measurement mirrored into main view: {total_distance:.3f} m")
+        return measurement_entry
+
+    def remove_measurement_entry(self, measurement_entry):
+        """
+        Remove one previously finalized measurement (its actors + list entry).
+
+        Additive counterpart to add_cross_section_measurement(), used by
+        CrossSectionMeasurementTool's undo. Does not touch the interactive
+        undo/redo stack used by main-view drawing (self.undo_stack) — those
+        are unrelated histories.
+        """
+        if measurement_entry is None or measurement_entry not in self.measurements:
+            return False
+
+        for label_data in measurement_entry.get('labels', []) or []:
+            try:
+                self._scene_remove(label_data.get('line'))
+            except Exception:
+                pass
+            try:
+                self._scene_remove(label_data.get('label'))
+            except Exception:
+                pass
+
+        for vertex in measurement_entry.get('vertices', []) or []:
+            try:
+                self._scene_remove(vertex)
+            except Exception:
+                pass
+
+        try:
+            self._scene_remove(measurement_entry.get('continuous_line'))
+        except Exception:
+            pass
+
+        try:
+            self.measurements.remove(measurement_entry)
+        except ValueError:
+            pass
+
+        self._invalidate_measure_snap_cache()
+        self._render_overlay_only()
+        return True
+
     def activate(self, mode="measure_line"):
         """
         Activate measurement mode with proper tool coordination.

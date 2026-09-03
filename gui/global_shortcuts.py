@@ -620,6 +620,23 @@ class GlobalShortcutFilter(QObject):
                     print("🛑 ESC - identification tool deactivated; left pan restored")
                     return True
 
+                # Deactivate cross-section measurement tool on Escape — cancels
+                # any pending point/chain in every open section view and turns
+                # the footer toggle off, matching how ESC fully stops an
+                # in-progress main-view measurement.
+                _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
+                if _cs_measure is not None and getattr(_cs_measure, 'active', False):
+                    try:
+                        footer_btn = getattr(self.app_window, 'cross_section_measure_footer_btn', None)
+                        if footer_btn is not None:
+                            footer_btn.setChecked(False)  # cascades to _cs_measure.deactivate()
+                        else:
+                            _cs_measure.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC cross-section measurement deactivation failed: {e}")
+                    print("🛑 ESC - cross-section measurement tool deactivated")
+                    return True
+
                 # Deactivate temp fence tool on Escape
                 _tft = getattr(self.app_window, 'temp_fence_tool', None)
                 if _tft is not None and getattr(_tft, 'active', False):
@@ -683,6 +700,34 @@ class GlobalShortcutFilter(QObject):
             # 6. Default (no tool owns it) → Classification undo/redo
             # ====================================================================
             if event.modifiers() & Qt.ControlModifier:
+
+                # =================================================================
+                # LEVEL 0.5: CROSS-SECTION MEASUREMENT TOOL (checked BEFORE the
+                # main measurement tool). The main measurement tool's `active`
+                # flag can stay True just from switching to the Measure ribbon
+                # tab (no actual main-view measuring in progress), which would
+                # otherwise swallow Ctrl+Z/Y here with "nothing to undo" and
+                # cross-section measurement's own undo would never be reached.
+                # While cross-section measuring is toggled on, it exclusively
+                # owns Ctrl+Z/Y — undo/redo segments measured inside
+                # cross-section views (and their mirrored main-view labels).
+                # =================================================================
+                _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
+                if _cs_measure is not None and getattr(_cs_measure, 'active', False):
+                    if event.key() == Qt.Key_Z:
+                        print("📏 Ctrl+Z → Cross-Section Measurement Undo (EXCLUSIVE)")
+                        try:
+                            _cs_measure.undo()
+                        except Exception as e:
+                            print(f"⚠️ Cross-section measurement undo failed: {e}")
+                        return True
+                    elif event.key() == Qt.Key_Y:
+                        print("📏 Ctrl+Y → Cross-Section Measurement Redo (EXCLUSIVE)")
+                        try:
+                            _cs_measure.redo()
+                        except Exception as e:
+                            print(f"⚠️ Cross-section measurement redo failed: {e}")
+                        return True
 
                 # ═══════════════════════════════════════════════════════════════════
                 # ✅ LEVEL 1: MEASUREMENT TOOL (HIGHEST PRIORITY)

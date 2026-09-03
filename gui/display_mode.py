@@ -2697,6 +2697,26 @@ class DisplayModeDialog(QDialog):
         if self.current_slot == 0:
             app.class_palette = clone_palette(class_map)
 
+            # Keep every other already-seeded view slot's colors/weights/etc.
+            # in sync with this Main View edit. Only 'show' (visibility) is
+            # meant to differ per view — everything else is meant to be
+            # shared. Without this, a cross-section view whose slot palette
+            # was already seeded before this edit keeps showing the old
+            # color even after re-taking its section, because nothing ever
+            # pushed the new value into its (already-persisted) snapshot.
+            for other_slot in range(1, 6):
+                for target_palettes in (self.view_palettes, app.view_palettes):
+                    existing = target_palettes.get(other_slot)
+                    if not existing:
+                        continue  # not seeded yet — will pick up fresh values when it is
+                    for code, entry in class_map.items():
+                        target_entry = existing.get(code)
+                        if target_entry is None:
+                            continue
+                        keep_show = target_entry.get('show', entry.get('show', True))
+                        target_entry.update(_copy.deepcopy(entry))
+                        target_entry['show'] = keep_show
+
             # ============================================================
             # ACTIVE PTC FOR AI
             # ============================================================
