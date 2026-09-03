@@ -4007,6 +4007,21 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
             getattr(app, "_section_visibility_refresh_required", False)
         )
 
+    # A cross-section can independently be in Shaded/Surface mode regardless
+    # of Main View's own display_mode (handled above) -- this function is the
+    # single place every classify/undo/redo commit path funnels through to
+    # refresh Main View, so it is also the single place to refresh any open
+    # section's mesh actor, instead of patching every individual call site.
+    # Reads app.data["classification"] directly (already updated by the time
+    # this function runs), so it does not depend on Main View's own render.
+    try:
+        from gui.cross_section.section_shaded_surface import (
+            refresh_all_shaded_surface_sections_after_classify,
+        )
+        refresh_all_shaded_surface_sections_after_classify(app)
+    except Exception as _section_mesh_err:
+        print(f"   ⚠️ Section Shaded/Surface refresh-after-commit failed: {_section_mesh_err}")
+
     commit_id = int(getattr(app, "_main_refresh_commit_id", 0)) + 1
     app._main_refresh_commit_id = commit_id
     if commit_id <= 20:
