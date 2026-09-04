@@ -77,14 +77,12 @@ pyinstaller>=6.0
 # git push origin MAIN
 
 
+
 # Since you intend to commit every listed change, run:
 # git add -A
-
 # git diff --cached --stat
 # git diff --cached
-
 # git commit -m "Update classification and display workflows"
-
 # git push origin MAIN
 
 

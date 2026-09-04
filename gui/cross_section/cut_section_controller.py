@@ -760,12 +760,31 @@ class CutSectionController:
         """Detach the cut-view right-click observer before widget teardown."""
         observer_id = self._cut_right_click_observer_id
         self._cut_right_click_observer_id = None
-        if observer_id is None or self.cut_vtk is None:
-            return
-        try:
-            self.cut_vtk.interactor.RemoveObserver(observer_id)
-        except Exception:
-            pass
+        if observer_id is not None and self.cut_vtk is not None:
+            try:
+                self.cut_vtk.interactor.RemoveObserver(observer_id)
+            except Exception:
+                pass
+
+        # Same teardown discipline for the locate click/move observers
+        # (added alongside the right-click observer at cut_vtk creation) --
+        # without this they'd dangle on the about-to-be-closed widget
+        # instead of being detached like every other observer here.
+        locate_id = getattr(self, "_cut_locate_observer_id", None)
+        self._cut_locate_observer_id = None
+        if locate_id is not None and self.cut_vtk is not None:
+            try:
+                self.cut_vtk.interactor.RemoveObserver(locate_id)
+            except Exception:
+                pass
+
+        move_id = getattr(self, "_cut_locate_move_observer_id", None)
+        self._cut_locate_move_observer_id = None
+        if move_id is not None and self.cut_vtk is not None:
+            try:
+                self.cut_vtk.interactor.RemoveObserver(move_id)
+            except Exception:
+                pass
 
     def _finalize_cut_render_window_once(self, vtk_widget=None):
         target = vtk_widget if vtk_widget is not None else self.cut_vtk
@@ -2295,7 +2314,62 @@ class CutSectionController:
             print("✅ Cut section undo/redo hooks installed")
         
         print("✅ ClassificationInteractor attached to dedicated cut widget!")
-        
+
+        # The "Nuclear cleanup" earlier in this cut flow
+        # (iren_cut.RemoveObservers("LeftButtonPressEvent")) wipes EVERY
+        # LeftButtonPressEvent observer on the cut widget, including
+        # PointSyncTool's own click-redirect observer if one was attached --
+        # but PointSyncTool's internal bookkeeping (_cut_observer) still
+        # thinks it's attached, so it never re-attaches on its own. Without
+        # this, clicking inside a Cut View silently stopped redirecting to
+        # Main View after any cut-from-cross/cut-from-cut action, even
+        # though the feature worked immediately after the cut dock was
+        # first created. Clear the stale reference and let
+        # activate_for_cut_view attach a fresh observer bound to the
+        # current cut_vtk widget.
+        try:
+            point_sync_tool = getattr(self.app, "point_sync_tool", None)
+            if point_sync_tool is not None and getattr(point_sync_tool, "active", False):
+                point_sync_tool._cut_observer = None
+                point_sync_tool.activate_for_cut_view(self.cut_vtk)
+        except Exception as _point_sync_reattach_err:
+            print(f"   ⚠️ Point sync re-attach to Cut View failed: {_point_sync_reattach_err}")
+
+        # Same nuclear-cleanup problem, same fix, for the Cut View's own
+        # MicroStation-style locate observer (click in Cut View while the
+        # cross-section tool is active -> pan Main View there). This runs
+        # on every finalize, including the very first one (where
+        # _ensure_cut_section_dock already added the observer once) -- so
+        # remove any previously tracked id first to avoid a duplicate
+        # observer double-firing every click. RemoveObserver on an
+        # already-invalid id (wiped by the nuclear cleanup) is a safe no-op.
+        try:
+            if self.cut_vtk is not None:
+                old_locate_id = getattr(self, "_cut_locate_observer_id", None)
+                if old_locate_id is not None:
+                    try:
+                        self.cut_vtk.interactor.RemoveObserver(old_locate_id)
+                    except Exception:
+                        pass
+                self._cut_locate_observer_id = self.cut_vtk.interactor.AddObserver(
+                    "LeftButtonPressEvent",
+                    self._on_cut_view_left_click_locate,
+                    1.0,
+                )
+                old_move_id = getattr(self, "_cut_locate_move_observer_id", None)
+                if old_move_id is not None:
+                    try:
+                        self.cut_vtk.interactor.RemoveObserver(old_move_id)
+                    except Exception:
+                        pass
+                self._cut_locate_move_observer_id = self.cut_vtk.interactor.AddObserver(
+                    "MouseMoveEvent",
+                    self._on_cut_view_mouse_move_locate,
+                    1.0,
+                )
+        except Exception as _locate_reattach_err:
+            print(f"   ⚠️ Cut View locate observer re-attach failed: {_locate_reattach_err}")
+
         self._state = CutSectionState.FINALIZED
         self.cut_phase = 2
         self._restore_cross_section_left_pan()
@@ -5331,6 +5405,172 @@ class CutSectionController:
         
         return self.cut_points, self._cut_index_map
 
+    def _do_cut_section_locate(self, vtk_interactor, display_x, display_y):
+        """MicroStation-style locate for the Cut View, mirroring
+        SectionController._do_section_locate for cross-section views 1-4:
+        click inside the Cut View while the cross-section tool is active ->
+        pan Main View's camera to that world XY.
+
+        The Cut View's own local coordinate frame (side/front axis swap,
+        accumulated rotation -- see _finalize_dynamic_cut_section) makes an
+        exact inverse-transform fragile to re-derive here. Instead, resolve
+        the click the same way point_sync_tool.py's cut-view click handler
+        already does reliably: nearest-neighbor against the Cut View's own
+        rendered points (self.cut_points, local space) to get a local
+        index, then self._cut_index_map[local_index] for the ORIGINAL
+        dataset global index, then app.data['xyz'][global_index] for the
+        true world position -- independent of whatever local transform was
+        used to build the Cut View.
+        """
+        if self.cut_points is None or self._cut_index_map is None or len(self.cut_points) == 0:
+            return
+
+        try:
+            ren = vtk_interactor.GetRenderWindow().GetRenderers().GetFirstRenderer()
+            picker = vtk.vtkPointPicker()
+            picker.SetTolerance(0.01)
+            if not picker.Pick(display_x, display_y, 0, ren):
+                return
+            local_pt = np.asarray(picker.GetPickPosition(), dtype=np.float64)
+        except Exception as e:
+            print(f"⚠️ Cut section locate: pick failed: {e}")
+            return
+
+        distances = np.linalg.norm(self.cut_points - local_pt, axis=1)
+        local_index = int(np.argmin(distances))
+        if distances[local_index] > 2.0:
+            return
+        if local_index >= len(self._cut_index_map):
+            return
+
+        global_index = int(self._cut_index_map[local_index])
+        xyz = getattr(self.app, "data", {}).get("xyz") if hasattr(self.app, "data") else None
+        if xyz is None or global_index < 0 or global_index >= len(xyz):
+            return
+
+        world_x, world_y = float(xyz[global_index, 0]), float(xyz[global_index, 1])
+
+        # Arm cross_interactor so main-view preview line starts from this
+        # point, same as cross-section's own locate.
+        cross = getattr(self.app, "cross_interactor", None)
+        main_vtk = getattr(self.app, "vtk_widget", None)
+        if cross is not None and main_vtk is not None:
+            focal_z = main_vtk.renderer.GetActiveCamera().GetFocalPoint()[2]
+            cross.P1 = np.array([world_x, world_y, focal_z], dtype=np.float64)
+            cross.slice_state = 1
+
+        if main_vtk is not None:
+            cam = main_vtk.renderer.GetActiveCamera()
+            focal = cam.GetFocalPoint()
+            pos = cam.GetPosition()
+            dx_pan = world_x - focal[0]
+            dy_pan = world_y - focal[1]
+            cam.SetFocalPoint(world_x, world_y, focal[2])
+            cam.SetPosition(pos[0] + dx_pan, pos[1] + dy_pan, pos[2])
+            main_vtk.renderer.ResetCameraClippingRange()
+            main_vtk.render()
+
+        if hasattr(self.app, "statusBar"):
+            self.app.statusBar().showMessage(
+                f"Locked ({world_x:.1f}, {world_y:.1f})  —  "
+                "move to main view and draw cross-section",
+                5000,
+            )
+        print(f"📍 Cut section locate: ({world_x:.2f}, {world_y:.2f})")
+
+        # Mirrors SectionController._do_section_locate's own bookkeeping:
+        # stores the click's DISPLAY position + which view it came from, so
+        # a MouseMoveEvent handler can draw a rubber-band line inside THIS
+        # view (not just pan Main View), matching cross-section's own
+        # _draw_locate_rubber_band behavior. "cut" is a sentinel distinct
+        # from the integer view indices section_vtks uses.
+        self.app._section_locate_display = (float(display_x), float(display_y))
+        self.app._section_locate_view = "cut"
+
+    def _draw_cut_locate_rubber_band(self, cursor_x, cursor_y):
+        """Draw a rubber-band line inside the Cut View from the locked
+        locate point to the current cursor position, mirroring
+        SectionController._draw_locate_rubber_band for cross-section views.
+        """
+        if self.cut_vtk is None:
+            return
+        ren = self.cut_vtk.renderer
+        locate_disp = getattr(self.app, "_section_locate_display", None)
+        if locate_disp is None:
+            return
+
+        if not hasattr(self, "_cut_locate_rb_actor") or self._cut_locate_rb_actor is None:
+            pts = vtk.vtkPoints()
+            pts.SetNumberOfPoints(2)
+            lines = vtk.vtkCellArray()
+            lines.InsertNextCell(2)
+            lines.InsertCellPoint(0)
+            lines.InsertCellPoint(1)
+            poly = vtk.vtkPolyData()
+            poly.SetPoints(pts)
+            poly.SetLines(lines)
+            dc = vtk.vtkCoordinate()
+            dc.SetCoordinateSystemToDisplay()
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(poly)
+            mapper.SetTransformCoordinate(dc)
+            actor = vtk.vtkActor2D()
+            actor.SetMapper(mapper)
+            self._cut_locate_rb_pts = pts
+            self._cut_locate_rb_poly = poly
+            self._cut_locate_rb_actor = actor
+
+        actor = self._cut_locate_rb_actor
+        if not ren.HasViewProp(actor):
+            ren.AddActor2D(actor)
+        actor.VisibilityOn()
+
+        color = getattr(self.app, "cross_line_color", (1.0, 0.0, 1.0))
+        width = getattr(self.app, "cross_line_width", 2)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetLineWidth(max(2, width))
+        prop.SetOpacity(1.0)
+
+        self._cut_locate_rb_pts.SetPoint(0, locate_disp[0], locate_disp[1], 0.0)
+        self._cut_locate_rb_pts.SetPoint(1, float(cursor_x), float(cursor_y), 0.0)
+        self._cut_locate_rb_pts.Modified()
+        self._cut_locate_rb_poly.Modified()
+        self.cut_vtk.render()
+
+    def clear_cut_locate_rubber_band(self):
+        """Remove the Cut View's own locate rubber-band actor, if present.
+        Called from SectionController.clear_locate_state so a click that
+        started in the Cut View gets cleaned up the same way a click
+        started in a regular cross-section view does.
+        """
+        actor = getattr(self, "_cut_locate_rb_actor", None)
+        if actor is None:
+            return
+        try:
+            if self.cut_vtk is not None and self.cut_vtk.renderer.HasViewProp(actor):
+                self.cut_vtk.renderer.RemoveActor2D(actor)
+                self.cut_vtk.render()
+        except Exception:
+            pass
+        self._cut_locate_rb_actor = None
+
+    def _on_cut_view_left_click_locate(self, obj, event):
+        if not getattr(self.app, "cross_section_active", False):
+            return
+        if not getattr(self.app, "section_locate_enabled", True):
+            return
+        x, y = obj.GetEventPosition()
+        self._do_cut_section_locate(obj, x, y)
+
+    def _on_cut_view_mouse_move_locate(self, obj, event):
+        if not getattr(self.app, "section_locate_enabled", True):
+            return
+        if getattr(self.app, "_section_locate_view", None) != "cut":
+            return
+        x, y = obj.GetEventPosition()
+        self._draw_cut_locate_rubber_band(x, y)
+
     def onclassificationchanged(self, changedoriginalindices=None):
         """🚀 MICROSTATION-STYLE REFRESH: Signal handler for classification changes."""
         if self._is_refreshing or not self.is_cut_view_active or self.cut_vtk is None:
@@ -5807,6 +6047,23 @@ class CutSectionController:
             self._cut_right_click_observer_id = self.cut_vtk.interactor.AddObserver(
                 "RightButtonPressEvent",
                 self._on_cut_view_right_click_reactivate,
+                1.0,
+            )
+            # MicroStation-style locate (same feature as cross-section views
+            # 1-4): click inside the Cut View while the cross-section tool
+            # is active -> pan Main View to that location. Priority 1.0
+            # matches SectionController's own left-click locate observer.
+            self._cut_locate_observer_id = self.cut_vtk.interactor.AddObserver(
+                "LeftButtonPressEvent",
+                self._on_cut_view_left_click_locate,
+                1.0,
+            )
+            # Rubber-band preview line inside the Cut View itself while the
+            # locate point is locked, mirroring the cross-section views'
+            # own mouse-move rubber-band.
+            self._cut_locate_move_observer_id = self.cut_vtk.interactor.AddObserver(
+                "MouseMoveEvent",
+                self._on_cut_view_mouse_move_locate,
                 1.0,
             )
             if hasattr(self.app, "_register_canvas_cursor_widget"):

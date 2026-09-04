@@ -44,17 +44,51 @@ def _section_half_width(app, view_idx, default=5.0):
     return hw if hw and hw > 0 else default
 
 
-def _source_polydata(app, mode):
+def _source_polydata(app, view_idx, mode, force_independent=False):
     """Return Main View's already-built mesh for `mode` if present (fast
     path, zero extra cost); otherwise build an equivalent mesh independently
-    so the section works regardless of Main View's current display mode."""
-    attr = "_shaded_mesh_polydata" if mode == "shaded" else "_surface_mesh_polydata"
-    mesh = getattr(app, attr, None)
-    if mesh is not None:
-        return mesh
+    so the section works regardless of Main View's current display mode.
+
+    force_independent=True skips the Main-View-cache reuse entirely. This
+    is required right after a classify action: Main View's fast incremental
+    patch (guarantee_main_view_visual_refresh / SHADING_CRISP_EDIT_OVERLAY)
+    deliberately leaves the cached `_shaded_mesh_polydata`'s own RGB data
+    untouched (base_rgb_untouched=True in its own diagnostics) and instead
+    draws the update via a separate overlay actor in Main View's renderer.
+    Reusing that cached mesh here would silently keep returning pre-classify
+    colors forever. The independent build reads classification straight
+    from app.data["classification"], so it is always fresh.
+    """
+    if not force_independent:
+        attr = "_shaded_mesh_polydata" if mode == "shaded" else "_surface_mesh_polydata"
+        mesh = getattr(app, attr, None)
+        if mesh is not None:
+            return mesh
     if mode == "shaded":
-        return _build_independent_shaded_mesh(app)
-    return _build_independent_surface_mesh(app)
+        return _build_independent_shaded_mesh(app, view_idx)
+    return _build_independent_surface_mesh(app, view_idx)
+
+
+def _section_palette_dict(app, view_idx):
+    """Return the class-visibility/color palette for THIS section's own
+    slot (view_idx+1 in Display Mode's per-slot view_palettes), falling
+    back to the global class_palette. Main View's own visibility helpers
+    (_get_shading_visibility / surface_palette) are hardcoded to slot 0,
+    which made section Shaded/Surface silently ignore a class filter set
+    directly on the section instead of on Main View -- this fixes that by
+    reading the section's own slot."""
+    slot_idx = view_idx + 1
+    dlg = getattr(app, "display_mode_dialog", None) or getattr(app, "display_dialog", None)
+    if dlg is not None:
+        vp = getattr(dlg, "view_palettes", None)
+        if isinstance(vp, dict) and vp.get(slot_idx):
+            return vp[slot_idx]
+    return getattr(app, "class_palette", {}) or {}
+
+
+def _section_visible_classes(app, view_idx):
+    palette = _section_palette_dict(app, view_idx)
+    return {int(c) for c, e in palette.items() if e.get("show", True)}
 
 
 def _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode):
@@ -67,7 +101,17 @@ def _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, qua
             round(float(angle), 3), round(float(ambient), 4), quality_mode)
 
 
-def _build_independent_shaded_mesh(app):
+# Geometry (triangulation/unique_indices/faces/shade) depends only on which
+# POINTS participate -- i.e. xyz + the visible-class SET + lighting/quality
+# -- never on the per-point classification VALUES themselves. Reclassifying
+# a point from one already-visible class to another already-visible class
+# changes nothing about participation, so the expensive triangulation can
+# be reused and only the (cheap) per-face color lookup needs to run again.
+# This is keyed separately from the old key so a classify action never
+# waits on _compute_shading_geometry_backend, only on a numpy re-lookup.
+
+
+def _build_independent_shaded_mesh(app, view_idx):
     """Build a Shaded Classification mesh independent of Main View's own
     display mode, so the section's Shaded Classification works even when
     Main View is currently showing Class/RGB/etc. This calls the same
@@ -76,13 +120,16 @@ def _build_independent_shaded_mesh(app):
     it never touches ``app.vtk_widget``, ``app.display_mode``, or any
     Main View actor, so Main View's current display is left untouched.
 
+    Visible classes and colors come from THIS section's own palette
+    (view_idx), not Main View's -- so filtering a class on the section
+    itself actually affects the section's Shaded/Surface mesh.
+
     Result is cached on `app` and only rebuilt when the underlying data,
     visible classes, or light settings actually change.
     """
     try:
         from gui.shading_display import (
             _compute_shading_geometry_backend,
-            _get_shading_visibility,
             normalize_shading_quality,
         )
         from gui.flight_line_filter import flight_line_visibility_mask
@@ -109,7 +156,7 @@ def _build_independent_shaded_mesh(app):
             xyz_raw = xyz_raw[line_mask]
             classes_raw = classes_raw[line_mask]
 
-    vc = _get_shading_visibility(app)
+    vc = _section_visible_classes(app, view_idx)
     if not vc:
         return None
 
@@ -118,33 +165,47 @@ def _build_independent_shaded_mesh(app):
     ambient = float(getattr(app, "shade_ambient", 0.25))
     quality_mode = normalize_shading_quality(getattr(app, "shading_quality", "normal"))
 
-    key = _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode)
-    cached = getattr(app, "_section_independent_shaded_cache", None)
-    if cached is not None and cached.get("key") == key:
-        return cached.get("mesh")
+    geom_key = _independent_shaded_cache_key(app, xyz_raw, vc, azimuth, angle, ambient, quality_mode)
+    geom_cache_attr = f"_section_{view_idx}_independent_shaded_geom_cache"
+    geom_cached = getattr(app, geom_cache_attr, None)
+    if geom_cached is not None and geom_cached.get("key") == geom_key:
+        faces = geom_cached["faces"]
+        xyz_final = geom_cached["xyz_final"]
+        unique_indices = geom_cached["unique_indices"]
+        shade = geom_cached["shade"]
+    else:
+        try:
+            from gui.shading_display import _compute_xyz_hash
+            res = _compute_shading_geometry_backend(
+                xyz_raw, classes_raw, vc, azimuth, angle, ambient,
+                3.0, None, _compute_xyz_hash(xyz_raw), quality_mode=quality_mode,
+            )
+        except Exception as exc:
+            print(f"   ⚠️ Section shaded mesh: independent build failed ({exc})")
+            return None
 
-    try:
-        from gui.shading_display import _compute_xyz_hash
-        res = _compute_shading_geometry_backend(
-            xyz_raw, classes_raw, vc, azimuth, angle, ambient,
-            3.0, None, _compute_xyz_hash(xyz_raw), quality_mode=quality_mode,
-        )
-    except Exception as exc:
-        print(f"   ⚠️ Section shaded mesh: independent build failed ({exc})")
-        return None
+        if res.get("empty", False):
+            return None
 
-    if res.get("empty", False):
-        return None
+        faces = np.asarray(res["faces"], dtype=np.int64)
+        if len(faces) == 0:
+            return None
+        xyz_final = np.asarray(res["xyz_final"], dtype=np.float64)
+        unique_indices = np.asarray(res["unique_indices"], dtype=np.int64)
+        shade = np.asarray(res["shade"], dtype=np.float32)
+        setattr(app, geom_cache_attr, {
+            "key": geom_key, "faces": faces, "xyz_final": xyz_final,
+            "unique_indices": unique_indices, "shade": shade,
+        })
+        print(f"   🔨 Section {view_idx+1}: built independent shaded geometry "
+              f"({len(xyz_final):,} verts, {len(faces):,} faces, quality={quality_mode}, "
+              f"visible_classes={sorted(vc)})")
 
-    faces = np.asarray(res["faces"], dtype=np.int64)
-    if len(faces) == 0:
-        return None
-    xyz_final = np.asarray(res["xyz_final"], dtype=np.float64)
-    unique_indices = np.asarray(res["unique_indices"], dtype=np.int64)
-    shade = np.asarray(res["shade"], dtype=np.float32)
-
+    # Colors are recomputed every call (cheap numpy lookup) so a reclassify
+    # of already-visible points is reflected immediately without re-running
+    # the expensive triangulation above.
     cm = classes_raw.astype(np.int32)[unique_indices]
-    palette = getattr(app, "class_palette", {}) or {}
+    palette = _section_palette_dict(app, view_idx)
     mc = max(int(cm.max()) + 1, 256)
     lut = np.zeros((mc, 3), dtype=np.float32)
     for c, e in palette.items():
@@ -163,9 +224,6 @@ def _build_independent_shaded_mesh(app):
     mesh = pv.PolyData(xyz_final, fv.ravel())
     mesh.cell_data["RGB"] = face_colors
 
-    app._section_independent_shaded_cache = {"key": key, "mesh": mesh}
-    print(f"   🔨 Section: built independent shaded mesh "
-          f"({len(xyz_final):,} verts, {len(faces):,} faces, quality={quality_mode})")
     return mesh
 
 
@@ -179,7 +237,49 @@ def _independent_surface_cache_key(app, xyz_all, global_idx, azimuth, angle, amb
             round(float(angle), 3), round(float(ambient), 4), quality_mode)
 
 
-def _build_independent_surface_mesh(app):
+def _section_surface_visible_mask(app, view_idx, xyz_all):
+    """Same membership logic as gui.surface_mode.surface_visible_mask, but
+    sourced from THIS section's own palette (view_idx) instead of Main
+    View's slot 0 -- so a class filter set directly on the section
+    actually affects the section's Surface mesh."""
+    from gui.flight_line_filter import flight_line_visibility_mask
+    from gui.surface_mode import _surface_support_entry
+
+    line_mask = flight_line_visibility_mask(app, len(xyz_all))
+    classes = (getattr(app, "data", None) or {}).get("classification")
+    if classes is None:
+        return line_mask
+
+    classes_arr = np.asarray(classes)
+    palette = _section_palette_dict(app, view_idx)
+    if not palette:
+        return line_mask
+
+    if classes_arr.dtype == np.uint8:
+        lut = np.zeros(256, dtype=bool)
+        for code, entry in palette.items():
+            try:
+                code_int = int(code)
+                if 0 <= code_int < 256:
+                    lut[code_int] = _surface_support_entry(code_int, entry)
+            except Exception:
+                continue
+        return lut[classes_arr] & line_mask
+
+    supported = []
+    for code, entry in palette.items():
+        try:
+            code_int = int(code)
+        except Exception:
+            continue
+        if _surface_support_entry(code_int, entry):
+            supported.append(code_int)
+    if not supported:
+        return np.zeros(len(xyz_all), dtype=bool)
+    return np.isin(classes_arr, np.asarray(supported, dtype=classes_arr.dtype)) & line_mask
+
+
+def _build_independent_surface_mesh(app, view_idx):
     """Build a Surface mesh independent of Main View's own display mode,
     the same way _build_independent_shaded_mesh does for Shaded
     Classification -- calls Main View's own pure, actor-free geometry
@@ -187,6 +287,9 @@ def _build_independent_surface_mesh(app):
     directly, never touching ``app.vtk_widget``/``app.display_mode``/any
     Main View actor. Colors come straight from the backend's own result
     (elevation-ramp + lighting), matching Main View's Surface exactly.
+
+    Visible classes come from THIS section's own palette (view_idx), not
+    Main View's.
     """
     try:
         from gui.surface_mode import (
@@ -195,7 +298,6 @@ def _build_independent_surface_mesh(app):
             _surface_quality_target,
             _surface_z_bounds_cached,
             _normalize_surface_ramp,
-            surface_visible_mask,
         )
     except Exception as exc:
         print(f"   ⚠️ Section surface mesh: import failed ({exc})")
@@ -209,8 +311,9 @@ def _build_independent_surface_mesh(app):
         return None
 
     try:
-        vis_mask = surface_visible_mask(app)
-    except Exception:
+        vis_mask = _section_surface_visible_mask(app, view_idx, xyz_all)
+    except Exception as exc:
+        print(f"   ⚠️ Section surface mesh: visibility mask failed ({exc})")
         vis_mask = None
     if vis_mask is None or len(vis_mask) != len(xyz_all):
         vis_mask = np.ones(len(xyz_all), dtype=bool)
@@ -231,7 +334,8 @@ def _build_independent_surface_mesh(app):
     )
 
     key = _independent_surface_cache_key(app, xyz_all, global_idx, azimuth, angle, ambient, quality_mode)
-    cached = getattr(app, "_section_independent_surface_cache", None)
+    cache_attr = f"_section_{view_idx}_independent_surface_cache"
+    cached = getattr(app, cache_attr, None)
     if cached is not None and cached.get("key") == key:
         return cached.get("mesh")
 
@@ -262,9 +366,10 @@ def _build_independent_surface_mesh(app):
     elif len(colors) == len(pts):
         mesh.point_data["RGB"] = colors
 
-    app._section_independent_surface_cache = {"key": key, "mesh": mesh}
-    print(f"   🔨 Section: built independent surface mesh "
-          f"({len(pts):,} verts, {len(faces):,} faces, quality={quality_mode})")
+    setattr(app, cache_attr, {"key": key, "mesh": mesh})
+    print(f"   🔨 Section {view_idx+1}: built independent surface mesh "
+          f"({len(pts):,} verts, {len(faces):,} faces, quality={quality_mode}, "
+          f"eligible_points={global_idx.size:,})")
     return mesh
 
 
@@ -327,10 +432,21 @@ def _profile_actor_name(view_idx, mode):
     return f"_section_{view_idx}_{mode}_profile"
 
 
-def build_section_shaded_surface_actor(app, view_idx, mode) -> bool:
+def build_section_shaded_surface_actor(app, view_idx, mode, force_independent=True) -> bool:
     """Build/refresh the mesh-slab profile actor for a section view.
 
     mode: "shaded" or "surface". Returns True on success.
+    force_independent: default True. Main View's cached mesh
+    (app._shaded_mesh_polydata) bakes in MAIN VIEW's own class-visibility
+    palette and goes stale the instant a classify patches Main View's
+    colors without touching that cached polydata -- reusing it here would
+    silently ignore a class filter set directly on the section, or show
+    pre-classify colors. The independent build reads the section's own
+    palette (_section_palette_dict) and live classification every call;
+    its own triangulation is cached separately (see
+    _build_independent_shaded_mesh) so repeated calls stay cheap. Pass
+    False only for a case that intentionally wants Main View's exact mesh
+    reused as-is.
     """
     if not hasattr(app, "section_vtks") or view_idx not in app.section_vtks:
         return False
@@ -343,7 +459,7 @@ def build_section_shaded_surface_actor(app, view_idx, mode) -> bool:
         print(f"   ⚠️ Section {view_idx+1}: no cutting line stored yet")
         return False
 
-    source_mesh = _source_polydata(app, mode)
+    source_mesh = _source_polydata(app, view_idx, mode, force_independent=force_independent)
     if source_mesh is None:
         label = "Shaded Classification" if mode == "shaded" else "Surface"
         print(f"   ⚠️ Section {view_idx+1}: could not build a {label} mesh "
@@ -441,3 +557,57 @@ def remove_section_shaded_surface_actor(app, view_idx) -> None:
         vtk_widget.render()
     except Exception:
         pass
+
+
+def refresh_all_shaded_surface_sections_after_classify(app) -> None:
+    """Rebuild every currently-open section's Shaded Classification/Surface
+    mesh after a classify, undo, or redo action. A section's Shaded/Surface
+    mesh is a snapshot -- nothing tells it to refresh on its own when
+    points inside it get reclassified, unlike Main View, which has its own
+    live incremental face-patch overlay system.
+
+    Deliberately checks every open section directly (via app.section_vtks)
+    rather than any "dirty view" tracking, since the fast cross-section
+    classify path (interactor_classify.py's
+    _refresh_all_views_after_classification) early-returns before ever
+    reaching the optimizer/dirty-view pipeline when Main View is in Shaded
+    Classification mode -- so this needs to be callable standalone,
+    independent of that pipeline's state.
+
+    Called centrally from unified_actor_manager.guarantee_main_view_visual_refresh
+    (the single function every classify/undo/redo commit path funnels
+    through for Main View's own refresh) so every commit path picks this
+    up for free, plus directly from app_window.undo_classification (which
+    does not route through that function) and from the cross-section
+    fast-classify path's non-shaded-Main-View branch.
+    """
+    if not hasattr(app, "section_vtks") or not app.section_vtks:
+        return
+
+    dlg = getattr(app, "display_mode_dialog", None)
+    view_color_modes = getattr(dlg, "view_color_modes", {}) if dlg else {}
+
+    for view_idx in list(app.section_vtks.keys()):
+        slot_idx = view_idx + 1
+        mode_idx = int(view_color_modes.get(slot_idx, 0) or 0)
+        if mode_idx not in (1, 6):
+            continue
+        try:
+            # NOTE: this used to unconditionally clear both independent-mesh
+            # caches here before rebuilding. That's dead weight for Shaded
+            # (its geometry cache is now separate -- see
+            # _build_independent_shaded_mesh -- and colors are recomputed
+            # fresh every call regardless) and it was actively harmful for
+            # Surface: Surface's cache key already correctly reflects
+            # whether the visible-point SET changed (which is the only
+            # thing that can affect a Surface mesh, since its color comes
+            # from the elevation ramp, not classification), so clearing it
+            # here forced a full multi-million-point/face rebuild on every
+            # single classify AND undo action instead of a cheap cache hit.
+            mesh_mode = "shaded" if mode_idx == 1 else "surface"
+            build_section_shaded_surface_actor(
+                app, view_idx, mesh_mode, force_independent=True
+            )
+        except Exception as mesh_refresh_err:
+            print(f"   ⚠️ Section {view_idx + 1} {mode_idx} mesh "
+                f"refresh-after-classify failed: {mesh_refresh_err}")

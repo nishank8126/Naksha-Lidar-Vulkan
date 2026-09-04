@@ -15402,6 +15402,11 @@ class ClassificationInteractor:
                         origin_view="cross_section",
                     )
                     if shaded_refresh_ok:
+                        # guarantee_main_view_visual_refresh (above) now also
+                        # refreshes every open section's Shaded/Surface mesh
+                        # itself (centralized there since every classify/
+                        # undo/redo commit path funnels through it) -- no
+                        # separate call needed here.
                         self.app._gpu_sync_done = False
                         return
                     print(
@@ -15419,6 +15424,20 @@ class ClassificationInteractor:
                 # fallback path below instead of suppressing the refresh.
                 self.app._gpu_sync_done = False
             else:
+                # display_mode here is MAIN VIEW's mode, not any section's --
+                # a section can be in Shaded/Surface mode independently of
+                # Main View (e.g. Main View in Class, section in Shaded).
+                # This branch used to return immediately, so that case never
+                # got a section mesh refresh on classify at all (only undo/
+                # redo did, since those call this unconditionally).
+                try:
+                    from gui.cross_section.section_shaded_surface import (
+                        refresh_all_shaded_surface_sections_after_classify,
+                    )
+                    refresh_all_shaded_surface_sections_after_classify(self.app)
+                except Exception as _mesh_refresh_err:
+                    print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+                        f"failed: {_mesh_refresh_err}")
                 self.app._gpu_sync_done = False
                 return
 
@@ -15560,6 +15579,14 @@ class ClassificationInteractor:
                     print(f"   ⚠️ Unified actor not ready — triggering build")
                     from gui.class_display import update_class_mode
                     update_class_mode(app, force_refresh=True)
+                try:
+                    from gui.cross_section.section_shaded_surface import (
+                        refresh_all_shaded_surface_sections_after_classify,
+                    )
+                    refresh_all_shaded_surface_sections_after_classify(app)
+                except Exception as _mesh_refresh_err:
+                    print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+                        f"failed: {_mesh_refresh_err}")
 
             elif display_mode == "shaded_class":
                 print(f"   🌗 Shaded mode – forcing rebuild...")
@@ -15568,6 +15595,14 @@ class ClassificationInteractor:
                 ambient = getattr(app, "shade_ambient", 0.2)
                 from gui.shading_display import update_shaded_class
                 update_shaded_class(app, azimuth, angle, ambient)
+                try:
+                    from gui.cross_section.section_shaded_surface import (
+                        refresh_all_shaded_surface_sections_after_classify,
+                    )
+                    refresh_all_shaded_surface_sections_after_classify(app)
+                except Exception as _mesh_refresh_err:
+                    print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+                        f"failed: {_mesh_refresh_err}")
 
             elif display_mode == "surface":
                 print("   🏔️ Surface mode – forcing mesh rebuild after cross-section classification...")
@@ -15578,6 +15613,14 @@ class ClassificationInteractor:
                     )
                 except Exception as e:
                     print(f"   ⚠️ Surface refresh failed: {e}")
+                try:
+                    from gui.cross_section.section_shaded_surface import (
+                        refresh_all_shaded_surface_sections_after_classify,
+                    )
+                    refresh_all_shaded_surface_sections_after_classify(app)
+                except Exception as _mesh_refresh_err:
+                    print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+                        f"failed: {_mesh_refresh_err}")
             else:
                 # We are in depth, intensity, elevation, or rgb mode.
                 # Guard: keep current non-class main-view buffer untouched until mode switch.
@@ -16475,10 +16518,11 @@ class ClassificationInteractor:
             # Mark active-classify timestamp so MemoryLeakGuard defers its
             # gen-2 GC while the user is mid-streak.
             self.app._last_classify_ts = time.time()
-            
+
             # The guarantee above is the sole shaded-class updater and presenter
-            # for this commit. Repeating the shading refresh here traversed the
-            # facet colors twice and scheduled another render of the same mask.
+            # for this commit, and it also refreshes every open section's
+            # Shaded/Surface mesh itself (centralized there since every
+            # classify/undo/redo commit path funnels through it).
 
         except Exception as e:
             print(f"⚠️ Fast injection failed, falling back to full refresh: {e}")

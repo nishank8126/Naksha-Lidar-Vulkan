@@ -1179,6 +1179,10 @@ class NakshaApp(QMainWindow):
         self.identification_tool = IdentificationTool(self)
         print("✅ Identification tool initialized")
 
+        from gui.cross_section_measurement_tool import CrossSectionMeasurementTool
+        self.cross_section_measurement_tool = CrossSectionMeasurementTool(self)
+        print("✅ Cross-section measurement tool initialized")
+
         from gui.point_sync_tool import PointSyncTool
         self.point_sync_tool = PointSyncTool(self)
         print("✅ Point sync tool initialized")
@@ -1329,6 +1333,37 @@ class NakshaApp(QMainWindow):
 
         self._update_snt_layer_pick_footer_icon()
         self._update_snt_layer_pick_footer_state_visual(False)
+
+        # 3b. Cross-section measurement toggle
+        self.cross_section_measure_footer_btn = QToolButton(self.status)
+        self.cross_section_measure_footer_btn.setObjectName("statusCrossSectionMeasureButton")
+        self.cross_section_measure_footer_btn.setCheckable(True)
+        self.cross_section_measure_footer_btn.setAutoRaise(True)
+        self.cross_section_measure_footer_btn.setFixedHeight(20)
+        self.cross_section_measure_footer_btn.setText("📏 XS")
+        self.cross_section_measure_footer_btn.setCursor(Qt.PointingHandCursor)
+        self.cross_section_measure_footer_btn.setFocusPolicy(Qt.NoFocus)
+        self.cross_section_measure_footer_btn.setToolTip(
+            "Measure distances inside cross-section views\n"
+            "(mirrored automatically into the main 3D view)"
+        )
+        self.cross_section_measure_footer_btn.setStyleSheet("""
+            QToolButton {
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 0 4px;
+                margin: 0 2px;
+            }
+            QToolButton:hover {
+                background: rgba(255, 255, 255, 0.08);
+            }
+            QToolButton:checked {
+                background: rgba(255, 255, 255, 0.14);
+                border-color: rgba(255, 255, 255, 0.18);
+            }
+        """)
+        self.cross_section_measure_footer_btn.toggled.connect(self._toggle_cross_section_measure_from_footer)
+        self.status.addPermanentWidget(self.cross_section_measure_footer_btn)
 
         # 4. Cursor-following axis guides
         axis_tooltip = "Show full-canvas X/Y guides that follow the cursor"
@@ -2894,6 +2929,19 @@ class NakshaApp(QMainWindow):
         else:
             self.point_sync_tool.deactivate()
             self.statusBar().showMessage("🎯 Point target sync disabled", 2000)
+
+    def _toggle_cross_section_measure_from_footer(self, enabled):
+        if not hasattr(self, "cross_section_measurement_tool") or self.cross_section_measurement_tool is None:
+            return
+
+        if enabled:
+            self.cross_section_measurement_tool.activate()
+            self.statusBar().showMessage(
+                "📏 Cross-section measurement enabled — click two points in a cross-section view", 4000
+            )
+        else:
+            self.cross_section_measurement_tool.deactivate()
+            self.statusBar().showMessage("📏 Cross-section measurement disabled", 2000)
 
     def _toggle_snt_layer_pick_from_footer(self, enabled):
         if not hasattr(self, "snt_layer_pick_tool") or self.snt_layer_pick_tool is None:
@@ -4509,6 +4557,13 @@ class NakshaApp(QMainWindow):
                 except Exception as e:
                     print(f"   ⚠️ Point sync section observer cleanup warning: {e}")
 
+                try:
+                    cs_measure = getattr(self, "cross_section_measurement_tool", None)
+                    if cs_measure is not None and hasattr(cs_measure, "deactivate_for_section"):
+                        cs_measure.deactivate_for_section(view_index)
+                except Exception as e:
+                    print(f"   ⚠️ Cross-section measurement observer cleanup warning: {e}")
+
                 # ✅ CRITICAL: Stop all VTK rendering FIRST
                 try:
                     # 1. Clear the VTK widget completely
@@ -4730,6 +4785,10 @@ class NakshaApp(QMainWindow):
         if hasattr(self, 'identification_tool') and self.identification_tool.active:
             self.identification_tool.activate_for_section(vtk_widget, view_index)
             print(f"🔍 Auto-activated identification for view {view_index + 1}")
+
+        if hasattr(self, 'cross_section_measurement_tool') and self.cross_section_measurement_tool.active:
+            self.cross_section_measurement_tool.activate_for_section(vtk_widget, view_index)
+            print(f"📏 Auto-activated cross-section measurement for view {view_index + 1}")
 
         if hasattr(self, 'point_sync_tool') and self.point_sync_tool.active:
             self.point_sync_tool.activate_for_section(vtk_widget, view_index)
@@ -10341,13 +10400,78 @@ class NakshaApp(QMainWindow):
                     clear_shading_cache("undo topology fallback")
                     update_shaded_class(self, force_rebuild=True)
 
+        # 6. Section Shaded/Surface meshes: undo never emits
+        #    classification_finished (unlike redo/classify commits), so the
+        #    section_mesh_display dispatcher never runs for it -- refresh
+        #    directly here instead.
+        try:
+            from gui.cross_section.section_shaded_surface import (
+                refresh_all_shaded_surface_sections_after_classify,
+            )
+            refresh_all_shaded_surface_sections_after_classify(self)
+        except Exception as _section_mesh_undo_err:
+            print(f"   ⚠️ Section Shaded/Surface refresh-after-undo failed: {_section_mesh_undo_err}")
+
         self._last_changed_mask = None
         self._last_changed_indices = None
         self._gpu_sync_done = False
         # Surface refresh owns its own presentation.  A metadata-only Surface
         # undo needs no 12M/50M-face redraw, while a true rebuild already rendered.
         if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            self.vtk_widget.render()
+            # gui/gpu_render_manager.py wraps vtk_widget.render() with TWO
+            # separate throttles: a classify-streak coalescer (gated on
+            # _last_classify_ts, cleared below just in case) AND a general
+            # "too soon since last render" debounce that schedules a delayed
+            # timer instead of rendering now -- a classify commit renders
+            # Main View milliseconds before undo's own render call, so undo
+            # almost always lands in that debounce window and gets deferred.
+            # Section widgets aren't wrapped by either throttle, which is why
+            # they always looked correct immediately while Main View lagged.
+            #
+            # unified_actor_manager._safe_direct_render was tried here first
+            # but is broken: it looks for the render manager on
+            # vtk_widget._naksha_gpu_render_manager, an attribute that is
+            # never actually set anywhere (the manager lives at
+            # app.gpu_render_manager instead) -- so its lookup always failed
+            # and it silently fell back to calling the raw VTK render
+            # window's Render() directly, which skips whatever pyvistaqt's
+            # own bound render() does for the Qt-embedded widget (buffer
+            # swap / widget update), leaving the screen not actually
+            # repainted even though "a render" nominally happened.
+            #
+            # force_render() is the correct, already-built "bypass the
+            # throttle" helper: it cancels the pending timer and calls
+            # _execute_render(), which uses the TRUE original bound render
+            # method captured at wrap time.
+            self._last_classify_ts = 0.0
+            mgr = getattr(self, "gpu_render_manager", None)
+            if mgr is not None:
+                mgr.force_render()
+            else:
+                self.vtk_widget.render()
+            # Root cause found by the user: pressing Ctrl+Z while Main View
+            # itself still holds keyboard focus after a Shaded-mode classify
+            # left the screen un-repainted even though force_render() above
+            # completed internally -- but clicking into a cross-section
+            # widget first (giving IT focus) made the SAME undo work. VTK's
+            # render can finish writing its buffer while Qt still defers
+            # actually compositing it to screen until something pumps the
+            # event loop; a focus/mouse event on another widget does that
+            # as a side effect. Force that flush directly instead of
+            # depending on incidental focus changes.
+            try:
+                self.vtk_widget.update()
+                from PySide6.QtCore import QEventLoop
+                from PySide6.QtWidgets import QApplication
+                # ExcludeUserInputEvents: flush the pending paint without
+                # reentrantly processing new mouse/keyboard events while
+                # still inside this keypress handler (undo_classification
+                # runs synchronously from Ctrl+Z) -- a bare processEvents()
+                # here could recursively dispatch another queued key/click,
+                # double-triggering something mid-undo.
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            except Exception:
+                pass
 
     def redo_classification(self):
         """🚀 MICROSTATION REDO: Instant GPU Forward-Patch"""
@@ -10442,7 +10566,32 @@ class NakshaApp(QMainWindow):
 
         # Surface refresh owns presentation for both no-op and exact topology paths.
         if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            self.vtk_widget.render()
+            # See matching comment in undo_classification: force_render()
+            # bypasses BOTH GPURenderManager throttles (classify-streak +
+            # general debounce) and uses the TRUE original bound render
+            # method, unlike the broken _safe_direct_render lookup that was
+            # here before.
+            self._last_classify_ts = 0.0
+            mgr = getattr(self, "gpu_render_manager", None)
+            if mgr is not None:
+                mgr.force_render()
+            else:
+                self.vtk_widget.render()
+            # Force a Qt paint flush explicitly instead of depending on
+            # incidental focus changes to another widget to make it happen.
+            try:
+                self.vtk_widget.update()
+                from PySide6.QtCore import QEventLoop
+                from PySide6.QtWidgets import QApplication
+                # ExcludeUserInputEvents: flush the pending paint without
+                # reentrantly processing new mouse/keyboard events while
+                # still inside this keypress handler (undo_classification
+                # runs synchronously from Ctrl+Z) -- a bare processEvents()
+                # here could recursively dispatch another queued key/click,
+                # double-triggering something mid-undo.
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            except Exception:
+                pass
 
 
     def _refresh_main_view_after_undo(self, affected_classes, changed_mask):

@@ -3763,7 +3763,26 @@ def _apply_surface_local_classification_patch(app, transition: dict, operation="
     except Exception:
         pass
     try:
-        app.vtk_widget.render()
+        # app.vtk_widget.render() is GPURenderManager's wrapped/throttled
+        # version. This runs synchronously right after a classify commit's
+        # own render (which just stamped _last_classify_ts / last_render_time),
+        # so it can re-enter the classify-streak or general debounce throttle
+        # and just reschedule a deferred timer instead of actually painting --
+        # the same bug found and fixed for the Shaded-mode overlay presenter
+        # (gui/shading_display.py's _schedule_fast_shaded_present). Bypass it
+        # the same way.
+        mgr = getattr(app, "gpu_render_manager", None)
+        if mgr is not None:
+            mgr.force_render()
+        else:
+            app.vtk_widget.render()
+        try:
+            app.vtk_widget.update()
+            from PySide6.QtCore import QEventLoop
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        except Exception:
+            pass
     except Exception:
         pass
 

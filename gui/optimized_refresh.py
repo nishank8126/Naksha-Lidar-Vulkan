@@ -156,6 +156,19 @@ class OptimizedRefreshPipeline:
             self._refresh_main_view_for_classification(to_class, state)
             self._pending_renders.add(0)
 
+            # Rebuild any dirty section's Shaded/Surface mesh AFTER Main
+            # View's own shading refresh above, not before. This step used
+            # to live inside fast_cross_section_update (called earlier, by
+            # _refresh_dirty_cross_sections at line ~154), which ran BEFORE
+            # _refresh_main_view_for_classification -> _refresh_shaded_mode
+            # patches Main View's shaded mesh's colors -- so a section
+            # reusing Main View's mesh as its source captured a stale
+            # pre-patch snapshot every time, then never updated again.
+            # Placing it here, after Main View's own patch has already
+            # applied, ensures the section rebuild reads fresh colors.
+            if ENABLE_DIRTY_VIEW_TRACKING:
+                self._refresh_dirty_section_meshes(state)
+
             if 5 in state.dirty_views:
                 self._refresh_cut_section()
                 self._pending_renders.add(5)
@@ -237,6 +250,28 @@ class OptimizedRefreshPipeline:
                 continue
             self._refresh_single_cross_section(view_idx, state)
             self._pending_renders.add(slot_idx)
+
+    def _refresh_dirty_section_meshes(self, state):
+        """Rebuild every open section's Shaded Classification/Surface mesh
+        after a classify action, via the shared
+        refresh_all_shaded_surface_sections_after_classify (also called
+        from interactor_classify.py's _refresh_all_views_after_classification
+        for the cross-section-targeted classify path, and centrally from
+        guarantee_main_view_visual_refresh -- kept here too as a fallback
+        for whatever cases reach this optimizer pipeline instead). Must run
+        AFTER _refresh_main_view_for_classification so a section reusing
+        Main View's mesh as its source picks up Main View's just-patched
+        colors instead of a stale pre-patch snapshot.
+        """
+        del state
+        try:
+            from gui.cross_section.section_shaded_surface import (
+                refresh_all_shaded_surface_sections_after_classify,
+            )
+            refresh_all_shaded_surface_sections_after_classify(self.app)
+        except Exception as mesh_refresh_err:
+            print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+                f"failed: {mesh_refresh_err}")
 
     def _refresh_single_cross_section(self, view_idx, state):
         del state

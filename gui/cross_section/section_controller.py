@@ -502,6 +502,12 @@ class SectionController:
                 self._locate_rb_actor = None
         except Exception:
             pass
+        try:
+            cut_controller = getattr(self.app, "cut_section_controller", None)
+            if cut_controller is not None and hasattr(cut_controller, "clear_cut_locate_rubber_band"):
+                cut_controller.clear_cut_locate_rubber_band()
+        except Exception:
+            pass
         self.app._section_locate_display = None
         self.app._section_locate_view = None
 
@@ -1783,7 +1789,17 @@ class SectionController:
                     print("❌ Point cloud data is empty!")
                     self.finalize_rectangle()
                     return
-    
+
+                # New section geometry replaces the old one for this view — drop any
+                # stale cross-section measurement overlays drawn against the previous
+                # cut. No-op unless that (opt-in) tool has been used.
+                cs_measure = getattr(self.app, "cross_section_measurement_tool", None)
+                if cs_measure is not None:
+                    try:
+                        cs_measure.clear_view(self.active_view)
+                    except Exception:
+                        pass
+
                 # Apply line style before finalizing rectangle
                 style = getattr(self.app, "cross_line_style", "solid")
                 if style != "solid":
@@ -2657,7 +2673,7 @@ class SectionController:
                         if reapplied:
                             print(f"   🎨 Re-applied View {view_index + 1}'s own display mode: {_mesh_mode} (mesh cut)")
                     else:
-                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation"}
+                        _SECTION_MODE_BY_IDX = {2: "depth", 3: "intensity", 4: "rgb", 5: "elevation", 7: "line"}
                         remembered_mode = _SECTION_MODE_BY_IDX.get(_reapply_idx)
                         if remembered_mode:
                             _reapply_border = float(
