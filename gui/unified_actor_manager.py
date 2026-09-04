@@ -5260,6 +5260,35 @@ def refresh_section_after_weight_change(
             vtk_ca.Modified()
         _mark_actor_dirty(actor)
     else:
+        # While this section is showing Shaded/Surface (a different actor
+        # entirely), fast_cross_section_update deliberately skips patching
+        # this point-actor's own _naksha_section_class mirror -- otherwise
+        # a classify would overwrite Shaded/Surface's own custom coloring
+        # with class-palette colors. That means the mirror can go stale for
+        # as long as the section stayed in Shaded/Surface, so switching
+        # back to Class mode must not just recolor from that stale mirror.
+        #
+        # app._sync_section_mirror_from_data looked like the right existing
+        # helper for this, but it is dead code: it looks up the actor via
+        # vtk_widget._naksha_unified_actor / _section_unified_actor, neither
+        # of which is ever assigned anywhere in this codebase, so it always
+        # silently no-ops. Resync directly here instead, using this
+        # function's own already-correct `actor` reference and the global
+        # index array set on it at build time (_wire_actor_metadata).
+        try:
+            global_indices = getattr(actor, '_naksha_global_indices', None)
+            classification = app.data.get('classification') if hasattr(app, 'data') and app.data else None
+            if (
+                global_indices is not None
+                and classification is not None
+                and len(global_indices) > 0
+                and int(np.max(global_indices)) < len(classification)
+            ):
+                actor._naksha_section_class = classification[global_indices].copy()
+        except Exception as _mirror_sync_err:
+            print(f"   ⚠️ Section {view_idx+1}: mirror resync before class-mode "
+                  f"recolor failed: {_mirror_sync_err}")
+
         sc = getattr(actor, '_naksha_section_class', None)
         if sc is not None:
             _rewrite_rgb_from_palette(rgb_ptr, sc, palette)
