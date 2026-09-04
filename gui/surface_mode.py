@@ -1846,36 +1846,16 @@ def _restore_snt_grid_above_surface(app) -> int:
           and picking state remain safer.
     """
     try:
-        vtk_widget = getattr(app, "vtk_widget", None)
-        main_renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
-
-        digitizer = getattr(app, "digitizer", None)
-        overlay = getattr(digitizer, "overlay_renderer", None) if digitizer is not None else None
-        text_overlay = getattr(digitizer, "text_overlay_renderer", None) if digitizer is not None else None
+        from gui.scene_render_pipeline import (
+            ROLE_DATA, ROLE_OVERLAY, ROLE_TEXT, ensure_scene_render_pipeline,
+        )
+        pipeline = ensure_scene_render_pipeline(app)
+        main_renderer = pipeline.get(ROLE_DATA)
+        overlay = pipeline.get(ROLE_OVERLAY)
+        text_overlay = pipeline.get(ROLE_TEXT)
 
         if main_renderer is None or overlay is None:
             return 0
-
-        try:
-            overlay.SetLayer(1)
-            overlay.SetErase(0)
-            overlay.SetInteractive(0)
-            overlay.SetActiveCamera(main_renderer.GetActiveCamera())
-        except Exception:
-            pass
-
-        try:
-            if text_overlay is not None:
-                text_overlay.SetLayer(2)
-                text_overlay.SetErase(1)
-                text_overlay.SetInteractive(0)
-                try:
-                    text_overlay.SetPreserveColorBuffer(True)
-                except Exception:
-                    pass
-                text_overlay.SetActiveCamera(main_renderer.GetActiveCamera())
-        except Exception:
-            pass
 
         surface_actor = getattr(app, "_surface_mesh_actor", None)
         unified_actor = getattr(app, "_unified_actor", None)

@@ -1158,6 +1158,8 @@ class NakshaApp(QMainWindow):
         from gui.digitize_tools import DigitizeManager
         renderer = self.vtk_widget.renderer
         self.digitizer = DigitizeManager(self, renderer, self.vtk_widget.interactor)
+        from gui.scene_render_pipeline import ensure_scene_render_pipeline
+        ensure_scene_render_pipeline(self)
         self._install_canvas_axis_render_observer()
         print("✅ Digitizer initialized")   
         
@@ -6118,7 +6120,8 @@ class NakshaApp(QMainWindow):
         from gui.shading_display import clear_shading_cache
         clear_shading_cache(reason="new file")
 
-        # Backup overlay actors (DXF + SNT) so they survive the clear
+        # Backup overlay actors (DXF + SNT) so they survive the data-layer clear.
+        # Rasters live in their own renderer and are never touched here.
         renderer    = self.vtk_widget.renderer
         dxf_backup  = []
         snt_backup  = []
@@ -7654,6 +7657,11 @@ class NakshaApp(QMainWindow):
         # ✅ FIX: suspend (never cancel) any in-progress curve drawing before
         # the mode switch actually happens. Covers every caller of this
         # method, not just the keyboard-shortcut path.
+        # Every display mode owns only data-layer actors. Repair the shared
+        # compositor once here instead of adding ordering fixes to each mode.
+        from gui.scene_render_pipeline import ensure_scene_render_pipeline
+        ensure_scene_render_pipeline(self)
+
         self._suspend_curve_tool_safely(f"switching to {mode} display mode")
 
         import time as _time

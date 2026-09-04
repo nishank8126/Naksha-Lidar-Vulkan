@@ -4903,6 +4903,8 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         )
     checkpoint("overlay_restore")
     _restore_camera(app, saved_camera); plotter.set_background("black")
+    from gui.scene_render_pipeline import sync_scene_background
+    sync_scene_background(app)
     plotter.renderer.ResetCameraClippingRange()
     try:
         m = app._shaded_mesh_actor.GetMapper()
