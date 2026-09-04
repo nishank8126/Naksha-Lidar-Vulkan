@@ -50,16 +50,7 @@ class MeasurementTool:
         self._line_actor_display_points = {}
         self._line_actor_polydata = {}
         # ✅ Overlay renderer for always-on-top measurement lines
-        self._overlay_renderer = None
-        try:
-            rw = self.app.vtk_widget.GetRenderWindow()
-            for i in range(rw.GetRenderers().GetNumberOfItems()):
-                ren = rw.GetRenderers().GetItemAsObject(i)
-                if ren.GetLayer() == 1 and not ren.GetInteractive():
-                    self._overlay_renderer = ren
-                    break
-        except Exception:
-            pass
+        self._overlay_renderer = getattr(digitizer, "overlay_renderer", None)
         # ⚡ Throttle + reuse state for fast mouse-move preview (Microstation-style)
         self._render_timer = None
         self._last_z = 0.0
@@ -159,58 +150,22 @@ class MeasurementTool:
         print("Measurement inactive: left-click pan restored")
 
     def _ensure_overlay_renderer(self):
-        """
-        Lazily create / repair a Layer-1 renderer that shares the active main camera.
-        Load Classification and 2D/3D switching can reset layers or leave the
-        stored overlay renderer detached. Measurement visuals must always be on
-        layer 1 and must always follow the current main renderer camera.
-        """
-        render_window = self.app.vtk_widget.GetRenderWindow()
+        """Return the pipeline-owned vector overlay renderer."""
+        from gui.scene_render_pipeline import ROLE_OVERLAY, ensure_scene_render_pipeline
 
-        try:
-            if render_window.GetNumberOfLayers() < 2:
-                render_window.SetNumberOfLayers(2)
-        except Exception:
-            pass
-
-        ren = self._overlay_renderer
-        attached = False
+        pipeline = ensure_scene_render_pipeline(
+            self.app,
+            overlay_renderer=getattr(self.digitizer, "overlay_renderer", None),
+            text_renderer=getattr(self.digitizer, "text_overlay_renderer", None),
+        )
+        ren = pipeline.get(ROLE_OVERLAY)
         if ren is not None:
-            try:
-                renderers = render_window.GetRenderers()
-                renderers.InitTraversal()
-                for _ in range(renderers.GetNumberOfItems()):
-                    if renderers.GetNextItem() is ren:
-                        attached = True
-                        break
-            except Exception:
-                attached = False
-
-        if ren is None or not attached:
-            ren = vtk.vtkRenderer()
-            render_window.AddRenderer(ren)
             self._overlay_renderer = ren
-
-        try:
-            ren.SetLayer(1)
-            ren.InteractiveOff()
-            ren.SetBackground(0.0, 0.0, 0.0)
-            ren.SetBackgroundAlpha(0.0)
-            ren.EraseOff()
-            # Always bind to the current renderer camera, not the camera that
-            # existed when the measurement tool was constructed.
-            active_ren = getattr(getattr(self.app, "vtk_widget", None), "renderer", None) or self.renderer
-            active_cam = active_ren.GetActiveCamera() if active_ren is not None else None
-            if active_cam is not None:
-                ren.SetActiveCamera(active_cam)
-        except Exception:
-            pass
-
         return ren
 
     def _prepare_overlay_actor(self, actor):
         """
-        Apply front-most overlay settings before adding a prop to Layer 1.
+        Apply front-most overlay settings before adding a prop to vector layer 2.
         """
         if actor is None:
             return

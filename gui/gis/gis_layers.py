@@ -4,16 +4,16 @@
 # A Global-Mapper-style, slide-in/out dock that manages ONLY the imported
 # geospatial overlays:
 #
-#     • GeoTIFF (.tif / .tiff)  → raster, lives on the MAIN renderer (layer 0)
-#     • Shapefile (.shp)        → vector, lives on the OVERLAY renderer (layer 1)
-#     • GeoJSON (.geojson)      → vector, lives on the OVERLAY renderer (layer 1)
+#     • GeoTIFF (.tif / .tiff)  → raster renderer (layer 0)
+#     • Shapefile (.shp)        → vector overlay renderer (layer 2)
+#     • GeoJSON (.geojson)      → vector overlay renderer (layer 2)
 #
 # It does NOT touch DXF / DWG / SNT attachments — those keep their own systems.
 #
 # Per layer you get: show/hide, opacity, reorder (top↔bottom), zoom-to, remove.
 #
 # Ordering model (this is a 3D scene, not a 2D layer stack):
-#   - Vectors (layer 1) ALWAYS render above rasters (layer 0) — the renderer-layer
+#   - Vectors (layer 2) ALWAYS render above rasters (layer 0) — the renderer-layer
 #     architecture guarantees it, which is the sensible GIS default.
 #   - Among RASTERS: order is applied with a tiny Z offset (higher = on top) since
 #     layer-0 has depth testing on.
@@ -158,7 +158,7 @@ def _next_layer_id(app) -> int:
 
 
 def _main_renderer(app):
-    """Layer-0 renderer (point cloud + rasters)."""
+    """Layer-1 data renderer (point cloud and terrain meshes)."""
     try:
         return app.vtk_widget.renderer
     except Exception:
@@ -168,30 +168,29 @@ def _main_renderer(app):
             return None
 
 
+def _raster_renderer(app):
+    """Layer-0 renderer dedicated to GeoTIFF/basemap underlays."""
+    try:
+        from gui.scene_render_pipeline import ROLE_RASTER, renderer_for_role
+        return renderer_for_role(app, ROLE_RASTER)
+    except Exception:
+        return None
+
+
 def _overlay_renderer(app):
-    """Layer-1 renderer (vector linework)."""
+    """Layer-2 renderer (vector linework)."""
     dz = getattr(app, "digitizer", None)
     return getattr(dz, "overlay_renderer", None) if dz is not None else None
 
 
 def _ensure_overlay_on_top(app):
     """
-    Guarantee the vector overlay renderer (layer 1) composites ON TOP of the
-    main renderer (layer 0). Adding an opaque raster to layer 0 must never hide
-    the vector linework; if the render window's layer count or the overlay's
-    layer assignment got disturbed, restore it here.
+    Repair the central four-pass compositor. Raster, LiDAR, vector, and text
+    ownership is enforced together so no subsystem can silently reset another.
     """
-    main = _main_renderer(app)
-    ovl = _overlay_renderer(app)
-    if main is None or ovl is None:
-        return
     try:
-        rw = main.GetRenderWindow() or ovl.GetRenderWindow()
-        if rw is not None and rw.GetNumberOfLayers() < 2:
-            rw.SetNumberOfLayers(2)
-        main.SetLayer(0)
-        ovl.SetLayer(1)
-        ovl.SetErase(0)  # preserve layer-0 color buffer (composite on top)
+        from gui.scene_render_pipeline import ensure_scene_render_pipeline
+        ensure_scene_render_pipeline(app)
     except Exception:
         pass
 
@@ -455,9 +454,10 @@ def zoom_to_gis_entries(app, entries):
 def _remove_layer(app, entry: dict):
     """Detach actors from their renderer and drop the layer from all stores."""
     main_ren = _main_renderer(app)
+    raster_ren = _raster_renderer(app)
     ovl_ren = _overlay_renderer(app)
     for a in entry["actors"]:
-        for ren in (main_ren, ovl_ren):
+        for ren in (raster_ren, main_ren, ovl_ren):
             if ren is None:
                 continue
             try:
@@ -560,13 +560,20 @@ def _apply_order(app):
     ANY layer, raster OR vector.
     """
     reg = _registry(app)
-    main = _main_renderer(app)
-    ovl = _overlay_renderer(app)
+    from gui.scene_render_pipeline import (
+        ROLE_DATA, ROLE_OVERLAY, ROLE_RASTER, ROLE_TEXT,
+        ensure_scene_render_pipeline,
+    )
+    pipeline = ensure_scene_render_pipeline(app)
+    raster_renderer = pipeline.get(ROLE_RASTER)
+    main = pipeline.get(ROLE_DATA)
+    ovl = pipeline.get(ROLE_OVERLAY)
+    text = pipeline.get(ROLE_TEXT)
 
     rasters = [e for e in reg if e.get("kind") == "raster"]
     vectors = [e for e in reg if e.get("kind") == "vector"]
 
-    # 1. Stack rasters on the main renderer using Z-offset
+    # 1. Stack rasters only inside the dedicated layer-0 renderer.
     for rank, e in enumerate(reversed(rasters)):
         actors = list(e.get("actors", []))
         if "sub_layers" in e:
@@ -574,10 +581,12 @@ def _apply_order(app):
                 actors.extend(_sub_layer_actors(sub_info))
         for a in actors:
             try:
-                if ovl is not None and ovl.HasViewProp(a):
-                    ovl.RemoveActor(a)
-                if main is not None and not main.HasViewProp(a):
-                    main.AddActor(a)
+                for other in (main, ovl, text):
+                    if other is not None and other.HasViewProp(a):
+                        other.RemoveViewProp(a)
+                if raster_renderer is not None and not raster_renderer.HasViewProp(a):
+                    raster_renderer.AddActor(a)
+                a._naksha_scene_role = ROLE_RASTER
                 try:
                     a.GetProperty().SetDepthTestingEnabled(True)
                 except Exception:
@@ -597,11 +606,12 @@ def _apply_order(app):
                 actors.extend(_sub_layer_actors(sub_info))
         for a in actors:
             try:
-                other_ren = main if target_ren is ovl else ovl
-                if other_ren is not None and other_ren.HasViewProp(a):
-                    other_ren.RemoveActor(a)
+                for other_ren in (raster_renderer, main, text):
+                    if other_ren is not None and other_ren is not target_ren and other_ren.HasViewProp(a):
+                        other_ren.RemoveViewProp(a)
                 if target_ren is not None and not target_ren.HasViewProp(a):
                     target_ren.AddActor(a)
+                a._naksha_scene_role = ROLE_OVERLAY if target_ren is ovl else ROLE_DATA
                 
                 # Depth testing: disabled on overlay, enabled on main
                 if target_ren is ovl:
@@ -1359,6 +1369,15 @@ class GisLayersDock:
         _used_colors: set = set()
 
         def _layer_color(entry) -> QColor:
+            if entry.get("kind") == "raster":
+                # Rasters (GeoTIFF/orthophoto) render their own pixel colors via a
+                # texture, not a flat fill - never assign/mutate a per-layer color
+                # here. The block below auto-tints any actor whose property color
+                # is still default white, which is exactly the texture actor's
+                # untouched default, so without this guard the orthophoto image
+                # itself gets tinted by the "unique per-layer color" logic meant
+                # for vector features.
+                return QColor(_occ_colors()["raster"])
             color = entry.get("color") or ""
             try:
                 qc = QColor(color)

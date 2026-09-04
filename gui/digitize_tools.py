@@ -923,38 +923,31 @@ class DigitizeManager:
         self._prop_picker = vtk.vtkPropPicker()
 
         # ── OVERLAY RENDERER (always draws on top of point cloud) ──────────────────
+        from gui.scene_render_pipeline import (
+            OVERLAY_LAYER, TEXT_LAYER, NUMBER_OF_LAYERS,
+            ensure_scene_render_pipeline,
+        )
         render_window = self.interactor.GetRenderWindow()
         self.overlay_renderer = vtk.vtkRenderer()
-        self.overlay_renderer.SetLayer(1)          # Layer 1 = always above layer 0
+        self.overlay_renderer.SetLayer(OVERLAY_LAYER)
         self.overlay_renderer.SetInteractive(0)    # Don't intercept mouse events
         self.overlay_renderer.SetBackgroundAlpha(0.0)
-        # ✅ FIX-SNT: Do NOT erase the framebuffer before rendering Layer 1.
-        # Without this, the overlay renderer clears the entire color buffer on every
-        # wiping out Layer 0 content — which includes all SNT actors — making them
-        # invisible while a draw tool is active. SetErase(0) tells VTK to COMPOSITE
-        # Layer 1 on top of Layer 0 instead of replacing it.
-        #
-        # NOTE on depth buffer: SetErase(0) also prevents the depth buffer from being
-        # cleared, so Layer 0's point-cloud depth values persist into Layer 1.
-        # Drawing actors at point-cloud Z elevation would therefore FAIL the depth
-        # test and render "below" the point cloud.  This is solved per-actor in
-        self.overlay_renderer.SetErase(0)
-        render_window.SetNumberOfLayers(2)
+        # Preserve lower-layer colors but start with a fresh depth buffer. Drawings
+        # then composite above LiDAR without depending on either actor's world Z.
+        self.overlay_renderer.SetErase(1)
+        self.overlay_renderer.SetPreserveColorBuffer(True)
+        self.overlay_renderer.SetPreserveDepthBuffer(False)
+        render_window.SetNumberOfLayers(NUMBER_OF_LAYERS)
         render_window.AddRenderer(self.overlay_renderer)
         # Share the EXACT same camera — pan/zoom stays in sync automatically
         self.overlay_renderer.SetActiveCamera(self.renderer.GetActiveCamera())
-        print("✅ Overlay renderer created (digitize tools always on top, erase=0)")
+        print("✅ Overlay renderer created (layer 2, isolated depth)")
         # ───────────────────────────────────────────────────────────────────────────
 
-        # ── TEXT OVERLAY RENDERER (Layer 2) ───────────────────────────────────────
-        # vtkTextActor3D cannot disable depth testing via GetProperty(), so it
-        # fails the inherited depth buffer from Layer 1 (SetErase=0 side-effect)
-        # and hides behind the point cloud.  Layer 2 with SetErase(1) clears the
-        # depth buffer before rendering, so all text always passes the depth test.
-        # SetPreserveColorBuffer(True) prevents it from wiping the color written by
-        # Layers 0 and 1 — text composites on top instead of replacing the scene.
+        # ── TEXT OVERLAY RENDERER (Layer 3) ───────────────────────────────────────
+        # Text has its own compositor pass so it cannot inherit vector/LiDAR depth.
         self.text_overlay_renderer = vtk.vtkRenderer()
-        self.text_overlay_renderer.SetLayer(2)
+        self.text_overlay_renderer.SetLayer(TEXT_LAYER)
         self.text_overlay_renderer.SetInteractive(0)
         self.text_overlay_renderer.SetBackground(0, 0, 0)
         self.text_overlay_renderer.SetBackgroundAlpha(0.0)
@@ -963,10 +956,15 @@ class DigitizeManager:
             self.text_overlay_renderer.SetPreserveColorBuffer(True)  # keep layers 0+1 visible
         except AttributeError:
             pass  # VTK < 8.2: fall back; text may still occlude but won't blank the scene
-        render_window.SetNumberOfLayers(3)
+        render_window.SetNumberOfLayers(NUMBER_OF_LAYERS)
         render_window.AddRenderer(self.text_overlay_renderer)
         self.text_overlay_renderer.SetActiveCamera(self.renderer.GetActiveCamera())
-        print("✅ Text overlay renderer created (Layer 2, depth-cleared, always on top)")
+        ensure_scene_render_pipeline(
+            self.app,
+            overlay_renderer=self.overlay_renderer,
+            text_renderer=self.text_overlay_renderer,
+        )
+        print("✅ Text overlay renderer created (layer 3, isolated depth)")
 
         # ── Draw tool style settings (per-tool color/width/style) ─────────────────
         from gui.draw_settings_dialog import load_draw_settings, DEFAULT_DRAW_STYLES
@@ -1024,6 +1022,13 @@ class DigitizeManager:
             if not render_window:
                 return
 
+            from gui.scene_render_pipeline import ensure_scene_render_pipeline
+            ensure_scene_render_pipeline(
+                self.app,
+                overlay_renderer=self.overlay_renderer,
+                text_renderer=self.text_overlay_renderer,
+            )
+
             renderers = render_window.GetRenderers()
             renderers.InitTraversal()
             r = renderers.GetNextItem()
@@ -1040,22 +1045,24 @@ class DigitizeManager:
 
             if needs_restore:
                 print("🛠️ Restoring DigitizeManager overlay renderers and layers...")
-                render_window.SetNumberOfLayers(3)
-
-                if hasattr(self.renderer, 'SetLayer'):
-                    self.renderer.SetLayer(0)
+                from gui.scene_render_pipeline import (
+                    OVERLAY_LAYER, TEXT_LAYER, NUMBER_OF_LAYERS,
+                )
+                render_window.SetNumberOfLayers(NUMBER_OF_LAYERS)
 
                 if not found_overlay:
                     render_window.AddRenderer(self.overlay_renderer)
-                self.overlay_renderer.SetLayer(1)
+                self.overlay_renderer.SetLayer(OVERLAY_LAYER)
                 self.overlay_renderer.SetInteractive(0)
                 self.overlay_renderer.SetBackgroundAlpha(0.0)
-                self.overlay_renderer.SetErase(0)
+                self.overlay_renderer.SetErase(1)
+                self.overlay_renderer.SetPreserveColorBuffer(True)
+                self.overlay_renderer.SetPreserveDepthBuffer(False)
                 self.overlay_renderer.SetActiveCamera(self.renderer.GetActiveCamera())
 
                 if not found_text_overlay:
                     render_window.AddRenderer(self.text_overlay_renderer)
-                self.text_overlay_renderer.SetLayer(2)
+                self.text_overlay_renderer.SetLayer(TEXT_LAYER)
                 self.text_overlay_renderer.SetInteractive(0)
                 self.text_overlay_renderer.SetBackground(0, 0, 0)
                 self.text_overlay_renderer.SetBackgroundAlpha(0.0)
@@ -9638,19 +9645,12 @@ class DigitizeManager:
 
     def _add_actor_to_overlay(self, actor):
         """
-        Add a digitize actor to the overlay renderer (always above point cloud).
+        Route drawing geometry to vector layer 2 and 3D text to text layer 3.
 
-        The overlay renderer uses SetErase(0) to preserve Layer 0's color buffer
-        (keeping SNT visible).  A side-effect is that Layer 0's depth buffer is also
-        preserved — point-cloud Z values are already written there, and drawing actors
-        at the same world-Z elevation would fail the depth test and appear BEHIND the
-        point cloud.
-
-        For vtkActor/vtkPolyData actors: disable depth testing so they always win.
-        For vtkTextActor3D: route to text_overlay_renderer (Layer 2) which has a fresh
-        depth buffer — SetDepthTestingEnabled() is not available on vtkTextActor3D.
+        Each pass preserves the lower layers' color and clears their depth, so the
+        scene order is determined centrally rather than by per-actor Z patches.
         """
-        # ── vtkTextActor3D: no GetProperty() depth control; use dedicated Layer 2 renderer ──
+        # vtkTextActor3D has no depth-test property; use the dedicated text pass.
         if isinstance(actor, vtk.vtkTextActor3D):
             if hasattr(self, 'text_overlay_renderer') and self.text_overlay_renderer:
                 self.text_overlay_renderer.AddActor(actor)
@@ -9663,8 +9663,8 @@ class DigitizeManager:
             return
 
         if hasattr(self, 'overlay_renderer') and self.overlay_renderer:
-            # ── Disable depth testing so this actor always wins against the
-            #    inherited point-cloud depth buffer (SetErase=0 side-effect). ──
+            # Keep legacy depth disabling for coincident vector geometry within
+            # this pass; cross-role ordering is handled by the compositor.
             try:
                 actor.GetProperty().SetDepthTestingEnabled(False)
             except AttributeError:
@@ -9690,10 +9690,9 @@ class DigitizeManager:
             self.renderer.AddActor(actor)   # fallback
 
     def _add_hatch_actor(self, actor):
-        """Add a hatch actor to text_overlay_renderer (Layer 2) so it always
-        renders above grid labels and other Layer 0/1 content.
+        """Add a hatch actor to text layer 3 so it always renders above labels.
 
-        Layer 2 uses SetErase(1) which clears the depth buffer before rendering,
+        Layer 3 clears depth before rendering,
         guaranteeing hatch lines are never occluded by point cloud or grid label
         geometry -- regardless of world-Z elevation.
         """
@@ -10062,11 +10061,8 @@ class DigitizeManager:
         prop.SetPointSize(12.0)
         prop.SetRenderPointsAsSpheres(True)
 
-        # Route vertex markers to Layer 2 (text_overlay_renderer) which uses SetErase(1)
-        # to clear the depth buffer before rendering.  On VTK 9.x, SetDepthTestingEnabled
-        # is not available on vtkProperty, so Layer 1 polygon-offset alone cannot beat
-        # the shaded mesh surface that fills the depth buffer at the same world coords.
-        # Layer 2 always wins the depth test because it starts with a fresh depth buffer.
+        # Route vertex markers to text layer 3. It clears depth before rendering,
+        # so markers stay visible over the shaded mesh at identical world coordinates.
         if hasattr(self, 'text_overlay_renderer') and self.text_overlay_renderer:
             actor.PickableOff()
             self.text_overlay_renderer.AddActor(actor)
@@ -11510,7 +11506,7 @@ class DigitizeManager:
                 return
             if is_text:
                 if is_scalable:
-                    # Scalable text (vtkTextActor3D) lives in text_overlay_renderer (Layer 2)
+                    # Scalable text (vtkTextActor3D) lives in text layer 3.
                     try:
                         if hasattr(self, 'text_overlay_renderer') and self.text_overlay_renderer:
                             self.text_overlay_renderer.RemoveActor(actor)
@@ -11536,8 +11532,8 @@ class DigitizeManager:
                 except Exception:
                     pass
             else:
-                # Endpoint/vertex sphere actors now live in text_overlay_renderer
-                # (Layer 2) so they always appear over the shaded mesh — remove
+                # Endpoint/vertex sphere actors live in text layer 3 so they
+                # always appear over the shaded mesh — remove
                 # from all three renderers defensively.
                 try:
                     if hasattr(self, 'text_overlay_renderer') and self.text_overlay_renderer:

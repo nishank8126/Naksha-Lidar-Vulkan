@@ -1,4 +1,4 @@
-﻿# from __future__ import annotations
+# from __future__ import annotations
 # from email import charset
 # import math
 # import mmap
@@ -13423,6 +13423,101 @@ def _parse_snt_adjacent_prj_blocks(snt_filename: str) -> List[Dict[str, object]]
         return []
 
 
+def _scale_snt_source_entities_in_place(entities, scale: float):
+    """Scale SNT geometry entities in-place before actors are generated."""
+    if not math.isfinite(scale) or scale <= 0.0 or math.isclose(scale, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        return
+    seen_ids = set()
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        for vkey in ("vertices", "points"):
+            vlist = ent.get(vkey)
+            if isinstance(vlist, list) and id(vlist) not in seen_ids:
+                seen_ids.add(id(vlist))
+                for i in range(len(vlist)):
+                    p = vlist[i]
+                    if len(p) >= 3:
+                        vlist[i] = (p[0] * scale, p[1] * scale, p[2] * scale)
+                    elif len(p) == 2:
+                        vlist[i] = (p[0] * scale, p[1] * scale)
+        blist = ent.get("boundaries")
+        if isinstance(blist, list) and id(blist) not in seen_ids:
+            seen_ids.add(id(blist))
+            for b in blist:
+                if isinstance(b, list) and id(b) not in seen_ids:
+                    seen_ids.add(id(b))
+                    for i in range(len(b)):
+                        p = b[i]
+                        if len(p) >= 3:
+                            b[i] = (p[0] * scale, p[1] * scale, p[2] * scale)
+                        elif len(p) == 2:
+                            b[i] = (p[0] * scale, p[1] * scale)
+        pos = ent.get("position")
+        if isinstance(pos, (tuple, list)):
+            if len(pos) >= 3:
+                ent["position"] = (pos[0] * scale, pos[1] * scale, pos[2] * scale)
+            elif len(pos) == 2:
+                ent["position"] = (pos[0] * scale, pos[1] * scale)
+        h = ent.get("height")
+        if h is not None:
+            try:
+                ent["height"] = float(h) * scale
+            except (TypeError, ValueError):
+                pass
+
+
+def _infer_snt_coordinate_scale(snt_bounds, prj_blocks) -> float:
+    """Infer coordinate scale factor between SNT bounds and PRJ blocks."""
+    if not snt_bounds or not prj_blocks:
+        return 1.0
+    try:
+        sx0, sx1, sy0, sy1 = float(snt_bounds[0]), float(snt_bounds[1]), float(snt_bounds[2]), float(snt_bounds[3])
+        s_cx = (sx0 + sx1) / 2.0
+        s_cy = (sy0 + sy1) / 2.0
+        s_span_x = abs(sx1 - sx0)
+        s_span_y = abs(sy1 - sy0)
+
+        all_pts = [p for b in prj_blocks for p in b.get("points_2d", [])]
+        if not all_pts:
+            return 1.0
+        px0 = min(p[0] for p in all_pts)
+        px1 = max(p[0] for p in all_pts)
+        py0 = min(p[1] for p in all_pts)
+        py1 = max(p[1] for p in all_pts)
+        p_cx = (px0 + px1) / 2.0
+        p_cy = (py0 + py1) / 2.0
+        p_span_x = abs(px1 - px0)
+        p_span_y = abs(py1 - py0)
+
+        candidates = [1.0, 0.1, 10.0, 0.01, 100.0, 0.001, 1000.0]
+        best_scale = 1.0
+        min_error = float("inf")
+
+        for s in candidates:
+            sc_x0, sc_x1 = sx0 * s, sx1 * s
+            sc_y0, sc_y1 = sy0 * s, sy1 * s
+            if sc_x0 > sc_x1:
+                sc_x0, sc_x1 = sc_x1, sc_x0
+            if sc_y0 > sc_y1:
+                sc_y0, sc_y1 = sc_y1, sc_y0
+
+            overlap_x = max(0.0, min(sc_x1, px1) - max(sc_x0, px0))
+            overlap_y = max(0.0, min(sc_y1, py1) - max(sc_y0, py0))
+            if overlap_x > 0 and overlap_y > 0:
+                center_dist = math.hypot((s_cx * s) - p_cx, (s_cy * s) - p_cy)
+                span_ratio_x = (s_span_x * s) / (p_span_x + 1e-9)
+                span_ratio_y = (s_span_y * s) / (p_span_y + 1e-9)
+                if 0.1 <= span_ratio_x <= 10.0 and 0.1 <= span_ratio_y <= 10.0:
+                    if center_dist < min_error:
+                        min_error = center_dist
+                        best_scale = s
+
+        return best_scale
+    except Exception:
+        return 1.0
+
+
 # def _open_polygon_xy(points) -> np.ndarray:
 #     """Return finite XY vertices without a duplicate closing point."""
 #     clean = []
@@ -24370,6 +24465,44 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 except Exception:
                     pass
 
+            # 10) Restore or clear canvas CRS if SNT attachments changed
+            try:
+                remaining_snts = [
+                    a for a in getattr(self.app, "snt_attachments", [])
+                    if a.get("type", "snt").lower() == "snt"
+                ]
+                if not remaining_snts:
+                    loaded = getattr(self.app, "loaded_file", None)
+                    p_data = getattr(self.app, "data", None)
+                    restored = False
+                    if loaded and p_data is not None and p_data.get("xyz") is not None:
+                        try:
+                            from gui.crs_manager import resolve_point_cloud_crs, set_canvas_crs
+                            p_crs, p_lbl = resolve_point_cloud_crs(loaded)
+                            if p_crs is not None:
+                                set_canvas_crs(self.app, p_crs, source=p_lbl, dataset=loaded, force=True)
+                                restored = True
+                        except Exception:
+                            restored = False
+                    if not restored:
+                        try:
+                            from gui.crs_manager import clear_canvas_crs
+                            clear_canvas_crs(self.app)
+                        except Exception:
+                            pass
+                else:
+                    survivor = remaining_snts[0].get("full_path") or remaining_snts[0].get("filename")
+                    if survivor:
+                        try:
+                            from gui.crs_manager import resolve_snt_crs, set_canvas_crs
+                            s_crs, s_lbl = resolve_snt_crs(survivor)
+                            if s_crs is not None:
+                                set_canvas_crs(self.app, s_crs, source=s_lbl, dataset=survivor, force=True)
+                        except Exception:
+                            pass
+            except Exception as _crs_clean_err:
+                print(f"  [warn] CRS cleanup after SNT remove failed: {_crs_clean_err}")
+
         except Exception as exc:
             print(f"  [warn] _remove_from_vtk failed: {exc}")
 
@@ -25227,7 +25360,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         repeatedly - gui.crs_manager.ensure_canvas_crs() is idempotent.
         """
         try:
-            from gui.crs_manager import (resolve_snt_crs, ensure_canvas_crs,
+            from gui.crs_manager import (resolve_snt_crs, set_canvas_crs,
                                          get_canvas_crs, log_dataset_crs)
         except Exception as e:
             print(f"[SNT CRS] gui.crs_manager unavailable: {e}")
@@ -25240,7 +25373,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             return False
 
         prev_canvas = get_canvas_crs(self.app)
-        ensure_canvas_crs(self.app, crs, source=label, dataset=fpath)
+        set_canvas_crs(self.app, crs, source=label, dataset=fpath, force=True)
         canvas = get_canvas_crs(self.app)
         log_dataset_crs(filename, "SNT", crs, label, canvas_crs=canvas)
 

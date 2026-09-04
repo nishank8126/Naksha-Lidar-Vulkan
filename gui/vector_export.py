@@ -589,7 +589,9 @@ def import_drawings_from_shapefile(app, input_path: str) -> bool:
             # Try multiple render methods
             if hasattr(app, 'vtk_widget') and app.vtk_widget:
                 try:
-                    app.vtk_widget.GetRenderWindow().Render()
+                    # Throttled/mutex-guarded render, not a raw GetRenderWindow().Render()
+                    # (see import_geotiff_as_texture for why the raw call is unsafe here).
+                    app.vtk_widget.render()
                     print(f"   ✅ VTK render triggered")
                 except Exception:
                     pass
@@ -3367,7 +3369,49 @@ def import_drawings_from_tiff(app, input_path: str) -> bool:
         import traceback
         traceback.print_exc()
         return False
-    
+
+
+def _geotiff_texture_pixel_budget(app, hard_cap: int = 16_000_000) -> int:
+    """
+    Cap a new GeoTIFF texture's pixel count by remaining GPU VRAM headroom,
+    not just a fixed resolution. This machine's 4GB card (T1000, ~2.8GB safe
+    budget) can end up with several full-resolution orthophoto/DTM/DSM
+    textures resident in the same session - the fixed 16M-pixel cap alone
+    doesn't account for that. Give raster textures a bounded slice of the
+    budget and shrink it by what's already loaded, independent of the
+    reentrancy bug fixed in import_geotiff_as_texture (confirmed by WER as
+    the actual cause of the production access-violation crashes).
+    """
+    try:
+        from gui.gpu_support import get_memory_budget_mb
+        budget_mb = float(get_memory_budget_mb() or 0) or 2048.0
+    except Exception:
+        budget_mb = 2048.0
+
+    # Point cloud + basemap tiles need the rest of the budget; give GeoTIFF
+    # textures a fixed slice of it rather than letting them consume it all.
+    texture_budget_mb = min(600.0, budget_mb * 0.2)
+
+    already_used_mb = 0.0
+    for actor in getattr(app, "geotiff_actors", []) or []:
+        try:
+            texture = actor.GetTexture()
+            image = texture.GetInput() if texture is not None else None
+            if image is None:
+                continue
+            dims = image.GetDimensions()
+            scalars = image.GetPointData().GetScalars()
+            comps = scalars.GetNumberOfComponents() if scalars is not None else 3
+            already_used_mb += (dims[0] * dims[1] * comps) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+
+    remaining_mb = max(16.0, texture_budget_mb - already_used_mb)
+    # Worst case 4 bytes/pixel (RGBA) - convert the remaining MB into a pixel count.
+    budget_pixels = int(remaining_mb * 1024.0 * 1024.0 / 4.0)
+    return max(1_000_000, min(hard_cap, budget_pixels))
+
+
 def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                               gcp_corners=None) -> bool:
     """
@@ -3382,6 +3426,18 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         georeferencing. Supports rotation/scale/translation (affine). Highest
         priority placement.
     """
+
+    # Re-entrancy guard. QCoreApplication.processEvents() below pumps the whole
+    # Qt event queue, including a second pending drag-drop/import event - without
+    # this guard that event re-enters this function while the first call is still
+    # on the stack, giving two live QProgressDialogs mutating app.geotiff_actors
+    # concurrently. Production crash dumps (WER: Qt6Widgets.dll, access violation,
+    # same offset both times) match this exact reentrancy pattern, seen right
+    # after back-to-back GeoTIFF imports in one session.
+    if getattr(app, "_geotiff_import_in_progress", False):
+        print("   ⚠️ A GeoTIFF import is already in progress; ignoring duplicate request")
+        return False
+    app._geotiff_import_in_progress = True
 
     try:
         import rasterio
@@ -3423,9 +3479,26 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
             except Exception:
                 is_georef = False
 
+            # Establish the canvas CRS from this GeoTIFF's own embedded CRS when
+            # nothing else has claimed it yet (ensure_canvas_crs = first trustworthy
+            # dataset wins, same as LAZ/SNT). Without this, a project with ONLY a
+            # georeferenced TIFF loaded never sets app.project_crs_epsg, so the
+            # basemap plugin finds no canvas CRS and silently assumes Web Mercator
+            # - misaligning its tiles relative to this raster's real-world position
+            # even though the TIFF itself carries perfectly good coordinates.
+            if is_georef:
+                try:
+                    from pyproj import CRS as _CRS
+                    from gui.crs_manager import ensure_canvas_crs
+                    ensure_canvas_crs(
+                        app, _CRS.from_wkt(src.crs.to_wkt()),
+                        source="GeoTIFF header", dataset=input_path,
+                    )
+                except Exception as _crs_err:
+                    print(f"   ⚠️ Could not register GeoTIFF CRS with canvas: {_crs_err}")
 
             # Guard against OOM by limiting texture pixel count before NumPy->VTK conversion.
-            max_texture_pixels = 16_000_000  # ~4k x 4k equivalent
+            max_texture_pixels = _geotiff_texture_pixel_budget(app)  # VRAM-aware, capped at ~4k x 4k
             total_pixels = src_width * src_height
             width = src_width
             height = src_height
@@ -3667,8 +3740,14 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
             progress.close()
             return False
  
-        renderer = app.vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
-        renderer.AddActor(actor)
+        from gui.scene_render_pipeline import (
+            ROLE_DATA, add_raster_actor, renderer_for_role,
+        )
+        renderer = add_raster_actor(app, actor)
+        if renderer is None:
+            print("   Raster renderer pipeline is unavailable")
+            progress.close()
+            return False
  
         existing_geotiff_actors = getattr(app, "geotiff_actors", [])
         if not isinstance(existing_geotiff_actors, list):
@@ -3706,10 +3785,17 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
  
         # ── Step 5: reset camera so the imported image is actually visible ─
         print(f"   📷 Resetting camera to show imported texture...")
-        renderer.ResetCamera()
-        renderer.ResetCameraClippingRange()
- 
-        app.vtk_widget.GetRenderWindow().Render()
+        camera_renderer = renderer_for_role(app, ROLE_DATA)
+        if camera_renderer is not None:
+            # Move the interactive/main camera to the combined raster extent.
+            # The raster camera mirrors this view with independent clipping.
+            camera_renderer.ResetCamera(renderer.ComputeVisiblePropBounds())
+
+        # Route through the app's throttled/mutex-guarded render (GPURenderManager),
+        # not a raw GetRenderWindow().Render(). The interactor's own auto-render is
+        # disabled app-wide specifically so every render funnels through there;
+        # stay consistent with that rather than bypassing it.
+        app.vtk_widget.render()
  
         # Also call the app's fit_view if available
         fit_view = getattr(app, 'fit_view', None)
@@ -3739,4 +3825,6 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         print(f"   ❌ GeoTIFF texture import failed: {e}")
         import traceback
         traceback.print_exc()
-        return False 
+        return False
+    finally:
+        app._geotiff_import_in_progress = False
