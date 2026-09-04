@@ -3897,6 +3897,13 @@ class SectionController:
         Observer callback: reactivate last classification tool on right-click
         in any cross-section view when no tool is currently active.
         """
+        cs_measure = getattr(self.app, "cross_section_measurement_tool", None)
+        if cs_measure is not None and getattr(cs_measure, "active", False):
+            # Right-click ends an XS measurement chain. Do not immediately
+            # reactivate classification underneath it, or shortcut routing
+            # stops belonging to the measurement tool.
+            return
+
         print(f"🖱️ Right-click detected in cross-section view")
         active_tool = getattr(self.app, "active_classify_tool", None)
         # A tool may be flagged active but only attached to the cut section (not cross-section

@@ -4643,6 +4643,9 @@ class NakshaApp(QMainWindow):
                 app_ref = self
                 def _make_handler(app):
                     def _handler(obj, event):
+                        cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                        if cs_measure is not None and getattr(cs_measure, "active", False):
+                            return
                         print(f"🖱️ Right-click detected in cross-section view")
                         active_tool = getattr(app, "active_classify_tool", None)
                         section_has_classifier = bool(getattr(app, "classify_interactors", None))
@@ -14586,6 +14589,9 @@ class NakshaApp(QMainWindow):
 
             def _make_right_click_handler(app):
                 def _handler(obj, event):
+                    cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                    if cs_measure is not None and getattr(cs_measure, "active", False):
+                        return
                     print(f"🖱️ Right-click detected in cross-section view (fallback)")
                     active_tool = getattr(app, "active_classify_tool", None)
                     section_has_classifier = bool(getattr(app, "classify_interactors", None))
@@ -14663,6 +14669,9 @@ class NakshaApp(QMainWindow):
 
         def _make_handler(app):
             def _handler(obj, event):
+                cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                if cs_measure is not None and getattr(cs_measure, "active", False):
+                    return
                 print(f"🖱️ Right-click detected in cross-section view (tabified)")
                 active_tool = getattr(app, "active_classify_tool", None)
                 section_has_classifier = bool(getattr(app, "classify_interactors", None))

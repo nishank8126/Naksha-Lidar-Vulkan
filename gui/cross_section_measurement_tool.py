@@ -319,18 +319,45 @@ class CrossSectionMeasurementTool:
         self._abort_event(obj)
 
     def _on_section_right_click(self, obj, evt, section_vtk_widget, view_index):
-        """Right-click ends the current measurement chain (no-op if nothing is pending)."""
+        """Hand right-click back to classification after ending XS measurement."""
         if not self.active:
             return
-        pending = self._pending_local_point.pop(view_index, None)
-        if pending is None:
-            return  # nothing to end — let normal right-click handling (menus, etc.) proceed
-        self._clear_preview(view_index)
+
+        # Use the ribbon button when available so its checked state and the
+        # tool state stay synchronized.
+        ribbon = getattr(self.app, "ribbon_manager", None)
+        measure_ribbon = getattr(ribbon, "ribbons", {}).get("measure") if ribbon else None
+        ribbon_btn = getattr(measure_ribbon, "cross_section_measure_btn", None)
+        if ribbon_btn is not None:
+            ribbon_btn.setChecked(False)
+        if self.active:
+            self.deactivate()
+
+        # Reactivate directly instead of depending on a lower-priority VTK
+        # observer receiving the same event. Observer ordering changes when a
+        # dock is tabified or recreated, which made the handoff intermittent.
+        # A first-time user has no remembered classifier yet. Rectangle is
+        # the standard general-purpose classifier and opens the Class Picker,
+        # so right-click still has a useful, deterministic handoff.
+        last_tool = getattr(self.app, "last_classify_tool", None) or "rectangle"
+        if hasattr(self.app, "set_classify_tool"):
+            try:
+                self.app.from_classes = getattr(self.app, "last_classify_from_classes", None)
+                self.app.to_class = getattr(self.app, "last_classify_to_class", None)
+                self.app._right_click_reactivating = True
+                try:
+                    self.app.set_classify_tool(last_tool)
+                    print(f"✅ Cross-section measurement handed off to classification: {last_tool}")
+                finally:
+                    self.app._right_click_reactivating = False
+            except Exception as e:
+                print(f"⚠️ Cross-section measurement classification handoff failed: {e}")
         try:
-            self.app.statusBar().showMessage("📏 Cross-section measurement finished", 2000)
+            self.app.statusBar().showMessage(
+                "📏 Cross-section measurement disabled - classification ready", 2000
+            )
         except Exception:
             pass
-        self._abort_event(obj)
 
     def _on_section_move(self, obj, evt, section_vtk_widget, view_index):
         if not self.active:
@@ -531,6 +558,12 @@ class CrossSectionMeasurementTool:
             # Restore "chain continues from here" state, same as a fresh click.
             self._pending_local_point[view_index] = old_segment["local_p2"]
             self._clear_preview(view_index)
+        else:
+            # A temporary render/section failure must not consume the user's
+            # redo step. Keeping it on the stack lets them retry once the view
+            # is available again.
+            self._redo_stack.append(record)
+            return False
         print(f"↷ Cross-section measure redo (redo stack: {len(self._redo_stack)})")
         return True
 
@@ -621,7 +654,21 @@ class CrossSectionMeasurementTool:
     # ------------------------------------------------------------------
     # Section-view rendering (local coordinates == that renderer's own world space)
     # ------------------------------------------------------------------
-    def _make_line_actor(self, p1, p2, color=(1.0, 0.55, 0.0), width=3):
+    @staticmethod
+    def _apply_line_style(prop, line_style):
+        """Apply the saved XS line pattern when the VTK backend supports it."""
+        patterns = {
+            "solid": 0xFFFF,
+            "dashed": 0xF0F0,
+            "dotted": 0xCCCC,
+        }
+        try:
+            prop.SetLineStipplePattern(patterns.get(line_style, patterns["solid"]))
+            prop.SetLineStippleRepeatFactor(1)
+        except Exception:
+            pass
+
+    def _make_line_actor(self, p1, p2, color=(1.0, 0.55, 0.0), width=3, line_style="solid"):
         pts = vtk.vtkPoints()
         pts.SetDataTypeToDouble()
         pts.InsertNextPoint(float(p1[0]), float(p1[1]), float(p1[2]))
@@ -651,6 +698,7 @@ class CrossSectionMeasurementTool:
         prop = actor.GetProperty()
         prop.SetColor(float(color[0]), float(color[1]), float(color[2]))
         prop.SetLineWidth(float(width))
+        self._apply_line_style(prop, line_style)
         prop.LightingOff()
         try:
             prop.SetDepthTestingEnabled(False)
@@ -714,7 +762,7 @@ class CrossSectionMeasurementTool:
         renderer's *2D* API (AddActor2D/RemoveActor2D), not AddActor.
         """
         style = self._measure_style or {}
-        sec = style.get('line', {})
+        sec = style.get('cross_section', style.get('line', {}))
         font_size = sec.get('label_font_size', 16)
         unit = sec.get('unit', 'm')
         text = f"{distance/1000.0:.3f} km" if unit == 'km' else f"{distance:.2f} m"
@@ -744,7 +792,13 @@ class CrossSectionMeasurementTool:
 
     def _draw_section_segment(self, view_index, section_vtk_widget, local_p1, local_p2, distance):
         renderer = section_vtk_widget.renderer
-        line_actor, _pts, _poly = self._make_line_actor(local_p1, local_p2)
+        sec = (self._measure_style or {}).get('cross_section', {})
+        color = sec.get('color', (1.0, 0.55, 0.0))
+        width = sec.get('width', 3)
+        line_style = sec.get('line_style', 'solid')
+        line_actor, _pts, _poly = self._make_line_actor(
+            local_p1, local_p2, color=color, width=width, line_style=line_style
+        )
         renderer.AddActor(line_actor)
 
         mid = tuple((a + b) / 2.0 for a, b in zip(local_p1, local_p2))
@@ -761,10 +815,10 @@ class CrossSectionMeasurementTool:
         segment_list = self._segment_actors.setdefault(view_index, [])
         vertex_actors = []
         if not segment_list:
-            start_marker = self._make_vertex_marker(local_p1)
+            start_marker = self._make_vertex_marker(local_p1, color=color)
             renderer.AddActor(start_marker)
             vertex_actors.append(start_marker)
-        end_marker = self._make_vertex_marker(local_p2)
+        end_marker = self._make_vertex_marker(local_p2, color=color)
         renderer.AddActor(end_marker)
         vertex_actors.append(end_marker)
 
@@ -779,6 +833,37 @@ class CrossSectionMeasurementTool:
         segment_list.append(segment)
         self._force_section_render(view_index, section_vtk_widget)
         return segment
+
+    def apply_style(self, style):
+        """Refresh existing XS measurement visuals after Settings > Apply."""
+        self._measure_style = style
+        sec = style.get('cross_section', style.get('line', {}))
+        color = sec.get('color', (1.0, 0.55, 0.0))
+        width = sec.get('width', 3)
+        line_style = sec.get('line_style', 'solid')
+        unit = sec.get('unit', 'm')
+        font_size = sec.get('label_font_size', 16)
+
+        for view_index, segments in self._segment_actors.items():
+            for segment in segments:
+                line = segment.get('line')
+                if line is not None:
+                    prop = line.GetProperty()
+                    prop.SetColor(*color)
+                    prop.SetLineWidth(width)
+                    self._apply_line_style(prop, line_style)
+                for marker in segment.get('vertices', []) or []:
+                    marker.GetProperty().SetColor(*color)
+                label = segment.get('label')
+                if label is not None:
+                    label.GetTextProperty().SetFontSize(font_size)
+                    distance = segment.get('distance', 0.0)
+                    label.SetInput(
+                        f"{distance / 1000.0:.3f} km" if unit == 'km' else f"{distance:.2f} m"
+                    )
+            widget = getattr(self.app, 'section_vtks', {}).get(view_index)
+            if widget is not None:
+                self._force_section_render(view_index, widget)
 
     def _update_preview(self, view_index, section_vtk_widget, local_p1, local_p2):
         """Reuse one preview actor per view, mutating its points in place."""
@@ -822,10 +907,35 @@ class CrossSectionMeasurementTool:
     # Cleanup
     # ------------------------------------------------------------------
     def clear_view(self, view_index):
-        """Remove all cross-section measurement visuals for one view."""
+        """Remove one view's measurements when its section geometry is replaced."""
         self._clear_preview(view_index)
         self._pending_local_point.pop(view_index, None)
         self._cancelled_pending_redo.pop(view_index, None)
+
+        # Section-local points are only valid for the section geometry they
+        # were drawn against. Remove both history stacks and their mirrored
+        # main-view labels so Ctrl+Z/Ctrl+Y cannot replay stale measurements
+        # after the user finalizes a replacement cross-section.
+        stale_records = []
+        for stack in (self._undo_stack, self._redo_stack):
+            retained = []
+            for record in stack:
+                if record.get("view_index") == view_index:
+                    stale_records.append(record)
+                else:
+                    retained.append(record)
+            stack[:] = retained
+
+        measurement_tool = getattr(self.app, "measurement_tool", None)
+        if measurement_tool is not None:
+            for record in stale_records:
+                main_entry = record.get("main_entry")
+                if main_entry is not None:
+                    try:
+                        measurement_tool.remove_measurement_entry(main_entry)
+                    except Exception:
+                        pass
+
         segments = self._segment_actors.pop(view_index, [])
         widget = getattr(self.app, "section_vtks", {}).get(view_index)
         if widget is None:

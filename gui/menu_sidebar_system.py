@@ -3631,6 +3631,12 @@ class MeasurementRibbon(QWidget):
             if tool is None:
                 return
             if checked and not tool.active:
+                # Measurement and classification both own the same section
+                # mouse events. Leave classification cleanly before enabling
+                # this tool so a checked XS button always means it can receive
+                # clicks and Ctrl+Z/Ctrl+Y.
+                if getattr(main_window, "active_classify_tool", None) is not None:
+                    main_window.deactivate_classification_tool(preserve_cross_section=True)
                 tool.activate()
                 if hasattr(main_window, "statusBar"):
                     main_window.statusBar().showMessage(

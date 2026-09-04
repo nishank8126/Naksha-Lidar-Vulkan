@@ -2111,6 +2111,8 @@ class MeasurementTool:
         for measurement in self.measurements:
             m_type = measurement.get('type')
             mode_key = 'line' if m_type == 'measure_line' else 'path'
+            if m_type == 'cross_section_line':
+                mode_key = 'cross_section'
             if m_type == 'measure_block_area':
                 mode_key = 'block'
             elif m_type == 'measure_grid_area':
