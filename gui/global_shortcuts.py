@@ -715,11 +715,23 @@ class GlobalShortcutFilter(QObject):
                 # view's own finalized measurements do), it exclusively owns
                 # Ctrl+Z/Y for undo/redo of cross-section segments (and their
                 # mirrored main-view labels).
+                #
+                # The history-only branch is tie-broken by recency: it must
+                # not stay claimed forever just because its stack is
+                # non-empty, or Ctrl+Z/Y for the MAIN view's own measurements
+                # silently stops working the moment the user has ever used
+                # cross-section measuring earlier in the session. Whichever
+                # tool was actually used more recently (finalize/undo/redo)
+                # wins, so switching to and using main-view measuring always
+                # reclaims Ctrl+Z/Y back from stale cross-section history.
                 # =================================================================
                 _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
+                _mt_for_priority = getattr(self.app_window, 'measurement_tool', None)
+                _cs_last_action = getattr(_cs_measure, '_last_action_time', 0.0) if _cs_measure is not None else 0.0
+                _mt_last_action = getattr(_mt_for_priority, '_last_action_time', 0.0) if _mt_for_priority is not None else 0.0
                 _cs_measure_claims_undo = _cs_measure is not None and (
                     getattr(_cs_measure, 'active', False)
-                    or _cs_measure.has_history()
+                    or (_cs_measure.has_history() and _cs_last_action > _mt_last_action)
                 )
                 if _cs_measure_claims_undo:
                     if event.key() == Qt.Key_Z:

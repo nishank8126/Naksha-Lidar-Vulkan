@@ -73,6 +73,18 @@ class CrossSectionMeasurementTool:
         # (view_index, local_p1, local_p2) plus the live handles to remove.
         self._undo_stack = []
         self._redo_stack = []
+        # Cancelling an unfinished pending point (Ctrl+Z with nothing
+        # finalized yet) had no matching redo — mirrors the gap main view's
+        # mid-draw undo had. view_index -> the cancelled local point, so a
+        # follow-up Ctrl+Y can restore it.
+        self._cancelled_pending_redo = {}
+        # Last time this tool actually did something (finalize/undo/redo).
+        # global_shortcuts.py uses this to break the tie with the main-view
+        # measurement tool over which one owns Ctrl+Z/Y when this tool still
+        # has history but isn't the one currently in use — most-recently-
+        # used wins, so switching back to main-view measuring reclaims
+        # Ctrl+Z/Y instead of it staying stuck on stale cross-section history.
+        self._last_action_time = 0.0
         print("✅ CrossSectionMeasurementTool initialized")
 
     # ------------------------------------------------------------------
@@ -155,6 +167,7 @@ class CrossSectionMeasurementTool:
             pass
         self._clear_preview(view_index, widget_hint=info.get("widget"))
         self._pending_local_point.pop(view_index, None)
+        self._cancelled_pending_redo.pop(view_index, None)
         self._last_move_time.pop(view_index, None)
 
     def deactivate_all_sections(self):
@@ -268,14 +281,26 @@ class CrossSectionMeasurementTool:
             return
 
         x, y = obj.GetEventPosition()
+        pending = self._pending_local_point.get(view_index)
         local_pt = self._pick_local_point(section_vtk_widget, view_index, x, y)
         if local_pt is None:
-            print("⚠️ Cross-section measure: no geometry under cursor")
+            # No geometry under the cursor (empty space in the section, e.g.
+            # above the point cloud's silhouette) — fall back to the same
+            # flat-plane projection the live preview already uses instead of
+            # refusing to place a point there. Matches the main view's own
+            # measurement tool, which can place a point anywhere in space,
+            # not only on existing geometry.
+            across_lock = pending[1] if pending is not None else 0.0
+            local_pt = self._project_to_local_plane(section_vtk_widget, x, y, across_lock=across_lock)
+        if local_pt is None:
+            print("⚠️ Cross-section measure: could not resolve a point under the cursor")
             return
 
-        pending = self._pending_local_point.get(view_index)
         if pending is None:
             self._pending_local_point[view_index] = local_pt
+            # A fresh click is a new action — any point cancelled by a
+            # previous Ctrl+Z is no longer "ahead" of us.
+            self._cancelled_pending_redo.pop(view_index, None)
             try:
                 self.app.statusBar().showMessage(
                     "📏 Cross-section: click next point (right-click or Esc to finish)", 4000
@@ -384,6 +409,7 @@ class CrossSectionMeasurementTool:
 
     def _create_segment_and_mirror(self, view_index, section_vtk_widget, local_p1, local_p2):
         """Build one segment's visuals (section view + main-view mirror). Returns an undo record."""
+        self._last_action_time = time.time()
         world_p1 = self._local_to_world(view_index, local_p1)
         world_p2 = self._local_to_world(view_index, local_p2)
         if world_p1 is None or world_p2 is None:
@@ -434,17 +460,26 @@ class CrossSectionMeasurementTool:
         """
         if not self._undo_stack:
             if self._pending_local_point:
-                for view_index in list(self._pending_local_point.keys()):
+                for view_index, local_pt in list(self._pending_local_point.items()):
+                    self._cancelled_pending_redo[view_index] = local_pt
                     self._pending_local_point.pop(view_index, None)
                     self._clear_preview(view_index)
+                self._last_action_time = time.time()
                 print("↶ Cross-section measure: cancelled pending (unfinished) point")
                 return True
+            # No-op: do NOT stamp _last_action_time here. Doing so on every
+            # failed "nothing to undo" call was a self-reinforcing bug — it
+            # let this tool keep "winning" the recency check in
+            # global_shortcuts.py just by being asked and failing, even
+            # while the user had moved on to actively using the main-view
+            # tool, permanently starving out its own Ctrl+Z.
             print("⚠️ Cross-section measure: nothing to undo")
             return False
 
         record = self._undo_stack.pop()
         view_index = record["view_index"]
         self._remove_segment(view_index, record["segment"])
+        self._last_action_time = time.time()
 
         measurement_tool = getattr(self.app, "measurement_tool", None)
         if measurement_tool is not None and record.get("main_entry") is not None:
@@ -466,6 +501,18 @@ class CrossSectionMeasurementTool:
 
     def redo(self):
         """Re-add the most recently undone segment (does not disturb further redo history)."""
+        if self._cancelled_pending_redo:
+            # Mirrors undo()'s own priority: a just-cancelled pending point
+            # takes precedence over redoing a finalized segment, the same
+            # way undo() always checks the pending point before falling back
+            # to _undo_stack.
+            for view_index, local_pt in list(self._cancelled_pending_redo.items()):
+                self._pending_local_point[view_index] = local_pt
+            self._cancelled_pending_redo.clear()
+            self._last_action_time = time.time()
+            print("↷ Cross-section measure: restored cancelled pending point")
+            return True
+
         if not self._redo_stack:
             print("⚠️ Cross-section measure: nothing to redo")
             return False
@@ -689,6 +736,7 @@ class CrossSectionMeasurementTool:
         """Remove all cross-section measurement visuals for one view."""
         self._clear_preview(view_index)
         self._pending_local_point.pop(view_index, None)
+        self._cancelled_pending_redo.pop(view_index, None)
         segments = self._segment_actors.pop(view_index, [])
         widget = getattr(self.app, "section_vtks", {}).get(view_index)
         if widget is None:

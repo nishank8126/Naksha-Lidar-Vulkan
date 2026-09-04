@@ -108,6 +108,13 @@ class MeasurementTool:
         self.redo_stack = []
         self.max_undo_levels = 50
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
+        # Last time this tool actually did something (finalize/undo/redo).
+        # Used by global_shortcuts.py to break the tie with
+        # CrossSectionMeasurementTool over which one owns Ctrl+Z/Y when both
+        # have non-empty history — most-recently-used wins, so using this
+        # tool always takes priority back after cross-section measuring.
+        self._last_action_time = 0.0
         self._block_boundary_cache = {}
         self._block_boundary_index = []
 
@@ -381,13 +388,42 @@ class MeasurementTool:
         self._line_actor_display_points.pop(key, None)
         self._line_actor_polydata.pop(key, None)
 
-    def _render_overlay_only(self):
-        """Render all layers so the layer-1 measurement overlay is repainted."""
-        try:
-            self._ensure_overlay_renderer()
-            self._refresh_all_measurement_line_positions()
-        except Exception:
-            pass
+    def _force_full_render(self):
+        """
+        Force an immediate, full (all-layers) repaint through the app's GPU
+        render manager — the same approach the digitizer/draw tools already
+        use (Digitizer._force_render()) — instead of calling
+        GetRenderWindow().Render() directly.
+
+        Calling GetRenderWindow().Render() directly bypasses the render
+        manager's own throttled/coalesced render pipeline entirely (the one
+        that drives, e.g., the animated mouse-wheel zoom). When a
+        measurement is being placed while the user is also zooming, that
+        creates two independent, uncoordinated triggers racing to repaint
+        the same window — the preview line can render a frame or two out of
+        sync with the point cloud underneath it, seen as it "jumping"/
+        snapping into place once the zoom settles. Routing through the
+        render manager's force_render() (which cancels any pending/
+        animating throttled render first, then performs one authoritative
+        full render) makes it the single source of truth for render timing,
+        removing that race.
+        """
+        manager = getattr(self.app, "gpu_render_manager", None)
+        if manager is not None and hasattr(manager, "force_render"):
+            try:
+                manager.force_render()
+                return
+            except Exception:
+                pass
+
+        force_main = getattr(self.app, "_force_render_main_view", None)
+        if callable(force_main):
+            try:
+                force_main()
+                return
+            except Exception:
+                pass
+
         try:
             self.app.vtk_widget.GetRenderWindow().Render()
         except Exception:
@@ -395,6 +431,15 @@ class MeasurementTool:
                 self.app.vtk_widget.render()
             except Exception:
                 pass
+
+    def _render_overlay_only(self):
+        """Render all layers so the layer-1 measurement overlay is repainted."""
+        try:
+            self._ensure_overlay_renderer()
+            self._refresh_all_measurement_line_positions()
+        except Exception:
+            pass
+        self._force_full_render()
 
     def _ensure_render_observer(self):
         """
@@ -1596,10 +1641,7 @@ class MeasurementTool:
                 self._save_state()
                 self._remove_entire_measurement(idx)
                 self.app.statusBar().showMessage(f"▦ {block['label']} deselected", 2000)
-                try:
-                    self.app.vtk_widget.GetRenderWindow().Render()
-                except Exception:
-                    self.app.vtk_widget.render()
+                self._force_full_render()
                 return
 
         z_value = float(world_point[2]) if self._is_valid_world_point(world_point) else float(self._last_z)
@@ -1636,10 +1678,7 @@ class MeasurementTool:
             f"▦ {block['label']} area: {block['area']:.2f} m²",
             5000,
         )
-        try:
-            self.app.vtk_widget.GetRenderWindow().Render()
-        except Exception:
-            self.app.vtk_widget.render()
+        self._force_full_render()
 
     def _measure_grid_area_at_click(self, display_pos=None):
         """Resolve one clicked SNT grid cell and display its exact polygon area."""
@@ -1674,10 +1713,7 @@ class MeasurementTool:
                 self._save_state()
                 self._remove_entire_measurement(idx)
                 self.app.statusBar().showMessage(f"Grid {grid['label']} deselected", 2000)
-                try:
-                    self.app.vtk_widget.GetRenderWindow().Render()
-                except Exception:
-                    self.app.vtk_widget.render()
+                self._force_full_render()
                 return
 
         self._save_state()
@@ -1715,10 +1751,7 @@ class MeasurementTool:
             f"Grid {grid['label']} area: {grid['area']:.2f} m²",
             5000,
         )
-        try:
-            self.app.vtk_widget.GetRenderWindow().Render()
-        except Exception:
-            self.app.vtk_widget.render()
+        self._force_full_render()
 
     def _get_measurement_world_point(self, display_pos=None, allow_focal_fallback=True):
         """
@@ -1926,7 +1959,7 @@ class MeasurementTool:
             self._update_preview_line(self.measurement_points[-1], self._last_cursor_pos)
 
         if render:
-            self.app.vtk_widget.GetRenderWindow().Render()
+            self._force_full_render()
 
     def _recreate_measurement_from_state(self, measurement_state):
         """Recreate one finalized measurement from captured state."""
@@ -1994,29 +2027,37 @@ class MeasurementTool:
         self._clear_active_drawing_visuals()
         self.measurement_points = []
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
 
         for measurement_state in state:
             self._recreate_measurement_from_state(measurement_state)
 
         self.mode = prev_mode
-                # ⚡ FIX: must repaint all layers so overlay actors update
-        try:
-            self.app.vtk_widget.GetRenderWindow().Render()
-        except Exception:
-            self.app.vtk_widget.render()
+        self._force_full_render()
         print(f"✅ Measurement state restored: {len(self.measurements)} measurements")
 
     def undo(self):
         """Undo last measurement operation (Ctrl+Z)."""
         if self.measurement_points:
+            # Mid-draw point-level undo: keep what we're moving away from so
+            # redo() can restore it — same push-before-pop pattern as the
+            # finalized-measurement branch below.
+            self._temp_vertex_redo_stack.append(list(self.measurement_points))
+            if len(self._temp_vertex_redo_stack) > self.max_undo_levels:
+                self._temp_vertex_redo_stack.pop(0)
             if self._temp_vertex_stack:
                 prev_points = self._temp_vertex_stack.pop()
                 self._rebuild_active_measurement(prev_points)
             else:
                 self._rebuild_active_measurement([])
+            self._last_action_time = time.time()
             return
 
         if not self.undo_stack:
+            # Do NOT stamp _last_action_time on a no-op — see the matching
+            # note in CrossSectionMeasurementTool.undo(). A failed "nothing
+            # to undo" must not let this tool win the recency check in
+            # global_shortcuts.py against real cross-section history.
             print("⚠️ Nothing to undo")
             return
 
@@ -2027,14 +2068,28 @@ class MeasurementTool:
             self.redo_stack.pop(0)
         previous_state = self.undo_stack.pop()
         self._restore_state(previous_state)
+        self._last_action_time = time.time()
         print(f"↶ Undo (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
 
     def redo(self):
         """Redo previously undone measurement operation (Ctrl+Y)."""
+        if self._temp_vertex_redo_stack:
+            # Mirrors undo()'s own priority: mid-draw point history takes
+            # precedence over finalized-measurement history whenever it has
+            # something to offer, the same way undo() always checks
+            # self.measurement_points before falling back to undo_stack.
+            next_points = self._temp_vertex_redo_stack.pop()
+            self._temp_vertex_stack.append(list(self.measurement_points))
+            self._rebuild_active_measurement(next_points)
+            self._last_action_time = time.time()
+            print(f"↷ Redo point (temp redo stack: {len(self._temp_vertex_redo_stack)})")
+            return
+
         if not self.redo_stack:
             print("⚠️ Nothing to redo")
             return
 
+        self._last_action_time = time.time()
         current_state = self._capture_state()
         self.undo_stack.append(current_state)
         if len(self.undo_stack) > self.max_undo_levels:
@@ -2338,6 +2393,7 @@ class MeasurementTool:
             self.vertex_markers = []
             self.continuous_line_actor = None
             self._temp_vertex_stack = []
+            self._temp_vertex_redo_stack = []
 
         # Ensure latest settings are loaded when activating.
         self._measure_style = load_measure_settings()
@@ -2352,6 +2408,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         self._last_cursor_pos = None
         self._invalidate_measure_snap_cache()
 
@@ -2416,13 +2473,11 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         self._last_cursor_pos = None
         self._invalidate_measure_snap_cache()
 
-        try:
-            self.app.vtk_widget.GetRenderWindow().Render()
-        except Exception:
-            self.app.vtk_widget.render()
+        self._force_full_render()
 
         print("📏 Measurement drawing deactivated (selection/deletion still active)")
     
@@ -2450,6 +2505,10 @@ class MeasurementTool:
             return
 
         self._temp_vertex_stack.append(list(self.measurement_points))
+        # Placing a new point is a fresh action — any previously-undone
+        # points are no longer "ahead" of us, same convention _save_state()
+        # already uses for the finalized-measurement redo_stack.
+        self._temp_vertex_redo_stack = []
 
         pos = self._get_measurement_world_point()
         if pos is None:
@@ -2466,6 +2525,12 @@ class MeasurementTool:
         pos = self._force_measurement_level(pos)
         self._last_z = pos[2]  # ← cache Z for fast preview
         self.measurement_points.append(pos)
+        # A point was genuinely placed — see the note on undo()/redo() about
+        # why the recency tie-breaker in global_shortcuts.py needs this: an
+        # active multi-click draw (not yet finalized) must count as "this
+        # tool was just used," or cross-section measurement's own history
+        # keeps winning Ctrl+Z for the whole drawing session.
+        self._last_action_time = time.time()
         
         # Add vertex marker with color coding
         # First point = GREEN, Last point = RED (will update as we add more)
@@ -2625,6 +2690,7 @@ class MeasurementTool:
     
     def _finalize_measurement(self, push_undo=True):
         """Finalize the current measurement."""
+        self._last_action_time = time.time()
         if push_undo and len(self.measurement_points) >= 2:
             self._save_state()
 
@@ -2772,6 +2838,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         
         self._invalidate_measure_snap_cache()
         self._render_overlay_only()
@@ -2824,6 +2891,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
 
         # Clear undo/redo stacks so history does not bleed after a full clear.
         self.undo_stack.clear()
@@ -2836,13 +2904,7 @@ class MeasurementTool:
         self._preview_polydata = None
         self._preview_actor_in_scene = False
 
-        # ⚡ FIX: vtk_widget.render() only repaints layer 0 (point cloud).
-        # Measurement actors live in overlay renderer at layer 1.
-        # Must call GetRenderWindow().Render() to repaint ALL layers.
-        try:
-            self.app.vtk_widget.GetRenderWindow().Render()
-        except Exception:
-            self.app.vtk_widget.render()
+        self._force_full_render()
 
         print("🗑️ All measurements cleared")
     # ============================================================
@@ -3126,6 +3188,7 @@ class MeasurementTool:
                 self._clear_active_drawing_visuals()
                 self.measurement_points = []
                 self._temp_vertex_stack = []
+                self._temp_vertex_redo_stack = []
                 self.stop_drawing()
                 self.app.statusBar().showMessage("Measurement cancelled (ESC)", 2000)
             else:
@@ -4117,6 +4180,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         self._last_cursor_pos = None
         self._invalidate_measure_snap_cache()
 
@@ -4136,6 +4200,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         self._last_cursor_pos = None
         self._clear_active_drawing_visuals()
         self._invalidate_measure_snap_cache()
@@ -4180,6 +4245,7 @@ class MeasurementTool:
         self.vertex_markers = []
         self.continuous_line_actor = None
         self._temp_vertex_stack = []
+        self._temp_vertex_redo_stack = []
         self._last_cursor_pos = None
         self._invalidate_measure_snap_cache()
         print("📏 Measurement tool fully deactivated")

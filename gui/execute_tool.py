@@ -17,6 +17,7 @@
     "MeasureLine": "measure_line",
     "MeasurePath": "measure_path",
     "ClearMeasurements": "clear_measurements",
+    "CrossSectionMeasure": "cross_section_measure",
     "Pan": "pan",
     "DisplayMode": "display_mode",
     "ShadingMode": "shading_mode",
@@ -802,7 +803,33 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             import traceback
             traceback.print_exc()
         return
-    
+
+    if tool_name == "cross_section_measure":
+        print("📏 Cross-section measurement shortcut triggered")
+        try:
+            # Toggle the same footer button the tool is normally switched on
+            # with, so this reuses its already-working activate/deactivate
+            # path instead of duplicating that logic here.
+            btn = getattr(app_window, "cross_section_measure_footer_btn", None)
+            if btn is not None:
+                btn.setChecked(not btn.isChecked())
+                print(f"   ✅ Cross-section measurement toggled: {btn.isChecked()}")
+            else:
+                cs_tool = getattr(app_window, "cross_section_measurement_tool", None)
+                if cs_tool is None:
+                    print("   ⚠️ Cross-section measurement tool not available")
+                elif getattr(cs_tool, "active", False):
+                    cs_tool.deactivate()
+                    print("   ✅ Cross-section measurement deactivated")
+                else:
+                    cs_tool.activate()
+                    print("   ✅ Cross-section measurement activated")
+        except Exception as e:
+            print(f"⚠️ Cross-section measurement shortcut failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
     if tool_name in ("save", "save_as"):
         print(f"💾 {'Save' if tool_name == 'save' else 'Save As'} triggered via shortcut")
         try:

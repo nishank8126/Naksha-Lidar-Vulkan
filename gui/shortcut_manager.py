@@ -35,7 +35,7 @@ TOOLS = [
     "Surface",
     "DrawSettings",
     "SyncViews",
-    "MeasureLine", "MeasurePath", "ClearMeasurements",
+    "MeasureLine", "MeasurePath", "ClearMeasurements", "CrossSectionMeasure",
     "Pan",
     "Save", "SaveAs",
 ]
@@ -43,7 +43,7 @@ TOOLS = [
 SIMPLE_SHORTCUT_TOOLS = (
     "CrossSectionRect", "CutSectionRect", "CutFromCross", "CutFromCut",
     "TopView", "Depth", "RGB", "Intensity", "Elevation", "Line", "Class", "Surface",
-    "MeasureLine", "MeasurePath", "ClearMeasurements",
+    "MeasureLine", "MeasurePath", "ClearMeasurements", "CrossSectionMeasure",
     "Pan",
     "Save", "SaveAs",
 )
