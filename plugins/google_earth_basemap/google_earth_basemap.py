@@ -2166,8 +2166,7 @@ class GoogleEarthBasemapPlugin(QObject):
         # Active tiles sit on the basemap plane (depth ordering vs placeholders is
         # handled by the negative Z offset applied to placeholders in _prepare_tile_set).
         actor.SetPosition(0.0, 0.0, 0.0)
-        from gui.scene_render_pipeline import add_raster_actor
-        add_raster_actor(self.app, actor)
+        self.app.vtk_widget.renderer.AddActor(actor)
         self._tile_actors[tile_id] = actor
         self._try_remove_parent(tile_id)
         self._maybe_purge_retired()
@@ -2463,8 +2462,7 @@ class GoogleEarthBasemapPlugin(QObject):
         if self.app is None or actor is None:
             return
         try:
-            from gui.scene_render_pipeline import remove_actor_from_pipeline
-            remove_actor_from_pipeline(self.app, actor)
+            self.app.vtk_widget.renderer.RemoveActor(actor)
         except Exception:
             pass
 

@@ -3602,14 +3602,28 @@ class MeasurementRibbon(QWidget):
             "Measure distances inside cross-section views\n"
             "(mirrored automatically into the main 3D view)"
         )
-        # Belt-and-braces sync: clear_all_tool_buttons() (fired when some
-        # OTHER ribbon's tool button is checked) unchecks this button
-        # directly via setChecked(), which does not go through the
-        # clicked-based wiring add_button() sets up above. Connecting
-        # toggled here as well means any state change to this button's
-        # checked state — however it happens — keeps the actual tool in
-        # sync instead of leaving it silently active with the button
-        # showing off.
+        # add_button() wired `clicked` through RibbonSection._on_button_click,
+        # which — for ANY checkable ribbon button, in ANY ribbon — calls
+        # ribbon_manager.clear_all_tool_buttons() and unchecks every other
+        # currently-checked button app-wide. That's the right behavior for
+        # mutually-exclusive tool selections (draw tools, classify tools,
+        # Identify...), but it swept this button in too: clicking something
+        # completely unrelated elsewhere silently switched cross-section
+        # measuring back off with no feedback — which is what "the shortcut
+        # sometimes doesn't work" and "undo sometimes doesn't work" actually
+        # were (the tool really had gone inactive; Ctrl+Z correctly stopped
+        # routing to it once that happened). Cross-section measuring should
+        # only be exclusive with other measuring, not the whole app, so
+        # replace that wiring with a private clicked handler that never
+        # calls clear_all_tool_buttons and never registers as this
+        # section's active_button (the only thing clear_all_tool_buttons
+        # acts on) — while still driving the same idempotent sync, so the
+        # button stays checkable and its visual state stays correct.
+        try:
+            self.cross_section_measure_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.cross_section_measure_btn.clicked.connect(self._on_cross_section_measure_clicked)
         self.cross_section_measure_btn.toggled.connect(self._sync_cross_section_measure_tool)
         layout.addWidget(cross_section)
 
