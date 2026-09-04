@@ -54,6 +54,9 @@ from tile_math import (
     tile_x_to_lon,
     tile_y_to_lat,
     lonlat_to_web_mercator,
+    web_mercator_to_lonlat,
+    WEB_MERCATOR_HALF_WORLD_M,
+    MAX_MERCATOR_LAT,
 )
 
 PLUGIN_OBJECT_NAME = "NakshaGoogleEarthBasemapPluginSection"
@@ -1321,6 +1324,9 @@ class GoogleEarthBasemapPlugin(QObject):
     def _project_crs(self):
         if self.app is None:
             return None
+        has_snt, snt_crs = self._attached_snt_crs()
+        if has_snt:
+            return snt_crs
         # Prefer the host app's single authoritative canvas CRS object
         # (gui.crs_manager) when available. It is kept in sync with the
         # legacy project_crs_* fields below, but going straight to the
@@ -1363,6 +1369,85 @@ class GoogleEarthBasemapPlugin(QObject):
         except Exception:
             pass
         return None
+
+    def _attached_snt_paths(self):
+        """Return the de-duplicated paths of SNT/DGN geometry on the canvas."""
+        candidates = []
+
+        def _add_record(record):
+            if not isinstance(record, dict):
+                return
+            for key in ("full_path", "filename", "path", "source_file"):
+                val = record.get(key)
+                if val:
+                    p = os.path.normcase(os.path.abspath(str(val)))
+                    if p not in candidates:
+                        candidates.append(p)
+                    break
+
+        try:
+            for actor_data in getattr(self.app, "snt_actors", []) or []:
+                _add_record(actor_data)
+        except Exception:
+            pass
+        try:
+            for att in getattr(self.app, "snt_attachments", []) or []:
+                _add_record(att)
+        except Exception:
+            pass
+        return candidates
+
+    def _cached_crs_for_path(self, path):
+        if not hasattr(self, "_snt_crs_cache"):
+            self._snt_crs_cache = {}
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key in self._snt_crs_cache:
+            return self._snt_crs_cache[key]
+        crs = self._resolve_crs_for_path(path)
+        self._snt_crs_cache[key] = crs
+        return crs
+
+    def _resolve_crs_for_path(self, path):
+        try:
+            from gui.crs_manager import resolve_snt_crs
+            crs, _ = resolve_snt_crs(path)
+            return crs
+        except Exception:
+            return None
+
+    def _attached_snt_crs(self):
+        """Return (has_snt, common_crs); unresolved/disagreeing SNT => None."""
+        paths = self._attached_snt_paths()
+        if not paths:
+            return False, None
+
+        common = None
+        for path in paths:
+            crs = self._cached_crs_for_path(path)
+            if crs is None:
+                return True, None
+            if common is None:
+                common = crs
+                continue
+            try:
+                agrees = bool(common.equals(crs))
+            except Exception:
+                agrees = common == crs
+            if not agrees:
+                return True, None
+        return True, common
+
+    def _current_project_signature(self):
+        """Stable signature that invalidates tile cache if project data or CRS changes."""
+        snt_paths = tuple(sorted(self._attached_snt_paths()))
+        p_crs = None
+        try:
+            c = self._project_crs()
+            p_crs = c.to_wkt() if c else None
+        except Exception:
+            p_crs = None
+        loaded = getattr(self.app, "loaded_file", None)
+        return (loaded, snt_paths, p_crs)
 
     def _discover_crs_from_app_files(self):
         """Find a CRS by scanning the app for any loaded .snt/.dgn/.laz/.las/.ply
@@ -1735,21 +1820,89 @@ class GoogleEarthBasemapPlugin(QObject):
                 # as its own temporary canvas CRS.
                 target_crs = CRS.from_epsg(3857)
 
-            to_wgs84 = Transformer.from_crs(target_crs, CRS.from_epsg(4326), always_xy=True)
-            corners = [
-                to_wgs84.transform(minx, miny),
-                to_wgs84.transform(minx, maxy),
-                to_wgs84.transform(maxx, miny),
-                to_wgs84.transform(maxx, maxy),
-            ]
-            lons = [float(p[0]) for p in corners if math.isfinite(float(p[0]))]
-            lats = [float(p[1]) for p in corners if math.isfinite(float(p[1]))]
-            if len(lons) != 4 or len(lats) != 4:
-                raise RuntimeError("Current camera bounds cannot be transformed to WGS84")
-            west, east = max(-180.0, min(lons)), min(180.0, max(lons))
-            south, north = max(-85.0, min(lats)), min(85.0, max(lats))
-            if east <= west or north <= south:
-                raise RuntimeError("Current geographic viewport is invalid")
+            is_mercator = (
+                getattr(target_crs, "to_epsg", lambda: None)() in (3857, 900913)
+                or "pseudo-mercator" in getattr(target_crs, "name", "").lower()
+                or "web mercator" in getattr(target_crs, "name", "").lower()
+            )
+
+            half_world = float(WEB_MERCATOR_HALF_WORLD_M)
+            max_lat = float(MAX_MERCATOR_LAT)
+
+            if is_mercator:
+                # Web Mercator world-extent clamping: when zoomed out to see the entire Earth
+                # or past world boundaries, clamp coordinates so they never wrap into strips or amoebas.
+                if (maxx - minx) >= 2.0 * half_world:
+                    west, east = -180.0, 180.0
+                else:
+                    c_minx = max(-half_world, min(half_world, minx))
+                    c_maxx = max(-half_world, min(half_world, maxx))
+                    if c_minx >= c_maxx:
+                        west, east = -180.0, 180.0
+                    else:
+                        west = (c_minx / half_world) * 180.0
+                        east = (c_maxx / half_world) * 180.0
+
+                if (maxy - miny) >= 2.0 * half_world:
+                    south, north = -max_lat, max_lat
+                else:
+                    c_miny = max(-half_world, min(half_world, miny))
+                    c_maxy = max(-half_world, min(half_world, maxy))
+                    if c_miny >= c_maxy:
+                        south, north = -max_lat, max_lat
+                    else:
+                        south = web_mercator_to_lonlat(0.0, c_miny)[1]
+                        north = web_mercator_to_lonlat(0.0, c_maxy)[1]
+            else:
+                # Projected local CRS (UTM, Lambert Conformal, State Plane, etc.):
+                # Sample grid across camera view and validate with round-trip inversion.
+                to_wgs84 = Transformer.from_crs(target_crs, CRS.from_epsg(4326), always_xy=True)
+                from_wgs84 = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
+                c_lon, c_lat = to_wgs84.transform(fx, fy)
+                if not (math.isfinite(c_lon) and math.isfinite(c_lat)):
+                    return None
+
+                valid_lons = [c_lon]
+                valid_lats = [c_lat]
+                grid_n = 5
+                for gi in range(grid_n):
+                    gx = minx + (maxx - minx) * (gi / float(grid_n - 1))
+                    for gj in range(grid_n):
+                        gy = miny + (maxy - miny) * (gj / float(grid_n - 1))
+                        lon, lat = to_wgs84.transform(gx, gy)
+                        if not (math.isfinite(lon) and math.isfinite(lat)):
+                            continue
+                        if not (-180.0 <= lon <= 180.0 and -max_lat <= lat <= max_lat):
+                            continue
+                        bx, by = from_wgs84.transform(lon, lat)
+                        if not (math.isfinite(bx) and math.isfinite(by)):
+                            continue
+                        if math.hypot(bx - gx, by - gy) > 5000.0:
+                            continue
+                        if abs(lon - c_lon) > 40.0:
+                            continue
+                        valid_lons.append(lon)
+                        valid_lats.append(lat)
+
+                if len(valid_lons) <= 1:
+                    dlon = min(45.0, max(5.0, (parallel_scale / 111000.0)))
+                    dlat = min(35.0, max(5.0, (parallel_scale / 111000.0)))
+                    west = max(-180.0, c_lon - dlon)
+                    east = min(180.0, c_lon + dlon)
+                    south = max(-max_lat, c_lat - dlat)
+                    north = min(max_lat, c_lat + dlat)
+                else:
+                    west = max(-180.0, min(valid_lons))
+                    east = min(180.0, max(valid_lons))
+                    south = max(-max_lat, min(valid_lats))
+                    north = min(max_lat, max(valid_lats))
+
+            if (east - west) < 0.001:
+                west -= 0.001
+                east += 0.001
+            if (north - south) < 0.001:
+                south -= 0.001
+                north += 0.001
 
             zoom = choose_zoom(
                 west,
@@ -1784,18 +1937,29 @@ class GoogleEarthBasemapPlugin(QObject):
         (a runaway). Once the host re-framed the point cloud, the camera far clip no
         longer reached the basemap and it vanished - exactly the "map disappears when
         I load a LAZ/LAS" symptom.
+
+        The margin below ``zmin`` must dwarf depth-buffer precision, not just the
+        data's own Z span: at real-world projected coordinates (UTM/Lambert, often
+        hundreds of thousands of meters) a flat/near-flat dataset (e.g. a 2D-mode
+        SNT) has near-zero span, so a tiny absolute epsilon here is smaller than
+        the depth buffer can resolve and the two actors z-fight - the basemap can
+        then win the coin flip and render in front of SNT/DXF/GIS data instead of
+        under it. Reuse the same parallel-scale-based separation already used for
+        placeholder tiles (_basemap_z_sep) so the gap scales with the view instead
+        of being swamped by coordinate magnitude.
         """
+        sep = self._basemap_z_sep()
         try:
             zb = self._data_z_bounds(renderer)
             if zb is not None:
                 zmin, zmax = zb
                 if math.isfinite(zmin) and math.isfinite(zmax) and zmax >= zmin:
                     span = max(1e-6, abs(zmax - zmin))
-                    return zmin - max(1e-3, span * 0.01)
+                    return zmin - max(sep, span * 0.01)
         except Exception:
             pass
         # No other geometry to sit under: keep the basemap just below the world origin.
-        return -1e-3
+        return -sep
 
     def _data_z_bounds(self, renderer):
         """Return (zmin, zmax) of every visible 3D actor EXCEPT the basemap tiles."""
@@ -1998,8 +2162,6 @@ class GoogleEarthBasemapPlugin(QObject):
                         p.unlink()
                 except Exception:
                     pass
-            else:
-                self._show_error_once("Basemap tile received but could not be decoded to an image.")
             return False
         # Active tiles sit on the basemap plane (depth ordering vs placeholders is
         # handled by the negative Z offset applied to placeholders in _prepare_tile_set).
@@ -2085,12 +2247,8 @@ class GoogleEarthBasemapPlugin(QObject):
         texture.RepeatOff()
 
         subdivisions = 6
-        points = vtk.vtkPoints()
-        tcoords = vtk.vtkFloatArray()
-        tcoords.SetNumberOfComponents(2)
-        tcoords.SetName("TextureCoordinates")
-
         from_wgs84 = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
+        raw_pts = []
         for j in range(subdivisions + 1):
             fy = j / float(subdivisions)
             lat = tile_y_to_lat(y + fy, z)
@@ -2098,8 +2256,27 @@ class GoogleEarthBasemapPlugin(QObject):
                 fx = i / float(subdivisions)
                 lon = tile_x_to_lon(x + fx, z)
                 wx, wy = from_wgs84.transform(lon, lat)
-                points.InsertNextPoint(float(wx), float(wy), float(z_plane))
-                tcoords.InsertNextTuple2(fx, 1.0 - fy)
+                raw_pts.append((wx, wy, fx, 1.0 - fy))
+
+        # Check for non-finite numbers or extreme projective distortion (amoeba rejection)
+        xs = [p[0] for p in raw_pts if math.isfinite(p[0])]
+        ys = [p[1] for p in raw_pts if math.isfinite(p[1])]
+        if len(xs) != len(raw_pts) or len(ys) != len(raw_pts):
+            return None
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        # In any realistic projection, a single slippy-map tile should never exceed 2.5e7 meters.
+        # Singularity tiles in conic/transverse projections produce spans of 100M-200M meters.
+        if span_x > 2.5e7 or span_y > 2.5e7:
+            return None
+
+        points = vtk.vtkPoints()
+        tcoords = vtk.vtkFloatArray()
+        tcoords.SetNumberOfComponents(2)
+        tcoords.SetName("TextureCoordinates")
+        for wx, wy, fx, tc_y in raw_pts:
+            points.InsertNextPoint(float(wx), float(wy), float(z_plane))
+            tcoords.InsertNextTuple2(fx, tc_y)
 
         polys = vtk.vtkCellArray()
         stride = subdivisions + 1
