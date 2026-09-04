@@ -5997,6 +5997,7 @@ class CutSectionController:
                 self.app._setup_interactor_swapper(
                     self.cut_vtk.interactor,
                     preserve_physical_middle_pan=True,
+                    honor_persistent_left_pan=True,
                 )
             self._mark_cut_vtk_active()
 

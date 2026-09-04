@@ -807,10 +807,12 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     if tool_name == "cross_section_measure":
         print("📏 Cross-section measurement shortcut triggered")
         try:
-            # Toggle the same footer button the tool is normally switched on
-            # with, so this reuses its already-working activate/deactivate
-            # path instead of duplicating that logic here.
-            btn = getattr(app_window, "cross_section_measure_footer_btn", None)
+            # Toggle the same Measure-ribbon button the tool is normally
+            # switched on with, so this reuses its already-working
+            # activate/deactivate path instead of duplicating that logic here.
+            ribbon = getattr(app_window, "ribbon_manager", None)
+            measure_ribbon = getattr(ribbon, "ribbons", {}).get("measure") if ribbon else None
+            btn = getattr(measure_ribbon, "cross_section_measure_btn", None)
             if btn is not None:
                 btn.setChecked(not btn.isChecked())
                 print(f"   ✅ Cross-section measurement toggled: {btn.isChecked()}")

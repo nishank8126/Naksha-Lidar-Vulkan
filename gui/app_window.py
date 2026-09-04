@@ -1023,6 +1023,7 @@ class NakshaApp(QMainWindow):
         self._setup_interactor_swapper(
             self.sec_vtk.interactor,
             preserve_physical_middle_pan=True,
+            honor_persistent_left_pan=True,
         )
         self.sec_vtk.set_background(bg_color)
         self.sec_vtk.renderer.SetBackground(*bg_rgb)
@@ -1333,37 +1334,6 @@ class NakshaApp(QMainWindow):
 
         self._update_snt_layer_pick_footer_icon()
         self._update_snt_layer_pick_footer_state_visual(False)
-
-        # 3b. Cross-section measurement toggle
-        self.cross_section_measure_footer_btn = QToolButton(self.status)
-        self.cross_section_measure_footer_btn.setObjectName("statusCrossSectionMeasureButton")
-        self.cross_section_measure_footer_btn.setCheckable(True)
-        self.cross_section_measure_footer_btn.setAutoRaise(True)
-        self.cross_section_measure_footer_btn.setFixedHeight(20)
-        self.cross_section_measure_footer_btn.setText("📏 XS")
-        self.cross_section_measure_footer_btn.setCursor(Qt.PointingHandCursor)
-        self.cross_section_measure_footer_btn.setFocusPolicy(Qt.NoFocus)
-        self.cross_section_measure_footer_btn.setToolTip(
-            "Measure distances inside cross-section views\n"
-            "(mirrored automatically into the main 3D view)"
-        )
-        self.cross_section_measure_footer_btn.setStyleSheet("""
-            QToolButton {
-                border: 1px solid transparent;
-                border-radius: 4px;
-                padding: 0 4px;
-                margin: 0 2px;
-            }
-            QToolButton:hover {
-                background: rgba(255, 255, 255, 0.08);
-            }
-            QToolButton:checked {
-                background: rgba(255, 255, 255, 0.14);
-                border-color: rgba(255, 255, 255, 0.18);
-            }
-        """)
-        self.cross_section_measure_footer_btn.toggled.connect(self._toggle_cross_section_measure_from_footer)
-        self.status.addPermanentWidget(self.cross_section_measure_footer_btn)
 
         # 4. Cursor-following axis guides
         axis_tooltip = "Show full-canvas X/Y guides that follow the cursor"
@@ -2930,19 +2900,6 @@ class NakshaApp(QMainWindow):
             self.point_sync_tool.deactivate()
             self.statusBar().showMessage("🎯 Point target sync disabled", 2000)
 
-    def _toggle_cross_section_measure_from_footer(self, enabled):
-        if not hasattr(self, "cross_section_measurement_tool") or self.cross_section_measurement_tool is None:
-            return
-
-        if enabled:
-            self.cross_section_measurement_tool.activate()
-            self.statusBar().showMessage(
-                "📏 Cross-section measurement enabled — click two points in a cross-section view", 4000
-            )
-        else:
-            self.cross_section_measurement_tool.deactivate()
-            self.statusBar().showMessage("📏 Cross-section measurement disabled", 2000)
-
     def _toggle_snt_layer_pick_from_footer(self, enabled):
         if not hasattr(self, "snt_layer_pick_tool") or self.snt_layer_pick_tool is None:
             self._sync_snt_layer_pick_footer_button(False)
@@ -4453,6 +4410,7 @@ class NakshaApp(QMainWindow):
         self._setup_interactor_swapper(
             vtk_widget.interactor,
             preserve_physical_middle_pan=True,
+            honor_persistent_left_pan=True,
         )
         from gui.theme_manager import ThemeManager
         bg_color = ThemeManager.canvas_background_for_theme()
@@ -15283,10 +15241,16 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage(status_message, 5000)
 
     def clear_all_measurements(self):
-        """Clear all measurement lines and labels."""
+        """Clear all measurement lines and labels — main view AND cross-section."""
         if hasattr(self, 'measurement_tool'):
             self.measurement_tool.clear_all_measurements()
-            self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
+        cs_measure = getattr(self, 'cross_section_measurement_tool', None)
+        if cs_measure is not None:
+            try:
+                cs_measure.clear_all()
+            except Exception as e:
+                print(f"⚠️ Failed to clear cross-section measurements: {e}")
+        self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
     def export_measurements(self):
         """Export measurement report to file."""
         if not hasattr(self, 'measurement_tool'):
@@ -18165,24 +18129,43 @@ class NakshaApp(QMainWindow):
         interactor,
         *,
         preserve_physical_middle_pan=False,
+        honor_persistent_left_pan=False,
     ):
         if not hasattr(self, "_vtk_event_swappers"):
             self._vtk_event_swappers = []
-            
+
         class VTKEventSwapper:
-            def __init__(self, interactor, app, preserve_middle_pan):
+            def __init__(self, interactor, app, preserve_middle_pan, honor_persistent_left_pan):
                 self.interactor = interactor
                 self.app = app
                 self._in_swap = False
                 self.preserve_middle_pan = bool(preserve_middle_pan)
-                
+                # Main view's persistent "Panning button: Left Mouse Button"
+                # setting is implemented separately, deep in the digitizer's
+                # own click/drag tracking (Digitizer checks app.panning_button
+                # directly) — this flag must stay False there so this swapper
+                # never also reacts to the same setting and fights that
+                # system. Cross-section/cut-section views have no such
+                # drag-tracking of their own, so for them this is the only
+                # place the persistent setting can be honored: a real drag on
+                # left when configured is simply relayed as a middle-drag,
+                # which the interactor's native style already pans on.
+                self.honor_persistent_left_pan = bool(honor_persistent_left_pan)
+
                 self.obs_ids = [
                     interactor.AddObserver("LeftButtonPressEvent", self.on_left_press, 10.0),
                     interactor.AddObserver("LeftButtonReleaseEvent", self.on_left_release, 10.0),
                     interactor.AddObserver("MiddleButtonPressEvent", self.on_middle_press, 10.0),
                     interactor.AddObserver("MiddleButtonReleaseEvent", self.on_middle_release, 10.0),
                 ]
-                
+
+            def _left_pan_wanted(self):
+                if getattr(self.app, "_left_pan_shortcut_active", False):
+                    return True
+                if self.honor_persistent_left_pan:
+                    return getattr(self.app, "panning_button", "scroll") == "left"
+                return False
+
             def _is_tool_active(self):
                 if getattr(self.app, "active_classify_tool", None) is not None:
                     return True
@@ -18205,6 +18188,11 @@ class NakshaApp(QMainWindow):
                     "identification_tool",
                     "point_sync_tool",
                     "snt_layer_pick_tool",
+                    # Cross-section measurement owns left-click in section
+                    # views to place points — without this, honoring the
+                    # persistent left-pan setting there would swallow those
+                    # clicks as pan gestures instead.
+                    "cross_section_measurement_tool",
                 ):
                     tool = getattr(self.app, tool_name, None)
                     if tool is not None and getattr(tool, "active", False):
@@ -18236,7 +18224,7 @@ class NakshaApp(QMainWindow):
             def on_left_press(self, obj, event):
                 if self._in_swap:
                     return
-                if getattr(self.app, "_left_pan_shortcut_active", False) and not self._is_tool_active():
+                if self._left_pan_wanted() and not self._is_tool_active():
                     self._in_swap = True
                     try:
                         self._safe_abort(obj)
@@ -18247,7 +18235,7 @@ class NakshaApp(QMainWindow):
             def on_left_release(self, obj, event):
                 if self._in_swap:
                     return
-                if getattr(self.app, "_left_pan_shortcut_active", False) and not self._is_tool_active():
+                if self._left_pan_wanted() and not self._is_tool_active():
                     self._in_swap = True
                     try:
                         self._safe_abort(obj)
@@ -18288,5 +18276,6 @@ class NakshaApp(QMainWindow):
             interactor,
             self,
             preserve_physical_middle_pan,
+            honor_persistent_left_pan,
         )
         self._vtk_event_swappers.append(swapper)

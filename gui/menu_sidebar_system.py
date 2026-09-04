@@ -3587,7 +3587,62 @@ class MeasurementRibbon(QWidget):
         )
         layout.addWidget(settings_section)
 
+        # 📏 Cross Section — toggles CrossSectionMeasurementTool (measures
+        # inside cross-section views; mirrored as a value-only label in the
+        # main view). Lives in its own section so it isn't part of the
+        # Distance section's Line/Path mutual-exclusion group — it's an
+        # independent on/off mode, not another main-view measure type.
+        cross_section = RibbonSection("Cross Section", self)
+        self.cross_section_measure_btn = cross_section.add_button(
+            "XS", "📏",
+            self._on_cross_section_measure_clicked,
+            toggleable=True,
+        )
+        self.cross_section_measure_btn.setToolTip(
+            "Measure distances inside cross-section views\n"
+            "(mirrored automatically into the main 3D view)"
+        )
+        # Belt-and-braces sync: clear_all_tool_buttons() (fired when some
+        # OTHER ribbon's tool button is checked) unchecks this button
+        # directly via setChecked(), which does not go through the
+        # clicked-based wiring add_button() sets up above. Connecting
+        # toggled here as well means any state change to this button's
+        # checked state — however it happens — keeps the actual tool in
+        # sync instead of leaving it silently active with the button
+        # showing off.
+        self.cross_section_measure_btn.toggled.connect(self._sync_cross_section_measure_tool)
+        layout.addWidget(cross_section)
+
         layout.addStretch()
+
+    def _on_cross_section_measure_clicked(self):
+        """add_button()'s clicked-driven callback — the button's checked
+        state already reflects the click by the time this runs."""
+        self._sync_cross_section_measure_tool(self.cross_section_measure_btn.isChecked())
+
+    def _sync_cross_section_measure_tool(self, checked):
+        """Idempotent: bring the tool's active state in line with `checked`.
+        Safe to call more than once with the same value (see the toggled
+        connection above), and is the single source of truth this ribbon
+        button drives the tool through."""
+        try:
+            main_window = self.window()
+            tool = getattr(main_window, "cross_section_measurement_tool", None)
+            if tool is None:
+                return
+            if checked and not tool.active:
+                tool.activate()
+                if hasattr(main_window, "statusBar"):
+                    main_window.statusBar().showMessage(
+                        "📏 Cross-section measurement enabled — click two points in a cross-section view",
+                        4000,
+                    )
+            elif not checked and tool.active:
+                tool.deactivate()
+                if hasattr(main_window, "statusBar"):
+                    main_window.statusBar().showMessage("📏 Cross-section measurement disabled", 2000)
+        except Exception as e:
+            print(f"⚠️ Cross-section measurement ribbon toggle failed: {e}")
 
     def _show_measure_settings(self):
         """Open the Measurement Tool Settings dialog."""

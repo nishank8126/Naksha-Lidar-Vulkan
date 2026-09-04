@@ -622,14 +622,16 @@ class GlobalShortcutFilter(QObject):
 
                 # Deactivate cross-section measurement tool on Escape — cancels
                 # any pending point/chain in every open section view and turns
-                # the footer toggle off, matching how ESC fully stops an
-                # in-progress main-view measurement.
+                # its Measure-ribbon toggle off, matching how ESC fully stops
+                # an in-progress main-view measurement.
                 _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
                 if _cs_measure is not None and getattr(_cs_measure, 'active', False):
                     try:
-                        footer_btn = getattr(self.app_window, 'cross_section_measure_footer_btn', None)
-                        if footer_btn is not None:
-                            footer_btn.setChecked(False)  # cascades to _cs_measure.deactivate()
+                        ribbon = getattr(self.app_window, 'ribbon_manager', None)
+                        measure_ribbon = getattr(ribbon, 'ribbons', {}).get('measure') if ribbon else None
+                        ribbon_btn = getattr(measure_ribbon, 'cross_section_measure_btn', None)
+                        if ribbon_btn is not None:
+                            ribbon_btn.setChecked(False)  # cascades to _cs_measure.deactivate()
                         else:
                             _cs_measure.deactivate()
                     except Exception as e:
@@ -703,35 +705,32 @@ class GlobalShortcutFilter(QObject):
 
                 # =================================================================
                 # LEVEL 0.5: CROSS-SECTION MEASUREMENT TOOL (checked BEFORE the
-                # main measurement tool). The main measurement tool's `active`
-                # flag can stay True just from switching to the Measure ribbon
-                # tab (no actual main-view measuring in progress), which would
-                # otherwise swallow Ctrl+Z/Y here with "nothing to undo" and
-                # cross-section measurement's own undo would never be reached.
-                # While cross-section measuring is toggled on, OR it still has
-                # a finalized segment to undo/redo (Escape deactivates the
-                # tool but must not strand that history — a segment you just
-                # finished stays undo-able after Escape, same as the main
-                # view's own finalized measurements do), it exclusively owns
-                # Ctrl+Z/Y for undo/redo of cross-section segments (and their
-                # mirrored main-view labels).
+                # main measurement tool). Claims Ctrl+Z/Y ONLY while actively
+                # toggled on — same convention every other tool in this file
+                # uses (see LEVEL 1's own comment: "Once tool is deactivated,
+                # even if measurements exist on screen, Ctrl+Z/Y should go to
+                # classification"). An earlier version also kept claiming
+                # Ctrl+Z/Y after deactivation whenever this tool's history was
+                # non-empty (so Escape-then-undo still worked) — that repeatedly
+                # starved OTHER tools' undo instead (main-view measurement, and
+                # then classification, since this tool can stay `active` at the
+                # same time a classify tool is armed in the same section view
+                # and has no timestamp-based way to know classification is what
+                # the user actually wants undone). Reverted to the simple,
+                # proven rule to stop that whole class of bug from recurring;
+                # to undo a cross-section measurement after Escape, re-toggle
+                # the tool back on first, same as every other tool requires.
                 #
-                # The history-only branch is tie-broken by recency: it must
-                # not stay claimed forever just because its stack is
-                # non-empty, or Ctrl+Z/Y for the MAIN view's own measurements
-                # silently stops working the moment the user has ever used
-                # cross-section measuring earlier in the session. Whichever
-                # tool was actually used more recently (finalize/undo/redo)
-                # wins, so switching to and using main-view measuring always
-                # reclaims Ctrl+Z/Y back from stale cross-section history.
+                # Also explicitly yields to an active classify tool, mirroring
+                # the same guard _on_section_click() already uses for clicks —
+                # classification and cross-section measuring can legitimately
+                # both be "active" in the same section view at once.
                 # =================================================================
                 _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
-                _mt_for_priority = getattr(self.app_window, 'measurement_tool', None)
-                _cs_last_action = getattr(_cs_measure, '_last_action_time', 0.0) if _cs_measure is not None else 0.0
-                _mt_last_action = getattr(_mt_for_priority, '_last_action_time', 0.0) if _mt_for_priority is not None else 0.0
-                _cs_measure_claims_undo = _cs_measure is not None and (
-                    getattr(_cs_measure, 'active', False)
-                    or (_cs_measure.has_history() and _cs_last_action > _mt_last_action)
+                _cs_measure_claims_undo = (
+                    _cs_measure is not None
+                    and getattr(_cs_measure, 'active', False)
+                    and getattr(self.app_window, 'active_classify_tool', None) is None
                 )
                 if _cs_measure_claims_undo:
                     if event.key() == Qt.Key_Z:

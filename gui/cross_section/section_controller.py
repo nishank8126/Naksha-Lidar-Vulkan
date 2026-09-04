@@ -3047,6 +3047,7 @@ class SectionController:
             self.app._setup_interactor_swapper(
                 self.app.sec_vtk.interactor,
                 preserve_physical_middle_pan=True,
+                honor_persistent_left_pan=True,
             )
         from gui.theme_manager import ThemeManager
         bg_color = "white" if ThemeManager.current() == "light" else "black"

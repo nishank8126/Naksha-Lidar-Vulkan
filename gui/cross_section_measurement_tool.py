@@ -534,6 +534,31 @@ class CrossSectionMeasurementTool:
         print(f"↷ Cross-section measure redo (redo stack: {len(self._redo_stack)})")
         return True
 
+    @staticmethod
+    def _render_preview_frame(widget):
+        """
+        Cheap, direct repaint for the live rubber-band preview.
+
+        Unlike _force_section_render() (routed through app._render_section_view,
+        which walks and re-validates EVERY actor in the scene — including the
+        full point cloud — to guarantee a redraw even for a backgrounded dock),
+        this just asks VTK to repaint. The preview actor's own points are
+        already marked Modified() right before this is called, so a plain
+        render is all that's needed. Calling the heavy path here instead was
+        the main source of the "snappy/glitchy" feel — it re-validated the
+        whole point-cloud pipeline on every single mouse-move frame during an
+        active drag (up to ~50 times/sec), not just when data actually changed.
+        """
+        if widget is None:
+            return
+        try:
+            widget.GetRenderWindow().Render()
+        except Exception:
+            try:
+                widget.render()
+            except Exception:
+                pass
+
     def _force_section_render(self, view_index, widget):
         """
         Force an immediate repaint of one section view.
@@ -589,6 +614,8 @@ class CrossSectionMeasurementTool:
             return
         for key in ("line", "label"):
             self._remove_segment_actor(widget.renderer, segment.get(key))
+        for vertex_actor in segment.get("vertices", []) or []:
+            self._remove_segment_actor(widget.renderer, vertex_actor)
         self._force_section_render(view_index, widget)
 
     # ------------------------------------------------------------------
@@ -631,6 +658,50 @@ class CrossSectionMeasurementTool:
             pass
         actor.PickableOff()
         return actor, pts, polydata
+
+    def _make_vertex_marker(self, position, color=(1.0, 0.55, 0.0)):
+        """
+        Same fixed-screen-size vertex dot the main-view measurement tool
+        draws at each clicked point — see
+        MeasurementTool._create_vertex_marker(). A single-point vtkActor
+        with RenderPointsAsSpheres, sized in pixels rather than world units
+        so it stays a consistent dot regardless of zoom.
+        """
+        pts = vtk.vtkPoints()
+        pts.SetDataTypeToDouble()
+        pts.InsertNextPoint(float(position[0]), float(position[1]), float(position[2]))
+
+        verts = vtk.vtkCellArray()
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(0)
+
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetVerts(verts)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        try:
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-4, -4)
+        except Exception:
+            pass
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(float(color[0]), float(color[1]), float(color[2]))
+        prop.SetPointSize(10.0)
+        try:
+            prop.SetRenderPointsAsSpheres(True)
+        except Exception:
+            pass
+        try:
+            prop.SetDepthTestingEnabled(False)
+        except Exception:
+            pass
+        actor.PickableOff()
+        return actor
 
     def _make_label_actor(self, position, distance):
         """
@@ -680,14 +751,32 @@ class CrossSectionMeasurementTool:
         label_actor = self._make_label_actor(mid, distance)
         renderer.AddActor2D(label_actor)
 
+        # Vertex dots, matching the main-view measurement tool. Only mark the
+        # chain's very first point here (segment_list empty means nothing has
+        # been drawn in this view yet) — every later local_p1 is some earlier
+        # segment's local_p2, which already got its own marker when it was
+        # drawn, so marking it again would double up. This also makes undo
+        # correct for free: removing a later segment only removes the one
+        # vertex it actually added, leaving earlier points on the chain intact.
+        segment_list = self._segment_actors.setdefault(view_index, [])
+        vertex_actors = []
+        if not segment_list:
+            start_marker = self._make_vertex_marker(local_p1)
+            renderer.AddActor(start_marker)
+            vertex_actors.append(start_marker)
+        end_marker = self._make_vertex_marker(local_p2)
+        renderer.AddActor(end_marker)
+        vertex_actors.append(end_marker)
+
         segment = {
             "line": line_actor,
             "label": label_actor,
+            "vertices": vertex_actors,
             "local_p1": local_p1,
             "local_p2": local_p2,
             "distance": distance,
         }
-        self._segment_actors.setdefault(view_index, []).append(segment)
+        segment_list.append(segment)
         self._force_section_render(view_index, section_vtk_widget)
         return segment
 
@@ -710,7 +799,7 @@ class CrossSectionMeasurementTool:
             self.app.statusBar().showMessage(f"📏 Distance: {distance:.2f} m", 100)
         except Exception:
             pass
-        self._force_section_render(view_index, section_vtk_widget)
+        self._render_preview_frame(section_vtk_widget)
 
     def _clear_preview(self, view_index, widget_hint=None):
         entry = self._preview.pop(view_index, None)
@@ -744,6 +833,8 @@ class CrossSectionMeasurementTool:
         for seg in segments:
             for key in ("line", "label"):
                 self._remove_segment_actor(widget.renderer, seg.get(key))
+            for vertex_actor in seg.get("vertices", []) or []:
+                self._remove_segment_actor(widget.renderer, vertex_actor)
         self._force_section_render(view_index, widget)
 
     def clear_all(self):
