@@ -125,3 +125,32 @@ def test_pan_followup_frame_uses_only_remaining_budget():
 
     assert len(manager.render_timer.starts) == 1
     assert 30 <= manager.render_timer.starts[0] <= 45
+
+
+def test_wheel_first_frame_is_immediate_and_coalesced():
+    manager = _RequestManager()
+    manager._pan_in_progress = False
+    GPURenderManager.request_render(manager, object())
+    GPURenderManager.request_render(manager, object())
+    assert manager.render_timer.starts == [0]
+    assert manager.skipped_renders == 1
+
+
+def test_wheel_slow_frame_does_not_pay_another_full_delay(monkeypatch):
+    manager = _RequestManager()
+    manager._pan_in_progress = False
+    manager._interaction_frame_started = True
+    manager._interaction_last_frame_monotonic = 10.0
+    monkeypatch.setattr(time, "monotonic", lambda: 10.090)
+    GPURenderManager.request_render(manager, object())
+    assert manager.render_timer.starts == [0]
+
+
+def test_wheel_fast_frame_waits_only_remaining_budget(monkeypatch):
+    manager = _RequestManager()
+    manager._pan_in_progress = False
+    manager._interaction_frame_started = True
+    manager._interaction_last_frame_monotonic = 10.0
+    monkeypatch.setattr(time, "monotonic", lambda: 10.050)
+    GPURenderManager.request_render(manager, object())
+    assert manager.render_timer.starts == [30]

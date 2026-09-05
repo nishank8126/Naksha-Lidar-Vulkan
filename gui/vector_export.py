@@ -3371,16 +3371,23 @@ def import_drawings_from_tiff(app, input_path: str) -> bool:
         return False
 
 
-def _geotiff_texture_pixel_budget(app, hard_cap: int = 16_000_000) -> int:
+def _geotiff_texture_pixel_budget(app, hard_cap: int = 160_000_000) -> int:
     """
     Cap a new GeoTIFF texture's pixel count by remaining GPU VRAM headroom,
     not just a fixed resolution. This machine's 4GB card (T1000, ~2.8GB safe
     budget) can end up with several full-resolution orthophoto/DTM/DSM
-    textures resident in the same session - the fixed 16M-pixel cap alone
-    doesn't account for that. Give raster textures a bounded slice of the
-    budget and shrink it by what's already loaded, independent of the
-    reentrancy bug fixed in import_geotiff_as_texture (confirmed by WER as
-    the actual cause of the production access-violation crashes).
+    textures resident in the same session - a fixed pixel cap alone doesn't
+    account for that. Give raster textures a bounded slice of the budget and
+    shrink it by what's already loaded, independent of the reentrancy bug
+    fixed in import_geotiff_as_texture (confirmed by WER as the actual cause
+    of the production access-violation crashes).
+
+    hard_cap is just a sanity ceiling, not the real limit - texture_budget_mb
+    below is already capped at 600MB, which alone bounds budget_pixels to
+    ~157M. hard_cap used to default to 16_000_000, silently overriding the
+    VRAM-aware budget on every import and force-downsampling every raster to
+    ~4000x4000 regardless of how much VRAM was actually free (root cause of
+    imported GeoTIFFs looking blurry compared to QGIS).
     """
     try:
         from gui.gpu_support import get_memory_budget_mb
@@ -3473,6 +3480,7 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
             bounds = src.bounds
             src_width = src.width
             src_height = src.height
+            band_count = src.count
             # A raster is usable for placement only if it carries real geo info.
             try:
                 is_georef = (src.crs is not None) and (not src.transform.is_identity)
@@ -3498,7 +3506,11 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                     print(f"   ⚠️ Could not register GeoTIFF CRS with canvas: {_crs_err}")
 
             # Guard against OOM by limiting texture pixel count before NumPy->VTK conversion.
-            max_texture_pixels = _geotiff_texture_pixel_budget(app)  # VRAM-aware, capped at ~4k x 4k
+            # Dynamic rasters need only a small overview at import. Native detail
+            # is fetched in background when the camera zooms into the image.
+            lod_eligible = gcp_corners is None and band_count >= 3
+            max_texture_pixels = _geotiff_texture_pixel_budget(
+                app, hard_cap=4_000_000 if lod_eligible else 16_000_000)
             total_pixels = src_width * src_height
             width = src_width
             height = src_height
@@ -3718,7 +3730,12 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
  
         texture = vtk.vtkTexture()
         texture.SetInputData(vtk_image)
-        texture.InterpolateOn()
+        # Nearest neighbour, matching QGIS's default resampling - bilinear
+        # softens texel edges into a smear once zoomed past native
+        # resolution, which read as "blurry" next to QGIS's crisp pixels.
+        # Raster Properties (raster_properties.py) can switch a layer to
+        # Bilinear if a user wants smoothing.
+        texture.InterpolateOff()
         texture.Update()
  
         progress.setValue(70)
@@ -3734,7 +3751,24 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         actor.SetMapper(mapper)
         actor.SetTexture(texture)
         actor.GetProperty().SetOpacity(1.0)
- 
+
+        # Metadata for raster_lod.py's dynamic zoom refresh: the initial
+        # texture above is a VRAM-capped downsample of the whole file, so once
+        # a user zooms in past it there's no more detail to show - only a
+        # windowed re-read of the source at the current view/zoom (matching
+        # QGIS) recovers native pixels. Not eligible for GCP placements
+        # (rotated parallelogram; the axis-aligned pixel<->world mapping
+        # raster_lod.py uses doesn't hold) or single-band rasters (elevation
+        # relief shading isn't reproduced by the windowed-read path yet).
+        actor._raster_lod_meta = {
+            "path": input_path,
+            "native_bounds": (left, right, bottom, top),
+            "native_size": (src_width, src_height),
+            "z": raster_z,
+            "eligible": lod_eligible,
+            "_preview_image": vtk_image if lod_eligible else None,
+        }
+
         if not (hasattr(app, 'vtk_widget') and app.vtk_widget):
             print(f"   ❌ No VTK widget found")
             progress.close()
@@ -3789,7 +3823,14 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         if camera_renderer is not None:
             # Move the interactive/main camera to the combined raster extent.
             # The raster camera mirrors this view with independent clipping.
-            camera_renderer.ResetCamera(renderer.ComputeVisiblePropBounds())
+            from gui.gis.gis_layers import _layer_bounds
+            from gui.gis.raster_lod import _restore_overview
+            visible = [a for a in app.geotiff_actors if a.GetVisibility()]
+            for existing in visible:
+                _restore_overview(existing)
+            full_bounds = _layer_bounds({"actors": visible})
+            if full_bounds is not None:
+                camera_renderer.ResetCamera(full_bounds)
 
         # Route through the app's throttled/mutex-guarded render (GPURenderManager),
         # not a raw GetRenderWindow().Render(). The interactor's own auto-render is
@@ -3797,14 +3838,9 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         # stay consistent with that rather than bypassing it.
         app.vtk_widget.render()
  
-        # Also call the app's fit_view if available
-        fit_view = getattr(app, 'fit_view', None)
-        if callable(fit_view):
-            try:
-                fit_view()
-            except Exception:
-                pass
- 
+        # The raster union above is authoritative here. Generic fit_view prefers
+        # point-cloud/vector bounds and can immediately hide a newly added TIFF.
+
         progress.setValue(100)
         progress.close()
  

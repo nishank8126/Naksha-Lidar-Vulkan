@@ -1,0 +1,471 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# raster_lod.py — dynamic zoom-based reload for imported GeoTIFF rasters
+#
+# import_geotiff_as_texture() (vector_export.py) bakes ONE static texture for
+# the whole file, capped by VRAM budget. That's fine at overview zoom, but
+# once a user zooms in past that baked resolution there is no more detail to
+# show - VTK just magnifies the same texels. QGIS avoids this by re-reading
+# the source file windowed to the current view on every zoom/pan step.
+#
+# This module reproduces that behaviour: on every camera change (2D parallel
+# / top view only - a perspective camera has no single rectangular "visible
+# extent" to key a window off of), it works out the world-space window
+# currently on screen, re-reads just that window from the source GeoTIFF at a
+# resolution matched to the viewport, and swaps the raster actor's texture +
+# plane geometry to it. Debounced so a drag/zoom gesture doesn't spawn a read
+# per frame, and skipped when the current texture already covers the view at
+# sufficient detail so plain panning within a loaded window is free.
+#
+# Only rasters flagged "eligible" in actor._raster_lod_meta participate (see
+# vector_export.py) - GCP (rotated) placements and single-band/elevation
+# rasters keep the original static-texture behaviour.
+# ─────────────────────────────────────────────────────────────────────────────
+from __future__ import annotations
+
+import math
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from functools import lru_cache
+import os
+
+_DEBOUNCE_MS = 250
+_REFETCH_MARGIN = 0.15   # read 15% extra world extent on each side, so a small pan reuses it
+_ZOOM_TOLERANCE = 1.1    # don't refetch for <10% extra zoom over what's already loaded
+
+
+def _get_render_window(vtk_widget):
+    """Resolve the host VTK render window without raising if not yet wired."""
+    if vtk_widget is None:
+        return None
+    for getter in (
+        lambda: vtk_widget.interactor.GetRenderWindow(),
+        lambda: vtk_widget.GetRenderWindow(),
+        lambda: getattr(vtk_widget, "render_window", None),
+    ):
+        try:
+            rw = getter()
+            if rw is not None:
+                return rw
+        except Exception:
+            continue
+    return None
+
+
+def _visible_world_bounds(app):
+    """(minx, maxx, miny, maxy, screen_w, screen_h) of the current camera
+    view in scene coords, or None if not in 2D parallel (top) projection."""
+    # Camera queries are a navigation hot path. Pipeline repair traverses all
+    # scene actors and belongs to layer setup, never each camera modification.
+    renderer = getattr(getattr(app, "vtk_widget", None), "renderer", None)
+    if renderer is None:
+        return None
+    rw = _get_render_window(getattr(app, "vtk_widget", None))
+    if rw is None:
+        return None
+    try:
+        cam = renderer.GetActiveCamera()
+        direction = cam.GetDirectionOfProjection()
+        up = cam.GetViewUp()
+        if (not cam.GetParallelProjection() or abs(direction[2] + 1) > 1e-6
+                or abs(up[0]) > 1e-6 or up[1] < 0.999999):
+            return None
+        width, height = rw.GetSize()
+        if width <= 0 or height <= 0:
+            return None
+        fx, fy, _fz = cam.GetFocalPoint()
+        parallel_scale = max(1e-9, float(cam.GetParallelScale()))
+        aspect = width / float(height)
+        half_w = parallel_scale * aspect
+        return (fx - half_w, fx + half_w, fy - parallel_scale, fy + parallel_scale,
+                int(width), int(height))
+    except Exception:
+        return None
+
+
+def _pixel_window_for_world(native_bounds, native_size, view_bounds, margin):
+    left, right, bottom, top = native_bounds
+    src_w, src_h = native_size
+    vminx, vmaxx, vminy, vmaxy = view_bounds
+    pad_x = (vmaxx - vminx) * margin
+    pad_y = (vmaxy - vminy) * margin
+    wx0, wx1 = max(vminx - pad_x, left), min(vmaxx + pad_x, right)
+    wy0, wy1 = max(vminy - pad_y, bottom), min(vmaxy + pad_y, top)
+    if wx1 <= wx0 or wy1 <= wy0:
+        return None
+
+    dxr = max(1e-9, right - left)
+    dyr = max(1e-9, top - bottom)
+    col0 = (wx0 - left) / dxr * src_w
+    col1 = (wx1 - left) / dxr * src_w
+    row0 = (top - wy1) / dyr * src_h
+    row1 = (top - wy0) / dyr * src_h
+    col0, col1 = max(0, int(col0)), min(src_w, int(math.ceil(col1)))
+    row0, row1 = max(0, int(row0)), min(src_h, int(math.ceil(row1)))
+    if col1 <= col0 or row1 <= row0:
+        return None
+    return {
+        "col_off": col0, "row_off": row0,
+        "width": col1 - col0, "height": row1 - row0,
+        "wx0": left + col0 / src_w * dxr, "wx1": left + col1 / src_w * dxr,
+        "wy0": top - row1 / src_h * dyr, "wy1": top - row0 / src_h * dyr,
+    }
+
+
+def _already_covers(last, view_bounds, screen_w):
+    """True if the last-loaded window already covers the current view at
+    equal-or-better detail, so this tick's refresh can be skipped."""
+    if last is None:
+        return False
+    vminx, vmaxx, vminy, vmaxy = view_bounds
+    if not (last["wx0"] <= vminx and vmaxx <= last["wx1"]
+            and last["wy0"] <= vminy and vmaxy <= last["wy1"]):
+        return False
+    view_px_per_world = screen_w / max(1e-9, vmaxx - vminx)
+    loaded_px_per_world = last["out_w"] / max(1e-9, last["wx1"] - last["wx0"])
+    return loaded_px_per_world >= view_px_per_world / _ZOOM_TOLERANCE
+
+
+def _style_for(app, path, actor=None):
+    """The user's Raster Properties style for this layer, so the zoom refresh
+    doesn't silently revert band mapping / stretch / gamma back to raw RGB."""
+    try:
+        from gui.gis.gis_layers import _registry
+        for entry in _registry(app):
+            if (entry.get("kind") == "raster" and entry.get("path") == path
+                    and (actor is None or any(a is actor for a in entry.get("actors", [])))):
+                if entry.get("style"):
+                    return entry["style"]
+                break
+    except Exception:
+        pass
+    from gui.gis.raster_properties import default_raster_style
+    return default_raster_style(3)
+
+
+@lru_cache(maxsize=64)
+def _source_ranges(path, stamp, size, indexes):
+    """Small, source-wide sample; identical contrast limits for every crop."""
+    import numpy as np
+    import rasterio
+    from rasterio.enums import Resampling
+    with rasterio.open(path) as src:
+        data = src.read(list(indexes), out_shape=(len(indexes), min(256, src.height),
+                                                 min(256, src.width)),
+                        masked=True, resampling=Resampling.nearest)
+    ranges = {}
+    for index, band in zip(indexes, data):
+        values = band.compressed()
+        values = values[np.isfinite(values)]
+        ranges[index] = tuple(np.percentile(values, (2, 98))) if values.size else (0, 255)
+    return ranges
+
+
+def _restore_overview(actor):
+    """Keep the complete layer visible while a new crop is being read."""
+    meta = getattr(actor, "_raster_lod_meta", None)
+    if not meta or not meta.get("_last_window") or meta.get("_preview_image") is None:
+        return False
+    plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
+    left, right, bottom, top = meta["native_bounds"]
+    plane.SetOrigin(left, bottom, meta["z"])
+    plane.SetPoint1(right, bottom, meta["z"])
+    plane.SetPoint2(left, top, meta["z"])
+    plane.Update()
+    actor.GetTexture().SetInputData(meta["_preview_image"])
+    meta.pop("_last_window", None)
+    return True
+
+
+def _load_window_texture(path, window, target_w, target_h, style):
+    import numpy as np
+    from rasterio.windows import Window
+    from gui.gis.raster_properties import _read_source_bands, process_raster_array
+
+    win = Window(window["col_off"], window["row_off"], window["width"], window["height"])
+    bands, _count = _read_source_bands(path, style, window=win,
+                                       out_shape=(target_h, target_w))
+    if style.get("enhancement") == "minmax" and (style.get("min") is None or style.get("max") is None):
+        stat = os.stat(path)
+        style = {**style, "_band_ranges": _source_ranges(
+            path, stat.st_mtime_ns, stat.st_size, tuple(sorted(bands)))}
+    rgb = process_raster_array(bands, style)          # (h, w, 3) uint8
+    return np.ascontiguousarray(rgb[::-1, :, :])
+
+
+def _request_for(app, actor, view):
+    meta = getattr(actor, "_raster_lod_meta", None)
+    if not meta or not meta.get("eligible") or not actor.GetVisibility() or view is None:
+        return None
+    vminx, vmaxx, vminy, vmaxy, screen_w, screen_h = view
+    bounds = meta["native_bounds"]
+    clipped = (max(vminx, bounds[0]), min(vmaxx, bounds[1]),
+               max(vminy, bounds[2]), min(vmaxy, bounds[3]))
+    if clipped[0] >= clipped[1] or clipped[2] >= clipped[3]:
+        return None
+    style = deepcopy(_style_for(app, meta["path"], actor))
+    last = meta.get("_last_window")
+    # Demand no more than native resolution, including at the raster edges.
+    density_x = min(screen_w / (vmaxx - vminx), meta["native_size"][0] / (bounds[1] - bounds[0]))
+    density_y = min(screen_h / (vmaxy - vminy), meta["native_size"][1] / (bounds[3] - bounds[2]))
+    if (last and meta.get("_last_style") == style
+            and _already_covers(last, clipped, density_x * (clipped[1] - clipped[0]))
+            and last["out_h"] / (last["wy1"] - last["wy0"]) >= density_y / _ZOOM_TOLERANCE):
+        return None
+    window = _pixel_window_for_world(bounds, meta["native_size"], view[:4], _REFETCH_MARGIN)
+    target_w = min(window["width"], max(1, math.ceil((window["wx1"] - window["wx0"]) * density_x)))
+    target_h = min(window["height"], max(1, math.ceil((window["wy1"] - window["wy0"]) * density_y)))
+    scale = min(1.0, (8_000_000 / (target_w * target_h)) ** 0.5,
+                4096 / target_w, 4096 / target_h)
+    w, h = max(1, int(target_w * scale)), max(1, int(target_h * scale))
+    # At the texture budget limit, rereading the identical request adds no detail.
+    if (last == {**window, "out_w": w, "out_h": h}
+            and meta.get("_last_style") == style):
+        return None
+    return actor, meta, window, w, h, style
+
+
+def _apply_texture(actor, meta, window, style, rgb_array):
+    # Called only by the GUI timer: workers never access Qt, VTK, or app state.
+    import vtk
+    from vtk.util import numpy_support
+    h, w = rgb_array.shape[0], rgb_array.shape[1]
+    vtk_colors = numpy_support.numpy_to_vtk(
+        rgb_array.reshape(-1, 3), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+    vtk_colors.SetNumberOfComponents(3)
+    vtk_colors.SetName("Colors")
+
+    vtk_image = vtk.vtkImageData()
+    vtk_image.SetDimensions(w, h, 1)
+    vtk_image.GetPointData().SetScalars(vtk_colors)
+
+    texture = actor.GetTexture()
+    if texture is None:
+        return
+    texture.SetInputData(vtk_image)
+    texture.InterpolateOff() if style.get("resampling", "nearest") == "nearest" else texture.InterpolateOn()
+    texture.Modified()
+
+    # The loaded image only covers `window`'s world extent, not the whole
+    # raster - reposition the plane to match, or the texture would appear
+    # squashed/misaligned across the old (larger) quad.
+    try:
+        plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
+        z = meta["z"]
+        plane.SetOrigin(window["wx0"], window["wy0"], z)
+        plane.SetPoint1(window["wx1"], window["wy0"], z)
+        plane.SetPoint2(window["wx0"], window["wy1"], z)
+        plane.Update()
+    except Exception as exc:
+        print(f"   ⚠️ Raster LOD plane update failed: {exc}")
+        return
+
+    meta["_last_window"] = {**window, "out_w": w, "out_h": h}
+    meta["_last_style"] = style
+    return True
+
+
+def _navigation_active(app):
+    manager = getattr(app, "gpu_render_manager", None)
+    return bool(getattr(manager, "_interaction_active", False)
+                or getattr(manager, "_pan_in_progress", False)
+                or getattr(app, "_qt_main_pan_active", False)
+                or getattr(app, "_zoom_anim_active", False))
+
+
+class _Loader:
+    """One in-flight read per app; new navigation replaces pending demand."""
+    def __init__(self, app):
+        from PySide6.QtCore import QTimer, QCoreApplication
+        self.app = app
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="raster-read")
+        self.future = None
+        self.request = None
+        self.generation = 0
+        self.closed = False
+        self.failed_keys = {}
+        self.cursor = 0
+        self.observers = []
+        self.poll = QTimer()
+        self.poll.setInterval(30)
+        self.poll.timeout.connect(self.finish)
+        qt_app = QCoreApplication.instance()
+        if qt_app is not None:
+            qt_app.aboutToQuit.connect(self.close)
+        if hasattr(app, "destroyed"):
+            app.destroyed.connect(self.close)
+
+    def close(self, *_):
+        if self.closed:
+            return
+        self.closed = True
+        for obj, tag in self.observers:
+            obj.RemoveObserver(tag)
+        self.observers.clear()
+        for timer in (self.poll, getattr(self.app, "_raster_lod_timer", None)):
+            try:
+                if timer is not None:
+                    timer.stop()
+            except RuntimeError:
+                pass  # Qt may already have destroyed children during shutdown.
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def start(self):
+        if self.closed or self.future is not None:
+            return
+        if getattr(self.app, "_geotiff_import_in_progress", False) or _navigation_active(self.app):
+            self.app._raster_lod_timer.start(_DEBOUNCE_MS)
+            return
+        view = _visible_world_bounds(self.app)
+        actors = list(getattr(self.app, "geotiff_actors", []) or [])
+        # Round-robin prevents a failing or repeatedly invalidated first layer
+        # from starving the remaining files.
+        for offset in range(len(actors)):
+            index = (self.cursor + offset) % len(actors)
+            actor = actors[index]
+            request = _request_for(self.app, actor, view)
+            if request is None:
+                continue
+            actor, meta, window, w, h, style = request
+            key = (id(actor), repr(window), w, h, repr(style))
+            if self.failed_keys.get(id(actor)) == key:
+                continue
+            self.cursor = (index + 1) % len(actors)
+            self.request = (request, view, self.generation, key)
+            self.future = self.executor.submit(_load_window_texture, meta["path"], window, w, h, style)
+            self.poll.start()
+            return
+
+    def finish(self):
+        if self.future is None or not self.future.done():
+            return
+        if getattr(self.app, "_geotiff_import_in_progress", False) or _navigation_active(self.app):
+            return  # Keep disk results off the GPU until navigation/import settles.
+        self.poll.stop()
+        future, self.future = self.future, None
+        request, view, generation, key = self.request
+        self.request = None
+        actor, meta, window, w, h, style = request
+        try:
+            rgb = future.result()
+        except Exception as exc:
+            self.failed_keys[id(actor)] = key
+            print(f"Raster LOD read failed: {exc}")
+        else:
+            if (not self.closed and generation == self.generation
+                    and view == _visible_world_bounds(self.app)
+                    and any(a is actor for a in getattr(self.app, "geotiff_actors", []))
+                    and actor.GetVisibility()
+                    and getattr(actor, "_raster_lod_meta", None) is meta
+                    and style == _style_for(self.app, meta["path"], actor)):
+                if _apply_texture(actor, meta, window, style, rgb):
+                    self.app.vtk_widget.render()
+        # A camera debounce already pending gets priority over starting another read.
+        if not self.closed and not self.app._raster_lod_timer.isActive():
+            self.start()
+
+
+def refresh_all(app):
+    loader = getattr(app, "_raster_lod_loader", None)
+    if loader is not None:
+        loader.start()
+
+
+def ensure_installed(app):
+    """Wire up the debounced camera watcher once per app instance."""
+    if getattr(app, "_raster_lod_installed", False):
+        return
+    try:
+        from gui.scene_render_pipeline import ROLE_DATA, renderer_for_role
+        renderer = renderer_for_role(app, ROLE_DATA)
+        cam = renderer.GetActiveCamera() if renderer is not None else None
+    except Exception:
+        cam = None
+    if cam is None:
+        return
+    app._raster_lod_installed = True
+    app._raster_lod_loader = _Loader(app)
+
+    from PySide6.QtCore import QTimer
+    timer = QTimer(app if hasattr(app, "children") else None)
+    timer.setSingleShot(True)
+    timer.timeout.connect(lambda: refresh_all(app))
+    app._raster_lod_timer = timer  # keep alive
+
+    def _on_camera_changed(_obj=None, _evt=None):
+        # Cursor anchoring updates several camera fields per wheel event. Only
+        # invalidate here; coverage is evaluated against the final camera once
+        # per rendered frame, avoiding transient overview texture uploads.
+        app._raster_lod_loader.generation += 1
+        app._raster_lod_frame_dirty = True
+        timer.start(_DEBOUNCE_MS)
+
+    def _prepare_frame(_obj=None, _evt=None):
+        if not getattr(app, "_raster_lod_frame_dirty", False):
+            return
+        app._raster_lod_frame_dirty = False
+        view = _visible_world_bounds(app)
+        for actor in list(getattr(app, "geotiff_actors", []) or []):
+            meta = getattr(actor, "_raster_lod_meta", {})
+            last = meta.get("_last_window")
+            if not last or not actor.GetVisibility():
+                continue
+            bounds = meta["native_bounds"]
+            clipped = None if view is None else (max(view[0], bounds[0]), min(view[1], bounds[1]),
+                                                  max(view[2], bounds[2]), min(view[3], bounds[3]))
+            if clipped is None or not _already_covers(last, clipped, 0):
+                _restore_overview(actor)
+
+    rw = _get_render_window(getattr(app, "vtk_widget", None))
+    if rw is not None:
+        tag = rw.AddObserver("StartEvent", _prepare_frame)
+        app._raster_lod_loader.observers.append((rw, tag))
+    tag = cam.AddObserver("ModifiedEvent", _on_camera_changed, -5.0)
+    app._raster_lod_loader.observers.append((cam, tag))
+    app._raster_lod_camera = cam
+    timer.start(_DEBOUNCE_MS)
+
+
+def kick(app):
+    """Install the watcher if needed and schedule a refresh soon - called
+    right after a new raster is registered, so it gets refined without
+    waiting for the user to first touch the camera."""
+    ensure_installed(app)
+    timer = getattr(app, "_raster_lod_timer", None)
+    if timer is not None:
+        app._raster_lod_loader.generation += 1
+        app._raster_lod_loader.failed_keys.clear()
+        timer.start(_DEBOUNCE_MS)
+
+
+def _demo():
+    """Self-check for the pixel<->world window math (no GDAL/VTK needed)."""
+    native_bounds = (0.0, 1000.0, 0.0, 500.0)   # left, right, bottom, top
+    native_size = (4000, 2000)                  # src_w, src_h (4px per world unit)
+
+    # Zoomed into the raster's lower-left quadrant.
+    view = (0.0, 100.0, 0.0, 100.0)
+    win = _pixel_window_for_world(native_bounds, native_size, view, margin=0.0)
+    assert win is not None
+    assert win["col_off"] == 0 and win["row_off"] == 1600  # top-origin rows
+    assert win["width"] == 400 and win["height"] == 400
+
+    # View entirely outside the raster's bounds -> no window.
+    assert _pixel_window_for_world(native_bounds, native_size, (2000, 2100, 0, 100), 0.0) is None
+
+    # Margin pads the request without going outside native_bounds.
+    padded = _pixel_window_for_world(native_bounds, native_size, view, margin=0.5)
+    assert padded["width"] > win["width"]
+
+    # A previously-loaded window covering the view at >= detail is reused.
+    last = {"wx0": -10, "wx1": 110, "wy0": -10, "wy1": 110, "out_w": 480, "out_h": 480}
+    assert _already_covers(last, (0.0, 100.0, 0.0, 100.0), screen_w=400) is True
+    # Same area but the view now demands much higher pixel density -> refetch.
+    assert _already_covers(last, (40.0, 60.0, 40.0, 60.0), screen_w=400) is False
+    # No prior window -> always refetch.
+    assert _already_covers(None, (0.0, 100.0, 0.0, 100.0), screen_w=400) is False
+
+    print("raster_lod self-check OK")
+
+
+if __name__ == "__main__":
+    _demo()

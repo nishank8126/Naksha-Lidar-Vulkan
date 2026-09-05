@@ -392,7 +392,13 @@ def _layer_bounds(entry: dict):
     found = False
     for a in entry["actors"]:
         try:
-            b = a.GetBounds()
+            meta = getattr(a, "_raster_lod_meta", None)
+            if meta and meta.get("eligible"):
+                left, right, bottom, top = meta["native_bounds"]
+                x, y, z = a.GetPosition()
+                b = (left + x, right + x, bottom + y, top + y, meta["z"] + z, meta["z"] + z)
+            else:
+                b = a.GetBounds()
         except Exception:
             b = None
         if not b or len(b) < 6:
@@ -2646,6 +2652,12 @@ def _import_raster_layer(app, path: str, name: str, world_bounds=None,
         # must be re-fitted once vectors/point-cloud exist — otherwise it sits
         # ~hundreds of km from the real data and looks "not visible".
         entry["_placement"] = getattr(app, "_last_raster_placement", "fit")
+
+    try:
+        from gui.gis.raster_lod import kick
+        kick(app)
+    except Exception as exc:
+        print(f"   ⚠️ Raster LOD watcher not installed: {exc}")
     return True
 
 
