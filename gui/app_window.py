@@ -170,6 +170,21 @@ class MainWheelZoomEventFilter(QObject):
             tool = getattr(app, tool_name, None)
             if tool is not None and getattr(tool, "active", False):
                 return True
+        # Main-view-only tools that own the left click while active. Section/cut
+        # viewports never run these, but in the main view a configured "Left
+        # Mouse Button" pan must not swallow their first click/drag.
+        for tool_attr in (
+            "select_rectangle_tool",
+            "zoom_rectangle_tool",
+            "grid_tool",
+            "curve_tool",
+            "temp_fence_tool",
+        ):
+            tool = getattr(app, tool_attr, None)
+            if tool is not None and getattr(tool, "active", False):
+                return True
+        if getattr(app, "_draw_curve_context_active", False):
+            return True
         return False
 
     def eventFilter(self, obj, event):
@@ -220,8 +235,14 @@ class MainWheelZoomEventFilter(QObject):
             try:
                 if event_type == QEvent.MouseButtonPress:
                     pressed_button = event.button()
+                    # Left-drag pans in the main view when the Pan shortcut is
+                    # armed OR when the persistent "Panning button: Left Mouse
+                    # Button" setting is enabled. _left_button_is_owned_by_tool()
+                    # keeps every active tool's left clicks untouched, and the
+                    # classification guard above already excluded classify tools.
                     left_pan_enabled = bool(
                         getattr(app, "_left_pan_shortcut_active", False)
+                        or getattr(app, "panning_button", "scroll") == "left"
                     )
                     if pressed_button == Qt.MiddleButton:
                         # Physical middle is always pan, irrespective of which
