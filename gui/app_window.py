@@ -155,13 +155,23 @@ class MainWheelZoomEventFilter(QObject):
         """True when the persistent panning button is set to tap-tap pan."""
         return getattr(app, "panning_button", "scroll") == "tap"
 
-    def _eligible_pan_button(self, app, pressed_button):
+    def _eligible_pan_button(self, app, pressed_button, modifiers=Qt.NoModifier):
         """Return the pan button for a press, or None if it is not one."""
         if pressed_button == Qt.MiddleButton:
             # Physical middle is always pan, irrespective of which
             # configurable primary pan button is selected.
             return Qt.MiddleButton
         if pressed_button == Qt.LeftButton:
+            # Shift+Left is reserved for the native 3D rotate/orbit gesture
+            # (works fine when the panning-button setting is "scroll",
+            # since that setting never claims Left at all) -- with "Left
+            # Mouse Button" or "Tap-Tap" panning, every Left press was
+            # claimed for pan unconditionally, including Shift+Left, so
+            # that gesture stopped reaching whatever handles it as soon as
+            # a Left-based panning-button setting was chosen. Let it
+            # through here regardless of the panning-button setting.
+            if modifiers & Qt.ShiftModifier:
+                return None
             pb = getattr(app, "panning_button", "scroll")
             if pb in ("left", "tap") or getattr(
                 app, "_left_pan_shortcut_active", False
@@ -322,7 +332,9 @@ class MainWheelZoomEventFilter(QObject):
                         # is armed or the persistent setting is Left / Tap-Tap.
                         # _left_button_is_owned_by_tool() keeps every active
                         # tool's left clicks untouched.
-                        pan_button = self._eligible_pan_button(app, pressed_button)
+                        pan_button = self._eligible_pan_button(
+                            app, pressed_button, event.modifiers()
+                        )
                         if pan_button is None:
                             if pressed_button == Qt.LeftButton and self._tap_session:
                                 self._finish_tap_session(app)
