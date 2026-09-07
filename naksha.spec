@@ -88,6 +88,9 @@ added_datas = [
     (str(project_root / 'gui' / 'theme_light.qss'),  'gui'),
     (str(project_root / 'models'),                   'models'),
     (str(project_root / 'Advance_Model'),            'Advance_Model'),
+    (str(project_root / 'gui' / 'AI' / 'basic' / 'models'),    'gui/AI/basic/models'),
+    (str(project_root / 'gui' / 'AI' / 'advanced' / 'models'), 'gui/AI/advanced/models'),
+    (str(project_root / 'gui' / 'AI' / 'premium' / 'models'),  'gui/AI/premium/models'),
     (str(project_root / 'naksha.crt'),               '.'),
     # .snt file-type registration helpers (called by post_install + app on launch)
     (str(project_root / 'post_install.py'),          '.'),
@@ -442,6 +445,8 @@ hidden_imports = [
     "jakteristics",
     "snt_core",
     "CSF",
+    "h5py",
+    "tqdm",
 
     # -- Misc runtime ----------------------------------------------------------
     "pkg_resources",
