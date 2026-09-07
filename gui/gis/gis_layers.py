@@ -2476,6 +2476,26 @@ def show_gis_layers_panel(app):
             panel.refresh()
         except Exception:
             pass
+        # A splitter pane dragged closed to 0px stays Qt-"visible" (isVisible()
+        # reflects show()/hide() state, not pixel size), so toggle_gis_layers_panel's
+        # first click after that drag actually called panel.hide() (believing it
+        # was toggling a visible panel off), and this re-show call only did
+        # panel.show() -- the splitter's stored size for this pane was still 0
+        # from the drag, so the panel came back "visible" but still crushed to
+        # 0 width. Only the very-first-creation branch above restored a real
+        # width; do the same restoration here whenever the pane is too
+        # thin to be usable.
+        try:
+            splitter = getattr(app, "splitter", None)
+            if splitter is not None:
+                idx = splitter.indexOf(panel)
+                if idx != -1:
+                    sizes = splitter.sizes()
+                    if idx < len(sizes) and sizes[idx] < 50:
+                        sizes[idx] = 280
+                        splitter.setSizes(sizes)
+        except Exception:
+            pass
     try:
         panel.setStyleSheet(_build_occ_style())
     except Exception:
@@ -2491,7 +2511,14 @@ def show_gis_layers_panel(app):
 
 def toggle_gis_layers_panel(app):
     panel = getattr(app, _PANEL_ATTR, None)
-    if panel is not None and panel.isVisible():
+    # isVisible() alone is not a reliable "is this actually shown" signal
+    # for a splitter pane: dragging its handle to 0px never calls hide(),
+    # so Qt still reports it visible even though nothing is on screen.
+    # Treat a crushed-to-0 pane the same as a hidden one -- restore it
+    # instead of calling hide() on something the user can't already see,
+    # which previously required a confusing second click to reopen.
+    effectively_shown = bool(panel is not None and panel.isVisible() and panel.width() > 10)
+    if effectively_shown:
         panel.hide()
         if hasattr(app, "_sync_activity_bar"):
             try:
