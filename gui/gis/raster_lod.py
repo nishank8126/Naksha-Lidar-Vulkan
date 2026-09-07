@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from functools import lru_cache
@@ -31,6 +32,8 @@ import os
 _DEBOUNCE_MS = 250
 _REFETCH_MARGIN = 0.15   # read 15% extra world extent on each side, so a small pan reuses it
 _ZOOM_TOLERANCE = 1.1    # don't refetch for <10% extra zoom over what's already loaded
+_FAIL_BACKOFF_BASE_S = 2.0
+_FAIL_BACKOFF_MAX_S = 30.0
 
 
 def _get_render_window(vtk_widget):
@@ -312,11 +315,15 @@ class _Loader:
     def start(self):
         if self.closed or self.future is not None:
             return
+        if getattr(self.app, "_shutdown_in_progress", False):
+            self.close()
+            return
         if getattr(self.app, "_geotiff_import_in_progress", False) or _navigation_active(self.app):
             self.app._raster_lod_timer.start(_DEBOUNCE_MS)
             return
         view = _visible_world_bounds(self.app)
         actors = list(getattr(self.app, "geotiff_actors", []) or [])
+        now = time.monotonic()
         # Round-robin prevents a failing or repeatedly invalidated first layer
         # from starving the remaining files.
         for offset in range(len(actors)):
@@ -327,7 +334,8 @@ class _Loader:
                 continue
             actor, meta, window, w, h, style = request
             key = (id(actor), repr(window), w, h, repr(style))
-            if self.failed_keys.get(id(actor)) == key:
+            failed = self.failed_keys.get(id(actor))
+            if failed is not None and failed["key"] == key and now < failed["retry_at"]:
                 continue
             self.cursor = (index + 1) % len(actors)
             self.request = (request, view, self.generation, key)
@@ -337,6 +345,9 @@ class _Loader:
 
     def finish(self):
         if self.future is None or not self.future.done():
+            return
+        if getattr(self.app, "_shutdown_in_progress", False):
+            self.close()
             return
         if getattr(self.app, "_geotiff_import_in_progress", False) or _navigation_active(self.app):
             return  # Keep disk results off the GPU until navigation/import settles.
@@ -348,9 +359,21 @@ class _Loader:
         try:
             rgb = future.result()
         except Exception as exc:
-            self.failed_keys[id(actor)] = key
-            print(f"Raster LOD read failed: {exc}")
+            prev = self.failed_keys.get(id(actor))
+            attempts = prev["attempts"] + 1 if prev is not None and prev["key"] == key else 1
+            backoff = min(_FAIL_BACKOFF_MAX_S, _FAIL_BACKOFF_BASE_S * attempts)
+            self.failed_keys[id(actor)] = {
+                "key": key, "attempts": attempts, "retry_at": time.monotonic() + backoff,
+            }
+            print(f"Raster LOD read failed, retrying in {backoff:.0f}s: {exc}")
+            timer = getattr(self.app, "_raster_lod_timer", None)
+            if timer is not None:
+                remaining = timer.remainingTime() if timer.isActive() else -1
+                delay_ms = int(backoff * 1000)
+                if remaining < 0 or remaining > delay_ms:
+                    timer.start(delay_ms)
         else:
+            self.failed_keys.pop(id(actor), None)
             if (not self.closed and generation == self.generation
                     and view == _visible_world_bounds(self.app)
                     and any(a is actor for a in getattr(self.app, "geotiff_actors", []))
@@ -384,6 +407,7 @@ def ensure_installed(app):
         return
     app._raster_lod_installed = True
     app._raster_lod_loader = _Loader(app)
+    app._raster_lod_renderer = renderer
 
     from PySide6.QtCore import QTimer
     timer = QTimer(app if hasattr(app, "children") else None)
@@ -399,7 +423,40 @@ def ensure_installed(app):
         app._raster_lod_frame_dirty = True
         timer.start(_DEBOUNCE_MS)
 
+    def _rebind_camera_if_replaced():
+        # The active camera can be swapped out (view reset, section tools,
+        # etc.) without the old one firing a ModifiedEvent - re-point the
+        # watcher or navigation on the new camera never triggers a refresh.
+        renderer = getattr(app, "_raster_lod_renderer", None)
+        current = renderer.GetActiveCamera() if renderer is not None else None
+        old = getattr(app, "_raster_lod_camera", None)
+        if current is None or current is old:
+            return
+        loader = app._raster_lod_loader
+        for obj, tag in list(loader.observers):
+            if obj is old:
+                try:
+                    obj.RemoveObserver(tag)
+                except Exception:
+                    pass
+                loader.observers.remove((obj, tag))
+        tag = current.AddObserver("ModifiedEvent", _on_camera_changed, -5.0)
+        loader.observers.append((current, tag))
+        app._raster_lod_camera = current
+        _on_camera_changed()
+
     def _prepare_frame(_obj=None, _evt=None):
+        _rebind_camera_if_replaced()
+        # A pure resize changes the viewport in pixels without touching the
+        # camera, so it never reaches _on_camera_changed - detect it here
+        # instead, via the cheap window size query rather than the full
+        # _visible_world_bounds() coverage check below (kept off the hot
+        # per-frame path unless something actually invalidated the view).
+        rw_now = _get_render_window(getattr(app, "vtk_widget", None))
+        size = rw_now.GetSize() if rw_now is not None else None
+        if size is not None and size != getattr(app, "_raster_lod_last_size", None):
+            app._raster_lod_last_size = size
+            _on_camera_changed()
         if not getattr(app, "_raster_lod_frame_dirty", False):
             return
         app._raster_lod_frame_dirty = False

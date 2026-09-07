@@ -597,6 +597,19 @@ def _apply_order(app):
                     a.GetProperty().SetDepthTestingEnabled(True)
                 except Exception:
                     pass
+                meta = getattr(a, "_raster_lod_meta", None)
+                mapper = a.GetMapper()
+                connection = mapper.GetInputConnection(0, 0) if mapper else None
+                plane = connection.GetProducer() if connection else None
+                if plane is not None and hasattr(plane, "SetOrigin"):
+                    for getter, setter in ((plane.GetOrigin, plane.SetOrigin),
+                                           (plane.GetPoint1, plane.SetPoint1),
+                                           (plane.GetPoint2, plane.SetPoint2)):
+                        x, y, _z = getter()
+                        setter(x, y, 0.0)
+                    plane.Update()
+                    if meta is not None:
+                        meta["z"] = 0.0
                 p = a.GetPosition()
                 a.SetPosition(p[0], p[1], rank * _RASTER_Z_STEP)
                 a.SetVisibility(1 if e.get("visible", True) else 0)
@@ -1215,7 +1228,7 @@ class GisLayersDock:
             QTreeWidget, QTreeWidgetItem, QPushButton, QSlider, QLabel,
             QToolButton, QSizePolicy, QLineEdit, QAbstractItemView, QHeaderView,
         )
-        from PySide6.QtCore import Qt, QSize
+        from PySide6.QtCore import Qt, QSize, QTimer
         from PySide6.QtGui import QColor, QIcon
         from gui.gis import icons as gicons
 
@@ -1483,133 +1496,139 @@ class GisLayersDock:
             entry_or_sub["_cached_count"] = total
             return total
 
+        panel._rebuilding = False
+        panel._reorder_pending = False
+
         def refresh():
-            reg = _registry(app)
-            cur = _current_entry()
-            prev = cur["id"] if cur else None
+            if panel._rebuilding:
+                return
+            panel._rebuilding = True
+            was_blocked = layer_list.blockSignals(True)
+            try:
+                # Model reset signals must reach Qt's selection model and views.
+                reg = list(_registry(app))
+                cur = _current_entry()
+                prev = cur["id"] if cur else None
+                layer_list.setCurrentItem(None)
+                layer_list.clear()
+                cols_theme = _occ_colors()
             
-            layer_list.blockSignals(True)
-            model = layer_list.model()
-            if model is not None:
-                model.blockSignals(True)
-            layer_list.clear()
-            
-            cols_theme = _occ_colors()
-            
-            for e in reg:
-                # Create root item for the layer
-                item = QTreeWidgetItem()
-                item.setData(0, Qt.UserRole, e["id"])
-                # Set drag and drop flags for top-level item (reordering only, no merging as child)
-                item.setFlags((item.flags() | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled)
+                for e in reg:
+                    # Create root item for the layer
+                    item = QTreeWidgetItem()
+                    item.setData(0, Qt.UserRole, e["id"])
+                    # Set drag and drop flags for top-level item (reordering only, no merging as child)
+                    item.setFlags((item.flags() | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled)
                 
-                # Checkbox
-                item.setCheckState(0, Qt.Checked if e.get("visible", True) else Qt.Unchecked)
+                    # Checkbox
+                    item.setCheckState(0, Qt.Checked if e.get("visible", True) else Qt.Unchecked)
                 
-                # Determine geometry type
-                geom_type = e.get("geom")
-                if not geom_type:
-                    if e.get("kind") == "raster":
-                        geom_type = "raster"
-                    else:
-                        name_lower = e.get("name", "").lower()
-                        if "_pnt" in name_lower or "point" in name_lower:
-                            geom_type = "point"
-                        elif "_line" in name_lower or "line" in name_lower:
-                            geom_type = "line"
+                    # Determine geometry type
+                    geom_type = e.get("geom")
+                    if not geom_type:
+                        if e.get("kind") == "raster":
+                            geom_type = "raster"
                         else:
-                            geom_type = "polygon"
+                            name_lower = e.get("name", "").lower()
+                            if "_pnt" in name_lower or "point" in name_lower:
+                                geom_type = "point"
+                            elif "_line" in name_lower or "line" in name_lower:
+                                geom_type = "line"
+                            else:
+                                geom_type = "polygon"
 
-                # Check if layer has multiple sub-layers
-                has_multiple_subs = "sub_layers" in e and len(e["sub_layers"]) > 1
+                    # Check if layer has multiple sub-layers
+                    has_multiple_subs = "sub_layers" in e and len(e["sub_layers"]) > 1
 
-                # Icon
-                if has_multiple_subs:
-                    multi_geom = f"multi{geom_type}" if geom_type in ("point", "line", "polygon") else geom_type
-                    symbol_color = _layer_color(e).name()
-                    item.setIcon(0, QIcon(_symbol_pixmap(multi_geom, symbol_color, 14)))
-                else:
-                    if "sub_layers" in e and len(e["sub_layers"]) == 1:
-                        sub_info = list(e["sub_layers"].values())[0]
-                        symbol_color = sub_info.get("color") or _layer_color(e).name()
-                    else:
+                    # Icon
+                    if has_multiple_subs:
+                        multi_geom = f"multi{geom_type}" if geom_type in ("point", "line", "polygon") else geom_type
                         symbol_color = _layer_color(e).name()
-                    item.setIcon(0, QIcon(_symbol_pixmap(geom_type, symbol_color, 14)))
+                        item.setIcon(0, QIcon(_symbol_pixmap(multi_geom, symbol_color, 14)))
+                    else:
+                        if "sub_layers" in e and len(e["sub_layers"]) == 1:
+                            sub_info = list(e["sub_layers"].values())[0]
+                            symbol_color = sub_info.get("color") or _layer_color(e).name()
+                        else:
+                            symbol_color = _layer_color(e).name()
+                        item.setIcon(0, QIcon(_symbol_pixmap(geom_type, symbol_color, 14)))
                 
-                # Text & count
-                item.setText(0, e["name"])
-                if e.get("kind") != "raster":
-                    count = _feature_count(e)
-                    item.setText(1, str(count))
-                    item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-                    item.setForeground(1, QColor(cols_theme["muted"]))
-                else:
-                    item.setText(1, "-")
-                    item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-                    item.setForeground(1, QColor(cols_theme["muted"]))
+                    # Text & count
+                    item.setText(0, e["name"])
+                    if e.get("kind") != "raster":
+                        count = _feature_count(e)
+                        item.setText(1, str(count))
+                        item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                        item.setForeground(1, QColor(cols_theme["muted"]))
+                    else:
+                        item.setText(1, "-")
+                        item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                        item.setForeground(1, QColor(cols_theme["muted"]))
                 
-                # Font and colors
-                font = layer_list.font()
-                font.setPointSize(9.0)
-                item.setFont(0, font)
-                item.setFont(1, font)
-                item.setForeground(0, QColor(cols_theme["text"]))
+                    # Font and colors
+                    font = layer_list.font()
+                    font.setPointSize(9.0)
+                    item.setFont(0, font)
+                    item.setFont(1, font)
+                    item.setForeground(0, QColor(cols_theme["text"]))
                 
-                layer_list.addTopLevelItem(item)
+                    layer_list.addTopLevelItem(item)
                 
-                # If layer has multiple sub-layers, add them as child items!
-                if has_multiple_subs:
-                    for sub_code, sub_info in e["sub_layers"].items():
-                        child = QTreeWidgetItem()
-                        child.setData(0, Qt.UserRole, e["id"])
-                        child.setData(0, Qt.UserRole + 1, sub_code)
-                        # Sub-layers cannot be dragged and do not accept drops
-                        child.setFlags(child.flags() & ~Qt.ItemIsDragEnabled & ~Qt.ItemIsDropEnabled)
+                    # If layer has multiple sub-layers, add them as child items!
+                    if has_multiple_subs:
+                        for sub_code, sub_info in e["sub_layers"].items():
+                            child = QTreeWidgetItem()
+                            child.setData(0, Qt.UserRole, e["id"])
+                            child.setData(0, Qt.UserRole + 1, sub_code)
+                            # Sub-layers cannot be dragged and do not accept drops
+                            child.setFlags(child.flags() & ~Qt.ItemIsDragEnabled & ~Qt.ItemIsDropEnabled)
                         
-                        # Sub-layer visibility
-                        sub_visible = True
-                        sub_actors = _sub_layer_actors(sub_info)
-                        if sub_actors:
-                            try:
-                                sub_visible = any(bool(actor.GetVisibility()) for actor in sub_actors)
-                            except Exception:
-                                pass
-                        child.setCheckState(0, Qt.Checked if sub_visible else Qt.Unchecked)
+                            # Sub-layer visibility
+                            sub_visible = True
+                            sub_actors = _sub_layer_actors(sub_info)
+                            if sub_actors:
+                                try:
+                                    sub_visible = any(bool(actor.GetVisibility()) for actor in sub_actors)
+                                except Exception:
+                                    pass
+                            child.setCheckState(0, Qt.Checked if sub_visible else Qt.Unchecked)
                         
-                        # Sub-layer colored geometry symbol
-                        sub_color = sub_info.get("color", "#ffffff")
-                        child.setIcon(0, QIcon(_symbol_pixmap(geom_type, sub_color, 12)))
+                            # Sub-layer colored geometry symbol
+                            sub_color = sub_info.get("color", "#ffffff")
+                            child.setIcon(0, QIcon(_symbol_pixmap(geom_type, sub_color, 12)))
                         
-                        # Sub-layer text & count
-                        child.setText(0, sub_info.get("label", "Subtype"))
-                        sub_count = _feature_count(sub_info)
-                        child.setText(1, str(sub_count))
-                        child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-                        child.setForeground(1, QColor(cols_theme["muted"]))
+                            # Sub-layer text & count
+                            child.setText(0, sub_info.get("label", "Subtype"))
+                            sub_count = _feature_count(sub_info)
+                            child.setText(1, str(sub_count))
+                            child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                            child.setForeground(1, QColor(cols_theme["muted"]))
                         
-                        sub_font = layer_list.font()
-                        sub_font.setPointSize(8.5)
-                        child.setFont(0, sub_font)
-                        child.setFont(1, sub_font)
-                        child.setForeground(0, QColor(cols_theme["text"]))
+                            sub_font = layer_list.font()
+                            sub_font.setPointSize(8.5)
+                            child.setFont(0, sub_font)
+                            child.setFont(1, sub_font)
+                            child.setForeground(0, QColor(cols_theme["text"]))
                         
-                        item.addChild(child)
+                            item.addChild(child)
                     
-                    # Expand the item by default to show subtypes
-                    item.setExpanded(True)
+                        # Expand the item by default to show subtypes
+                        item.setExpanded(True)
                     
-            model = layer_list.model()
-            if model is not None:
-                model.blockSignals(False)
-            layer_list.blockSignals(False)
-            stack.setCurrentIndex(0 if reg else 1)
-            if prev is not None:
-                _select_id(prev)
+                stack.setCurrentIndex(0 if reg else 1)
+                if prev is not None:
+                    _select_id(prev)
+            finally:
+                layer_list.blockSignals(was_blocked)
+                panel._rebuilding = False
             _sync_table_btn()
 
         panel.refresh = refresh
 
         def _reorder_from_list():
+            panel._reorder_pending = False
+            if panel._rebuilding:
+                return
             ids = []
             for i in range(layer_list.topLevelItemCount()):
                 item = layer_list.topLevelItem(i)
@@ -1620,8 +1639,19 @@ class GisLayersDock:
                 _reorder_registry(app, ids)
             refresh()
 
-        layer_list.model().rowsMoved.connect(_reorder_from_list)
-        layer_list.model().layoutChanged.connect(_reorder_from_list)
+        reorder_timer = QTimer(panel)
+        reorder_timer.setSingleShot(True)
+        reorder_timer.timeout.connect(_reorder_from_list)
+
+        def _queue_reorder(*_):
+            if panel._rebuilding or panel._reorder_pending:
+                return
+            panel._reorder_pending = True
+            # Do not delete QTreeWidgetItems inside a Qt move/layout callback.
+            reorder_timer.start(0)
+
+        layer_list.model().rowsMoved.connect(_queue_reorder)
+        layer_list.model().layoutChanged.connect(_queue_reorder)
 
         # Checkbox toggling handler
         def _on_item_changed(item, column):

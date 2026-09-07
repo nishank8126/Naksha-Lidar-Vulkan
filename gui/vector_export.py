@@ -3708,7 +3708,7 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         else:
             xy_extent = max(abs(right - left), abs(top - bottom))
         raster_z_offset = max(xy_extent * 0.001, 1e-3)  # ~0.1% of extent, scale-aware
-        raster_z = scene_z - raster_z_offset
+        raster_z = 0.0  # Dedicated raster renderer: layer rank alone controls depth.
         print(f"   📐 Placing texture plane at Z = {raster_z:.3f} "
               f"(vectors at {scene_z:.3f}, offset {raster_z_offset:.3f})")
 

@@ -207,7 +207,8 @@ def apply_raster_style(app, entry: dict, style: dict) -> bool:
         entry["style"] = dict(style)
         entry["opacity"] = max(0.0, min(1.0, style.get("opacity", 100) / 100.0))
         actor.GetProperty().SetOpacity(entry["opacity"])
-        meta.pop("_last_window", None)
+        # Keep crop coverage until replacement; only its style is stale.
+        meta.pop("_last_style", None)
         from gui.gis.raster_lod import kick
         kick(app)
         app.vtk_widget.render()

@@ -13061,6 +13061,18 @@ class NakshaApp(QMainWindow):
                 "The application has not closed. Please try again shortly.",
             )
             return
+
+        # Past this point the close is committed - stop the raster refinement
+        # loader before VTK teardown below, since its timer/executor could
+        # otherwise deliver a texture upload after the render window is
+        # finalized (_shutdown_in_progress also guards this loader directly).
+        try:
+            _raster_loader = getattr(self, "_raster_lod_loader", None)
+            if _raster_loader is not None:
+                _raster_loader.close()
+        except Exception as _e:
+            print(f"⚠️ Raster LOD loader shutdown failed: {_e}")
+
         active_classification_dialog = getattr(
             self,
             "_lidar_classification_active_dialog",
