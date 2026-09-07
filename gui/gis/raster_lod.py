@@ -30,7 +30,17 @@ from functools import lru_cache
 import os
 
 _DEBOUNCE_MS = 250
-_REFETCH_MARGIN = 0.15   # read 15% extra world extent on each side, so a small pan reuses it
+# How far past the visible view to pre-load on each side, as a fraction of
+# the view's own width/height. Panning within this padded region reuses the
+# already-loaded texture with zero fetch - genuinely instant, not just fast.
+# Kept moderate rather than large: the padded window's target pixel count
+# grows with the SQUARE of (1 + 2*margin), and that has to stay within
+# _BASE_MEGAPIXEL_CAP/_TIGHT_ZOOM_MEGAPIXEL_CAP below or the extra padding
+# would eat into the sharpness budget meant for the visible center, not just
+# add buffer around it. 0.35 covers roughly meaningful pan distance (more
+# than a third of the current view in every direction) while keeping the
+# fetched crop well clear of those caps and of GPU max-texture-size limits.
+_REFETCH_MARGIN = 0.35
 _ZOOM_TOLERANCE = 1.1    # don't refetch for <10% extra zoom over what's already loaded
 _FAIL_BACKOFF_BASE_S = 2.0
 _FAIL_BACKOFF_MAX_S = 30.0
