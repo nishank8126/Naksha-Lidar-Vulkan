@@ -796,13 +796,16 @@ class GlobalSettingsDialog(QDialog):
         self.panning_button_combo = QComboBox()
         self.panning_button_combo.addItem("Scroll Button (Middle Click)", "scroll")
         self.panning_button_combo.addItem("Left Mouse Button", "left")
+        self.panning_button_combo.addItem("Tap-Tap Pan (MicroStation)", "tap")
         self.panning_button_combo.currentIndexChanged.connect(self._update_navigation_summary)
         form.addRow("Panning button:", self.panning_button_combo)
 
         note_pan = QLabel(
             "Scroll Button uses the scroll wheel press for panning. "
-            "Left Mouse Button pans only after the user-defined Pan shortcut is activated. "
-            "Pan stays disabled while another tool owns left click."
+            "Left Mouse Button pans by left-dragging (MicroStation Pan-tool style). "
+            "Tap-Tap Pan pans like MicroStation's dynamic pan: tap once to start "
+            "panning, move the mouse without holding any button, and tap again to stop. "
+            "Pan stays disabled while another tool owns the left click."
         )
         note_pan.setObjectName("dialogCaption")
         note_pan.setWordWrap(True)
@@ -1314,7 +1317,9 @@ class GlobalSettingsDialog(QDialog):
 
         panning = self.panning_button_combo.currentData() or "scroll"
         if panning == "left":
-            panning_text = "Activate the configured Pan shortcut, then left-drag; active tools keep ownership of left click."
+            panning_text = "Left-drag pans in the main view (when no tool owns left click); middle-click drag also pans."
+        elif panning == "tap":
+            panning_text = "Tap once to start panning, move to pan without holding, tap again to stop (MicroStation dynamic pan)."
         else:
             panning_text = "Scroll Button (Middle Click) is used for panning."
 
