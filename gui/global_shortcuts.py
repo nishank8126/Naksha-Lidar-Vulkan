@@ -820,8 +820,29 @@ class GlobalShortcutFilter(QObject):
                     # FINALIZED=3 means cut dock is open but user may have moved to Draw tab
                     cut_section_waiting = _cut_state in (1, 2)  # WAITING_CENTER or WAITING_DEPTH only
  
+                # Element Select (the block-select/Move tool) must win LEVEL 3's
+                # curve-history fallback below. That fallback matches whenever
+                # ANY curve was ever finished this session (history_stack stays
+                # non-empty across tool switches, by design - see its comment),
+                # with no check on what tool is active now. Without excluding
+                # Element Select here, pressing Ctrl+Z during/after a Move on
+                # a totally unrelated element gets hijacked into
+                # `_curve_tool.undo_curve()` instead of reaching LEVEL 3.5's
+                # "Element Select Undo", which also carries the classification-
+                # priority guard that path is supposed to enforce.
+                element_select_active = bool(getattr(
+                    getattr(getattr(self.app_window, 'digitizer', None),
+                            '_element_select_tool', None),
+                    '_active', False,
+                ))
+
                 # If ANY other tool is active, curve/digitizer completed undo is blocked
-                other_tool_active = classification_active or cross_section_active or cut_section_waiting
+                other_tool_active = (
+                    classification_active
+                    or cross_section_active
+                    or cut_section_waiting
+                    or element_select_active
+                )
  
 
                 # ═══════════════════════════════════════════════════════════════════
