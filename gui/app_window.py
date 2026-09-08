@@ -18068,7 +18068,24 @@ class NakshaApp(QMainWindow):
         # its section-refresh keeps firing - even though drawing curves
         # visibly proceeds, exactly the "curve doesn't behave like
         # SmartLine" symptom reported.
-        if getattr(self, 'active_classify_tool', None):
+        #
+        # Checking only active_classify_tool isn't enough: a line-style tool
+        # (above_line/below_line/parallel_line) armed while a cross-section
+        # exists attaches wrapper interactors into classify_interactors
+        # without ever touching the main view, and other code paths can
+        # clear active_classify_tool while leaving those wrappers (or the
+        # main-view classify_interactor / cut_classify_interactor) attached.
+        # Ctrl+Z's routing (see global_shortcuts._is_classification_active
+        # and UndoContextManager.is_classification_active) treats any of
+        # those as "classification still active", so this guard must use
+        # the same comprehensive check - otherwise it silently skips
+        # teardown and undo keeps eating classification forever after,
+        # even once the curve is finalized and visibly the active tool.
+        try:
+            from gui.undo_context_manager import get_undo_context_manager
+        except ImportError:
+            from .undo_context_manager import get_undo_context_manager
+        if get_undo_context_manager(self).is_classification_active():
             try:
                 print("🛑 Draw tool 'curve' selected — deactivating classification tool")
                 self.deactivate_classification_tool(preserve_cross_section=True)
