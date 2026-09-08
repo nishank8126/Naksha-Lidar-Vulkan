@@ -18057,6 +18057,39 @@ class NakshaApp(QMainWindow):
  
     def on_curve_button_clicked(self):
         """Activate the curve drawing tool"""
+        # Curve is activated through its own dedicated path rather than
+        # digitizer.set_tool() (which every other draw tool - SmartLine,
+        # Polyline, Rectangle, etc. - goes through), so it never got the
+        # classification/cross-section/cut-section teardown set_tool()
+        # does for those tools (see set_tool()'s own "Draw tool selected -
+        # deactivating ..." checks in digitize_tools.py). Without this,
+        # picking Curve while a classification tool is armed leaves it
+        # armed - the classification undo stack keeps eating Ctrl+Z and
+        # its section-refresh keeps firing - even though drawing curves
+        # visibly proceeds, exactly the "curve doesn't behave like
+        # SmartLine" symptom reported.
+        if getattr(self, 'active_classify_tool', None):
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating classification tool")
+                self.deactivate_classification_tool(preserve_cross_section=True)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate classification before curve tool: {e}")
+
+        if getattr(self, 'cross_section_active', False):
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating cross-section tool")
+                self.deactivate_cross_section_tool()
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate cross-section before curve tool: {e}")
+
+        if getattr(self, 'cut_section_mode_on', False):
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating cut-section tool")
+                self.cut_section_controller.cancel_cut_section()
+                self.cut_section_mode_on = False
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate cut-section before curve tool: {e}")
+
         # Deactivate other tools first (safe checks)
         for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
             dialog = getattr(self, dialog_attr, None)
