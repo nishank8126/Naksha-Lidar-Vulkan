@@ -30,15 +30,15 @@ class PremiumAIController:
 
     # Frozen strict-exact production contract.
     EXPECTED_SHA256 = {
-        "engine": "29b190f2c5d629f3fa9b6d21d0f34e78842a9345116850b82317d86425884095",
-        "v33": "45b107b59f014992449dd815b7baef4dd66fecd654817cf7170ecc2569b54ed9",
-        "phase15_worker": "4d456982f856900f4a84f02c247d8f1acc4f9d6c201effa31f0c5e020b868750",
-        "scripted_fps": "a25b39f7c8c371bf76edd33b8e366c7681575b1c018bdc6176e48369abe6f0c4",
+        "engine": "0572b623db2216fc07d896a1c67894908994476fa455368224f6e32817197ce4",
+        "v33": "925e3bdff08819455b6ea19bee423e250926baaae5a22a522c05d939d557aa7f",
+        "phase15_worker": "cb6d021c9792c998f2bb6082f390546f874b7e9f3ba20dddb97bcc922ad68015",
+        "scripted_fps": "870e82cf9c8a7bc596685c08858387c1b58ceb8ccafbc66dc0fd51de781fba93",
         "model": "ed36e6eba1802fa7a50c69792e2d212c522bdac3e2cb42ac4e8d3991945fbcbe",
         "stats": "c395874c3dcb7a1f4bb319f882e0d52295a04b40657632803690d6054f317e6f",
         "model_py": "8e76e094c5225cddba588affbc5edccb26db2ca17786bf3892356c0a6e61ff91",
-        "hybrid": "ff3d380f6c96d4cdc880f1fb02b31352ef5c342c3fd692e68c568440e51ffd17",
-        "dtm": "2d2a461331654768d2a5024bfe24369b6020d3aa6ca87d426ac359ed68061a9e",
+        "hybrid": "0890ff56a573cbeccea96eab7b704a8920a8f0dbd17d0237b5429e9c99b7d2d7",
+        "dtm": "29c6fb2434e764f5746156663a8f73ff4ca5fbea4fb9e07f6c5604546e433f44",
     }
 
     def __init__(self, device=None):

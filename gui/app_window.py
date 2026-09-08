@@ -1,4 +1,4 @@
-﻿import os
+import os
 import random
 import vtk
 import time
@@ -143,6 +143,55 @@ class MainWheelZoomEventFilter(QObject):
         # release instead of leaking an unmatched release into VTK.
         self._owns_main_pan = False
         self._owned_main_pan_button = None
+        # MicroStation-style "tap-tap" (dynamic) pan state: one tap starts
+        # panning, the view follows the cursor without holding any button,
+        # and a second tap / Esc / right-click ends it.
+        self._tap_session = False
+        self._tap_press_pos = None
+        self._tap_swallow_release_button = None
+
+    @staticmethod
+    def _tap_mode(app):
+        """True when the persistent panning button is set to tap-tap pan."""
+        return getattr(app, "panning_button", "scroll") == "tap"
+
+    def _eligible_pan_button(self, app, pressed_button, modifiers=Qt.NoModifier):
+        """Return the pan button for a press, or None if it is not one."""
+        if pressed_button == Qt.MiddleButton:
+            # Physical middle is always pan, irrespective of which
+            # configurable primary pan button is selected.
+            return Qt.MiddleButton
+        if pressed_button == Qt.LeftButton:
+            # Shift+Left is reserved for the native 3D rotate/orbit gesture
+            # (works fine when the panning-button setting is "scroll",
+            # since that setting never claims Left at all) -- with "Left
+            # Mouse Button" or "Tap-Tap" panning, every Left press was
+            # claimed for pan unconditionally, including Shift+Left, so
+            # that gesture stopped reaching whatever handles it as soon as
+            # a Left-based panning-button setting was chosen. Let it
+            # through here regardless of the panning-button setting.
+            if modifiers & Qt.ShiftModifier:
+                return None
+            pb = getattr(app, "panning_button", "scroll")
+            if pb in ("left", "tap") or getattr(
+                app, "_left_pan_shortcut_active", False
+            ):
+                return Qt.LeftButton
+        return None
+
+    def _finish_tap_session(self, app):
+        """End an open tap-pan session cleanly (second tap, Esc, right-click,
+        a key press, or a tool taking over the canvas)."""
+        self._tap_session = False
+        self._tap_press_pos = None
+        self._owns_main_pan = False
+        self._owned_main_pan_button = None
+        release = getattr(app, "_handle_fast_main_pan_release", None)
+        try:
+            if callable(release):
+                release()
+        except Exception:
+            pass
 
     @staticmethod
     def _left_button_is_owned_by_tool(app):
@@ -170,6 +219,32 @@ class MainWheelZoomEventFilter(QObject):
             tool = getattr(app, tool_name, None)
             if tool is not None and getattr(tool, "active", False):
                 return True
+        # Main-view-only tools that own the left click while active. Section/cut
+        # viewports never run these, but in the main view a configured "Left
+        # Mouse Button" pan must not swallow their first click/drag.
+        for tool_attr in (
+            "select_rectangle_tool",
+            "zoom_rectangle_tool",
+            "grid_tool",
+            "curve_tool",
+            "temp_fence_tool",
+        ):
+            tool = getattr(app, tool_attr, None)
+            if tool is not None and getattr(tool, "active", False):
+                return True
+        if getattr(app, "_draw_curve_context_active", False):
+            return True
+        # Parallel/Centerline dialogs pick an existing line by installing
+        # their own one-shot VTK LeftButtonPressEvent observer directly on
+        # the interactor (see gui/parallel_tool_dialog.py and
+        # gui/centerline_tool_dialog.py) while `_select_mode` is True -
+        # they never set `digitizer.active_tool`, so without this check a
+        # configured Left/Tap-Tap pan claims and swallows that click as a
+        # camera pan instead of letting it reach the dialog's picker.
+        for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
+            dialog = getattr(app, dialog_attr, None)
+            if dialog is not None and getattr(dialog, "_select_mode", False):
+                return True
         return False
 
     def eventFilter(self, obj, event):
@@ -190,7 +265,15 @@ class MainWheelZoomEventFilter(QObject):
                 )
             except Exception:
                 is_plain_escape = False
-            if is_plain_escape:
+            if self._tap_session:
+                # An open tap-pan session is ended by any key press - Esc
+                # above all - so the user always has a reliable escape hatch.
+                if is_plain_escape:
+                    self._finish_tap_session(app)
+                    event.accept()
+                    return True
+                self._finish_tap_session(app)
+            elif is_plain_escape:
                 deactivate = getattr(
                     app,
                     "_deactivate_active_identification_tools_for_escape",
@@ -214,35 +297,102 @@ class MainWheelZoomEventFilter(QObject):
             if getattr(app, "is_3d_mode", False):
                 return False
             if getattr(app, "active_classify_tool", None) is not None:
+                # Classification tools take over the canvas: close any
+                # still-open tap-pan session before handing events over.
+                if self._tap_session:
+                    self._finish_tap_session(app)
+                return False
+
+            if self._tap_session and self._left_button_is_owned_by_tool(app):
+                # A tap-pan session runs with no button held, so the user's
+                # hand is completely free to activate cross-section, the
+                # draw/digitizer tools, measurement, etc. via a toolbar
+                # button or shortcut while the view is still dynamically
+                # following the cursor. Without this check, every mouse
+                # event kept getting swallowed by the still-active tap
+                # session (see the MouseMove branch below, which pans
+                # unconditionally while _tap_session is True) until the
+                # user happened to click again -- silently eating that
+                # tool's first click/hover instead of letting it own the
+                # canvas immediately, the way _left_button_is_owned_by_tool
+                # already guarantees for a brand new press. An ordinary
+                # (non-tap) hold-drag pan is not affected: that requires
+                # the mouse button to be physically held down while
+                # switching tools, which is not a realistic path here and
+                # already ends on its own physical release regardless.
+                self._finish_tap_session(app)
                 return False
 
             active = bool(getattr(app, "_qt_main_pan_active", False))
+            tap_mode = self._tap_mode(app)
             try:
                 if event_type == QEvent.MouseButtonPress:
                     pressed_button = event.button()
-                    left_pan_enabled = bool(
-                        getattr(app, "_left_pan_shortcut_active", False)
-                    )
-                    if pressed_button == Qt.MiddleButton:
-                        # Physical middle is always pan, irrespective of which
-                        # configurable primary pan button is selected.
-                        pan_button = Qt.MiddleButton
-                    elif pressed_button == Qt.LeftButton and left_pan_enabled:
-                        pan_button = Qt.LeftButton
+                    # A new press supersedes a pending release-swallow (the OS
+                    # normally delivers the matching release first, so this
+                    # only guards lost-focus edge cases).
+                    if self._tap_swallow_release_button is not None:
+                        self._tap_swallow_release_button = None
+                    # A right press ends an open tap-pan session and is
+                    # consumed so it cannot open menus behind the pan.
+                    if pressed_button == Qt.RightButton and self._tap_session:
+                        self._finish_tap_session(app)
+                        handled = True
                     else:
-                        return False
-                    if (
-                        pan_button == Qt.LeftButton
-                        and self._left_button_is_owned_by_tool(app)
-                    ):
-                        return False
-                    handler = getattr(app, "_handle_fast_main_pan_press", None)
-                    handled = bool(
-                        handler(event.position(), obj.width(), obj.height())
-                    ) if callable(handler) else False
-                    if handled:
-                        self._owns_main_pan = True
-                        self._owned_main_pan_button = pan_button
+                        # Left-drag pans in the main view when the Pan shortcut
+                        # is armed or the persistent setting is Left / Tap-Tap.
+                        # _left_button_is_owned_by_tool() keeps every active
+                        # tool's left clicks untouched.
+                        pan_button = self._eligible_pan_button(
+                            app, pressed_button, event.modifiers()
+                        )
+                        if pan_button is None:
+                            if pressed_button == Qt.LeftButton and self._tap_session:
+                                self._finish_tap_session(app)
+                            return False
+                        if (
+                            pan_button == Qt.LeftButton
+                            and self._left_button_is_owned_by_tool(app)
+                        ):
+                            if self._tap_session:
+                                self._finish_tap_session(app)
+                            return False
+                        if self._tap_session:
+                            # Second tap/click ends the MicroStation-style pan.
+                            self._finish_tap_session(app)
+                            self._tap_swallow_release_button = pressed_button
+                            handled = True
+                        else:
+                            handler = getattr(
+                                app, "_handle_fast_main_pan_press", None
+                            )
+                            handled = bool(
+                                handler(
+                                    event.position(), obj.width(), obj.height()
+                                )
+                            ) if callable(handler) else False
+                            if handled:
+                                self._owns_main_pan = True
+                                self._owned_main_pan_button = pan_button
+                                # Tap-vs-drag detection is a Left-button-only
+                                # feature (it exists to let the configured
+                                # primary pan button skip holding it down).
+                                # Physical middle-click pan must always stay
+                                # plain hold-drag, per _eligible_pan_button's
+                                # own contract above ("Physical middle is
+                                # always pan, irrespective of which
+                                # configurable primary pan button is
+                                # selected") -- without this button check, a
+                                # quick middle-click tap (little movement
+                                # before release) would have been
+                                # misclassified as a tap and started a
+                                # dynamic pan session bound to the middle
+                                # button instead of ending normally.
+                                if tap_mode and pan_button == Qt.LeftButton:
+                                    self._tap_press_pos = (
+                                        event.position().x(),
+                                        event.position().y(),
+                                    )
                 elif event_type == QEvent.MouseMove:
                     if not active:
                         # A right-click grid load can block Qt long enough for
@@ -262,7 +412,13 @@ class MainWheelZoomEventFilter(QObject):
                     pan_button = self._owned_main_pan_button
                     if pan_button is None:
                         return False
-                    pan_button_down = bool(event.buttons() & pan_button)
+                    if self._tap_session:
+                        # MicroStation dynamic pan: no button needs to stay
+                        # held - the view keeps following the cursor until the
+                        # second tap / Esc / right-click / key ends the session.
+                        pan_button_down = True
+                    else:
+                        pan_button_down = bool(event.buttons() & pan_button)
                     handler = getattr(app, "_handle_fast_main_pan_move", None)
                     handled = bool(
                         handler(
@@ -272,21 +428,79 @@ class MainWheelZoomEventFilter(QObject):
                             middle_down=pan_button_down,
                         )
                     ) if callable(handler) else False
-                else:
-                    pan_button = self._owned_main_pan_button
-                    if pan_button is None:
-                        return False
-                    if event.button() != pan_button or not (
-                        active or self._owns_main_pan
-                    ):
-                        return False
-                    if active:
-                        handler = getattr(app, "_handle_fast_main_pan_release", None)
-                        handled = bool(handler()) if callable(handler) else False
+                else:  # MouseButtonRelease
+                    if self._tap_swallow_release_button is not None:
+                        # Consume the release that belongs to the tap which
+                        # ended the session; the widget must never see it.
+                        if event.button() == self._tap_swallow_release_button:
+                            self._tap_swallow_release_button = None
+                            handled = True
+                        else:
+                            return False
                     else:
-                        handled = True
-                    self._owns_main_pan = False
-                    self._owned_main_pan_button = None
+                        pan_button = self._owned_main_pan_button
+                        if pan_button is None:
+                            return False
+                        if event.button() != pan_button or not (
+                            active or self._owns_main_pan
+                        ):
+                            return False
+                        started_tap_session = False
+                        if active:
+                            if (
+                                tap_mode
+                                and not self._tap_session
+                                and self._tap_press_pos is not None
+                            ):
+                                # Decide tap vs hold-drag on release: a release
+                                # with (almost) no movement means the user
+                                # tapped once -> stay in a dynamic pan session.
+                                # A real physical mouse click routinely jitters
+                                # more than 4px between press and release, so
+                                # that radius misclassified many genuine taps
+                                # as a hold-drag -- falling through to the
+                                # ordinary press-drag-release pan below, which
+                                # looks and feels identical to left-click-pan.
+                                # 10px matches typical OS click-vs-drag
+                                # tolerance and still sits far below any
+                                # deliberate drag gesture (tens/hundreds of
+                                # pixels), so genuine drags are unaffected.
+                                pos = (event.position().x(), event.position().y())
+                                dx = pos[0] - self._tap_press_pos[0]
+                                dy = pos[1] - self._tap_press_pos[1]
+                                if (dx * dx + dy * dy) <= 100.0:  # ~10 px radius
+                                    self._tap_session = True
+                                    started_tap_session = True
+                                    handled = True  # swallow the release
+                                else:
+                                    handler = getattr(
+                                        app, "_handle_fast_main_pan_release", None
+                                    )
+                                    handled = bool(handler()) if callable(handler) else False
+                            else:
+                                handler = getattr(
+                                    app, "_handle_fast_main_pan_release", None
+                                )
+                                handled = bool(handler()) if callable(handler) else False
+                        else:
+                            handled = True
+                        # A tap session that just started must keep "owning"
+                        # the pan button so the next MouseMove (see the
+                        # `active` branch above, which reads
+                        # _owned_main_pan_button to decide whether to call
+                        # _handle_fast_main_pan_move) still runs -- clearing
+                        # it here unconditionally (as before) made the view
+                        # never follow the cursor after the first tap, since
+                        # every move event bailed out at "pan_button is
+                        # None" before ever reaching the move handler.
+                        # Middle-click pan and "left" mode never set
+                        # started_tap_session (tap_mode is only true for the
+                        # "tap" panning-button setting), so both keep
+                        # resetting exactly as before.
+                        if not started_tap_session:
+                            self._owns_main_pan = False
+                            self._owned_main_pan_button = None
+                        self._tap_press_pos = None
             except Exception:
                 handled = False
 
@@ -1023,6 +1237,7 @@ class NakshaApp(QMainWindow):
         self._setup_interactor_swapper(
             self.sec_vtk.interactor,
             preserve_physical_middle_pan=True,
+            honor_persistent_left_pan=True,
         )
         self.sec_vtk.set_background(bg_color)
         self.sec_vtk.renderer.SetBackground(*bg_rgb)
@@ -1158,6 +1373,8 @@ class NakshaApp(QMainWindow):
         from gui.digitize_tools import DigitizeManager
         renderer = self.vtk_widget.renderer
         self.digitizer = DigitizeManager(self, renderer, self.vtk_widget.interactor)
+        from gui.scene_render_pipeline import ensure_scene_render_pipeline
+        ensure_scene_render_pipeline(self)
         self._install_canvas_axis_render_observer()
         print("✅ Digitizer initialized")   
         
@@ -1178,6 +1395,10 @@ class NakshaApp(QMainWindow):
         from gui.identification_tool import IdentificationTool
         self.identification_tool = IdentificationTool(self)
         print("✅ Identification tool initialized")
+
+        from gui.cross_section_measurement_tool import CrossSectionMeasurementTool
+        self.cross_section_measurement_tool = CrossSectionMeasurementTool(self)
+        print("✅ Cross-section measurement tool initialized")
 
         from gui.point_sync_tool import PointSyncTool
         self.point_sync_tool = PointSyncTool(self)
@@ -2509,11 +2730,11 @@ class NakshaApp(QMainWindow):
         # (and silently misreported it for mixed-CRS projects).
         epsg = None
         try:
-            from gui.crs_manager import get_canvas_crs
+            from gui.crs_manager import get_canvas_crs, extract_epsg_code
             canvas = get_canvas_crs(self)
             if canvas is not None:
-                code = canvas.to_epsg()
-                epsg = str(code) if code else None
+                code = extract_epsg_code(canvas)
+                epsg = str(code) if code else (getattr(canvas, "name", None) or "custom")
         except Exception:
             epsg = None
 
@@ -4405,6 +4626,7 @@ class NakshaApp(QMainWindow):
         self._setup_interactor_swapper(
             vtk_widget.interactor,
             preserve_physical_middle_pan=True,
+            honor_persistent_left_pan=True,
         )
         from gui.theme_manager import ThemeManager
         bg_color = ThemeManager.canvas_background_for_theme()
@@ -4508,6 +4730,13 @@ class NakshaApp(QMainWindow):
                         point_sync_tool.deactivate_for_section(view_index)
                 except Exception as e:
                     print(f"   ⚠️ Point sync section observer cleanup warning: {e}")
+
+                try:
+                    cs_measure = getattr(self, "cross_section_measurement_tool", None)
+                    if cs_measure is not None and hasattr(cs_measure, "deactivate_for_section"):
+                        cs_measure.deactivate_for_section(view_index)
+                except Exception as e:
+                    print(f"   ⚠️ Cross-section measurement observer cleanup warning: {e}")
 
                 # ✅ CRITICAL: Stop all VTK rendering FIRST
                 try:
@@ -4630,6 +4859,9 @@ class NakshaApp(QMainWindow):
                 app_ref = self
                 def _make_handler(app):
                     def _handler(obj, event):
+                        cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                        if cs_measure is not None and getattr(cs_measure, "active", False):
+                            return
                         print(f"🖱️ Right-click detected in cross-section view")
                         active_tool = getattr(app, "active_classify_tool", None)
                         section_has_classifier = bool(getattr(app, "classify_interactors", None))
@@ -4730,6 +4962,10 @@ class NakshaApp(QMainWindow):
         if hasattr(self, 'identification_tool') and self.identification_tool.active:
             self.identification_tool.activate_for_section(vtk_widget, view_index)
             print(f"🔍 Auto-activated identification for view {view_index + 1}")
+
+        if hasattr(self, 'cross_section_measurement_tool') and self.cross_section_measurement_tool.active:
+            self.cross_section_measurement_tool.activate_for_section(vtk_widget, view_index)
+            print(f"📏 Auto-activated cross-section measurement for view {view_index + 1}")
 
         if hasattr(self, 'point_sync_tool') and self.point_sync_tool.active:
             self.point_sync_tool.activate_for_section(vtk_widget, view_index)
@@ -6059,7 +6295,8 @@ class NakshaApp(QMainWindow):
         from gui.shading_display import clear_shading_cache
         clear_shading_cache(reason="new file")
 
-        # Backup overlay actors (DXF + SNT) so they survive the clear
+        # Backup overlay actors (DXF + SNT) so they survive the data-layer clear.
+        # Rasters live in their own renderer and are never touched here.
         renderer    = self.vtk_widget.renderer
         dxf_backup  = []
         snt_backup  = []
@@ -6141,6 +6378,15 @@ class NakshaApp(QMainWindow):
         # relative to the next LAZ file. _get_snt_z_offset reads this cache first;
         # if it holds the previous file's z_max the SNT grid appears at the wrong height.
         self.data_bounds    = None
+
+        # Reset canvas CRS if no SNT is preserved across file switch
+        has_snt = bool(snt_backup or getattr(self, "snt_attachments", None))
+        if not has_snt:
+            try:
+                from gui.crs_manager import clear_canvas_crs
+                clear_canvas_crs(self)
+            except Exception:
+                pass
 
         for attr in ("view_palettes", "layers"):
             obj = getattr(self, attr, None)
@@ -6341,15 +6587,61 @@ class NakshaApp(QMainWindow):
         print(f"   Memory used: {xyz_mb + cls_mb + rgb_mb:.1f} MB")
 
         # ── CRS ────────────────────────────────────────────────────────
-        if result.get("crs_epsg"):
-            self.project_crs_epsg = result["crs_epsg"]
-            self.project_crs_wkt  = result.get("crs_wkt")
-            try:
-                from pyproj import CRS
-                self.crs = CRS.from_epsg(self.project_crs_epsg)
-                print(f"   📐 CRS: {self.crs.name}")
-            except Exception:
-                pass
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import (
+                set_canvas_crs,
+                ensure_canvas_crs,
+                clear_canvas_crs,
+                resolve_point_cloud_crs,
+            )
+            source_crs = None
+            source_label = "LAZ/LAS header"
+
+            if result.get("crs_wkt"):
+                try:
+                    source_crs = _CRS.from_wkt(result["crs_wkt"])
+                    source_label = "LAZ/LAS header WKT"
+                except Exception:
+                    source_crs = None
+
+            if source_crs is None and result.get("crs_epsg"):
+                try:
+                    source_crs = _CRS.from_epsg(int(result["crs_epsg"]))
+                    source_label = "LAZ/LAS header EPSG"
+                except Exception:
+                    source_crs = None
+
+            if source_crs is None and first_file:
+                try:
+                    source_crs, source_label = resolve_point_cloud_crs(first_file)
+                except Exception:
+                    source_crs = None
+
+            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
+            if source_crs is not None:
+                if not has_snt:
+                    set_canvas_crs(
+                        self,
+                        source_crs,
+                        source=source_label or "LAZ/LAS metadata",
+                        dataset=first_file,
+                        force=True,
+                    )
+                else:
+                    ensure_canvas_crs(
+                        self,
+                        source_crs,
+                        source=source_label or "LAZ/LAS metadata",
+                        dataset=first_file,
+                    )
+                print(f"   📐 CRS: {source_crs.name} ({source_label})")
+            else:
+                if not has_snt:
+                    clear_canvas_crs(self)
+                print("   ⚠️ CRS unresolved: basemap alignment remains disabled")
+        except Exception as _crs_err:
+            print(f"   ⚠️ CRS registration failed: {_crs_err}")
 
         # ── Layers panel ───────────────────────────────────────────────
         for fi in result["layer_info_list"]:
@@ -6813,31 +7105,62 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Spatial index failed: {e}")
                 self.spatial_index = None
        
-        # Set CRS - route through the authoritative canvas CRS manager so the
-        # FIRST trustworthy georeferenced dataset establishes the canvas CRS and
-        # later datasets are reprojected into it rather than replacing it.
-        if lidar_data.get("crs_epsg"):
-            try:
-                from pyproj import CRS as _CRS
-                from gui.crs_manager import ensure_canvas_crs
-                _crs_obj = None
+        # Set CRS - route through the authoritative canvas CRS manager.
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import (
+                set_canvas_crs,
+                ensure_canvas_crs,
+                clear_canvas_crs,
+                resolve_point_cloud_crs,
+            )
+            _crs_obj = None
+            _crs_source = "LAZ/LAS header"
+
+            if lidar_data.get("crs_wkt"):
+                try:
+                    _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
+                    _crs_source = "LAZ/LAS header WKT"
+                except Exception:
+                    _crs_obj = None
+
+            if _crs_obj is None and lidar_data.get("crs_epsg"):
                 try:
                     _crs_obj = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
+                    _crs_source = "LAZ/LAS header EPSG"
                 except Exception:
-                    if lidar_data.get("crs_wkt"):
-                        try:
-                            _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
-                        except Exception:
-                            _crs_obj = None
-                if _crs_obj is not None:
-                    ensure_canvas_crs(self, _crs_obj,
-                                      source="LAZ/LAS header",
-                                      dataset=filename)
-                    print(f"Project CRS: {_crs_obj.name}")
+                    _crs_obj = None
+
+            if _crs_obj is None and filename:
+                try:
+                    _crs_obj, _crs_source = resolve_point_cloud_crs(filename)
+                except Exception:
+                    _crs_obj = None
+
+            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
+            if _crs_obj is not None:
+                if not has_snt:
+                    set_canvas_crs(
+                        self,
+                        _crs_obj,
+                        source=_crs_source or "LAZ/LAS metadata",
+                        dataset=filename,
+                        force=True,
+                    )
                 else:
-                    print("Could not create CRS object from lidar metadata")
-            except Exception as e:
-                print(f"Could not set canvas CRS: {e}")
+                    ensure_canvas_crs(
+                        self,
+                        _crs_obj,
+                        source=_crs_source or "LAZ/LAS metadata",
+                        dataset=filename,
+                    )
+                print(f"Project CRS: {_crs_obj.name} ({_crs_source})")
+            else:
+                if not has_snt:
+                    clear_canvas_crs(self)
+                print("Could not create CRS object from lidar metadata: basemap alignment disabled")
+        except Exception as e:
+            print(f"Could not set canvas CRS: {e}")
        
         self.loaded_file = filename
         self.last_save_path = filename
@@ -7509,6 +7832,11 @@ class NakshaApp(QMainWindow):
         # ✅ FIX: suspend (never cancel) any in-progress curve drawing before
         # the mode switch actually happens. Covers every caller of this
         # method, not just the keyboard-shortcut path.
+        # Every display mode owns only data-layer actors. Repair the shared
+        # compositor once here instead of adding ordering fixes to each mode.
+        from gui.scene_render_pipeline import ensure_scene_render_pipeline
+        ensure_scene_render_pipeline(self)
+
         self._suspend_curve_tool_safely(f"switching to {mode} display mode")
 
         import time as _time
@@ -10255,13 +10583,78 @@ class NakshaApp(QMainWindow):
                     clear_shading_cache("undo topology fallback")
                     update_shaded_class(self, force_rebuild=True)
 
+        # 6. Section Shaded/Surface meshes: undo never emits
+        #    classification_finished (unlike redo/classify commits), so the
+        #    section_mesh_display dispatcher never runs for it -- refresh
+        #    directly here instead.
+        try:
+            from gui.cross_section.section_shaded_surface import (
+                refresh_all_shaded_surface_sections_after_classify,
+            )
+            refresh_all_shaded_surface_sections_after_classify(self)
+        except Exception as _section_mesh_undo_err:
+            print(f"   ⚠️ Section Shaded/Surface refresh-after-undo failed: {_section_mesh_undo_err}")
+
         self._last_changed_mask = None
         self._last_changed_indices = None
         self._gpu_sync_done = False
         # Surface refresh owns its own presentation.  A metadata-only Surface
         # undo needs no 12M/50M-face redraw, while a true rebuild already rendered.
         if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            self.vtk_widget.render()
+            # gui/gpu_render_manager.py wraps vtk_widget.render() with TWO
+            # separate throttles: a classify-streak coalescer (gated on
+            # _last_classify_ts, cleared below just in case) AND a general
+            # "too soon since last render" debounce that schedules a delayed
+            # timer instead of rendering now -- a classify commit renders
+            # Main View milliseconds before undo's own render call, so undo
+            # almost always lands in that debounce window and gets deferred.
+            # Section widgets aren't wrapped by either throttle, which is why
+            # they always looked correct immediately while Main View lagged.
+            #
+            # unified_actor_manager._safe_direct_render was tried here first
+            # but is broken: it looks for the render manager on
+            # vtk_widget._naksha_gpu_render_manager, an attribute that is
+            # never actually set anywhere (the manager lives at
+            # app.gpu_render_manager instead) -- so its lookup always failed
+            # and it silently fell back to calling the raw VTK render
+            # window's Render() directly, which skips whatever pyvistaqt's
+            # own bound render() does for the Qt-embedded widget (buffer
+            # swap / widget update), leaving the screen not actually
+            # repainted even though "a render" nominally happened.
+            #
+            # force_render() is the correct, already-built "bypass the
+            # throttle" helper: it cancels the pending timer and calls
+            # _execute_render(), which uses the TRUE original bound render
+            # method captured at wrap time.
+            self._last_classify_ts = 0.0
+            mgr = getattr(self, "gpu_render_manager", None)
+            if mgr is not None:
+                mgr.force_render()
+            else:
+                self.vtk_widget.render()
+            # Root cause found by the user: pressing Ctrl+Z while Main View
+            # itself still holds keyboard focus after a Shaded-mode classify
+            # left the screen un-repainted even though force_render() above
+            # completed internally -- but clicking into a cross-section
+            # widget first (giving IT focus) made the SAME undo work. VTK's
+            # render can finish writing its buffer while Qt still defers
+            # actually compositing it to screen until something pumps the
+            # event loop; a focus/mouse event on another widget does that
+            # as a side effect. Force that flush directly instead of
+            # depending on incidental focus changes.
+            try:
+                self.vtk_widget.update()
+                from PySide6.QtCore import QEventLoop
+                from PySide6.QtWidgets import QApplication
+                # ExcludeUserInputEvents: flush the pending paint without
+                # reentrantly processing new mouse/keyboard events while
+                # still inside this keypress handler (undo_classification
+                # runs synchronously from Ctrl+Z) -- a bare processEvents()
+                # here could recursively dispatch another queued key/click,
+                # double-triggering something mid-undo.
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            except Exception:
+                pass
 
     def redo_classification(self):
         """🚀 MICROSTATION REDO: Instant GPU Forward-Patch"""
@@ -10356,7 +10749,32 @@ class NakshaApp(QMainWindow):
 
         # Surface refresh owns presentation for both no-op and exact topology paths.
         if str(getattr(self, "display_mode", "") or "").lower() != "surface":
-            self.vtk_widget.render()
+            # See matching comment in undo_classification: force_render()
+            # bypasses BOTH GPURenderManager throttles (classify-streak +
+            # general debounce) and uses the TRUE original bound render
+            # method, unlike the broken _safe_direct_render lookup that was
+            # here before.
+            self._last_classify_ts = 0.0
+            mgr = getattr(self, "gpu_render_manager", None)
+            if mgr is not None:
+                mgr.force_render()
+            else:
+                self.vtk_widget.render()
+            # Force a Qt paint flush explicitly instead of depending on
+            # incidental focus changes to another widget to make it happen.
+            try:
+                self.vtk_widget.update()
+                from PySide6.QtCore import QEventLoop
+                from PySide6.QtWidgets import QApplication
+                # ExcludeUserInputEvents: flush the pending paint without
+                # reentrantly processing new mouse/keyboard events while
+                # still inside this keypress handler (undo_classification
+                # runs synchronously from Ctrl+Z) -- a bare processEvents()
+                # here could recursively dispatch another queued key/click,
+                # double-triggering something mid-undo.
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            except Exception:
+                pass
 
 
     def _refresh_main_view_after_undo(self, affected_classes, changed_mask):
@@ -12666,6 +13084,18 @@ class NakshaApp(QMainWindow):
                 "The application has not closed. Please try again shortly.",
             )
             return
+
+        # Past this point the close is committed - stop the raster refinement
+        # loader before VTK teardown below, since its timer/executor could
+        # otherwise deliver a texture upload after the render window is
+        # finalized (_shutdown_in_progress also guards this loader directly).
+        try:
+            _raster_loader = getattr(self, "_raster_lod_loader", None)
+            if _raster_loader is not None:
+                _raster_loader.close()
+        except Exception as _e:
+            print(f"⚠️ Raster LOD loader shutdown failed: {_e}")
+
         active_classification_dialog = getattr(
             self,
             "_lidar_classification_active_dialog",
@@ -13742,6 +14172,31 @@ class NakshaApp(QMainWindow):
         """Deactivate any active digitize/selection tool (for mutual exclusion with section tools)."""
         self._deactivate_selection_tools("section tool activation")
 
+        # AccuDraw can remain active even when digitizer.active_tool is None
+        # or already something else - activate()/deactivate() only clear
+        # active_tool via AccuDraw's own path, so a plain `active_tool`
+        # check below misses it and its priority-100 VTK observers
+        # (LeftButtonPressEvent/MouseMoveEvent/RightButtonPressEvent) keep
+        # intercepting canvas input ahead of the section tool's own
+        # observers - the exact "AccuDraw collides with cross-section"
+        # symptom. Mirror digitizer.deactivate_all()'s own AccuDraw guard.
+        digitizer = getattr(self, 'digitizer', None)
+        accudraw_tool = getattr(digitizer, "accudraw_tool", None) if digitizer is not None else None
+        if accudraw_tool is not None and getattr(accudraw_tool, "active", False):
+            try:
+                print("🛑 Deactivating AccuDraw before section tool activation")
+                if hasattr(accudraw_tool, "finish_for_tool_switch"):
+                    accudraw_tool.finish_for_tool_switch("section tool activation")
+                else:
+                    has_unfinished = bool(
+                        getattr(accudraw_tool, "points", None)
+                        or getattr(accudraw_tool, "drawing", None) is not None
+                        or getattr(accudraw_tool, "preview_actor", None) is not None
+                    )
+                    accudraw_tool.deactivate(cancel=has_unfinished)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate AccuDraw: {e}")
+
         if hasattr(self, 'digitizer') and self.digitizer and getattr(self.digitizer, 'active_tool', None):
             try:
                 print("🛑 Deactivating digitize tool before section tool activation")
@@ -14479,6 +14934,9 @@ class NakshaApp(QMainWindow):
 
             def _make_right_click_handler(app):
                 def _handler(obj, event):
+                    cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                    if cs_measure is not None and getattr(cs_measure, "active", False):
+                        return
                     print(f"🖱️ Right-click detected in cross-section view (fallback)")
                     active_tool = getattr(app, "active_classify_tool", None)
                     section_has_classifier = bool(getattr(app, "classify_interactors", None))
@@ -14556,6 +15014,9 @@ class NakshaApp(QMainWindow):
 
         def _make_handler(app):
             def _handler(obj, event):
+                cs_measure = getattr(app, "cross_section_measurement_tool", None)
+                if cs_measure is not None and getattr(cs_measure, "active", False):
+                    return
                 print(f"🖱️ Right-click detected in cross-section view (tabified)")
                 active_tool = getattr(app, "active_classify_tool", None)
                 section_has_classifier = bool(getattr(app, "classify_interactors", None))
@@ -15134,10 +15595,16 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage(status_message, 5000)
 
     def clear_all_measurements(self):
-        """Clear all measurement lines and labels."""
+        """Clear all measurement lines and labels — main view AND cross-section."""
         if hasattr(self, 'measurement_tool'):
             self.measurement_tool.clear_all_measurements()
-            self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
+        cs_measure = getattr(self, 'cross_section_measurement_tool', None)
+        if cs_measure is not None:
+            try:
+                cs_measure.clear_all()
+            except Exception as e:
+                print(f"⚠️ Failed to clear cross-section measurements: {e}")
+        self.statusBar().showMessage("🗑️ Measurements cleared", 2000)
     def export_measurements(self):
         """Export measurement report to file."""
         if not hasattr(self, 'measurement_tool'):
@@ -18016,24 +18483,43 @@ class NakshaApp(QMainWindow):
         interactor,
         *,
         preserve_physical_middle_pan=False,
+        honor_persistent_left_pan=False,
     ):
         if not hasattr(self, "_vtk_event_swappers"):
             self._vtk_event_swappers = []
-            
+
         class VTKEventSwapper:
-            def __init__(self, interactor, app, preserve_middle_pan):
+            def __init__(self, interactor, app, preserve_middle_pan, honor_persistent_left_pan):
                 self.interactor = interactor
                 self.app = app
                 self._in_swap = False
                 self.preserve_middle_pan = bool(preserve_middle_pan)
-                
+                # Main view's persistent "Panning button: Left Mouse Button"
+                # setting is implemented separately, deep in the digitizer's
+                # own click/drag tracking (Digitizer checks app.panning_button
+                # directly) — this flag must stay False there so this swapper
+                # never also reacts to the same setting and fights that
+                # system. Cross-section/cut-section views have no such
+                # drag-tracking of their own, so for them this is the only
+                # place the persistent setting can be honored: a real drag on
+                # left when configured is simply relayed as a middle-drag,
+                # which the interactor's native style already pans on.
+                self.honor_persistent_left_pan = bool(honor_persistent_left_pan)
+
                 self.obs_ids = [
                     interactor.AddObserver("LeftButtonPressEvent", self.on_left_press, 10.0),
                     interactor.AddObserver("LeftButtonReleaseEvent", self.on_left_release, 10.0),
                     interactor.AddObserver("MiddleButtonPressEvent", self.on_middle_press, 10.0),
                     interactor.AddObserver("MiddleButtonReleaseEvent", self.on_middle_release, 10.0),
                 ]
-                
+
+            def _left_pan_wanted(self):
+                if getattr(self.app, "_left_pan_shortcut_active", False):
+                    return True
+                if self.honor_persistent_left_pan:
+                    return getattr(self.app, "panning_button", "scroll") == "left"
+                return False
+
             def _is_tool_active(self):
                 if getattr(self.app, "active_classify_tool", None) is not None:
                     return True
@@ -18056,6 +18542,11 @@ class NakshaApp(QMainWindow):
                     "identification_tool",
                     "point_sync_tool",
                     "snt_layer_pick_tool",
+                    # Cross-section measurement owns left-click in section
+                    # views to place points — without this, honoring the
+                    # persistent left-pan setting there would swallow those
+                    # clicks as pan gestures instead.
+                    "cross_section_measurement_tool",
                 ):
                     tool = getattr(self.app, tool_name, None)
                     if tool is not None and getattr(tool, "active", False):
@@ -18087,7 +18578,7 @@ class NakshaApp(QMainWindow):
             def on_left_press(self, obj, event):
                 if self._in_swap:
                     return
-                if getattr(self.app, "_left_pan_shortcut_active", False) and not self._is_tool_active():
+                if self._left_pan_wanted() and not self._is_tool_active():
                     self._in_swap = True
                     try:
                         self._safe_abort(obj)
@@ -18098,7 +18589,7 @@ class NakshaApp(QMainWindow):
             def on_left_release(self, obj, event):
                 if self._in_swap:
                     return
-                if getattr(self.app, "_left_pan_shortcut_active", False) and not self._is_tool_active():
+                if self._left_pan_wanted() and not self._is_tool_active():
                     self._in_swap = True
                     try:
                         self._safe_abort(obj)
@@ -18139,5 +18630,6 @@ class NakshaApp(QMainWindow):
             interactor,
             self,
             preserve_physical_middle_pan,
+            honor_persistent_left_pan,
         )
         self._vtk_event_swappers.append(swapper)

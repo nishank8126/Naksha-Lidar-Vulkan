@@ -5,7 +5,7 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLabel, QSpinBox, QColorDialog,
-    QGroupBox, QComboBox, QWidget, QMessageBox,
+    QGroupBox, QComboBox, QWidget, QMessageBox, QScrollArea,
 )
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QColor
@@ -28,6 +28,13 @@ DEFAULT_MEASURE_STYLE = {
         'label_font_size': 16,
         'unit': 'm',
     },
+    'cross_section': {
+        'color': (1.0, 0.55, 0.0),
+        'width': 3,
+        'line_style': 'solid',
+        'label_font_size': 16,
+        'unit': 'm',
+    },
     'block': {
         'unit': 'm',
         'label_font_size': 24,
@@ -41,6 +48,12 @@ DEFAULT_MEASURE_STYLE = {
 _UNIT_OPTIONS = [
     ("Meters (m)",       "m"),
     ("Kilometers (km)",  "km"),
+]
+
+_LINE_STYLE_OPTIONS = [
+    ("Solid", "solid"),
+    ("Dashed", "dashed"),
+    ("Dotted", "dotted"),
 ]
 
 
@@ -71,7 +84,7 @@ def load_measure_settings():
     s = QSettings("NakshaAI", "LidarApp")
     out = {}
 
-    for section in ('line', 'path'):
+    for section in ('line', 'path', 'cross_section'):
         dflt = DEFAULT_MEASURE_STYLE[section]
         color_name = s.value(f"measure_style/{section}/color", None)
         if color_name:
@@ -82,6 +95,7 @@ def load_measure_settings():
         out[section] = {
             'color':           color,
             'width':           int(s.value(f"measure_style/{section}/width",           dflt['width'])),
+            'line_style':      s.value(f"measure_style/{section}/line_style",          dflt.get('line_style', 'solid')),
             'label_font_size': int(s.value(f"measure_style/{section}/label_font_size", dflt['label_font_size'])),
             'unit':            s.value(f"measure_style/{section}/unit",                dflt['unit']),
         }
@@ -105,12 +119,14 @@ def save_measure_settings(style):
     """Persist style dict to QSettings."""
     s = QSettings("NakshaAI", "LidarApp")
 
-    for section in ('line', 'path'):
+    for section in ('line', 'path', 'cross_section'):
         sec = style.get(section, {})
         if 'color' in sec:
             s.setValue(f"measure_style/{section}/color", _vtk_to_qcolor(sec['color']).name())
         if 'width' in sec:
             s.setValue(f"measure_style/{section}/width", int(sec['width']))
+        if 'line_style' in sec:
+            s.setValue(f"measure_style/{section}/line_style", sec['line_style'])
         if 'label_font_size' in sec:
             s.setValue(f"measure_style/{section}/label_font_size", int(sec['label_font_size']))
         if 'unit' in sec:
@@ -227,9 +243,10 @@ class _MeasureSectionWidget(QGroupBox):
         Unit        |  QComboBox (m / km)
     """
 
-    def __init__(self, title: str, section_key: str, initial: dict, parent=None):
+    def __init__(self, title: str, section_key: str, initial: dict, parent=None, *, allow_line_style=False):
         super().__init__(title, parent)
         self._key = section_key
+        self._allow_line_style = allow_line_style
         self._color = _vtk_to_qcolor(initial['color'])
         self._build(initial)
 
@@ -259,6 +276,16 @@ class _MeasureSectionWidget(QGroupBox):
         self._width_spin.setSuffix(" px")
         self._width_spin.setToolTip("Measurement line thickness in pixels")
         form.addRow("Line Width:", self._width_spin)
+
+        if self._allow_line_style:
+            self._line_style_combo = QComboBox()
+            for label, value in _LINE_STYLE_OPTIONS:
+                self._line_style_combo.addItem(label, value)
+            selected_style = initial.get('line_style', 'solid')
+            self._line_style_combo.setCurrentIndex(
+                next((i for i, (_, value) in enumerate(_LINE_STYLE_OPTIONS) if value == selected_style), 0)
+            )
+            form.addRow("Line Design:", self._line_style_combo)
 
         # ── Label Font Size ──────────────────────────────────────────
         self._font_spin = QSpinBox()
@@ -300,12 +327,15 @@ class _MeasureSectionWidget(QGroupBox):
     # ------------------------------------------------------------------
     def get_style(self) -> dict:
         """Return the current control values as a style dict."""
-        return {
+        style = {
             'color':           _qcolor_to_vtk(self._color),
             'width':           self._width_spin.value(),
             'label_font_size': self._font_spin.value(),
             'unit':            self._unit_combo.currentData(),
         }
+        if self._allow_line_style:
+            style['line_style'] = self._line_style_combo.currentData()
+        return style
 
     def reset_to_defaults(self):
         """Restore controls to DEFAULT_MEASURE_STYLE for this section."""
@@ -313,6 +343,11 @@ class _MeasureSectionWidget(QGroupBox):
         self._color = _vtk_to_qcolor(dflt['color'])
         self._refresh_color_btn()
         self._width_spin.setValue(dflt['width'])
+        if self._allow_line_style:
+            selected_style = dflt.get('line_style', 'solid')
+            self._line_style_combo.setCurrentIndex(
+                next((i for i, (_, value) in enumerate(_LINE_STYLE_OPTIONS) if value == selected_style), 0)
+            )
         self._font_spin.setValue(dflt['label_font_size'])
         for i, (_, v) in enumerate(_UNIT_OPTIONS):
             if v == dflt.get('unit', 'm'):
@@ -402,31 +437,48 @@ class MeasureSettingsDialog(QDialog):
         root.setContentsMargins(18, 12, 18, 12)
         root.setSpacing(10)
 
+        # Keep all setting groups reachable on short screens while leaving
+        # the action buttons visible at the bottom of the dialog.
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_content = QWidget(scroll_area)
+        settings_layout = QVBoxLayout(scroll_content)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(10)
+        scroll_area.setWidget(scroll_content)
+        root.addWidget(scroll_area, 1)
+
         # ── Line section ─────────────────────────────────────────────
         self._line_sec = _MeasureSectionWidget(
-            "Line", "line", loaded['line'], parent=self
+            "Line", "line", loaded['line'], parent=scroll_content
         )
-        root.addWidget(self._line_sec)
+        settings_layout.addWidget(self._line_sec)
 
         # ── Path section ─────────────────────────────────────────────
         self._path_sec = _MeasureSectionWidget(
-            "Path", "path", loaded['path'], parent=self
+            "Path", "path", loaded['path'], parent=scroll_content
         )
-        root.addWidget(self._path_sec)
+        settings_layout.addWidget(self._path_sec)
+
+        self._cross_section_sec = _MeasureSectionWidget(
+            "Cross Section", "cross_section", loaded['cross_section'], parent=scroll_content
+        )
+        settings_layout.addWidget(self._cross_section_sec)
 
         # ── Block section ────────────────────────────────────────────
-        self._block_sec = _BlockSectionWidget(loaded['block'], parent=self)
-        root.addWidget(self._block_sec)
+        self._block_sec = _BlockSectionWidget(loaded['block'], parent=scroll_content)
+        settings_layout.addWidget(self._block_sec)
 
         self._grid_sec = _BlockSectionWidget(
             loaded['grid'],
-            parent=self,
+            parent=scroll_content,
             title="Grid",
             section_key="grid",
         )
-        root.addWidget(self._grid_sec)
+        settings_layout.addWidget(self._grid_sec)
 
-        root.addStretch()
+        settings_layout.addStretch()
 
         # ── Action buttons ───────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -455,6 +507,7 @@ class MeasureSettingsDialog(QDialog):
         return {
             'line':  self._line_sec.get_style(),
             'path':  self._path_sec.get_style(),
+            'cross_section': self._cross_section_sec.get_style(),
             'block': self._block_sec.get_style(),
             'grid':  self._grid_sec.get_style(),
         }
@@ -481,6 +534,9 @@ class MeasureSettingsDialog(QDialog):
                 mt._measure_style = style
                 if hasattr(mt, 'apply_style'):
                     mt.apply_style(style)
+            cs_measure = getattr(app, 'cross_section_measurement_tool', None)
+            if cs_measure is not None and hasattr(cs_measure, 'apply_style'):
+                cs_measure.apply_style(style)
                     
             try:
                 # Show status bar message
@@ -502,6 +558,7 @@ class MeasureSettingsDialog(QDialog):
         """Restore all section controls to default values (does not persist until Apply)."""
         self._line_sec.reset_to_defaults()
         self._path_sec.reset_to_defaults()
+        self._cross_section_sec.reset_to_defaults()
         self._block_sec.reset_to_defaults()
         self._grid_sec.reset_to_defaults()
 

@@ -59,12 +59,13 @@ class SNTLayerPickTool(QObject):
         print("🎯 SNT layer pick tool DEACTIVATED")
 
     def _deactivate_conflicting_tools(self):
-        point_sync_tool = getattr(self.app, "point_sync_tool", None)
-        if point_sync_tool is not None and getattr(point_sync_tool, "active", False):
-            try:
-                point_sync_tool.deactivate()
-            except Exception:
-                pass
+        for tool_name in ("point_sync_tool", "coordinate_pick_tool"):
+            tool = getattr(self.app, tool_name, None)
+            if tool is not None and getattr(tool, "active", False):
+                try:
+                    tool.deactivate()
+                except Exception:
+                    pass
 
     def _attach_main_observer(self):
         if self._main_observer is not None:

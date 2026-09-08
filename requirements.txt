@@ -35,6 +35,8 @@ zstandard==0.23.0
                                  # let pip resolve CUDA vs CPU
 jakteristics==0.6.2
 cloth-simulation-filter==1.1.7
+h5py
+tqdm
 
 
 # ── System monitoring ─────────────────────────────────────────────

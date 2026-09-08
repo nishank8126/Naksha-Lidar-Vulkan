@@ -311,39 +311,6 @@ def prune_stale_classification_interactors(app) -> int:
     return pruned
 
 
-def _release_vtk_actor_resources(actor) -> None:
-    """Drop heavy VTK refs (texture/mapper/input data) from an actor."""
-    if actor is None:
-        return
-    try:
-        texture = actor.GetTexture()
-        if texture is not None:
-            try:
-                texture.SetInputData(None)
-            except Exception:
-                pass
-            try:
-                actor.SetTexture(None)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        mapper = actor.GetMapper()
-        if mapper is not None:
-            try:
-                mapper.SetInputData(None)
-            except Exception:
-                pass
-            try:
-                actor.SetMapper(None)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
 def release_data_arrays(app) -> None:
     """Release project arrays and memory-heavy structures."""
     data = getattr(app, "data", None)
@@ -377,32 +344,14 @@ def release_data_arrays(app) -> None:
                 _free_undo_entry(entry)
             stack.clear()
 
-    geotiff_actors = getattr(app, "geotiff_actors", None)
-    if isinstance(geotiff_actors, list) and geotiff_actors:
-        renderer = None
-        vtk_widget = getattr(app, "vtk_widget", None)
-        if vtk_widget is not None:
-            renderer = getattr(vtk_widget, "renderer", None)
-            if renderer is None:
-                try:
-                    renderer = vtk_widget.GetRenderWindow().GetRenderers().GetFirstRenderer()
-                except Exception:
-                    renderer = None
-
-        released = 0
-        for actor in list(geotiff_actors):
-            try:
-                if renderer is not None:
-                    renderer.RemoveActor(actor)
-            except Exception:
-                pass
-            _release_vtk_actor_resources(actor)
-            released += 1
-
-        geotiff_actors.clear()
-        app.geotiff_actors = []
-        if released:
-            print(f"[MEM] Released {released} GeoTIFF texture actor(s)")
+    # GeoTIFF/GIS raster overlays are NOT point-cloud data - they're user-visible
+    # GIS layers (gui.gis.gis_layers registry) that must survive a point-cloud
+    # clear/grid-switch exactly like DXF/DWG/SNT actors already do. This used to
+    # also tear down every geotiff_actors entry here, which silently deleted the
+    # user's loaded orthophotos/DTMs on every SNT-grid LAZ load while the GIS
+    # layer panel still listed them as loaded - remove a raster the same way any
+    # other GIS layer is removed (gui.gis.gis_layers._remove_layer), not as a
+    # side effect of freeing point-cloud memory.
 
     print("[MEM] Data arrays explicitly released")
 

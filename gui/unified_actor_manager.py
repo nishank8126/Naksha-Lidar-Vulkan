@@ -4007,6 +4007,21 @@ def guarantee_main_view_visual_refresh(app, changed_mask, to_class=None, reason=
             getattr(app, "_section_visibility_refresh_required", False)
         )
 
+    # A cross-section can independently be in Shaded/Surface mode regardless
+    # of Main View's own display_mode (handled above) -- this function is the
+    # single place every classify/undo/redo commit path funnels through to
+    # refresh Main View, so it is also the single place to refresh any open
+    # section's mesh actor, instead of patching every individual call site.
+    # Reads app.data["classification"] directly (already updated by the time
+    # this function runs), so it does not depend on Main View's own render.
+    try:
+        from gui.cross_section.section_shaded_surface import (
+            refresh_all_shaded_surface_sections_after_classify,
+        )
+        refresh_all_shaded_surface_sections_after_classify(app)
+    except Exception as _section_mesh_err:
+        print(f"   ⚠️ Section Shaded/Surface refresh-after-commit failed: {_section_mesh_err}")
+
     commit_id = int(getattr(app, "_main_refresh_commit_id", 0)) + 1
     app._main_refresh_commit_id = commit_id
     if commit_id <= 20:
@@ -5245,6 +5260,35 @@ def refresh_section_after_weight_change(
             vtk_ca.Modified()
         _mark_actor_dirty(actor)
     else:
+        # While this section is showing Shaded/Surface (a different actor
+        # entirely), fast_cross_section_update deliberately skips patching
+        # this point-actor's own _naksha_section_class mirror -- otherwise
+        # a classify would overwrite Shaded/Surface's own custom coloring
+        # with class-palette colors. That means the mirror can go stale for
+        # as long as the section stayed in Shaded/Surface, so switching
+        # back to Class mode must not just recolor from that stale mirror.
+        #
+        # app._sync_section_mirror_from_data looked like the right existing
+        # helper for this, but it is dead code: it looks up the actor via
+        # vtk_widget._naksha_unified_actor / _section_unified_actor, neither
+        # of which is ever assigned anywhere in this codebase, so it always
+        # silently no-ops. Resync directly here instead, using this
+        # function's own already-correct `actor` reference and the global
+        # index array set on it at build time (_wire_actor_metadata).
+        try:
+            global_indices = getattr(actor, '_naksha_global_indices', None)
+            classification = app.data.get('classification') if hasattr(app, 'data') and app.data else None
+            if (
+                global_indices is not None
+                and classification is not None
+                and len(global_indices) > 0
+                and int(np.max(global_indices)) < len(classification)
+            ):
+                actor._naksha_section_class = classification[global_indices].copy()
+        except Exception as _mirror_sync_err:
+            print(f"   ⚠️ Section {view_idx+1}: mirror resync before class-mode "
+                  f"recolor failed: {_mirror_sync_err}")
+
         sc = getattr(actor, '_naksha_section_class', None)
         if sc is not None:
             _rewrite_rgb_from_palette(rgb_ptr, sc, palette)

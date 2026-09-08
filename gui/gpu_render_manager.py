@@ -315,6 +315,8 @@ class GPURenderManager(QObject):
         except Exception:
             self.interaction_frame_ms = max(33, int(self.interaction_frame_ms or 33))
 
+        if not self._interaction_active:
+            self._interaction_frame_started = False
         self._interaction_active = True
         self._engage_lod()
         try:
@@ -511,8 +513,15 @@ class GPURenderManager(QObject):
 
         if self._interaction_active:
             if not self.pending_render:
+                # Leading frame is immediate; subsequent frames wait only the
+                # unused budget. A slow mixed scene must not pay render time
+                # plus another complete throttle interval for every wheel step.
+                delay_ms = 0
+                if getattr(self, "_interaction_frame_started", False):
+                    elapsed_ms = (time.monotonic() - self._interaction_last_frame_monotonic) * 1000.0
+                    delay_ms = max(0, int(round(self.interaction_frame_ms - elapsed_ms)))
                 self.pending_render = True
-                self.render_timer.start(self.interaction_frame_ms)
+                self.render_timer.start(delay_ms)
             else:
                 self.skipped_renders += 1
             return
@@ -556,6 +565,10 @@ class GPURenderManager(QObject):
                 self._pan_frame_started = True
                 self._pan_last_frame_monotonic = time.monotonic()
              
+            if self._interaction_active:
+                self._interaction_frame_started = True
+                self._interaction_last_frame_monotonic = time.monotonic()
+
             # Use original render method
             if self._original_render:
                 self._original_render()

@@ -51,3 +51,6 @@ crash_config.json
 Thumbs.db
 .vscode/
 .idea/
+cloth_nodes.txt
+.claude/
+.cwj_uploads/

@@ -620,6 +620,25 @@ class GlobalShortcutFilter(QObject):
                     print("🛑 ESC - identification tool deactivated; left pan restored")
                     return True
 
+                # Deactivate cross-section measurement tool on Escape — cancels
+                # any pending point/chain in every open section view and turns
+                # its Measure-ribbon toggle off, matching how ESC fully stops
+                # an in-progress main-view measurement.
+                _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
+                if _cs_measure is not None and getattr(_cs_measure, 'active', False):
+                    try:
+                        ribbon = getattr(self.app_window, 'ribbon_manager', None)
+                        measure_ribbon = getattr(ribbon, 'ribbons', {}).get('measure') if ribbon else None
+                        ribbon_btn = getattr(measure_ribbon, 'cross_section_measure_btn', None)
+                        if ribbon_btn is not None:
+                            ribbon_btn.setChecked(False)  # cascades to _cs_measure.deactivate()
+                        else:
+                            _cs_measure.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC cross-section measurement deactivation failed: {e}")
+                    print("🛑 ESC - cross-section measurement tool deactivated")
+                    return True
+
                 # Deactivate temp fence tool on Escape
                 _tft = getattr(self.app_window, 'temp_fence_tool', None)
                 if _tft is not None and getattr(_tft, 'active', False):
@@ -683,6 +702,51 @@ class GlobalShortcutFilter(QObject):
             # 6. Default (no tool owns it) → Classification undo/redo
             # ====================================================================
             if event.modifiers() & Qt.ControlModifier:
+
+                # =================================================================
+                # LEVEL 0.5: CROSS-SECTION MEASUREMENT TOOL (checked BEFORE the
+                # main measurement tool). Claims Ctrl+Z/Y ONLY while actively
+                # toggled on — same convention every other tool in this file
+                # uses (see LEVEL 1's own comment: "Once tool is deactivated,
+                # even if measurements exist on screen, Ctrl+Z/Y should go to
+                # classification"). An earlier version also kept claiming
+                # Ctrl+Z/Y after deactivation whenever this tool's history was
+                # non-empty (so Escape-then-undo still worked) — that repeatedly
+                # starved OTHER tools' undo instead (main-view measurement, and
+                # then classification, since this tool can stay `active` at the
+                # same time a classify tool is armed in the same section view
+                # and has no timestamp-based way to know classification is what
+                # the user actually wants undone). Reverted to the simple,
+                # proven rule to stop that whole class of bug from recurring;
+                # to undo a cross-section measurement after Escape, re-toggle
+                # the tool back on first, same as every other tool requires.
+                #
+                # Also explicitly yields to an active classify tool, mirroring
+                # the same guard _on_section_click() already uses for clicks —
+                # classification and cross-section measuring can legitimately
+                # both be "active" in the same section view at once.
+                # =================================================================
+                _cs_measure = getattr(self.app_window, 'cross_section_measurement_tool', None)
+                _cs_measure_claims_undo = (
+                    _cs_measure is not None
+                    and getattr(_cs_measure, 'active', False)
+                    and getattr(self.app_window, 'active_classify_tool', None) is None
+                )
+                if _cs_measure_claims_undo:
+                    if event.key() == Qt.Key_Z:
+                        print("📏 Ctrl+Z → Cross-Section Measurement Undo (EXCLUSIVE)")
+                        try:
+                            _cs_measure.undo()
+                        except Exception as e:
+                            print(f"⚠️ Cross-section measurement undo failed: {e}")
+                        return True
+                    elif event.key() == Qt.Key_Y:
+                        print("📏 Ctrl+Y → Cross-Section Measurement Redo (EXCLUSIVE)")
+                        try:
+                            _cs_measure.redo()
+                        except Exception as e:
+                            print(f"⚠️ Cross-section measurement redo failed: {e}")
+                        return True
 
                 # ═══════════════════════════════════════════════════════════════════
                 # ✅ LEVEL 1: MEASUREMENT TOOL (HIGHEST PRIORITY)
@@ -756,8 +820,29 @@ class GlobalShortcutFilter(QObject):
                     # FINALIZED=3 means cut dock is open but user may have moved to Draw tab
                     cut_section_waiting = _cut_state in (1, 2)  # WAITING_CENTER or WAITING_DEPTH only
  
+                # Element Select (the block-select/Move tool) must win LEVEL 3's
+                # curve-history fallback below. That fallback matches whenever
+                # ANY curve was ever finished this session (history_stack stays
+                # non-empty across tool switches, by design - see its comment),
+                # with no check on what tool is active now. Without excluding
+                # Element Select here, pressing Ctrl+Z during/after a Move on
+                # a totally unrelated element gets hijacked into
+                # `_curve_tool.undo_curve()` instead of reaching LEVEL 3.5's
+                # "Element Select Undo", which also carries the classification-
+                # priority guard that path is supposed to enforce.
+                element_select_active = bool(getattr(
+                    getattr(getattr(self.app_window, 'digitizer', None),
+                            '_element_select_tool', None),
+                    '_active', False,
+                ))
+
                 # If ANY other tool is active, curve/digitizer completed undo is blocked
-                other_tool_active = classification_active or cross_section_active or cut_section_waiting
+                other_tool_active = (
+                    classification_active
+                    or cross_section_active
+                    or cut_section_waiting
+                    or element_select_active
+                )
  
 
                 # ═══════════════════════════════════════════════════════════════════
@@ -3428,6 +3513,11 @@ class GlobalShortcutFilter(QObject):
             print(f"   🔒 Fresh camera lock observer installed (measurement)")
 
             self.app_window._main_view_2d_locked = True
+            # Symmetric with _unlock_main_view setting this True: re-locking
+            # to 2D must hand button-claiming back to MainWheelZoomEventFilter
+            # (Left/Tap-Tap panning-button settings), not leave it deferring
+            # to native VTK bindings on what is now a 2D-locked interactor.
+            self.app_window.is_3d_mode = False
             renderer.ResetCameraClippingRange()
             vtk_widget.render()
             print(f"   🔒 Main view 2D lock REFRESHED")
@@ -3581,6 +3671,12 @@ class GlobalShortcutFilter(QObject):
         # STEP 9: Mark as locked
         # ====================================================================
         self.app_window._main_view_2d_locked = True
+        # See matching comment in the measurement-lock branch above and in
+        # _unlock_main_view: keep is_3d_mode in sync with the interactor
+        # style actually in effect, so MainWheelZoomEventFilter resumes
+        # claiming Left for the configured panning-button setting once the
+        # view is locked back to 2D.
+        self.app_window.is_3d_mode = False
 
         # Final render
         renderer.ResetCameraClippingRange()
@@ -3696,8 +3792,20 @@ class GlobalShortcutFilter(QObject):
             vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
             camera.ParallelProjectionOff()
             vtk_widget.render()
-            
+
             self.app_window._main_view_2d_locked = False
+            # MainWheelZoomEventFilter (app_window.py) only steps aside and
+            # lets VTK's native TrackballCamera bindings (Left=Rotate,
+            # Middle=Pan, Right=Zoom) govern the canvas when is_3d_mode is
+            # True. Without this, the filter kept claiming every Left press
+            # for our own custom pan whenever the "Left Mouse Button" or
+            # "Tap-Tap" panning-button setting was active, even after this
+            # unlock switched to a 3D-capable interactor style -- silently
+            # stealing what should have been native rotate. The "Scroll"
+            # setting never showed this because it never claims Left at
+            # all, so Left-drag reached VTK's native Rotate binding by
+            # accident, not because 3D mode was actually being tracked.
+            self.app_window.is_3d_mode = True
             
             # Re-enable digitize manager picker
             if hasattr(self.app_window, 'digitize_manager'):

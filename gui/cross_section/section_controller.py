@@ -502,6 +502,12 @@ class SectionController:
                 self._locate_rb_actor = None
         except Exception:
             pass
+        try:
+            cut_controller = getattr(self.app, "cut_section_controller", None)
+            if cut_controller is not None and hasattr(cut_controller, "clear_cut_locate_rubber_band"):
+                cut_controller.clear_cut_locate_rubber_band()
+        except Exception:
+            pass
         self.app._section_locate_display = None
         self.app._section_locate_view = None
 
@@ -1783,7 +1789,17 @@ class SectionController:
                     print("❌ Point cloud data is empty!")
                     self.finalize_rectangle()
                     return
-    
+
+                # New section geometry replaces the old one for this view — drop any
+                # stale cross-section measurement overlays drawn against the previous
+                # cut. No-op unless that (opt-in) tool has been used.
+                cs_measure = getattr(self.app, "cross_section_measurement_tool", None)
+                if cs_measure is not None:
+                    try:
+                        cs_measure.clear_view(self.active_view)
+                    except Exception:
+                        pass
+
                 # Apply line style before finalizing rectangle
                 style = getattr(self.app, "cross_line_style", "solid")
                 if style != "solid":
@@ -3031,6 +3047,7 @@ class SectionController:
             self.app._setup_interactor_swapper(
                 self.app.sec_vtk.interactor,
                 preserve_physical_middle_pan=True,
+                honor_persistent_left_pan=True,
             )
         from gui.theme_manager import ThemeManager
         bg_color = "white" if ThemeManager.current() == "light" else "black"
@@ -3880,6 +3897,13 @@ class SectionController:
         Observer callback: reactivate last classification tool on right-click
         in any cross-section view when no tool is currently active.
         """
+        cs_measure = getattr(self.app, "cross_section_measurement_tool", None)
+        if cs_measure is not None and getattr(cs_measure, "active", False):
+            # Right-click ends an XS measurement chain. Do not immediately
+            # reactivate classification underneath it, or shortcut routing
+            # stops belonging to the measurement tool.
+            return
+
         print(f"🖱️ Right-click detected in cross-section view")
         active_tool = getattr(self.app, "active_classify_tool", None)
         # A tool may be flagged active but only attached to the cut section (not cross-section

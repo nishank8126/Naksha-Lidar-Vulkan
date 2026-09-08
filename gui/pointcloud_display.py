@@ -1214,6 +1214,8 @@ def update_pointcloud(app, mode="rgb"):
     from gui.theme_manager import ThemeManager
     bg_color = "white" if ThemeManager.current() == "light" else "black"
     app.vtk_widget.set_background(bg_color)
+    from gui.scene_render_pipeline import sync_scene_background
+    sync_scene_background(app)
     from gui.views import set_view
     set_view(app, app.current_view)
 

@@ -30,7 +30,7 @@ def default_raster_style(band_count: int) -> dict:
         "green_band": 2 if band_count >= 2 else 1,
         "blue_band": 3 if band_count >= 3 else 1,
         "gray_band": 1,
-        "enhancement": "minmax",      # "none" | "minmax"
+        "enhancement": "none" if multiband else "minmax",      # "none" | "minmax"
         "min": None,                  # None → auto per-band; or float
         "max": None,
         "brightness": 0,              # -255..255
@@ -38,7 +38,7 @@ def default_raster_style(band_count: int) -> dict:
         "gamma": 1.0,                 # 0.1..5.0
         "saturation": 0,              # -100..100
         "opacity": 100,               # 0..100 (opaque so list-order stacking works)
-        "resampling": "bilinear",     # "nearest" | "bilinear"
+        "resampling": "nearest",      # "nearest" | "bilinear" — QGIS-default parity
     }
 
 
@@ -77,10 +77,18 @@ def process_raster_array(src_bands: dict, style: dict) -> np.ndarray:
         if a is None:
             # fall back to any available band
             a = next(iter(src_bands.values()))
+        source_dtype = a.dtype
         a = _to_float_band(a)
         if enh == "minmax":
-            a = _stretch(a, mn, mx)
+            lo, hi = style.get("_band_ranges", {}).get(int(idx), (mn, mx))
+            a = _stretch(a, lo, hi)
         else:
+            # Match the importer's integer conversion instead of clipping
+            # 16-bit imagery to white when the first detail window arrives.
+            if np.issubdtype(source_dtype, np.integer):
+                info = np.iinfo(source_dtype)
+                if info.min < 0 or info.max > 255:
+                    a = (a - float(info.min)) * (255.0 / (int(info.max) - int(info.min)))
             a = np.clip(a, 0.0, 255.0)
         return a
 
@@ -121,10 +129,27 @@ def process_raster_array(src_bands: dict, style: dict) -> np.ndarray:
     return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
 
 
-def _read_source_bands(path: str, style: dict):
-    """Read just the bands the style needs, with memory-safe downsampling."""
+def _read_source_bands(path: str, style: dict, app=None, window=None, out_shape=None):
+    """
+    Read just the bands the style needs, with memory-safe downsampling.
+
+    window: optional rasterio Window to read a sub-region of the file instead
+        of the whole raster (used by raster_lod.py's zoom-based refresh).
+    out_shape: optional explicit (out_h, out_w) to read at - overrides the
+        budget-derived downsample (raster_lod.py already matches this to the
+        screen). Ignored when None, in which case the whole-raster budget
+        logic below picks the size (the "re-style whole file" path).
+    """
     import rasterio
     from rasterio.enums import Resampling
+
+    max_pixels = _MAX_TEXTURE_PIXELS
+    if app is not None and out_shape is None:
+        try:
+            from gui.vector_export import _geotiff_texture_pixel_budget
+            max_pixels = _geotiff_texture_pixel_budget(app, hard_cap=_MAX_TEXTURE_PIXELS)
+        except Exception:
+            pass
 
     rt = style.get("render_type", "multiband")
     if rt == "singleband":
@@ -137,17 +162,25 @@ def _read_source_bands(path: str, style: dict):
     with rasterio.open(path) as src:
         count = src.count
         wanted = [max(1, min(count, b)) for b in wanted]
-        w, h = src.width, src.height
         read_kwargs = {}
-        total = w * h
-        if total > _MAX_TEXTURE_PIXELS:
-            scale = (_MAX_TEXTURE_PIXELS / float(total)) ** 0.5
-            ow, oh = max(1, int(w * scale)), max(1, int(h * scale))
-            read_kwargs = {"out_shape": (oh, ow), "resampling": Resampling.bilinear}
-        bands = {}
-        for b in set(wanted):
-            bands[b] = src.read(b, **read_kwargs)
-        return bands, count
+        if window is not None:
+            read_kwargs["window"] = window
+        if out_shape is not None:
+            oh, ow = out_shape
+            read_kwargs["out_shape"] = (oh, ow)
+            read_kwargs["resampling"] = (Resampling.nearest if style.get("resampling", "nearest") == "nearest" else Resampling.bilinear)
+        else:
+            w = window.width if window is not None else src.width
+            h = window.height if window is not None else src.height
+            total = w * h
+            if total > max_pixels:
+                scale = (max_pixels / float(total)) ** 0.5
+                ow, oh = max(1, int(w * scale)), max(1, int(h * scale))
+                read_kwargs["out_shape"] = (oh, ow)
+                read_kwargs["resampling"] = (Resampling.nearest if style.get("resampling", "nearest") == "nearest" else Resampling.bilinear)
+        indexes = sorted(set(wanted))
+        data = src.read(indexes, **read_kwargs)
+        return dict(zip(indexes, data)), count
 
 
 def apply_raster_style(app, entry: dict, style: dict) -> bool:
@@ -167,9 +200,22 @@ def apply_raster_style(app, entry: dict, style: dict) -> bool:
     if not path or not actors:
         return False
     actor = actors[0]
+    meta = getattr(actor, "_raster_lod_meta", None)
+    if meta and meta.get("eligible"):
+        # Restyle the visible window asynchronously; a whole-file texture on
+        # the cropped LOD plane would distort the image as well as block UI.
+        entry["style"] = dict(style)
+        entry["opacity"] = max(0.0, min(1.0, style.get("opacity", 100) / 100.0))
+        actor.GetProperty().SetOpacity(entry["opacity"])
+        # Keep crop coverage until replacement; only its style is stale.
+        meta.pop("_last_style", None)
+        from gui.gis.raster_lod import kick
+        kick(app)
+        app.vtk_widget.render()
+        return True
 
     try:
-        bands, _count = _read_source_bands(path, style)
+        bands, _count = _read_source_bands(path, style, app=app)
     except Exception as exc:
         print(f"   ❌ Could not read raster bands: {exc}")
         return False

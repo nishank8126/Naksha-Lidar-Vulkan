@@ -232,7 +232,7 @@ class PluginManager:
 
                 # 2. Read and parse manifest.json
                 try:
-                    manifest_content = zf.read(manifest_in_zip).decode("utf-8")
+                    manifest_content = zf.read(manifest_in_zip).decode("utf-8-sig")
                     manifest = json.loads(manifest_content)
                 except Exception as e:
                     return False, f"Failed to parse manifest.json inside zip: {e}"

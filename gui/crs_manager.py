@@ -49,6 +49,7 @@ import math
 import os
 import re
 import struct
+from pyproj import CRS
 
 __all__ = [
     "CANVAS_CRS_ATTR",
@@ -58,12 +59,14 @@ __all__ = [
     "set_canvas_crs",
     "ensure_canvas_crs",
     "clear_canvas_crs",
+    "extract_epsg_code",
     "has_geospatial_data",
     "transform_xy_to_canvas",
     "transform_xy_from_canvas",
     "log_dataset_crs",
     "notify_plugins_crs_changed",
     "resolve_laz_crs",
+    "resolve_point_cloud_crs",
     "resolve_prj_crs",
     "resolve_snt_crs",
     "resolve_gis_crs",
@@ -132,6 +135,45 @@ def get_canvas_crs_info(app):
     return dict(info) if isinstance(info, dict) else {}
 
 
+def extract_epsg_code(crs):
+    """Extract a numeric EPSG code from a pyproj.CRS with fuzzy/confidence fallbacks."""
+    if crs is None:
+        return None
+    try:
+        code = crs.to_epsg()
+        if code:
+            return int(code)
+    except Exception:
+        pass
+    try:
+        code = crs.to_epsg(min_confidence=25)
+        if code:
+            return int(code)
+    except Exception:
+        pass
+    try:
+        auth = crs.to_authority()
+        if auth and str(auth[0]).upper() == "EPSG":
+            return int(auth[1])
+    except Exception:
+        pass
+    try:
+        for sub in getattr(crs, "sub_crs_list", None) or []:
+            sub_code = extract_epsg_code(sub)
+            if sub_code:
+                return sub_code
+    except Exception:
+        pass
+    try:
+        wkt = crs.to_wkt()
+        m = re.search(r'(?:AUTHORITY|ID)\["EPSG",\s*"?(\d+)"?\]', wkt, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def _sync_legacy_fields(app, crs):
     """Keep project_crs_* fields in sync for older code paths."""
     if app is None or crs is None:
@@ -145,7 +187,7 @@ def _sync_legacy_fields(app, crs):
     except Exception:
         pass
     try:
-        epsg = crs.to_epsg()
+        epsg = extract_epsg_code(crs)
         setattr(app, "project_crs_epsg", int(epsg) if epsg else None)
     except Exception:
         pass
@@ -171,7 +213,7 @@ def set_canvas_crs(app, crs, source="unknown", dataset=None, notify=True,
     info = {
         "source": source,
         "dataset": dataset,
-        "epsg": crs.to_epsg(),
+        "epsg": extract_epsg_code(crs),
         "name": getattr(crs, "name", None),
     }
     try:
@@ -587,53 +629,202 @@ def resolve_laz_crs(path):
 # --------------------------------------------------------------------------
 # CRS resolution: SNT
 # --------------------------------------------------------------------------
-def resolve_snt_crs(snt_path):
-    """Return (crs, source_label) for an SNT/DGN, or (None, None).
+def _normalized_delivery_stem(name):
+    """Normalize classified/copy stems so 3206_CLASS-1 matches 3206."""
+    from pathlib import Path
+    stem = Path(str(name)).stem.casefold()
+    stem = re.sub(r'[\s_\-]*(?:copy|\(?\d+\)?)+$', '', stem, flags=re.IGNORECASE)
+    stem = re.sub(r'[\s_\-]*class(?:[\s_\-]*\d+)?$', '', stem, flags=re.IGNORECASE)
+    stem = re.sub(r'[\s_\-]*(?:copy|\(?\d+\)?)+$', '', stem, flags=re.IGNORECASE)
+    return stem.strip()
 
-    Chain:
-      1. adjacent OGC WKT .prj
-      2. adjacent TerraScan .prj -> ProjectionSystem=<EPSG>
-      3. LAZ/LAS listed in the SNT's TerraScan block list -> their VLR CRS
-      4. a single differently-named .prj in the same folder (delivery convention)
-    """
+
+def _adjacent_prj_groups(path):
+    """Group PRJs next to path: exact same-stem, matching normalized-stem, and all siblings."""
+    from pathlib import Path
+    p = Path(str(path))
+    parent = p.parent
+    same = p.with_suffix(".prj")
+    exact = [same] if same.is_file() else []
+    try:
+        siblings = sorted([q for q in parent.glob("*.prj") if q.is_file()],
+                          key=lambda q: q.name.casefold())
+    except Exception:
+        siblings = []
+    wanted = _normalized_delivery_stem(p.name)
+    matching = [
+        q for q in siblings
+        if q not in exact and _normalized_delivery_stem(q.name) == wanted
+    ]
+    return exact, matching, siblings
+
+
+def _unambiguous_crs(pairs):
+    """Return (crs, label) if all pairs have identical CRS, else (None, None)."""
+    if not pairs:
+        return None, None
+    first_crs, first_label = pairs[0]
+    for crs, label in pairs[1:]:
+        if crs is None or first_crs is None:
+            return None, None
+        try:
+            if not first_crs.equals(crs):
+                return None, None
+        except Exception:
+            return None, None
+    return first_crs, first_label
+
+
+def _resolve_dgn_spatial_ref_crs(dgn_path):
+    """Parse DGNv8 OLE storage to extract embedded ECSchema SpatialRef WKT."""
     try:
         from pathlib import Path
-        if not snt_path:
+        import zlib
+        from plugins.naksha_converter import olefile
+        p = Path(str(dgn_path))
+        if not p.is_file():
             return None, None
-        p = Path(str(snt_path))
-        candidates = []
-        same = p.with_suffix(".prj")
-        if same.is_file():
-            candidates.append(same)
-        try:
-            siblings = [q for q in p.parent.glob("*.prj") if q.is_file()]
-        except Exception:
-            siblings = []
-        if len(siblings) == 1 and siblings[0] not in candidates:
-            candidates.append(siblings[0])
-
-        terrascans = []
-        for prj in candidates:
-            crs, label = resolve_prj_crs(str(prj))
-            if crs is not None:
-                return crs, label
-            # remember TerraScan files for the block-list fallback
-            try:
-                with open(prj, "r", encoding="utf-8", errors="ignore") as f:
-                    if f.read(2048).lstrip()[:32].lstrip().upper().startswith("[TERRASCAN"):
-                        terrascans.append(prj)
-            except Exception:
-                pass
-
-        # 3. referenced LAZ/LAS from TerraScan block list
-        for prj in terrascans:
-            for laz in _terrascan_block_laz(prj):
-                crs, label = resolve_laz_crs(laz)
-                if crs is not None:
-                    return crs, f"{label} (via SNT block {os.path.basename(laz)})"
-        return None, None
+        with olefile.OleFileIO(str(p)) as ole:
+            entries = ole.listdir()
+            streams_to_check = [e for e in entries if any("dgn" in str(part).lower() or "$" in str(part) for part in e)]
+            if not streams_to_check:
+                streams_to_check = entries
+            crss = []
+            for entry in streams_to_check:
+                try:
+                    raw = ole.openstream(entry).read()
+                    xml_text = None
+                    for off in (16, 0):
+                        try:
+                            decomp = zlib.decompress(raw[off:])
+                            for enc in ("utf-16le", "utf-8"):
+                                txt = decomp.decode(enc, errors="ignore")
+                                if "<SpatialRef>" in txt:
+                                    xml_text = txt
+                                    break
+                            if xml_text:
+                                break
+                        except Exception:
+                            pass
+                    if not xml_text:
+                        for enc in ("utf-16le", "utf-8", "latin-1"):
+                            try:
+                                txt = raw.decode(enc, errors="ignore")
+                                if "<SpatialRef>" in txt:
+                                    xml_text = txt
+                                    break
+                            except Exception:
+                                pass
+                    if xml_text and "<SpatialRef>" in xml_text:
+                        for part in xml_text.split("<SpatialRef>")[1:]:
+                            sref = part.split("</SpatialRef>")[0].strip()
+                            if sref:
+                                try:
+                                    c = CRS.from_user_input(sref)
+                                    crss.append(c)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            if not crss:
+                return None, None
+            first = crss[0]
+            for other in crss[1:]:
+                if not first.equals(other):
+                    return None, None
+            return first, f"DGN embedded SpatialRef ({p.name})"
     except Exception:
         return None, None
+
+
+def _resolve_adjacent_dgn_crs(dataset_path):
+    """Resolve a directly associated or otherwise unambiguous sibling DGN."""
+    try:
+        from pathlib import Path
+        path = Path(str(dataset_path))
+        siblings = sorted(
+            (p for p in path.parent.glob("*.dgn") if p.is_file()),
+            key=lambda p: p.name.casefold(),
+        )
+        same = path.with_suffix(".dgn")
+        exact = [same] if same.is_file() else []
+        wanted = _normalized_delivery_stem(path.name)
+        matching = [
+            p for p in siblings
+            if p not in exact and _normalized_delivery_stem(p.name) == wanted
+        ]
+        for dgn in exact:
+            crs, label = _resolve_dgn_spatial_ref_crs(dgn)
+            if crs is not None:
+                return crs, label
+        matched = []
+        for dgn in matching:
+            crs, label = _resolve_dgn_spatial_ref_crs(dgn)
+            if crs is not None:
+                matched.append((crs, label))
+        crs, label = _unambiguous_crs(matched)
+        if crs is not None:
+            return crs, label
+        if len(siblings) == 1:
+            return _resolve_dgn_spatial_ref_crs(siblings[0])
+        resolved = []
+        for dgn in siblings:
+            crs, label = _resolve_dgn_spatial_ref_crs(dgn)
+            if crs is not None:
+                resolved.append((crs, label))
+        if len(resolved) >= 2:
+            return _unambiguous_crs(resolved)
+    except Exception:
+        pass
+    return None, None
+
+
+def resolve_point_cloud_crs(path):
+    """Resolve a LAS/LAZ CRS from its header or an unambiguous adjacent PRJ/DGN.
+
+    The LAS header remains authoritative. Deliveries that omit projection
+    VLRs commonly include a same-stem WKT PRJ; classified copies may instead
+    use the base project stem. When several unrelated PRJs are present, no
+    CRS is guessed unless all parseable definitions agree.
+    """
+    crs, label = resolve_laz_crs(path)
+    if crs is not None:
+        return crs, label
+
+    exact, matching, siblings = _adjacent_prj_groups(path)
+    if exact:
+        crs, label = resolve_prj_crs(str(exact[0]))
+        if crs is not None:
+            return crs, f"{label} ({exact[0].name})"
+
+    matched = []
+    for prj in matching:
+        crs, label = resolve_prj_crs(str(prj))
+        if crs is not None:
+            matched.append((crs, f"{label} ({prj.name})"))
+    crs, label = _unambiguous_crs(matched)
+    if crs is not None:
+        return crs, label
+
+    if len(siblings) == 1:
+        crs, label = resolve_prj_crs(str(siblings[0]))
+        if crs is not None:
+            return crs, f"{label} ({siblings[0].name})"
+
+    resolved = []
+    for prj in siblings:
+        crs, label = resolve_prj_crs(str(prj))
+        if crs is not None:
+            resolved.append((crs, f"{label} ({prj.name}; adjacent PRJs agree)"))
+    if len(resolved) >= 2:
+        crs, label = _unambiguous_crs(resolved)
+        if crs is not None:
+            return crs, label
+
+    crs, label = _resolve_adjacent_dgn_crs(path)
+    if crs is not None:
+        return crs, label
+    return None, None
 
 
 def _terrascan_block_laz(prj_path):
@@ -662,6 +853,77 @@ def _terrascan_block_laz(prj_path):
     except Exception:
         pass
     return out
+
+
+def resolve_snt_crs(snt_path):
+    """Return (crs, source_label) for an SNT/DGN, or (None, None).
+
+    Chain:
+      1. adjacent OGC WKT .prj
+      2. adjacent TerraScan .prj -> ProjectionSystem=<EPSG>
+      3. companion DGNv8 embedded SpatialRef WKT
+      4. LAZ/LAS listed in the SNT's TerraScan block list -> their VLR CRS
+      5. a single differently-named .prj in the same folder (delivery convention)
+    """
+    try:
+        from pathlib import Path
+        if not snt_path:
+            return None, None
+        p = Path(str(snt_path))
+        exact, matching, siblings = _adjacent_prj_groups(p)
+
+        if exact:
+            crs, label = resolve_prj_crs(str(exact[0]))
+            if crs is not None:
+                return crs, f"{label} ({exact[0].name})"
+
+        matched = []
+        for prj in matching:
+            crs, label = resolve_prj_crs(str(prj))
+            if crs is not None:
+                matched.append((crs, f"{label} ({prj.name})"))
+        crs, label = _unambiguous_crs(matched)
+        if crs is not None:
+            return crs, label
+
+        crs, label = _resolve_adjacent_dgn_crs(p)
+        if crs is not None:
+            return crs, label
+
+        if len(siblings) == 1:
+            crs, label = resolve_prj_crs(str(siblings[0]))
+            if crs is not None:
+                return crs, f"{label} ({siblings[0].name})"
+
+        sibling_resolutions = []
+        for prj in siblings:
+            crs, label = resolve_prj_crs(str(prj))
+            if crs is not None:
+                sibling_resolutions.append(
+                    (crs, f"{label} ({prj.name}; adjacent PRJs agree)")
+                )
+        if len(sibling_resolutions) >= 2:
+            crs, label = _unambiguous_crs(sibling_resolutions)
+            if crs is not None:
+                return crs, label
+
+        terrascans = exact + [prj for prj in matching if prj not in exact]
+        if not terrascans and len(siblings) == 1:
+            terrascans = list(siblings)
+        laz_resolutions = []
+        for prj in terrascans:
+            for laz in _terrascan_block_laz(prj):
+                crs, label = resolve_laz_crs(laz)
+                if crs is not None:
+                    laz_resolutions.append(
+                        (crs, f"{label} (via SNT block {os.path.basename(laz)})")
+                    )
+        crs, label = _unambiguous_crs(laz_resolutions)
+        if crs is not None:
+            return crs, label
+        return None, None
+    except Exception:
+        return None, None
 
 
 # --------------------------------------------------------------------------

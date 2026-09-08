@@ -2606,6 +2606,11 @@ class ThemeManager:
 
         for vtk_widget in cls._iter_vtk_widgets(app_window):
             cls._apply_vtk_widget_theme(vtk_widget)
+        try:
+            from gui.scene_render_pipeline import sync_scene_background
+            sync_scene_background(app_window)
+        except Exception:
+            pass
 
     @classmethod
     def _iter_vtk_widgets(cls, app_window):

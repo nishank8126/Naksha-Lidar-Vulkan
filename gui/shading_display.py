@@ -236,7 +236,28 @@ def _schedule_fast_shaded_present(
             if widget is not None:
                 reason = getattr(app, '_shading_present_reason', None)
                 pt0 = time.perf_counter()
-                widget.render()
+                # widget.render() is GPURenderManager's WRAPPED/throttled
+                # version -- calling it here (already inside a deferred
+                # timer meant to bypass throttling) can re-enter the same
+                # classify-streak/debounce throttle and just reschedule yet
+                # another pending render instead of actually painting,
+                # which is why this print's render_ms sometimes measured
+                # ~0.1ms (the cost of re-arming a timer, not a real paint)
+                # while Undo visually appeared to do nothing until an
+                # unrelated widget focus change happened to flush it later.
+                # Use the render manager's own bypass when available.
+                mgr = getattr(app, 'gpu_render_manager', None)
+                if mgr is not None:
+                    mgr.force_render()
+                else:
+                    widget.render()
+                try:
+                    widget.update()
+                    from PySide6.QtCore import QEventLoop
+                    from PySide6.QtWidgets import QApplication
+                    QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                except Exception:
+                    pass
                 if reason:
                     print(
                         "SHADING_PRESENT "
@@ -4882,6 +4903,8 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         )
     checkpoint("overlay_restore")
     _restore_camera(app, saved_camera); plotter.set_background("black")
+    from gui.scene_render_pipeline import sync_scene_background
+    sync_scene_background(app)
     plotter.renderer.ResetCameraClippingRange()
     try:
         m = app._shaded_mesh_actor.GetMapper()
