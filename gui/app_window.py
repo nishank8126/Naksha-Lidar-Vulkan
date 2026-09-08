@@ -234,6 +234,17 @@ class MainWheelZoomEventFilter(QObject):
                 return True
         if getattr(app, "_draw_curve_context_active", False):
             return True
+        # Parallel/Centerline dialogs pick an existing line by installing
+        # their own one-shot VTK LeftButtonPressEvent observer directly on
+        # the interactor (see gui/parallel_tool_dialog.py and
+        # gui/centerline_tool_dialog.py) while `_select_mode` is True -
+        # they never set `digitizer.active_tool`, so without this check a
+        # configured Left/Tap-Tap pan claims and swallows that click as a
+        # camera pan instead of letting it reach the dialog's picker.
+        for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
+            dialog = getattr(app, dialog_attr, None)
+            if dialog is not None and getattr(dialog, "_select_mode", False):
+                return True
         return False
 
     def eventFilter(self, obj, event):
@@ -14160,6 +14171,31 @@ class NakshaApp(QMainWindow):
     def _deactivate_digitize_tool(self):
         """Deactivate any active digitize/selection tool (for mutual exclusion with section tools)."""
         self._deactivate_selection_tools("section tool activation")
+
+        # AccuDraw can remain active even when digitizer.active_tool is None
+        # or already something else - activate()/deactivate() only clear
+        # active_tool via AccuDraw's own path, so a plain `active_tool`
+        # check below misses it and its priority-100 VTK observers
+        # (LeftButtonPressEvent/MouseMoveEvent/RightButtonPressEvent) keep
+        # intercepting canvas input ahead of the section tool's own
+        # observers - the exact "AccuDraw collides with cross-section"
+        # symptom. Mirror digitizer.deactivate_all()'s own AccuDraw guard.
+        digitizer = getattr(self, 'digitizer', None)
+        accudraw_tool = getattr(digitizer, "accudraw_tool", None) if digitizer is not None else None
+        if accudraw_tool is not None and getattr(accudraw_tool, "active", False):
+            try:
+                print("🛑 Deactivating AccuDraw before section tool activation")
+                if hasattr(accudraw_tool, "finish_for_tool_switch"):
+                    accudraw_tool.finish_for_tool_switch("section tool activation")
+                else:
+                    has_unfinished = bool(
+                        getattr(accudraw_tool, "points", None)
+                        or getattr(accudraw_tool, "drawing", None) is not None
+                        or getattr(accudraw_tool, "preview_actor", None) is not None
+                    )
+                    accudraw_tool.deactivate(cancel=has_unfinished)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate AccuDraw: {e}")
 
         if hasattr(self, 'digitizer') and self.digitizer and getattr(self.digitizer, 'active_tool', None):
             try:
