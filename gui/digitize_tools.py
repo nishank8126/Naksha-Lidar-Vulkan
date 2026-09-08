@@ -8189,6 +8189,43 @@ class DigitizeManager:
                 self._restore_layer_metadata(drawing_entry, d)
                 self.drawings.append(drawing_entry)
 
+    def _sync_curve_finalized_actors(self):
+        """Keep CurveTool.finalized_actors in lockstep with self.drawings
+        after any undo/redo.
+
+        curve_tool.undo_curve()/redo_curve() delegate straight to this
+        class's own undo()/redo() (the unified undo stack), which correctly
+        adds/removes the curve's dict from self.drawings - but never touches
+        curve_tool.finalized_actors, its own separate bookkeeping list of
+        every curve ever finished. Left stale, an already-undone curve stays
+        in finalized_actors forever, and Element Select's
+        _iter_pickable_drawings() (element_select_tool.py) merges
+        finalized_actors into what it treats as selectable - resurrecting
+        the undone curve into Block/Individual-select (and, once selected,
+        onto the canvas again via Move) even though it is correctly gone
+        from self.drawings. Reconcile by `_uid` (stable across a "rebuilt"
+        drawing getting a fresh dict/actor) rather than by object identity.
+        """
+        curve_tool = getattr(self.app, "curve_tool", None)
+        finalized = getattr(curve_tool, "finalized_actors", None)
+        if not finalized:
+            return
+        try:
+            live_by_uid = {
+                d.get('_uid'): d for d in self.drawings
+                if isinstance(d, dict) and d.get('_uid')
+            }
+            kept = []
+            for curve_data in finalized:
+                uid = curve_data.get('_uid') if isinstance(curve_data, dict) else None
+                if uid is None:
+                    kept.append(curve_data)
+                elif uid in live_by_uid:
+                    kept.append(live_by_uid[uid])
+            curve_tool.finalized_actors = kept
+        except Exception as e:
+            print(f"⚠️ Failed to sync curve finalized_actors after undo/redo: {e}")
+
     def _restore_state(self, state):
         """
         Undo/redo entry point.
@@ -8521,6 +8558,7 @@ class DigitizeManager:
 
             previous_state = self.undo_stack.pop()
             self._restore_state(previous_state)
+            self._sync_curve_finalized_actors()
             self.clear_coordinate_labels()
             self._clear_vertex_delete_highlight()
             print(f"↶ Undo (undo stack: {len(self.undo_stack)}, redo stack: {len(self.redo_stack)})")
@@ -8579,6 +8617,7 @@ class DigitizeManager:
 
         next_state = self.redo_stack.pop()
         self._restore_state(next_state)
+        self._sync_curve_finalized_actors()
         self.clear_coordinate_labels()
         self._clear_vertex_delete_highlight()
 
