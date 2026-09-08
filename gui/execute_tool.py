@@ -209,36 +209,52 @@ def _schedule_curve_tool_resume(app_window, reason="mode switch"):
     QTimer.singleShot(0, _do_resume)
 
 
-def _deactivate_curve_tool_safely(app_window, reason="switching tools"):
+def _deactivate_curve_tool_safely(app_window, reason="switching tools", *, exclusive=False):
     """
     Safely deactivate curve tool in all modes.
     Called when switching to any other tool context.
+
+    exclusive=True is for tool contexts curve must not silently fight for
+    input with once you've switched away - classification, cut-section,
+    CutFromCross/CutFromCut, temp fence. Without it, suspend()+schedule-
+    resume (below) re-arms curve_tool on the very next Qt tick because
+    `_draw_curve_context_active` is never cleared, so curve keeps its VTK
+    observers live and intercepts clicks meant for the tool you just
+    switched to - unlike SmartLine/Polyline, which fully stand down via
+    digitizer.set_tool(None) and never come back on their own. Mirrors
+    the existing resume_after_switch=False guard in
+    app_window._suspend_curve_tool_safely, used for the same reason when
+    entering cross-section.
     """
     if not hasattr(app_window, 'curve_tool') or app_window.curve_tool is None:
         return
-    
+
     ct = app_window.curve_tool
-    
+
     # Check if curve tool has any active mode
     is_active = ct.active
     is_select_mode = getattr(ct, '_select_mode', False)
-    
+
     if not is_active and not is_select_mode:
         return
-    
+
     print(f"   🎨 Deactivating curve tool ({reason})")
-    
+
+    if exclusive:
+        app_window._draw_curve_context_active = False
+
     # Cancel active drawing if in progress
     if is_active:
         if hasattr(ct, "suspend"):
             ct.suspend()
-            # ✅ FIX: don't leave it suspended — re-arm it once this mode
-            # switch finishes, so the very next canvas click continues the
-            # curve instead of requiring the user to reselect the tool.
-            _schedule_curve_tool_resume(app_window, reason)
+            if not exclusive:
+                # ✅ FIX: don't leave it suspended — re-arm it once this mode
+                # switch finishes, so the very next canvas click continues the
+                # curve instead of requiring the user to reselect the tool.
+                _schedule_curve_tool_resume(app_window, reason)
         else:
             ct._cancel_curve()
-    
+
     # Exit select mode if active
     if is_select_mode:
         ct.deactivate_select_mode()
@@ -1214,7 +1230,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         print("🔧 Activating Cut Section tool")
         
         # ✅ Deactivate curve tool when switching to cut-section
-        _deactivate_curve_tool_safely(app_window, "switching to cut-section")
+        _deactivate_curve_tool_safely(app_window, "switching to cut-section", exclusive=True)
         
         # ✅ Deactivate measurement tool
         _deactivate_measurement_tool_safely(app_window, "switching to cut-section")
@@ -1241,7 +1257,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # ========================================================================
     if tool_name == "CutFromCross":
         # ✅ Deactivate curve tool
-        _deactivate_curve_tool_safely(app_window, "switching to CutFromCross")
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCross", exclusive=True)
 
         # ✅ Stand down temp fence tool
         _deactivate_temp_fence_safely(app_window, "switching to CutFromCross")
@@ -1252,7 +1268,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
 
     if tool_name == "CutFromCut":
         # ✅ Deactivate curve tool
-        _deactivate_curve_tool_safely(app_window, "switching to CutFromCut")
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCut", exclusive=True)
 
         # ✅ Stand down temp fence tool
         _deactivate_temp_fence_safely(app_window, "switching to CutFromCut")
@@ -1265,7 +1281,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # TEMP FENCE (standalone fence tool — no ClassPicker, no classification)
     # ========================================================================
     if tool_name == "temp_fence":
-        _deactivate_curve_tool_safely(app_window, "switching to temp fence")
+        _deactivate_curve_tool_safely(app_window, "switching to temp fence", exclusive=True)
         _deactivate_measurement_tool_safely(app_window, "switching to temp fence")
         if hasattr(app_window, "set_classify_tool"):
             app_window.set_classify_tool("temp_fence")
@@ -1298,7 +1314,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     print(f"🎯 Activating classification tool: {tool_name}")
     
     # ✅ CRITICAL: Deactivate curve tool when switching to classification
-    _deactivate_curve_tool_safely(app_window, "switching to classification")
+    _deactivate_curve_tool_safely(app_window, "switching to classification", exclusive=True)
     
     # ✅ CRITICAL: Deactivate measurement tool when switching to classification
     _deactivate_measurement_tool_safely(app_window, "switching to classification")

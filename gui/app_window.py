@@ -155,13 +155,23 @@ class MainWheelZoomEventFilter(QObject):
         """True when the persistent panning button is set to tap-tap pan."""
         return getattr(app, "panning_button", "scroll") == "tap"
 
-    def _eligible_pan_button(self, app, pressed_button):
+    def _eligible_pan_button(self, app, pressed_button, modifiers=Qt.NoModifier):
         """Return the pan button for a press, or None if it is not one."""
         if pressed_button == Qt.MiddleButton:
             # Physical middle is always pan, irrespective of which
             # configurable primary pan button is selected.
             return Qt.MiddleButton
         if pressed_button == Qt.LeftButton:
+            # Shift+Left is reserved for the native 3D rotate/orbit gesture
+            # (works fine when the panning-button setting is "scroll",
+            # since that setting never claims Left at all) -- with "Left
+            # Mouse Button" or "Tap-Tap" panning, every Left press was
+            # claimed for pan unconditionally, including Shift+Left, so
+            # that gesture stopped reaching whatever handles it as soon as
+            # a Left-based panning-button setting was chosen. Let it
+            # through here regardless of the panning-button setting.
+            if modifiers & Qt.ShiftModifier:
+                return None
             pb = getattr(app, "panning_button", "scroll")
             if pb in ("left", "tap") or getattr(
                 app, "_left_pan_shortcut_active", False
@@ -224,6 +234,17 @@ class MainWheelZoomEventFilter(QObject):
                 return True
         if getattr(app, "_draw_curve_context_active", False):
             return True
+        # Parallel/Centerline dialogs pick an existing line by installing
+        # their own one-shot VTK LeftButtonPressEvent observer directly on
+        # the interactor (see gui/parallel_tool_dialog.py and
+        # gui/centerline_tool_dialog.py) while `_select_mode` is True -
+        # they never set `digitizer.active_tool`, so without this check a
+        # configured Left/Tap-Tap pan claims and swallows that click as a
+        # camera pan instead of letting it reach the dialog's picker.
+        for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
+            dialog = getattr(app, dialog_attr, None)
+            if dialog is not None and getattr(dialog, "_select_mode", False):
+                return True
         return False
 
     def eventFilter(self, obj, event):
@@ -322,7 +343,9 @@ class MainWheelZoomEventFilter(QObject):
                         # is armed or the persistent setting is Left / Tap-Tap.
                         # _left_button_is_owned_by_tool() keeps every active
                         # tool's left clicks untouched.
-                        pan_button = self._eligible_pan_button(app, pressed_button)
+                        pan_button = self._eligible_pan_button(
+                            app, pressed_button, event.modifiers()
+                        )
                         if pan_button is None:
                             if pressed_button == Qt.LeftButton and self._tap_session:
                                 self._finish_tap_session(app)
@@ -14149,6 +14172,31 @@ class NakshaApp(QMainWindow):
         """Deactivate any active digitize/selection tool (for mutual exclusion with section tools)."""
         self._deactivate_selection_tools("section tool activation")
 
+        # AccuDraw can remain active even when digitizer.active_tool is None
+        # or already something else - activate()/deactivate() only clear
+        # active_tool via AccuDraw's own path, so a plain `active_tool`
+        # check below misses it and its priority-100 VTK observers
+        # (LeftButtonPressEvent/MouseMoveEvent/RightButtonPressEvent) keep
+        # intercepting canvas input ahead of the section tool's own
+        # observers - the exact "AccuDraw collides with cross-section"
+        # symptom. Mirror digitizer.deactivate_all()'s own AccuDraw guard.
+        digitizer = getattr(self, 'digitizer', None)
+        accudraw_tool = getattr(digitizer, "accudraw_tool", None) if digitizer is not None else None
+        if accudraw_tool is not None and getattr(accudraw_tool, "active", False):
+            try:
+                print("🛑 Deactivating AccuDraw before section tool activation")
+                if hasattr(accudraw_tool, "finish_for_tool_switch"):
+                    accudraw_tool.finish_for_tool_switch("section tool activation")
+                else:
+                    has_unfinished = bool(
+                        getattr(accudraw_tool, "points", None)
+                        or getattr(accudraw_tool, "drawing", None) is not None
+                        or getattr(accudraw_tool, "preview_actor", None) is not None
+                    )
+                    accudraw_tool.deactivate(cancel=has_unfinished)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate AccuDraw: {e}")
+
         if hasattr(self, 'digitizer') and self.digitizer and getattr(self.digitizer, 'active_tool', None):
             try:
                 print("🛑 Deactivating digitize tool before section tool activation")
@@ -18009,6 +18057,56 @@ class NakshaApp(QMainWindow):
  
     def on_curve_button_clicked(self):
         """Activate the curve drawing tool"""
+        # Curve is activated through its own dedicated path rather than
+        # digitizer.set_tool() (which every other draw tool - SmartLine,
+        # Polyline, Rectangle, etc. - goes through), so it never got the
+        # classification/cross-section/cut-section teardown set_tool()
+        # does for those tools (see set_tool()'s own "Draw tool selected -
+        # deactivating ..." checks in digitize_tools.py). Without this,
+        # picking Curve while a classification tool is armed leaves it
+        # armed - the classification undo stack keeps eating Ctrl+Z and
+        # its section-refresh keeps firing - even though drawing curves
+        # visibly proceeds, exactly the "curve doesn't behave like
+        # SmartLine" symptom reported.
+        #
+        # Checking only active_classify_tool isn't enough: a line-style tool
+        # (above_line/below_line/parallel_line) armed while a cross-section
+        # exists attaches wrapper interactors into classify_interactors
+        # without ever touching the main view, and other code paths can
+        # clear active_classify_tool while leaving those wrappers (or the
+        # main-view classify_interactor / cut_classify_interactor) attached.
+        # Ctrl+Z's routing (see global_shortcuts._is_classification_active
+        # and UndoContextManager.is_classification_active) treats any of
+        # those as "classification still active", so this guard must use
+        # the same comprehensive check - otherwise it silently skips
+        # teardown and undo keeps eating classification forever after,
+        # even once the curve is finalized and visibly the active tool.
+        try:
+            from gui.undo_context_manager import get_undo_context_manager
+        except ImportError:
+            from .undo_context_manager import get_undo_context_manager
+        if get_undo_context_manager(self).is_classification_active():
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating classification tool")
+                self.deactivate_classification_tool(preserve_cross_section=True)
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate classification before curve tool: {e}")
+
+        if getattr(self, 'cross_section_active', False):
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating cross-section tool")
+                self.deactivate_cross_section_tool()
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate cross-section before curve tool: {e}")
+
+        if getattr(self, 'cut_section_mode_on', False):
+            try:
+                print("🛑 Draw tool 'curve' selected — deactivating cut-section tool")
+                self.cut_section_controller.cancel_cut_section()
+                self.cut_section_mode_on = False
+            except Exception as e:
+                print(f"⚠️ Failed to deactivate cut-section before curve tool: {e}")
+
         # Deactivate other tools first (safe checks)
         for dialog_attr in ("_parallel_tool_dialog", "_centerline_tool_dialog"):
             dialog = getattr(self, dialog_attr, None)

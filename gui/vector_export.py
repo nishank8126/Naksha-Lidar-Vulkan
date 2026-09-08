@@ -3843,11 +3843,23 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
 
         progress.setValue(100)
         progress.close()
- 
+
         print(f"   ✅ GeoTIFF texture added successfully")
         print(f"   📏 Coverage: X({left:.2f} → {right:.2f})  "
               f"Y({bottom:.2f} → {top:.2f})  Z={scene_z:.2f}")
         print(f"{'='*60}\n")
+
+        # Build a resolution pyramid in the background for files raster_lod.py
+        # will re-read repeatedly at every zoom level - see raster_overviews.py.
+        # Fire-and-forget: doesn't block this import, doesn't touch the source
+        # file (external .ovr sidecar only), safe to skip on failure.
+        if lod_eligible:
+            try:
+                from gui.gis.raster_overviews import ensure_overviews_async
+                ensure_overviews_async(input_path)
+            except Exception as exc:
+                print(f"   ⚠️ Could not schedule overview build: {exc}")
+
         return True
  
     except ImportError as e:
