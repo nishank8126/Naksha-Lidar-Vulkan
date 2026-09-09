@@ -179,8 +179,7 @@ class CRSSelectorDialog(QDialog):
         tools.addStretch(1)
         meta = proj_database_metadata()
         epsg_ver = meta.get("EPSG.VERSION") or "?"
-        esri_ver = meta.get("ESRI.VERSION") or "?"
-        tools.addWidget(QLabel(f"PROJ catalog · EPSG {epsg_ver} · ESRI {esri_ver}"))
+        tools.addWidget(QLabel(f"PROJ catalog · EPSG {epsg_ver}"))
         root.addLayout(tools)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)

@@ -395,7 +395,7 @@ class CreateFeaturesPanel(QDialog):
             elif esri_type == "esriFieldTypeBigInteger":
                 le = QLineEdit()
                 le.setValidator(QRegularExpressionValidator(QRegularExpression(r"[-+]?\d{0,19}")))
-                le.setPlaceholderText("64-bit integer / safe ArcGIS value")
+                le.setPlaceholderText("64-bit integer")
                 self._field_widgets[fname_lower] = le
                 label = fname
                 if not nullable:
