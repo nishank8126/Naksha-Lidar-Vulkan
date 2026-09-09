@@ -6682,7 +6682,7 @@ class NakshaApp(QMainWindow):
         _prog(92, "Restoring settings…")
         try:
             from gui.display_mode import restore_display_settings_for_file
-            restore_display_settings_for_file(self, first_file)
+            restore_display_settings_for_file(self, first_file, refresh=False)
         except Exception:
             pass
 
@@ -7156,7 +7156,7 @@ class NakshaApp(QMainWindow):
         # Restore settings
         update_progress(55, "Checking for saved settings...")
         from .display_mode import restore_display_settings_for_file
-        restore_display_settings_for_file(self, filename)
+        restore_display_settings_for_file(self, filename, refresh=False)
         from gui.unified_actor_manager import reset_border_logic_to_structured
         reset_border_logic_to_structured(self)
        
@@ -12331,6 +12331,10 @@ class NakshaApp(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
     def _auto_backup(self):
         """Trigger a background auto-backup without blocking the UI."""
+        if getattr(self, "_dataset_load_in_progress", False):
+            print("Auto-backup deferred - dataset load is still in progress")
+            return
+
         # Guard: prevent overlapping backups
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
@@ -16315,7 +16319,7 @@ class NakshaApp(QMainWindow):
                     from gui.display_mode import restore_display_settings_for_file
                     self._prefer_session_display_restore = True
                     try:
-                        restore_display_settings_for_file(self, str(las_file))
+                        restore_display_settings_for_file(self, str(las_file), refresh=False)
                     finally:
                         self._prefer_session_display_restore = False
                 except Exception:
