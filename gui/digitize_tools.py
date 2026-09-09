@@ -4830,6 +4830,10 @@ class DigitizeManager:
                 self._select_actor(actor)
             return
 
+        # ============ GIS POINT ============
+        if self.active_tool == "gispoint":
+            self._finalize_gis_point(pos)
+            return
         # ============ FREEHAND ============
         if self.active_tool == "freehand":
             if not self.temp_points:
@@ -10564,6 +10568,41 @@ class DigitizeManager:
         return actor
 
     # ---------------- FINALIZE EXISTING SHAPES ----------------
+    def _finalize_gis_point(self, point):
+        """Create one point drawing; the GIS bridge persists it to the active layer."""
+        self._save_state()
+        style = self._get_draw_style("smartline")
+        points = vtk.vtkPoints()
+        points.SetDataType(vtk.VTK_DOUBLE)
+        points.InsertNextPoint(float(point[0]), float(point[1]), float(point[2]))
+        vertices = vtk.vtkCellArray()
+        vertices.InsertNextCell(1)
+        vertices.InsertCellPoint(0)
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetVerts(vertices)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*style["color"])
+        actor.GetProperty().SetPointSize(8.0)
+        actor.GetProperty().SetRenderPointsAsSpheres(True)
+        actor.PickableOn()
+        self._add_actor_to_overlay(actor)
+        drawing_entry = {
+            "type": "gispoint",
+            "coords": [tuple(point)],
+            "actor": actor,
+            "bounds": actor.GetBounds(),
+            "original_color": style["color"],
+            "original_width": 8.0,
+        }
+        self.drawings.append(drawing_entry)
+        self._emit_drawing_finalized(drawing_entry)
+        self.renderer.Modified()
+        self.app.vtk_widget.render()
+
     def _finalize_rectangle(self):
         """Finalize rectangle drawing immediately."""
         self._save_state()
@@ -14308,6 +14347,18 @@ class DigitizeManager:
                     'text': drawing_data.get('text', ''),
                     'radius': drawing_data.get('radius', 0)
                 }
+
+                # Preserve GIS source identity/schema metadata on the display/edit
+                # drawing. The VTK actor is only a render representation; these
+                # fields let higher-level GIS tools keep attributes and source
+                # provenance instead of reducing imported GIS features to lines.
+                for _meta_key in (
+                    'source_attributes', 'source_fid', 'source_layer', 'source_path',
+                    'source_driver', 'source_crs_wkt', 'source_geometry_type',
+                    'native_wkb', 'source_has_z', 'source_has_m',
+                ):
+                    if _meta_key in drawing_data:
+                        drawing[_meta_key] = drawing_data[_meta_key]
 
                 if shape_type == 'text':
                     drawing['original_text_color'] = color_vtk

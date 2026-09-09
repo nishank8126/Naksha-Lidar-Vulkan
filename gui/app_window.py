@@ -902,6 +902,27 @@ class _VTKCrosshair:
 #  (after the _VTKCrosshair class, around line 178)
 # ═══════════════════════════════════════════════════════════════════════
 
+class _CRSStatusClickFilter(QObject):
+    """Make the footer CRS badge a discoverable project-CRS control."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            try:
+                if event.button() == Qt.LeftButton:
+                    opener = getattr(self.app, "open_project_crs_dialog", None)
+                    if callable(opener):
+                        opener()
+                        event.accept()
+                        return True
+            except Exception:
+                pass
+        return False
+
+
 class _BackupWorker(QThread):
     """
     Writes LAZ backup in a background thread.
@@ -913,7 +934,8 @@ class _BackupWorker(QThread):
 
     def __init__(self, snapshot, path, las_version, point_format,
                  crs_wkt=None, crs_epsg=None, drawing_data=b"",
-                 source_path=None, import_options=None):
+                 source_path=None, import_options=None,
+                 runtime_crs_wkt=None, output_crs_wkt=None):
         super().__init__()
         self.setObjectName("NakshaBackupWorker")
         self._snapshot = snapshot
@@ -925,6 +947,8 @@ class _BackupWorker(QThread):
         self._drawing_data = drawing_data
         self._source_path = source_path
         self._import_options = import_options
+        self._runtime_crs_wkt = runtime_crs_wkt
+        self._output_crs_wkt = output_crs_wkt or crs_wkt
 
     def run(self):
         try:
@@ -936,6 +960,30 @@ class _BackupWorker(QThread):
             )
 
             xyz = self._snapshot["xyz"]
+            # Runtime points may live in the Naksha project CRS even when the
+            # native LAS/LAZ source uses another CRS. Reverse-transform in this
+            # background thread so the UI stays responsive and backups remain
+            # faithful to the source coordinate system.
+            if self._runtime_crs_wkt and self._output_crs_wkt:
+                try:
+                    from gui.projection_engine import parse_crs, transform_points
+                    _src = parse_crs(self._runtime_crs_wkt)
+                    _dst = parse_crs(self._output_crs_wkt)
+                    if _src is not None and _dst is not None and not _src.equals(_dst):
+                        xyz, _ = transform_points(
+                            xyz, _src, _dst, copy=True, chunk_size=1_000_000
+                        )
+                except Exception as _proj_exc:
+                    # Never label project coordinates as native-source CRS when
+                    # reverse transformation fails. Fall back to runtime CRS.
+                    print(f"Backup CRS round-trip warning: {_proj_exc}")
+                    self._output_crs_wkt = self._runtime_crs_wkt
+                    self._crs_wkt = self._runtime_crs_wkt
+                    try:
+                        from pyproj import CRS as _CRS
+                        self._crs_epsg = _CRS.from_wkt(self._runtime_crs_wkt).to_epsg()
+                    except Exception:
+                        self._crs_epsg = None
             n = xyz.shape[0]
             classes_u8 = self._snapshot["classes"]
             rgb16 = self._snapshot["rgb"]
@@ -1162,6 +1210,14 @@ class NakshaApp(QMainWindow):
         self.project_crs_epsg = None
         self.project_crs_wkt = None
         self.crs = None
+        # Unified spatial-reference / coordinate-operation core.  The object is
+        # lightweight; PROJ's database is queried lazily by the CRS selector.
+        try:
+            from gui.projection_engine import get_projection_engine
+            self.projection_engine = get_projection_engine(self)
+        except Exception as _proj_exc:
+            self.projection_engine = None
+            print(f"Projection engine init warning: {_proj_exc}")
         self.active_classify_tool = None
         self.from_classes = None
         self.to_class = None
@@ -1593,6 +1649,12 @@ class NakshaApp(QMainWindow):
         # Globe Icon and EPSG projection label (far right side, QGIS style)
         self.epsg_widget = QWidget(self.status)
         self.epsg_widget.setObjectName("epsgWidget")
+        self.epsg_widget.setCursor(Qt.PointingHandCursor)
+        self.epsg_widget.setToolTip(
+            "Project Coordinate Reference System. Click to browse/search the installed CRS catalog."
+        )
+        self._crs_status_click_filter = _CRSStatusClickFilter(self)
+        self.epsg_widget.installEventFilter(self._crs_status_click_filter)
         
         epsg_layout = QHBoxLayout(self.epsg_widget)
         epsg_layout.setContentsMargins(0, 0, 0, 0)
@@ -1687,13 +1749,12 @@ class NakshaApp(QMainWindow):
         # Managed by the Overlay Control Center dock (Global-Mapper style).
         self.gis_layers = []                 # registry of imported overlay layers
         self._gis_layers_dock = None         # lazily created QDockWidget
-        self.shortcut_gis_layers = QShortcut(QKeySequence("Alt+C"), self)
-        self.shortcut_gis_layers.activated.connect(self.toggle_gis_layers_panel)
-        print("🗺️ Press Alt+C to open the Overlay Control Center")
+        self.active_gis_edit_layer = None    # selected writable vector target
+        self.active_gis_edit_subtype = None
 
-        self.shortcut_gdb = QShortcut(QKeySequence("Alt+G"), self)
-        self.shortcut_gdb.activated.connect(self.toggle_gdb_panel)
-        print("🗄️ Press Alt+G to open the GDB import panel")
+        self.shortcut_project_crs = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        self.shortcut_project_crs.activated.connect(self.open_project_crs_dialog)
+        print("🌐 Press Ctrl+Shift+P to select/view the Project CRS")
 
         # Allow GIS files to be dropped straight onto the window (Global-Mapper style).
         self.setAcceptDrops(True)
@@ -2720,6 +2781,74 @@ class NakshaApp(QMainWindow):
             except Exception:
                 pass
 
+    def open_project_crs_dialog(self):
+        """Open the unified project/world CRS selector.
+
+        The project CRS may be selected freely before data are loaded.  Once
+        geometry is active, changing it is deliberately blocked here because a
+        true project reprojection must update *every* subsystem (LiDAR, SNT,
+        CAD, raster and GIS) atomically.  Individual source layers are already
+        transformed into the established project CRS on load.
+        """
+        try:
+            from gui.crs_manager import get_canvas_crs, set_canvas_crs
+            from gui.crs_selector_dialog import choose_crs
+            from gui.projection_engine import crs_identifier
+
+            current = get_canvas_crs(self)
+            chosen = choose_crs(self, current_crs=current, title="Project Coordinate Reference System")
+            if chosen is None:
+                return False
+            if current is not None:
+                try:
+                    if current.equals(chosen):
+                        self.update_epsg_display()
+                        return True
+                except Exception:
+                    pass
+
+            # Changing the display/project CRS after data are active can only be
+            # safe when every loaded source is transformed in one transaction.
+            # For now, sources are reprojected ON LOAD into the established CRS,
+            # so prevent accidental coordinate relabelling of an active scene.
+            has_data = bool(
+                (isinstance(getattr(self, "data", None), dict) and getattr(self, "data", {}).get("xyz") is not None)
+                or getattr(self, "snt_attachments", None)
+                or getattr(self, "dxf_attachments", None)
+                or getattr(self, "dwg_attachments", None)
+                or getattr(self, "gis_layers", None)
+                or (getattr(getattr(self, "digitizer", None), "drawings", None))
+            )
+            if current is not None and has_data:
+                QMessageBox.information(
+                    self,
+                    "Project CRS",
+                    "The project already contains geospatial data.\n\n"
+                    f"Current: {crs_identifier(current)} - {current.name}\n"
+                    f"Selected: {crs_identifier(chosen)} - {chosen.name}\n\n"
+                    "Naksha will not merely relabel active coordinates, because that would move/misalign "
+                    "LiDAR, SNT, GIS and CAD data. Clear the project and select the desired Project CRS "
+                    "first, then load your sources; each source will be transformed into it automatically."
+                )
+                return False
+
+            set_canvas_crs(
+                self, chosen,
+                source="User-selected project CRS",
+                dataset=None, force=True,
+            )
+            self.update_epsg_display()
+            try:
+                self.statusBar().showMessage(
+                    f"Project CRS: {crs_identifier(chosen)} - {chosen.name}", 5000
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Project CRS", f"Could not open/set project CRS:\n{exc}")
+            return False
+
     def update_epsg_display(self):
         if not hasattr(self, "epsg_label"):
             return
@@ -2729,12 +2858,24 @@ class NakshaApp(QMainWindow):
         # that created a false impression that the project/canvas CRS was known
         # (and silently misreported it for mixed-CRS projects).
         epsg = None
+        _prefix = "EPSG:"
+        _tooltip = "Project Coordinate Reference System. Click to select/view."
         try:
-            from gui.crs_manager import get_canvas_crs, extract_epsg_code
+            from gui.crs_manager import get_canvas_crs
+            from gui.projection_engine import crs_authority
             canvas = get_canvas_crs(self)
             if canvas is not None:
-                code = extract_epsg_code(canvas)
-                epsg = str(code) if code else (getattr(canvas, "name", None) or "custom")
+                auth, code = crs_authority(canvas)
+                if auth and code:
+                    _prefix = f"{auth}:"
+                    epsg = str(code)
+                else:
+                    _prefix = "CRS:"
+                    epsg = getattr(canvas, "name", None) or "Custom"
+                _tooltip = (
+                    f"Project CRS: {auth + ':' + code if auth and code else 'Custom'}\n"
+                    f"{getattr(canvas, 'name', '')}\n\nClick to browse/search coordinate systems."
+                )
         except Exception:
             epsg = None
 
@@ -2745,10 +2886,14 @@ class NakshaApp(QMainWindow):
 
         if epsg:
             self.epsg_label.setText(epsg)
+            self.epsg_label.setToolTip(_tooltip)
+            if hasattr(self, "epsg_widget"):
+                self.epsg_widget.setToolTip(_tooltip)
             self.epsg_label.show()
             if hasattr(self, "epsg_icon_label") and self.epsg_icon_label:
                 self.epsg_icon_label.show()
             if hasattr(self, "epsg_prefix_label") and self.epsg_prefix_label:
+                self.epsg_prefix_label.setText(_prefix)
                 self.epsg_prefix_label.show()
         else:
             self.epsg_label.setText("-")
@@ -2882,7 +3027,7 @@ class NakshaApp(QMainWindow):
         self._btn_layers.blockSignals(was_blocked)
 
         state_text = "Hide" if panel_visible else "Show"
-        self._btn_layers.setToolTip(f"{state_text} Overlay Control Center (Alt+C)")
+        self._btn_layers.setToolTip(f"{state_text} Overlay Control Center")
         self._btn_layers.setStatusTip(f"{state_text} Overlay Control Center")
         self._refresh_activity_bar_theme()
 
@@ -2901,7 +3046,7 @@ class NakshaApp(QMainWindow):
         import_action = menu.addAction("Import Overlay...")
         zoom_action = menu.addAction("Zoom To GIS Layers")
         zoom_action.setEnabled(has_layers)
-        gdb_action = menu.addAction("Open GDB Import Panel")
+        gdb_action = menu.addAction("Open GIS Catalog")
         menu.addSeparator()
         refresh_action = menu.addAction("Refresh Activity Bar")
 
@@ -3293,7 +3438,7 @@ class NakshaApp(QMainWindow):
         self._btn_layers.setObjectName("ActivityBtn")
         self._btn_layers.setFixedSize(24, 24)
         self._btn_layers.setIconSize(QSize(16, 16))
-        self._btn_layers.setToolTip("Toggle Overlay Control Center (Alt+C)")
+        self._btn_layers.setToolTip("Toggle Overlay Control Center")
         self._btn_layers.setCursor(Qt.PointingHandCursor)
         self._btn_layers.setCheckable(True)
         self._btn_layers.clicked.connect(self.toggle_gis_layers_panel)
@@ -6485,7 +6630,19 @@ class NakshaApp(QMainWindow):
         #   Main thread is now FREE — the event loop keeps running.
         from gui.file_loader_worker import FileLoaderWorker
 
-        worker = FileLoaderWorker(filenames, batch_import_options, parent=None)
+        _target_project_crs_wkt = None
+        try:
+            from gui.crs_manager import get_canvas_crs
+            _existing_project_crs = get_canvas_crs(self)
+            if _existing_project_crs is not None:
+                _target_project_crs_wkt = _existing_project_crs.to_wkt()
+        except Exception:
+            _target_project_crs_wkt = None
+
+        worker = FileLoaderWorker(
+            filenames, batch_import_options, parent=None,
+            target_project_crs_wkt=_target_project_crs_wkt,
+        )
         self._file_loader_worker = worker
         self._batch_import_options_last = batch_import_options  # read by _on_load_finished
 
@@ -6566,6 +6723,15 @@ class NakshaApp(QMainWindow):
         self.data = {"xyz": result["xyz"], "classification": result["classification"]}
         if "rgb"       in result: self.data["rgb"]       = result["rgb"]
         if "intensity" in result: self.data["intensity"] = result["intensity"]
+        # Source coordinates are preserved logically through this metadata even
+        # when runtime XYZ was reprojected into the Naksha project CRS by the
+        # background loader. Save/export uses this to transform back safely.
+        self.data["_source_crs_wkt"] = result.get("source_crs_wkt") or result.get("crs_wkt")
+        self.data["_runtime_crs_wkt"] = result.get("runtime_crs_wkt")
+        self.data["_runtime_reprojected"] = bool(result.get("runtime_reprojected"))
+        self.data["_source_crs_consistent"] = bool(result.get("source_crs_consistent", True))
+        self.data["_projection_report"] = result.get("projection_report")
+        self.data["_layer_crs_info"] = list(result.get("layer_info_list") or [])
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
         # Track whether this load was class-filtered so auto-save skips the file.
@@ -6586,60 +6752,76 @@ class NakshaApp(QMainWindow):
         rgb_mb = result.get("rgb",       np.array([])).nbytes / (1024**2)
         print(f"   Memory used: {xyz_mb + cls_mb + rgb_mb:.1f} MB")
 
-        # ── CRS ────────────────────────────────────────────────────────
+        # ── CRS / unified project coordinates ──────────────────────────
         try:
             from pyproj import CRS as _CRS
             from gui.crs_manager import (
-                set_canvas_crs,
-                ensure_canvas_crs,
-                clear_canvas_crs,
-                resolve_point_cloud_crs,
+                set_canvas_crs, ensure_canvas_crs, clear_canvas_crs,
+                get_canvas_crs, resolve_point_cloud_crs,
             )
             source_crs = None
+            runtime_crs = None
             source_label = "LAZ/LAS header"
 
-            if result.get("crs_wkt"):
+            if result.get("source_crs_wkt"):
+                try:
+                    source_crs = _CRS.from_wkt(result["source_crs_wkt"])
+                    source_label = "LAZ/LAS source CRS"
+                except Exception:
+                    source_crs = None
+            if source_crs is None and result.get("crs_wkt"):
                 try:
                     source_crs = _CRS.from_wkt(result["crs_wkt"])
                     source_label = "LAZ/LAS header WKT"
                 except Exception:
                     source_crs = None
-
             if source_crs is None and result.get("crs_epsg"):
                 try:
                     source_crs = _CRS.from_epsg(int(result["crs_epsg"]))
                     source_label = "LAZ/LAS header EPSG"
                 except Exception:
                     source_crs = None
-
             if source_crs is None and first_file:
                 try:
                     source_crs, source_label = resolve_point_cloud_crs(first_file)
                 except Exception:
                     source_crs = None
 
-            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
-            if source_crs is not None:
-                if not has_snt:
+            if result.get("runtime_crs_wkt"):
+                try:
+                    runtime_crs = _CRS.from_wkt(result["runtime_crs_wkt"])
+                except Exception:
+                    runtime_crs = None
+            if runtime_crs is None:
+                runtime_crs = source_crs
+
+            existing = get_canvas_crs(self)
+            if runtime_crs is not None:
+                if existing is None:
                     set_canvas_crs(
-                        self,
-                        source_crs,
-                        source=source_label or "LAZ/LAS metadata",
-                        dataset=first_file,
-                        force=True,
+                        self, runtime_crs, source="LiDAR project/runtime CRS",
+                        dataset=first_file, force=True,
                     )
                 else:
                     ensure_canvas_crs(
-                        self,
-                        source_crs,
-                        source=source_label or "LAZ/LAS metadata",
+                        self, runtime_crs, source="LiDAR project/runtime CRS",
                         dataset=first_file,
                     )
-                print(f"   📐 CRS: {source_crs.name} ({source_label})")
+
+                if source_crs is not None:
+                    try:
+                        if source_crs.equals(runtime_crs):
+                            print(f"   📐 LiDAR CRS: {source_crs.name} ({source_label})")
+                        else:
+                            print(f"   🌐 LiDAR source CRS: {source_crs.name}")
+                            print(f"   🌐 Project CRS:      {runtime_crs.name}")
+                            print("   ✅ XYZ is stored in project coordinates for this session; source CRS is preserved for save/export")
+                    except Exception:
+                        pass
             else:
-                if not has_snt:
+                if existing is None:
                     clear_canvas_crs(self)
-                print("   ⚠️ CRS unresolved: basemap alignment remains disabled")
+                print("   ⚠️ CRS unresolved: coordinates are kept unchanged; no CRS is guessed")
         except Exception as _crs_err:
             print(f"   ⚠️ CRS registration failed: {_crs_err}")
 
@@ -6653,6 +6835,11 @@ class NakshaApp(QMainWindow):
                 "rgb"       : self.data.get("rgb"),
                 "intensity" : self.data.get("intensity"),
                 "crs_epsg"  : fi.get("crs_epsg"),
+                "source_crs_wkt": fi.get("source_crs_wkt"),
+                "runtime_crs_wkt": fi.get("runtime_crs_wkt"),
+                "runtime_reprojected": bool(fi.get("runtime_reprojected")),
+                "point_start": fi.get("point_start"),
+                "point_end": fi.get("point_end"),
                 "visible"   : True,
             }
             if hasattr(self, "layers"):
@@ -6993,11 +7180,49 @@ class NakshaApp(QMainWindow):
                 prompt_user=False,
             )
             if laz_data:
+                _src_crs = None
+                _dst_crs = None
+                try:
+                    from pyproj import CRS as _CRS
+                    from gui.crs_manager import get_canvas_crs, set_canvas_crs, resolve_point_cloud_crs
+                    from gui.projection_engine import transform_points, crs_identifier
+
+                    if laz_data.get("crs_wkt"):
+                        try:
+                            _src_crs = _CRS.from_wkt(laz_data["crs_wkt"])
+                        except Exception:
+                            _src_crs = None
+                    if _src_crs is None and laz_data.get("crs_epsg"):
+                        try:
+                            _src_crs = _CRS.from_epsg(int(laz_data["crs_epsg"]))
+                        except Exception:
+                            _src_crs = None
+                    if _src_crs is None:
+                        try:
+                            _src_crs, _ = resolve_point_cloud_crs(laz)
+                        except Exception:
+                            _src_crs = None
+
+                    _dst_crs = get_canvas_crs(self)
+                    if _dst_crs is None and _src_crs is not None:
+                        set_canvas_crs(self, _src_crs, source="TerraScan tile CRS", dataset=laz, force=True)
+                        _dst_crs = get_canvas_crs(self) or _src_crs
+                    if _src_crs is not None and _dst_crs is not None and not _src_crs.equals(_dst_crs):
+                        laz_data["xyz"], _rep = transform_points(
+                            laz_data["xyz"], _src_crs, _dst_crs,
+                            copy=False, chunk_size=1_000_000,
+                        )
+                        print(f"TerraScan tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
+                except Exception as _crs_exc:
+                    print(f"TerraScan tile CRS warning ({laz}): {_crs_exc}")
+
                 layer = {
                     "type": "laz_tile",
                     "filename": laz,
                     "xyz": laz_data["xyz"],
                     "crs_epsg": laz_data.get("crs_epsg"),
+                    "source_crs_wkt": _src_crs.to_wkt() if _src_crs is not None else laz_data.get("crs_wkt"),
+                    "runtime_crs_wkt": _dst_crs.to_wkt() if _dst_crs is not None else laz_data.get("crs_wkt"),
                     "visible": True,
                 }
                 self.layers.append(layer)
@@ -7020,14 +7245,15 @@ class NakshaApp(QMainWindow):
         self.last_save_path = filename
         self._refresh_footer_file_label()
        
-        # Set CRS
-        if self.project_crs_epsg and not hasattr(self, 'crs'):
-            try:
-                from pyproj import CRS
-                self.crs = CRS.from_epsg(self.project_crs_epsg)
-                print(f"✅ Project CRS set: {self.crs.name}")
-            except Exception as e:
-                print(f"⚠️ Could not create CRS object: {e}")
+        # Project CRS is established by the first trustworthy tile above.
+        try:
+            from gui.crs_manager import get_canvas_crs
+            _pc = get_canvas_crs(self)
+            if _pc is not None:
+                self.crs = _pc
+                print(f"Project CRS: {_pc.name}")
+        except Exception as e:
+            print(f"Could not report TerraScan project CRS: {e}")
        
         from .display_mode import restore_display_settings_for_file
         restore_display_settings_for_file(self, filename)
@@ -7084,7 +7310,88 @@ class NakshaApp(QMainWindow):
        
         update_progress(35, f"Processing {n_points:,} points...")
        
-        # Set main data
+        # Resolve native source CRS and bring coordinates into the ONE project CRS
+        # BEFORE spatial indexing / VTK.  This is the same policy used by GIS
+        # layers and SNT attachments: source coordinates stay documented, while
+        # runtime geometry lives in app.canvas_crs.
+        _source_crs = None
+        _source_crs_label = None
+        _runtime_crs = None
+        _projection_report = None
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import get_canvas_crs, set_canvas_crs, resolve_point_cloud_crs
+            from gui.projection_engine import transform_points, crs_identifier
+
+            if lidar_data.get("crs_wkt"):
+                try:
+                    _source_crs = _CRS.from_wkt(lidar_data["crs_wkt"])
+                    _source_crs_label = "LAZ/LAS header WKT"
+                except Exception:
+                    _source_crs = None
+            if _source_crs is None and lidar_data.get("crs_epsg"):
+                try:
+                    _source_crs = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
+                    _source_crs_label = "LAZ/LAS header EPSG"
+                except Exception:
+                    _source_crs = None
+            if _source_crs is None and filename:
+                try:
+                    _source_crs, _source_crs_label = resolve_point_cloud_crs(filename)
+                except Exception:
+                    _source_crs = None
+
+            _runtime_crs = get_canvas_crs(self)
+            if _runtime_crs is not None and _source_crs is None:
+                raise RuntimeError(
+                    "[CRS] This LiDAR file has no trustworthy coordinate reference system, "
+                    "while the Naksha project CRS is already established. Assign/repair the LiDAR CRS first; "
+                    "Naksha will not guess and mix raw coordinates into the project."
+                )
+            if _runtime_crs is None and _source_crs is not None:
+                set_canvas_crs(
+                    self, _source_crs,
+                    source=_source_crs_label or "LiDAR source CRS",
+                    dataset=filename, force=True,
+                )
+                _runtime_crs = get_canvas_crs(self) or _source_crs
+
+            if _source_crs is not None and _runtime_crs is not None and not _source_crs.equals(_runtime_crs):
+                update_progress(42, f"Reprojecting LiDAR to project CRS {crs_identifier(_runtime_crs)}...")
+                _xyz, _projection_report = transform_points(
+                    lidar_data["xyz"], _source_crs, _runtime_crs,
+                    copy=False, chunk_size=1_000_000,
+                )
+                lidar_data["xyz"] = _xyz
+                print(
+                    f"LiDAR reprojected for project display: "
+                    f"{crs_identifier(_source_crs)} -> {crs_identifier(_runtime_crs)}"
+                )
+
+            if _source_crs is not None:
+                lidar_data["_source_crs_wkt"] = _source_crs.to_wkt()
+                try:
+                    lidar_data["_source_crs_epsg"] = _source_crs.to_epsg()
+                except Exception:
+                    lidar_data["_source_crs_epsg"] = None
+            if _runtime_crs is not None:
+                lidar_data["_runtime_crs_wkt"] = _runtime_crs.to_wkt()
+            lidar_data["_runtime_reprojected"] = bool(
+                _source_crs is not None and _runtime_crs is not None and not _source_crs.equals(_runtime_crs)
+            )
+            lidar_data["_source_crs_consistent"] = True
+            if _projection_report is not None:
+                lidar_data["_projection_report"] = (
+                    _projection_report.to_dict() if hasattr(_projection_report, "to_dict") else str(_projection_report)
+                )
+        except Exception as _crs_exc:
+            print(f"Could not resolve/reproject LiDAR CRS: {_crs_exc}")
+            if str(_crs_exc).startswith("[CRS]"):
+                progress.finish_error(str(_crs_exc))
+                QMessageBox.warning(self, "LiDAR Coordinate System", str(_crs_exc))
+                return
+
+        # Set main data only after coordinates are in project space.
         self.data = lidar_data
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
@@ -7105,62 +7412,19 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Spatial index failed: {e}")
                 self.spatial_index = None
        
-        # Set CRS - route through the authoritative canvas CRS manager.
+        # Project CRS was already established above before spatial indexing.
+        # Never overwrite it here: first trustworthy source wins; later sources
+        # are transformed into that project/world coordinate system.
         try:
-            from pyproj import CRS as _CRS
-            from gui.crs_manager import (
-                set_canvas_crs,
-                ensure_canvas_crs,
-                clear_canvas_crs,
-                resolve_point_cloud_crs,
-            )
-            _crs_obj = None
-            _crs_source = "LAZ/LAS header"
-
-            if lidar_data.get("crs_wkt"):
-                try:
-                    _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
-                    _crs_source = "LAZ/LAS header WKT"
-                except Exception:
-                    _crs_obj = None
-
-            if _crs_obj is None and lidar_data.get("crs_epsg"):
-                try:
-                    _crs_obj = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
-                    _crs_source = "LAZ/LAS header EPSG"
-                except Exception:
-                    _crs_obj = None
-
-            if _crs_obj is None and filename:
-                try:
-                    _crs_obj, _crs_source = resolve_point_cloud_crs(filename)
-                except Exception:
-                    _crs_obj = None
-
-            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
-            if _crs_obj is not None:
-                if not has_snt:
-                    set_canvas_crs(
-                        self,
-                        _crs_obj,
-                        source=_crs_source or "LAZ/LAS metadata",
-                        dataset=filename,
-                        force=True,
-                    )
-                else:
-                    ensure_canvas_crs(
-                        self,
-                        _crs_obj,
-                        source=_crs_source or "LAZ/LAS metadata",
-                        dataset=filename,
-                    )
-                print(f"Project CRS: {_crs_obj.name} ({_crs_source})")
+            from gui.crs_manager import get_canvas_crs
+            from gui.projection_engine import crs_identifier
+            _canvas_now = get_canvas_crs(self)
+            if _canvas_now is not None:
+                print(f"Project CRS: {crs_identifier(_canvas_now)} - {_canvas_now.name}")
             else:
-                if not has_snt:
-                    clear_canvas_crs(self)
-                print("Could not create CRS object from lidar metadata: basemap alignment disabled")
+                print("Project CRS unresolved: source coordinates will be treated as local/unknown")
         except Exception as e:
-            print(f"Could not set canvas CRS: {e}")
+            print(f"Could not report project CRS: {e}")
        
         self.loaded_file = filename
         self.last_save_path = filename
@@ -12410,8 +12674,17 @@ class NakshaApp(QMainWindow):
             from .save_pointcloud import _serialize_drawings
             drawing_data = _serialize_drawings(self)
 
-            crs_wkt = getattr(self, "project_crs_wkt", None)
-            crs_epsg = getattr(self, "project_crs_epsg", None)
+            runtime_crs_wkt = data.get("_runtime_crs_wkt") or getattr(self, "project_crs_wkt", None)
+            source_crs_wkt = data.get("_source_crs_wkt") if bool(data.get("_source_crs_consistent", True)) else None
+            output_crs_wkt = source_crs_wkt or runtime_crs_wkt
+            crs_wkt = output_crs_wkt
+            crs_epsg = None
+            if output_crs_wkt:
+                try:
+                    from pyproj import CRS as _CRS
+                    crs_epsg = _CRS.from_wkt(output_crs_wkt).to_epsg()
+                except Exception:
+                    crs_epsg = None
 
             snapshot = {
                 "xyz": xyz,
@@ -12435,6 +12708,8 @@ class NakshaApp(QMainWindow):
             drawing_data=drawing_data,
             source_path=getattr(self, "loaded_file", None),
             import_options=data.get("import_options"),
+            runtime_crs_wkt=runtime_crs_wkt,
+            output_crs_wkt=output_crs_wkt,
         )
         worker.finished_ok.connect(self._on_backup_finished)
         worker.failed.connect(self._on_backup_failed)
@@ -12599,7 +12874,7 @@ class NakshaApp(QMainWindow):
             # Keep defaults if load fails
 
     def toggle_gis_layers_panel(self):
-        """Show/hide the Overlay Control Center for imported GIS layers (Alt+C)."""
+        """Show/hide the Overlay Control Center for imported GIS layers."""
         try:
             from gui.gis.gis_layers import toggle_gis_layers_panel
             result = toggle_gis_layers_panel(self)
@@ -12612,7 +12887,7 @@ class NakshaApp(QMainWindow):
             return None
 
     def toggle_gdb_panel(self):
-        """Show/hide the GDB import panel for ESRI File Geodatabases."""
+        """Show/hide the universal GIS Catalog."""
         try:
             from gui.gis.gdb import toggle_gdb_panel
             return toggle_gdb_panel(self)
@@ -12625,7 +12900,12 @@ class NakshaApp(QMainWindow):
     # ── Drag-and-drop import of GIS overlays ────────────────────────────────
     # Supported extensions that we will accept on a drop. Anything else is
     # ignored so we don't interfere with other drop targets.
-    _GIS_DROP_EXTS = (".shp", ".tif", ".tiff", ".geojson", ".json", ".gdb")
+    _GIS_DROP_EXTS = (
+        ".shp", ".geojson", ".json", ".gpkg", ".gdb", ".kml", ".kmz",
+        ".gpx", ".gml", ".fgb", ".sqlite", ".db", ".csv",
+        ".tif", ".tiff", ".jp2", ".j2k", ".ecw", ".img", ".vrt",
+        ".png", ".jpg", ".jpeg", ".mbtiles",
+    )
 
     def _gis_paths_from_event(self, event):
         """Return the list of droppable GIS file paths from a drag/drop event."""
@@ -13084,18 +13364,6 @@ class NakshaApp(QMainWindow):
                 "The application has not closed. Please try again shortly.",
             )
             return
-
-        # Past this point the close is committed - stop the raster refinement
-        # loader before VTK teardown below, since its timer/executor could
-        # otherwise deliver a texture upload after the render window is
-        # finalized (_shutdown_in_progress also guards this loader directly).
-        try:
-            _raster_loader = getattr(self, "_raster_lod_loader", None)
-            if _raster_loader is not None:
-                _raster_loader.close()
-        except Exception as _e:
-            print(f"⚠️ Raster LOD loader shutdown failed: {_e}")
-
         active_classification_dialog = getattr(
             self,
             "_lidar_classification_active_dialog",

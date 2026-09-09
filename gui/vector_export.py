@@ -1173,6 +1173,15 @@ def _collect_visible_digitizer_entities_for_snt_export(app) -> List[Dict[str, An
             }
         )
 
+    # Digitizer/GIS-import drawings are stored in project/canvas coordinates.
+    try:
+        from gui.crs_manager import get_canvas_crs
+        _pc = get_canvas_crs(app)
+        _pc_wkt = _pc.to_wkt() if _pc is not None else None
+    except Exception:
+        _pc_wkt = getattr(app, "project_crs_wkt", None)
+    for _entity in out:
+        _entity.setdefault("_source_crs_wkt", _pc_wkt)
     return out
 
 
@@ -1382,6 +1391,16 @@ def _collect_visible_snt_entities_for_export(app) -> List[Dict[str, Any]]:
         if not raw_entities:
             continue
 
+        _out_start = len(out)
+        _native_snt_crs_wkt = attachment.get("source_crs_wkt")
+        if not _native_snt_crs_wkt:
+            try:
+                from gui.crs_manager import get_canvas_crs
+                _pc = get_canvas_crs(app)
+                _native_snt_crs_wkt = _pc.to_wkt() if _pc is not None else None
+            except Exception:
+                _native_snt_crs_wkt = getattr(app, "project_crs_wkt", None)
+
         for ent in raw_entities:
             etype = str(ent.get("type", "") or "").upper().strip()
             layer = _normalize_layer_name(ent.get("layer", "0"), fallback="0")
@@ -1456,6 +1475,9 @@ def _collect_visible_snt_entities_for_export(app) -> List[Dict[str, Any]]:
                         "vertices": verts,
                     }
                 )
+
+        for _entity in out[_out_start:]:
+            _entity.setdefault("_source_crs_wkt", _native_snt_crs_wkt)
 
     return out
 
@@ -1723,6 +1745,76 @@ def _resolve_snt_export_output_path(app, default_dir: Path, default_base_name: s
     return str(Path(output_path).with_suffix(".snt"))
 
 
+def _resolve_snt_export_crs(app, output_path: str):
+    """Choose one CRS for the entire SNT output.
+
+    Overwriting a known attached SNT preserves that SNT's native CRS.  New SNT
+    files use the Naksha project CRS.  This prevents one output file from
+    accidentally containing a mixture of source and project coordinates.
+    """
+    try:
+        from gui.projection_engine import parse_crs
+    except Exception:
+        return None
+    try:
+        target_norm = str(Path(output_path).resolve()).lower()
+    except Exception:
+        target_norm = str(output_path).lower()
+    for att in _dedupe_attachment_records(app):
+        raw = str(att.get("full_path") or "").strip()
+        if not raw:
+            continue
+        try:
+            att_norm = str(Path(raw).resolve()).lower()
+        except Exception:
+            att_norm = raw.lower()
+        if att_norm == target_norm:
+            try:
+                obj = parse_crs(att.get("source_crs_wkt"))
+                if obj is not None:
+                    return obj
+            except Exception:
+                pass
+    try:
+        from gui.crs_manager import get_canvas_crs
+        obj = get_canvas_crs(app)
+        if obj is not None:
+            return obj
+    except Exception:
+        pass
+    try:
+        return parse_crs(getattr(app, "project_crs_wkt", None) or getattr(app, "project_crs_epsg", None))
+    except Exception:
+        return None
+
+
+def _transform_snt_export_entity(entity: Dict[str, Any], target_crs) -> Dict[str, Any]:
+    """Return an SNT export entity normalized into target_crs."""
+    out = dict(entity)
+    src_wkt = out.pop("_source_crs_wkt", None)
+    if not src_wkt or target_crs is None:
+        return out
+    try:
+        from gui.projection_engine import parse_crs, transform_point_sequence
+        src = parse_crs(src_wkt)
+        dst = parse_crs(target_crs)
+        if src is None or dst is None or src.equals(dst):
+            return out
+        for key in ("points", "vertices"):
+            seq = out.get(key)
+            if seq:
+                out[key] = transform_point_sequence(seq, src, dst)
+        for key in ("position", "center", "insert"):
+            pt = out.get(key)
+            if pt is not None:
+                converted = transform_point_sequence([pt], src, dst)
+                if converted:
+                    out[key] = converted[0]
+        return out
+    except Exception as exc:
+        raise RuntimeError(f"Could not transform SNT export entity to target CRS: {exc}") from exc
+
+
 def export_visible_vectors_to_snt(app, output_path: str) -> bool:
     """
     Export all currently visible vector data in the main view to SNT:
@@ -1759,6 +1851,7 @@ def export_visible_vectors_to_snt(app, output_path: str) -> bool:
         return False
 
     target = Path(output_path).with_suffix(".snt")
+    _target_crs = _resolve_snt_export_crs(app, str(target))
     temp_root = Path(tempfile.mkdtemp(prefix="naksha_snt_export_"))
     temp_dxf = temp_root / f"{target.stem}.dxf"
     temp_snt = temp_root / f"{target.stem}.snt"
@@ -1776,7 +1869,8 @@ def export_visible_vectors_to_snt(app, output_path: str) -> bool:
 
         emitted = 0
         for entity in entities:
-            if _emit_entity_to_dxf(msp, doc, entity):
+            _normalized_entity = _transform_snt_export_entity(entity, _target_crs)
+            if _emit_entity_to_dxf(msp, doc, _normalized_entity):
                 emitted += 1
 
         if emitted <= 0:
@@ -1822,6 +1916,17 @@ def export_visible_vectors_to_snt(app, output_path: str) -> bool:
             pass
         temp_target.replace(target)
 
+        _prj_path = None
+        if _target_crs is not None:
+            try:
+                from gui.projection_engine import write_prj_sidecar, crs_identifier
+                _prj_path = write_prj_sidecar(str(target), _target_crs, esri_compatible=True)
+                print(f"   Projected SNT CRS: {crs_identifier(_target_crs)}")
+                if _prj_path:
+                    print(f"   CRS sidecar: {_prj_path}")
+            except Exception as _prj_exc:
+                print(f"   SNT .prj warning: {_prj_exc}")
+
         app._last_snt_export_summary = {
             "output_path": str(target),
             "input_entities": int(stats["total_entities"]),
@@ -1830,6 +1935,8 @@ def export_visible_vectors_to_snt(app, output_path: str) -> bool:
             "emitted_entities": int(emitted),
             "backend_entities": int(getattr(result, "entity_count", emitted)),
             "backend_layers": int(getattr(result, "layer_count", 0)),
+            "crs_wkt": _target_crs.to_wkt() if _target_crs is not None else None,
+            "prj_path": _prj_path,
         }
 
         print(f"   ✅ SNT export complete")
@@ -1849,6 +1956,211 @@ def export_visible_vectors_to_snt(app, output_path: str) -> bool:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+
+# ============================================================================
+# NATIVE GIS CONTAINER EXPORT (FileGDB / GeoPackage)
+# ============================================================================
+
+def _drawing_native_feature_for_gis(drawing: dict):
+    """Return (bucket, shapely geometry, properties) without linework flattening."""
+    bucket, feature = _drawing_to_shapefile_feature(drawing)
+    if not bucket or not feature:
+        return None, None, None
+    geom = feature.get("geometry")
+    props = {k: v for k, v in feature.items() if k != "geometry"}
+    # Keep arbitrary imported GIS attributes in one lossless JSON payload rather
+    # than discarding them because different digitizer drawings may have totally
+    # different source schemas.
+    src_attrs = drawing.get("source_attributes")
+    if src_attrs:
+        try:
+            props["ATTR_JSON"] = json.dumps(src_attrs, ensure_ascii=False, default=str)
+        except Exception:
+            props["ATTR_JSON"] = str(src_attrs)
+    props["SRC_LAYER"] = str(drawing.get("source_layer") or "")
+    props["SRC_FID"] = str(drawing.get("source_fid") if drawing.get("source_fid") is not None else "")
+    return bucket, geom, props
+
+
+def _ogr_srs_from_app(app):
+    try:
+        from osgeo import osr
+    except Exception:
+        return None
+    srs = osr.SpatialReference()
+    epsg = getattr(app, "project_crs_epsg", None)
+    if epsg:
+        try:
+            if srs.ImportFromEPSG(int(epsg)) == 0:
+                return srs
+        except Exception:
+            pass
+    wkt = getattr(app, "project_crs_wkt", None)
+    if wkt:
+        try:
+            if srs.ImportFromWkt(str(wkt)) == 0:
+                return srs
+        except Exception:
+            pass
+    canvas = getattr(app, "canvas_crs", None)
+    try:
+        if canvas is not None and hasattr(canvas, "to_wkt"):
+            if srs.ImportFromWkt(canvas.to_wkt()) == 0:
+                return srs
+    except Exception:
+        pass
+    return None
+
+
+def export_drawings_to_gis_container(app, output_path: str, driver_name: str = "OpenFileGDB") -> bool:
+    """Export digitizer drawings to FileGDB or GeoPackage using native geometry types.
+
+    Points, lines and polygons are written as separate feature classes/tables
+    because OGR layers have one declared geometry type.  Unlike the legacy
+    single-SHP "linework" mode, polygons remain polygons and points remain points.
+    """
+    try:
+        from osgeo import gdal, ogr
+    except Exception as exc:
+        print(f"   ❌ Native GIS export requires GDAL Python bindings: {exc}")
+        return False
+
+    digitizer = getattr(app, "digitizer", None)
+    drawings = list(getattr(digitizer, "drawings", []) or [])
+    if not drawings:
+        print("   ⚠️ No digitizer drawings to export")
+        return False
+
+    driver_name = str(driver_name or "OpenFileGDB")
+    if driver_name == "OpenFileGDB" and not str(output_path).lower().endswith(".gdb"):
+        output_path += ".gdb"
+    if driver_name == "GPKG" and not str(output_path).lower().endswith(".gpkg"):
+        output_path += ".gpkg"
+
+    drv = gdal.GetDriverByName(driver_name)
+    if drv is None and driver_name == "OpenFileGDB":
+        drv = gdal.GetDriverByName("FileGDB")
+        if drv is not None:
+            driver_name = "FileGDB"
+    if drv is None:
+        print(f"   ❌ GDAL driver not installed: {driver_name}")
+        return False
+
+    # Never silently replace an existing user's database.
+    if os.path.exists(output_path):
+        print(f"   ❌ Target already exists: {output_path}")
+        return False
+
+    ds = None
+    try:
+        if hasattr(drv, "CreateVector"):
+            try:
+                ds = drv.CreateVector(output_path)
+            except Exception:
+                ds = None
+        if ds is None:
+            ds = drv.Create(output_path, 0, 0, 0, gdal.GDT_Unknown)
+        if ds is None:
+            raise RuntimeError(f"Could not create {driver_name} dataset")
+
+        grouped = {"points": [], "lines": [], "polygons": []}
+        skipped = 0
+        for drawing in drawings:
+            try:
+                bucket, geom, props = _drawing_native_feature_for_gis(drawing)
+                if bucket in grouped and geom is not None and not geom.is_empty:
+                    grouped[bucket].append((geom, props))
+                else:
+                    skipped += 1
+            except Exception as exc:
+                skipped += 1
+                print(f"   ⚠️ Drawing skipped in GIS export: {exc}")
+
+        srs = _ogr_srs_from_app(app)
+        geom_types = {
+            "points": ogr.wkbPoint,
+            "lines": ogr.wkbLineString,
+            "polygons": ogr.wkbPolygon,
+        }
+        suffix = {"points": "Points", "lines": "Lines", "polygons": "Polygons"}
+        created_layers = 0
+        written = 0
+        for bucket, records in grouped.items():
+            if not records:
+                continue
+            layer_name = f"Naksha_{suffix[bucket]}"
+            layer = ds.CreateLayer(layer_name, srs=srs, geom_type=geom_types[bucket])
+            if layer is None:
+                print(f"   ⚠️ Could not create layer: {layer_name}")
+                continue
+            # Stable standard schema; ATTR_JSON carries arbitrary imported fields.
+            fields = [
+                ("TYPE", ogr.OFTString, 32), ("COLOR_R", ogr.OFTInteger, 0),
+                ("COLOR_G", ogr.OFTInteger, 0), ("COLOR_B", ogr.OFTInteger, 0),
+                ("TEXT", ogr.OFTString, 255), ("RADIUS", ogr.OFTReal, 0),
+                ("LWIDTH", ogr.OFTReal, 0), ("LSTYLE", ogr.OFTString, 32),
+                ("SRC_LAYER", ogr.OFTString, 160), ("SRC_FID", ogr.OFTString, 64),
+                ("ATTR_JSON", ogr.OFTString, 0),
+            ]
+            for fname, ftype, width in fields:
+                fd = ogr.FieldDefn(fname, ftype)
+                if width:
+                    try: fd.SetWidth(width)
+                    except Exception: pass
+                layer.CreateField(fd)
+            defn = layer.GetLayerDefn()
+            for geom, props in records:
+                feat = ogr.Feature(defn)
+                try:
+                    ogr_geom = ogr.CreateGeometryFromWkb(bytes(geom.wkb))
+                    feat.SetGeometry(ogr_geom)
+                    mapping = {
+                        "TYPE": props.get("type", ""), "COLOR_R": props.get("color_r", 255),
+                        "COLOR_G": props.get("color_g", 255), "COLOR_B": props.get("color_b", 255),
+                        "TEXT": props.get("text", ""), "RADIUS": props.get("radius", 0.0),
+                        "LWIDTH": props.get("lwidth", 0.0), "LSTYLE": props.get("lstyle", ""),
+                        "SRC_LAYER": props.get("SRC_LAYER", ""), "SRC_FID": props.get("SRC_FID", ""),
+                        "ATTR_JSON": props.get("ATTR_JSON", ""),
+                    }
+                    for key, value in mapping.items():
+                        if value is not None:
+                            feat.SetField(key, value)
+                    if layer.CreateFeature(feat) == 0:
+                        written += 1
+                finally:
+                    feat = None
+            created_layers += 1
+
+        try: ds.FlushCache()
+        except Exception: pass
+        ds = None
+        app._last_native_gis_export_summary = {
+            "output_path": output_path,
+            "driver": driver_name,
+            "layers": created_layers,
+            "features": written,
+            "skipped": skipped,
+        }
+        print(f"   ✅ Native GIS export: {written:,} features / {created_layers} layers → {output_path}")
+        if skipped:
+            print(f"   ⚠️ Skipped drawings: {skipped}")
+        return created_layers > 0 and written > 0
+    except Exception as exc:
+        print(f"   ❌ Native GIS container export failed: {exc}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        ds = None
+
+
+def export_drawings_to_filegdb(app, output_path: str) -> bool:
+    return export_drawings_to_gis_container(app, output_path, "OpenFileGDB")
+
+
+def export_drawings_to_geopackage(app, output_path: str) -> bool:
+    return export_drawings_to_gis_container(app, output_path, "GPKG")
+
+
 # ============================================================================
 # MAIN EXPORT DIALOG
 # ============================================================================
@@ -1857,7 +2169,7 @@ def show_export_dialog(app):
     """
     Show export format selection dialog and perform export.
     """
-    from PySide6.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QDialogButtonBox
+    from PySide6.QtWidgets import QDialog, QVBoxLayout, QRadioButton, QDialogButtonBox, QLabel
     from PySide6.QtCore import Qt
     from gui.theme_manager import ThemeManager, get_dialog_stylesheet
     
@@ -1870,14 +2182,25 @@ def show_export_dialog(app):
     
     layout = QVBoxLayout()
     
-    # Format selection
+    # Format selection. This dialog exports Naksha drawing/digitizer content;
+    # native GIS layer-to-layer conversion is intentionally a different workflow.
+    note = QLabel(
+        "Exports Naksha drawings only. For schema-faithful GIS dataset conversion, "
+        "use File → GIS Data → Convert."
+    )
+    note.setWordWrap(True)
+    layout.addWidget(note)
 
-    shp_radio = QRadioButton("Shapefile")
-    shp_radio.setChecked(True)
+    shp_radio = QRadioButton("Shapefile (single linework file — Legacy / Compatibility)")
+    gdb_radio = QRadioButton("File Geodatabase (.gdb) — drawing Points / Lines / Polygons")
+    gpkg_radio = QRadioButton("GeoPackage (.gpkg) — drawing Points / Lines / Polygons")
+    gpkg_radio.setChecked(True)
     tiff_radio = QRadioButton("GeoTIFF")
     snt_radio = QRadioButton("SNT (All Visible Vectors)")
 
     layout.addWidget(shp_radio)
+    layout.addWidget(gdb_radio)
+    layout.addWidget(gpkg_radio)
     layout.addWidget(tiff_radio)
     layout.addWidget(snt_radio)
     # Buttons
@@ -1920,23 +2243,27 @@ def show_export_dialog(app):
             success = export_visible_vectors_to_snt(app, output_path)
         else:
             if shp_radio.isChecked():
-                ext = "shp"
-                filter_str = "Shapefile (*.shp)"
+                ext, filter_str = "shp", "Shapefile (*.shp)"
+            elif gdb_radio.isChecked():
+                ext, filter_str = "gdb", "File Geodatabase (*.gdb)"
+            elif gpkg_radio.isChecked():
+                ext, filter_str = "gpkg", "GeoPackage (*.gpkg)"
             else:
-                ext = "tif"
-                filter_str = "GeoTIFF Files (*.tif *.tiff)"
+                ext, filter_str = "tif", "GeoTIFF Files (*.tif *.tiff)"
 
             output_path, _ = QFileDialog.getSaveFileName(
-                app,
-                "Export Drawings",
-                str(base_dir / f"{base_name}_drawings.{ext}"),
-                filter_str
+                app, "Export Drawings",
+                str(base_dir / f"{base_name}_drawings.{ext}"), filter_str
             )
             if not output_path:
                 return
 
             if shp_radio.isChecked():
                 success = export_drawings_to_shapefile(app, output_path)
+            elif gdb_radio.isChecked():
+                success = export_drawings_to_filegdb(app, output_path)
+            elif gpkg_radio.isChecked():
+                success = export_drawings_to_geopackage(app, output_path)
             else:
                 success = export_drawings_to_tiff(app, output_path)
 
@@ -1953,12 +2280,17 @@ def show_export_dialog(app):
                     f"Entities: {int(backend_entities):,}\n"
                     f"Layers: {int(backend_layers):,}"
                 )
-            else:
+            elif gdb_radio.isChecked() or gpkg_radio.isChecked():
+                summary = getattr(app, "_last_native_gis_export_summary", None) or {}
                 QMessageBox.information(
-                    app,
-                    "Export Successful",
-                    f"Drawings exported to:\n{output_path}"
+                    app, "Export Successful",
+                    f"Drawings exported to:\n{summary.get('output_path', output_path)}\n\n"
+                    f"Features: {int(summary.get('features', 0)):,}\n"
+                    f"Layers: {int(summary.get('layers', 0)):,}\n"
+                    f"Driver: {summary.get('driver', '')}"
                 )
+            else:
+                QMessageBox.information(app, "Export Successful", f"Drawings exported to:\n{output_path}")
         else:
             QMessageBox.warning(
                 app,
@@ -2278,16 +2610,13 @@ def _infer_scene_xy_bounds(app):
     return None
 
 
-def read_world_file_bounds(tif_path, width, height):
-    """
-    Look for a sidecar world file next to an image and return the real-world
-    bounds (west, south, east, north) for a width×height raster, or None.
+def read_world_file_corners(tif_path, width, height):
+    """Return affine world-file corners as ``(BL, BR, TL, TR)``.
 
-    World file (6 lines): A, D, B, E, C, F
-        A = x pixel size,  E = y pixel size (usually negative)
-        D, B = rotation terms (we only handle the unrotated case)
-        C, F = world coords of the CENTRE of the top-left pixel
-    Recognised extensions: .tfw .tifw .wld  and  <name>.tif.tfw / .wld
+    World-file coordinates describe the centre of the top-left pixel.  Using
+    half-pixel offsets here preserves all six affine terms (including rotation),
+    so a rotated image can be rendered as a parallelogram instead of being
+    silently reduced to an axis-aligned extent.
     """
     from pathlib import Path
     p = Path(str(tif_path))
@@ -2309,21 +2638,39 @@ def read_world_file_bounds(tif_path, width, height):
         if len(nums) < 6:
             return None
         A, D, B, E, C, F = nums[:6]
-        if abs(D) > 1e-9 or abs(B) > 1e-9:
-            print(f"   ⚠️ World file {wf.name} has rotation terms — "
-                  f"using axis-aligned bounds only (no rotation applied)")
-        left = C - A / 2.0
-        top = F - E / 2.0
-        right = left + A * float(width)
-        bottom = top + E * float(height)
-        west, east = min(left, right), max(left, right)
-        south, north = min(bottom, top), max(bottom, top)
-        print(f"   🌍 World file found: {wf.name} → "
-              f"X({west:.2f}→{east:.2f}) Y({south:.2f}→{north:.2f})")
-        return (west, south, east, north)
+
+        def xy(col, row):
+            return (
+                A * float(col) + B * float(row) + C,
+                D * float(col) + E * float(row) + F,
+            )
+
+        # Outer image corners. Pixel centres run 0..width-1 / 0..height-1.
+        tl = xy(-0.5, -0.5)
+        tr = xy(float(width) - 0.5, -0.5)
+        bl = xy(-0.5, float(height) - 0.5)
+        br = xy(float(width) - 0.5, float(height) - 0.5)
+        print(
+            f"   🌍 World file found: {wf.name}"
+            + (" (rotated affine)" if abs(D) > 1e-9 or abs(B) > 1e-9 else "")
+        )
+        return (bl, br, tl, tr)
     except Exception as exc:
         print(f"   ⚠️ Could not parse world file {wf}: {exc}")
         return None
+
+
+def read_world_file_bounds(tif_path, width, height):
+    """Return the axis-aligned envelope of the full affine world-file corners."""
+    corners = read_world_file_corners(tif_path, width, height)
+    if not corners:
+        return None
+    xs = [p[0] for p in corners]
+    ys = [p[1] for p in corners]
+    west, east = min(xs), max(xs)
+    south, north = min(ys), max(ys)
+    print(f"   🌍 World-file envelope → X({west:.2f}→{east:.2f}) Y({south:.2f}→{north:.2f})")
+    return (west, south, east, north)
 
 def _coords_to_scene_z(coord_iterable, default_z: float):
     coords = []
@@ -3472,43 +3819,65 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         QCoreApplication.processEvents()
  
         # ── Step 1: read raster ───────────────────────────────────────────
-        with rasterio.open(input_path) as src:
+        from contextlib import ExitStack
+        with ExitStack() as _raster_stack:
+            base_src = _raster_stack.enter_context(rasterio.open(input_path))
+            src = base_src
+            raster_warped = False
+
+            # A raster is geospatial only when both a CRS and a non-identity
+            # affine transform are present. If the Project CRS differs, use a
+            # rasterio WarpedVRT so PIXELS and bounds are actually reprojected;
+            # merely transforming the four bounds would stretch an unwarped image
+            # into the wrong geography.
+            try:
+                is_georef = (base_src.crs is not None) and (not base_src.transform.is_identity)
+            except Exception:
+                is_georef = False
+
+            if is_georef:
+                try:
+                    from pyproj import CRS as _CRS
+                    from gui.crs_manager import ensure_canvas_crs, get_canvas_crs
+                    source_pycrs = _CRS.from_wkt(base_src.crs.to_wkt())
+                    ensure_canvas_crs(
+                        app, source_pycrs,
+                        source="GeoTIFF header", dataset=input_path,
+                    )
+                    canvas_crs = get_canvas_crs(app)
+                    if canvas_crs is not None and not source_pycrs.equals(canvas_crs):
+                        from rasterio.vrt import WarpedVRT
+                        src = _raster_stack.enter_context(
+                            WarpedVRT(base_src, crs=canvas_crs.to_wkt(), resampling=Resampling.bilinear)
+                        )
+                        raster_warped = True
+                        print(f"   🔄 Raster warped on-the-fly: {source_pycrs.name} -> {canvas_crs.name}")
+                except Exception as _crs_err:
+                    try:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.critical(
+                            app, "Raster Coordinate Transformation Failed",
+                            f"Naksha could not safely transform this raster into the Project CRS.\n\n"
+                            f"{_crs_err}\n\nThe raster was NOT loaded."
+                        )
+                    except Exception:
+                        pass
+                    print(f"   ❌ Could not safely prepare GeoTIFF CRS: {_crs_err}")
+                    return False
+
             print(f"   📊 Raster: {src.width}x{src.height}")
             print(f"   📊 Bands: {src.count}")
-            print(f"   🌍 CRS: {src.crs}")
- 
+            print(f"   🌍 CRS: {src.crs}" + (" (warped to Project CRS)" if raster_warped else ""))
+
             bounds = src.bounds
             src_width = src.width
             src_height = src.height
             band_count = src.count
-            # A raster is usable for placement only if it carries real geo info.
-            try:
-                is_georef = (src.crs is not None) and (not src.transform.is_identity)
-            except Exception:
-                is_georef = False
-
-            # Establish the canvas CRS from this GeoTIFF's own embedded CRS when
-            # nothing else has claimed it yet (ensure_canvas_crs = first trustworthy
-            # dataset wins, same as LAZ/SNT). Without this, a project with ONLY a
-            # georeferenced TIFF loaded never sets app.project_crs_epsg, so the
-            # basemap plugin finds no canvas CRS and silently assumes Web Mercator
-            # - misaligning its tiles relative to this raster's real-world position
-            # even though the TIFF itself carries perfectly good coordinates.
-            if is_georef:
-                try:
-                    from pyproj import CRS as _CRS
-                    from gui.crs_manager import ensure_canvas_crs
-                    ensure_canvas_crs(
-                        app, _CRS.from_wkt(src.crs.to_wkt()),
-                        source="GeoTIFF header", dataset=input_path,
-                    )
-                except Exception as _crs_err:
-                    print(f"   ⚠️ Could not register GeoTIFF CRS with canvas: {_crs_err}")
 
             # Guard against OOM by limiting texture pixel count before NumPy->VTK conversion.
             # Dynamic rasters need only a small overview at import. Native detail
             # is fetched in background when the camera zooms into the image.
-            lod_eligible = gcp_corners is None and band_count >= 3
+            lod_eligible = gcp_corners is None and band_count >= 3 and not raster_warped
             max_texture_pixels = _geotiff_texture_pixel_budget(
                 app, hard_cap=4_000_000 if lod_eligible else 16_000_000)
             total_pixels = src_width * src_height
@@ -3640,32 +4009,31 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         left, right, bottom, top = (bounds.left, bounds.right,
                                     bounds.bottom, bounds.top)
 
-        # Reproject raster bounds to project CRS if different
-        target_crs_code = getattr(app, "project_crs_epsg", None)
-        if target_crs_code and src.crs is not None:
-            try:
-                from rasterio.warp import transform_bounds
-                target_crs = f"EPSG:{target_crs_code}"
-                if src.crs.to_string() != target_crs:
-                    print(f"   🔄 Reprojecting raster bounds from {src.crs.to_string()} to project CRS {target_crs}")
-                    left, bottom, right, top = transform_bounds(src.crs, target_crs, left, bottom, right, top)
-            except Exception as e:
-                print(f"   ⚠️ Could not reproject raster bounds: {e}")
+        # ``bounds`` already belong to the Project CRS when WarpedVRT was
+        # required above. Never re-label source bounds without warping pixels.
         # If no explicit bounds were passed and the file itself isn't
         # georeferenced, try a sidecar world file (.tfw/.wld) — this is the
         # standard georeference carrier for drone orthos and gives a CORRECT,
         # GCP-derived placement (unlike the stretch-to-fit fallback).
-        if world_bounds is None and not is_georef:
-            wf_bounds = read_world_file_bounds(input_path, src_width, src_height)
-            if wf_bounds is not None:
-                world_bounds = wf_bounds
+        auto_worldfile_affine = False
+        if world_bounds is None and gcp_corners is None and not is_georef:
+            try:
+                wf_corners = read_world_file_corners(input_path, src_width, src_height)
+            except Exception:
+                wf_corners = None
+            if wf_corners is not None:
+                # VTK plane accepts BL/BR/TL and therefore preserves all six
+                # world-file affine coefficients, including rotation/shear.
+                gcp_corners = (wf_corners[0], wf_corners[1], wf_corners[2])
+                auto_worldfile_affine = True
+                lod_eligible = False  # windowed LOD assumes an axis-aligned pixel/world mapping
 
         # Track how the raster ended up placed so the layer manager can decide
         # whether it still needs fitting (e.g. a raster imported before any
         # vectors lands at pixel coords and must be re-fitted once data exists).
         placement = "georef" if is_georef else "pixel"
         if gcp_corners is not None and len(gcp_corners) == 3:
-            placement = "gcp"
+            placement = "worldfile" if auto_worldfile_affine else "gcp"
 
         if world_bounds is not None and len(world_bounds) == 4:
             # Explicit / world-file georeferencing: place exactly at W/S/E/N.
@@ -3708,7 +4076,7 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         else:
             xy_extent = max(abs(right - left), abs(top - bottom))
         raster_z_offset = max(xy_extent * 0.001, 1e-3)  # ~0.1% of extent, scale-aware
-        raster_z = 0.0  # Dedicated raster renderer: layer rank alone controls depth.
+        raster_z = scene_z - raster_z_offset
         print(f"   📐 Placing texture plane at Z = {raster_z:.3f} "
               f"(vectors at {scene_z:.3f}, offset {raster_z_offset:.3f})")
 
@@ -3719,8 +4087,10 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
             plane.SetOrigin(blx, bly, raster_z)   # image bottom-left
             plane.SetPoint1(brx, bry, raster_z)   # image bottom-right
             plane.SetPoint2(tlx, tly, raster_z)   # image top-left
-            print(f"   🎯 GCP placement: BL({blx:.2f},{bly:.2f}) "
-                  f"BR({brx:.2f},{bry:.2f}) TL({tlx:.2f},{tly:.2f})")
+            print(
+                f"   🎯 {'World-file affine' if auto_worldfile_affine else 'GCP'} placement: "
+                f"BL({blx:.2f},{bly:.2f}) BR({brx:.2f},{bry:.2f}) TL({tlx:.2f},{tly:.2f})"
+            )
         else:
             plane.SetOrigin(left,  bottom, raster_z)
             plane.SetPoint1(right, bottom, raster_z)

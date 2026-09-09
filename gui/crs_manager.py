@@ -63,6 +63,9 @@ __all__ = [
     "has_geospatial_data",
     "transform_xy_to_canvas",
     "transform_xy_from_canvas",
+    "transform_xyz_to_canvas",
+    "transform_xyz_from_canvas",
+    "project_points_to_canvas",
     "log_dataset_crs",
     "notify_plugins_crs_changed",
     "resolve_laz_crs",
@@ -221,6 +224,11 @@ def set_canvas_crs(app, crs, source="unknown", dataset=None, notify=True,
     except Exception:
         pass
     _sync_legacy_fields(app, crs)
+    try:
+        from gui.projection_engine import get_projection_engine
+        get_projection_engine(app)
+    except Exception:
+        pass
     print(f"[CRS] canvas CRS set: EPSG:{info['epsg']} ({info['name']}) "
           f"from {source}" + (f" [{os.path.basename(str(dataset))}]" if dataset else ""))
     if notify:
@@ -282,67 +290,123 @@ def has_geospatial_data(app):
 # transforms
 # --------------------------------------------------------------------------
 def _transformer(src_crs, dst_crs):
-    from pyproj import Transformer
-    return Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    """Compatibility helper; real selection lives in projection_engine."""
+    try:
+        from gui.projection_engine import build_transformer
+        t, _report = build_transformer(src_crs, dst_crs)
+        return t
+    except Exception:
+        from pyproj import Transformer
+        return Transformer.from_crs(src_crs, dst_crs, always_xy=True)
 
 
 def transform_xy_to_canvas(app, xs, ys, source_crs):
-    """Transform source XY arrays -> canvas CRS XY. Returns (new_xs, new_ys).
+    """Transform source XY arrays -> authoritative project/canvas CRS.
 
-    Uses float64 and ``always_xy=True``. If no canvas CRS or no source CRS is
-    known, the coordinates are returned UNCHANGED (never silently reinterpreted
-    as another CRS).
+    Coordinates are never re-labelled.  When either CRS is unresolved they are
+    returned unchanged and the caller can surface the unresolved state.
     """
-    src = source_crs
     dst = get_canvas_crs(app)
-    if src is None or dst is None:
+    if source_crs is None or dst is None:
         return xs, ys
     try:
-        if src.equals(dst):
-            return xs, ys
-    except Exception:
-        pass
-    try:
-        import numpy as np
-        ax = np.asarray(xs, dtype=np.float64)
-        ay = np.asarray(ys, dtype=np.float64)
-        t = _transformer(src, dst)
-        nx, ny = t.transform(ax, ay)
+        from gui.projection_engine import transform_xy
+        nx, ny, report = transform_xy(xs, ys, source_crs, dst)
+        try:
+            get_projection_engine = __import__('gui.projection_engine', fromlist=['get_projection_engine']).get_projection_engine
+            get_projection_engine(app).last_report = report
+        except Exception:
+            pass
         return nx, ny
     except Exception:
-        # Fall back to a scalar loop; still float64.
         try:
-            t = _transformer(src, dst)
-            nx = []
-            ny = []
-            for x, y in zip(xs, ys):
-                a, b = t.transform(float(x), float(y))
-                nx.append(a)
-                ny.append(b)
-            return nx, ny
+            t = _transformer(source_crs, dst)
+            if t is None:
+                return xs, ys
+            return t.transform(xs, ys)
         except Exception:
             return xs, ys
 
 
 def transform_xy_from_canvas(app, xs, ys, target_crs):
-    """Inverse: canvas CRS XY -> target CRS XY (for write/export boundaries)."""
+    """Inverse: project/canvas CRS XY -> target/source CRS XY."""
     src = get_canvas_crs(app)
     if src is None or target_crs is None:
         return xs, ys
     try:
-        if src.equals(target_crs):
-            return xs, ys
-    except Exception:
-        pass
-    try:
-        import numpy as np
-        ax = np.asarray(xs, dtype=np.float64)
-        ay = np.asarray(ys, dtype=np.float64)
-        t = _transformer(src, target_crs)
-        nx, ny = t.transform(ax, ay)
+        from gui.projection_engine import transform_xy
+        nx, ny, report = transform_xy(xs, ys, src, target_crs)
+        try:
+            from gui.projection_engine import get_projection_engine
+            get_projection_engine(app).last_report = report
+        except Exception:
+            pass
         return nx, ny
     except Exception:
-        return xs, ys
+        try:
+            t = _transformer(src, target_crs)
+            if t is None:
+                return xs, ys
+            return t.transform(xs, ys)
+        except Exception:
+            return xs, ys
+
+
+def transform_xyz_to_canvas(app, xs, ys, zs, source_crs):
+    """Transform XYZ into project coordinates.
+
+    PROJ applies a vertical operation only when the CRS/available grids define
+    one. Otherwise Z is passed through rather than guessed.
+    """
+    dst = get_canvas_crs(app)
+    if source_crs is None or dst is None:
+        return xs, ys, zs
+    try:
+        from gui.projection_engine import transform_xyz
+        nx, ny, nz, report = transform_xyz(xs, ys, zs, source_crs, dst)
+        try:
+            from gui.projection_engine import get_projection_engine
+            get_projection_engine(app).last_report = report
+        except Exception:
+            pass
+        return nx, ny, nz
+    except Exception:
+        return xs, ys, zs
+
+
+def transform_xyz_from_canvas(app, xs, ys, zs, target_crs):
+    src = get_canvas_crs(app)
+    if src is None or target_crs is None:
+        return xs, ys, zs
+    try:
+        from gui.projection_engine import transform_xyz
+        nx, ny, nz, report = transform_xyz(xs, ys, zs, src, target_crs)
+        try:
+            from gui.projection_engine import get_projection_engine
+            get_projection_engine(app).last_report = report
+        except Exception:
+            pass
+        return nx, ny, nz
+    except Exception:
+        return xs, ys, zs
+
+
+def project_points_to_canvas(app, points, source_crs, *, copy=True, chunk_size=1_000_000):
+    """Transform an Nx2/Nx3 array to canvas CRS with bounded memory."""
+    dst = get_canvas_crs(app)
+    if source_crs is None or dst is None:
+        try:
+            import numpy as np
+            return np.array(points, dtype=np.float64, copy=copy)
+        except Exception:
+            return points
+    try:
+        from gui.projection_engine import transform_points, get_projection_engine
+        out, report = transform_points(points, source_crs, dst, copy=copy, chunk_size=chunk_size)
+        get_projection_engine(app).last_report = report
+        return out
+    except Exception:
+        return points
 
 
 # --------------------------------------------------------------------------
@@ -859,9 +923,9 @@ def resolve_snt_crs(snt_path):
     """Return (crs, source_label) for an SNT/DGN, or (None, None).
 
     Chain:
-      1. adjacent OGC WKT .prj
-      2. adjacent TerraScan .prj -> ProjectionSystem=<EPSG>
-      3. companion DGNv8 embedded SpatialRef WKT
+      1. companion DGNv8 embedded SpatialRef WKT
+      2. adjacent OGC WKT .prj
+      3. adjacent TerraScan .prj -> ProjectionSystem=<EPSG>
       4. LAZ/LAS listed in the SNT's TerraScan block list -> their VLR CRS
       5. a single differently-named .prj in the same folder (delivery convention)
     """
@@ -870,6 +934,16 @@ def resolve_snt_crs(snt_path):
         if not snt_path:
             return None, None
         p = Path(str(snt_path))
+
+        # DGN-embedded CRS is checked first: it comes straight from the source
+        # drawing's own SpatialRef, which is more authoritative than a sidecar
+        # .prj (TerraScan project files in particular are tile-index files
+        # that only sometimes carry a ProjectionSystem= code, and adjacent
+        # OGC .prj files can be stale copies from an unrelated delivery step).
+        crs, label = _resolve_adjacent_dgn_crs(p)
+        if crs is not None:
+            return crs, label
+
         exact, matching, siblings = _adjacent_prj_groups(p)
 
         if exact:
@@ -883,10 +957,6 @@ def resolve_snt_crs(snt_path):
             if crs is not None:
                 matched.append((crs, f"{label} ({prj.name})"))
         crs, label = _unambiguous_crs(matched)
-        if crs is not None:
-            return crs, label
-
-        crs, label = _resolve_adjacent_dgn_crs(p)
         if crs is not None:
             return crs, label
 
@@ -924,6 +994,56 @@ def resolve_snt_crs(snt_path):
         return None, None
     except Exception:
         return None, None
+
+
+def embed_snt_crs_metadata(snt_path, *, crs=None, source_label=None):
+    """Resolve (or accept) an SNT's CRS and durably write it into the file's
+    own META block, so the SNT stops depending on an adjacent .prj/.dgn to be
+    re-georeferenced correctly later.
+
+    Uses the existing snt_core.snt_direct_writer metadata_updates hook, so no
+    binary/geometry format change is involved - this only replaces the
+    writer's placeholder ``{"hemisphere": "unknown", ...}`` "crs" block with
+    real authority/code/WKT, or leaves it untouched when nothing resolves.
+
+    Pass an explicit ``crs`` (a pyproj.CRS) when the user picked one manually
+    (e.g. a future "Select CRS" prompt); otherwise this calls resolve_snt_crs()
+    itself. Returns (success: bool, message: str).
+    """
+    try:
+        from snt_core.snt_direct_writer import direct_write
+    except Exception as exc:
+        return False, f"snt_core.snt_direct_writer is unavailable: {exc}"
+
+    if crs is None:
+        crs, source_label = resolve_snt_crs(snt_path)
+    if crs is None:
+        return False, "CRS is not defined for this SNT (no DGN/.prj/LAS source carried one); nothing to embed."
+
+    epsg = extract_epsg_code(crs)
+    try:
+        wkt2 = crs.to_wkt()
+    except Exception:
+        wkt2 = None
+    crs_block = {
+        "authority": "EPSG" if epsg else None,
+        "code": epsg,
+        "name": crs.name,
+        "wkt2": wkt2,
+        "horizontal_crs": crs.name,
+        "vertical_crs": None,
+        "compound_crs": bool(getattr(crs, "is_compound", False)),
+        "source": source_label,
+        "hemisphere": "unknown",  # retained for legacy readers of the old stub shape
+        "estimated_lat": None,
+        "confidence": "resolved" if epsg else "resolved_no_epsg",
+        "notes": [],
+    }
+    try:
+        result = direct_write(snt_path, metadata_updates={"crs": crs_block})
+    except Exception as exc:
+        return False, f"direct_write failed: {exc}"
+    return True, f"Embedded CRS {crs.name} (EPSG:{epsg}) via {source_label}; wrote {result.output_size_bytes} bytes."
 
 
 # --------------------------------------------------------------------------

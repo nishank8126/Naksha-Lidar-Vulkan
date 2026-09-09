@@ -327,9 +327,14 @@ class GDBEngine:
         except Exception as e:
             log.error("Error loading GDB %s: %s", self.gdb_path, e)
         finally:
+            # ds = None already drops the last reference (CPython refcounting
+            # frees the OGR handle immediately, no cycle involved) - a forced
+            # gc.collect() here ran arbitrary __del__ finalizers for whatever
+            # else happened to be pending (closed dialogs, detached VTK
+            # actors) at a point inside live Qt event delivery, which is
+            # exactly the kind of teardown-timing race this app has hit
+            # native crashes from before.
             ds = None
-            import gc
-            gc.collect()
         log.warning("GDBEngine._load: TOTAL %.3fs for %s", time.perf_counter() - _t0, self.gdb_path)
 
     def _read_basic_layer_info(self, ds):

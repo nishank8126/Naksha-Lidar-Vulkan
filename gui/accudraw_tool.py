@@ -287,14 +287,16 @@ class AccuDrawTool(QObject):
 
         self._rebuild_or_create_drawing()
 
-        if self.drawing is not None:
-            self.drawing["type"] = "polyline"
-            self.drawing["source"] = "accudraw"
-            self.drawing["coords"] = list(self.points)
-            self.drawing["finalized"] = True
-            self.drawing["committed"] = True
-            self.drawing["layer"] = self.drawing.get("layer", "DIGITIZER")
-
+        finished_drawing = self.drawing
+        if finished_drawing is not None:
+            finished_drawing["type"] = "polyline"
+            finished_drawing["source"] = "accudraw"
+            finished_drawing["coords"] = list(self.points)
+            finished_drawing["finalized"] = True
+            finished_drawing["committed"] = True
+            finished_drawing["layer"] = finished_drawing.get("layer", "DIGITIZER")
+            if hasattr(self.digitizer, "_emit_drawing_finalized"):
+                self.digitizer._emit_drawing_finalized(finished_drawing)
         finished_count = len(self.points)
 
         # Detach committed drawing from active AccuDraw draft.

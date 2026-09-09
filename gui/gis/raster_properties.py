@@ -207,8 +207,7 @@ def apply_raster_style(app, entry: dict, style: dict) -> bool:
         entry["style"] = dict(style)
         entry["opacity"] = max(0.0, min(1.0, style.get("opacity", 100) / 100.0))
         actor.GetProperty().SetOpacity(entry["opacity"])
-        # Keep crop coverage until replacement; only its style is stale.
-        meta.pop("_last_style", None)
+        meta.pop("_last_window", None)
         from gui.gis.raster_lod import kick
         kick(app)
         app.vtk_widget.render()
@@ -296,18 +295,15 @@ def open_raster_properties(app, entry: dict):
     )
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QDoubleValidator
-    try:
-        from gui.theme_manager import get_dialog_stylesheet
-    except Exception:
-        def get_dialog_stylesheet():
-            return ""
+    from gui.gis.gis_style import apply_gis_dialog_style, compact_layout
 
     dlg = QDialog(app)
     dlg.setWindowTitle(f"Raster Properties — {entry.get('name', '')}")
     dlg.setModal(True)
-    dlg.setStyleSheet(get_dialog_stylesheet())
+    apply_gis_dialog_style(dlg)
     dlg.setMinimumWidth(380)
     root = QVBoxLayout(dlg)
+    compact_layout(root)
 
     band_items = [f"Band {i}" for i in range(1, band_count + 1)]
 

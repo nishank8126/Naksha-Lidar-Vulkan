@@ -1,4 +1,4 @@
-﻿"""
+"""
 Menu-Based Ribbon System for NakshaAI
 Displays all menu options horizontally in a ribbon layout
 """
@@ -202,13 +202,25 @@ RIBBON_TOOLTIP_META = {
         "title": "Save As",
         "description": "Save the current project to a new file or location.",
     },
-    ("FileRibbon", "Vectors", "Export"): {
-        "title": "Export Drawings",
-        "description": "Export drawings to supported vector formats such as DXF, GeoJSON, or Shapefile.",
+    ("FileRibbon", "GIS Data", "Catalog"): {
+        "title": "GIS Catalog",
+        "description": "Browse and manage GIS data on disk: FileGDB, GeoPackage, vector and raster datasets.",
     },
-    ("FileRibbon", "Vectors", "Import"): {
-        "title": "Import Drawings",
-        "description": "Import drawings from supported vector files into the current project.",
+    ("FileRibbon", "GIS Data", "Import"): {
+        "title": "Import GIS Data",
+        "description": "Load GIS layers into the current map using the native GIS layer pipeline.",
+    },
+    ("FileRibbon", "GIS Data", "Convert"): {
+        "title": "Convert GIS Data",
+        "description": "Copy/convert native GIS datasets while preserving geometry, fields and CRS where supported.",
+    },
+    ("FileRibbon", "GIS Data", "Export"): {
+        "title": "Export Naksha Drawings",
+        "description": "Export Naksha drawing/digitizer content. Use Convert for native GIS dataset-to-dataset conversion.",
+    },
+    ("FileRibbon", "GIS Data", "Layers"): {
+        "title": "GIS Layers",
+        "description": "Show the layers and standalone tables currently loaded in the active map.",
     },
     ("FileRibbon", "Attachments", "Attach DXF"): {
         "title": "Attach DXF",
@@ -864,11 +876,16 @@ class FileRibbon(QWidget):
 
         layout.addWidget(file_ops)
         
-        # Vector Export/Import Section
-        vector_ops = RibbonSection("Vectors", self)
-        vector_ops.add_button("Export", "📤", self._export_drawings)
-        vector_ops.add_button("Import", "📥", self._import_drawings)
-        layout.addWidget(vector_ops)
+        # GIS data management. Keep native dataset conversion separate from
+        # Naksha drawing export so users never confuse visual/digitizer output
+        # with a schema-faithful GIS round trip.
+        gis_ops = RibbonSection("GIS Data", self)
+        gis_ops.add_button("Layers", "🧱", self._show_gis_layers)
+        gis_ops.add_button("Catalog", "🗂️", self._open_gis_catalog)
+        gis_ops.add_button("Import", "📥", self._import_drawings)
+        gis_ops.add_button("Export", "📤", self._export_drawings)
+        gis_ops.add_button("Convert", "🔁", self._convert_gis_data)
+        layout.addWidget(gis_ops)
 
         # Combined attachment tools
         attachments = RibbonSection("Attachments", self)
@@ -888,8 +905,35 @@ class FileRibbon(QWidget):
         
         layout.addStretch()
     
+    def _open_gis_catalog(self):
+        """Open the GIS Catalog (data-on-disk workspace)."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.catalog_browser import show_catalog_panel
+            show_catalog_panel(app)
+        except Exception as e:
+            print(f"⚠️ GIS Catalog failed: {e}")
+
+    def _convert_gis_data(self):
+        """Open the native GIS dataset conversion tool."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.conversion_dialog import show_batch_conversion_dialog
+            show_batch_conversion_dialog(app)
+        except Exception as e:
+            print(f"⚠️ GIS conversion dialog failed: {e}")
+
+    def _show_gis_layers(self):
+        """Toggle the current-map GIS Layers panel."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.gis_layers import toggle_gis_layers_panel
+            toggle_gis_layers_panel(app)
+        except Exception as e:
+            print(f"⚠️ GIS Layers panel failed: {e}")
+
     def _export_drawings(self):
-        """Show export dialog for drawings"""
+        """Export Naksha drawing/digitizer content (not native GIS conversion)."""
         try:
             app = self.parent().parent().parent()
             from gui.vector_export import show_export_dialog
@@ -898,7 +942,7 @@ class FileRibbon(QWidget):
             print(f"⚠️ Export failed: {e}")
 
     def _import_drawings(self):
-        """Import GIS overlays (.shp/.tif/.geojson) into the Overlay Control Center."""
+        """Import GIS datasets into the native Layers/Overlay workspace."""
         try:
             app = self.parent().parent().parent()
             # Unified, auto-detecting import that registers each file as a managed
@@ -3297,17 +3341,22 @@ class DrawRibbon(QWidget):
     def _show_vertex_action_menu(self):
         """Show Create/Move/Delete Vertex actions from the Vertex ribbon button."""
         menu = QMenu(self)
+        point_action  = menu.addAction("Create GIS Point")
+        menu.addSeparator()
         create_action = menu.addAction("Add Vertex")
         move_action   = menu.addAction("Move Vertex")
         delete_action = menu.addAction("Delete Vertex")
-
         button = getattr(self, "vertex_btn", None)
         if button is not None:
             action = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
         else:
             action = menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
 
-        if action is create_action:
+        if action is point_action:
+            self._deactivate_accudraw_before_other_tool("Create GIS Point")
+            print("GIS Point tool activation")
+            self.draw_tool_selected.emit("GIS Point")
+        elif action is create_action:
             self._deactivate_accudraw_before_other_tool("Add Vertex")
             print("🔵 Add Vertex tool activation")
             self.draw_tool_selected.emit("Vertex")

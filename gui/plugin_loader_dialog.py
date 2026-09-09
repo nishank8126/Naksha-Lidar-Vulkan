@@ -244,6 +244,7 @@ class PluginLoaderDialog(QDialog):
         self.uninstall_btn.setEnabled(False)
         self.uninstall_btn.setProperty("danger", True)
         self.reinstall_btn = QPushButton("Reinstall Plugin")
+        self.reinstall_btn.clicked.connect(self._on_reinstall)
         self.reinstall_btn.setEnabled(False)
         action_bar.addWidget(self.uninstall_btn)
         action_bar.addWidget(self.reinstall_btn)
@@ -658,6 +659,25 @@ class PluginLoaderDialog(QDialog):
                 QMessageBox.critical(self, "Error", msg)
 
     # ──────────────────────────────────────────────────────────────────
+    def _on_reinstall(self):
+        name = self._get_selected_name()
+        if not name:
+            return
+        ans = QMessageBox.question(
+            self, "Reinstall Plugin",
+            f"Reinstall '{name}' and reload it now?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if ans != QMessageBox.Yes:
+            return
+        ok, msg = self.pm.reinstall_plugin(name)
+        if ok:
+            self._selected_plugin_name = name
+            self._refresh()
+            QMessageBox.information(self, "Success", msg)
+        else:
+            QMessageBox.critical(self, "Error", msg)
+
     def _on_browse_zip(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Plugin ZIP Archive", "", "ZIP Archives (*.zip)"

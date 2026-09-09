@@ -6001,7 +6001,7 @@
 #     valid = [e for e in entities if isinstance(e, dict) and len(e.get("points", [])) >= 2]
 #     if not valid:
 #         return False
-#     dtype = np.float64 if any(e.get("_boundary_precision_corrected") for e in valid) else np.float32
+#     dtype = np.float64
 #     prepared = []
 #     total = 0
 #     for e in valid:
@@ -6051,11 +6051,11 @@
 #     valid = [e for e in entities if isinstance(e, dict) and e.get("position") is not None]
 #     if not valid:
 #         return False
-#     pts_np = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in valid], dtype=np.float32)
+#     pts_np = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in valid], dtype=np.float64)
 #     if pts_np.ndim != 2:
 #         return False
 #     if pts_np.shape[1] == 2:
-#         pts_np = np.column_stack((pts_np, np.zeros(len(pts_np), dtype=np.float32)))
+#         pts_np = np.column_stack((pts_np, np.zeros(len(pts_np), dtype=np.float64)))
 #     vtk_points = vtk.vtkPoints()
 #     vtk_points.SetData(numpy_support.numpy_to_vtk(pts_np[:, :3], deep=True))
 #     cells_np = np.empty(len(valid) * 2, dtype=np.int64)
@@ -12154,7 +12154,7 @@
 #                 if not chunk:
 #                     return
 
-#                 pts_data = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in chunk], dtype=np.float32)
+#                 pts_data = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in chunk], dtype=np.float64)
 #                 if pts_data.size == 0:
 #                     return
 #                 _update_bounds_np(pts_data)
@@ -12209,14 +12209,14 @@
 #                     total_pts += n_v
 #                     total_poly_items += (n_v + 1)
 
-#                 combined_pts = np.empty((total_pts, 3), dtype=np.float32)
+#                 combined_pts = np.empty((total_pts, 3), dtype=np.float64)
 #                 combined_polys = np.empty(total_poly_items, dtype=np.int64)
 
 #                 p_off = 0
 #                 c_off = 0
 #                 for e in valid:
 #                     n_v = 3 if e.get("is_triangle", False) else min(4, len(e.get("vertices", [])))
-#                     verts_np = np.asarray(e.get("vertices", [])[:n_v], dtype=np.float32)
+#                     verts_np = np.asarray(e.get("vertices", [])[:n_v], dtype=np.float64)
 #                     if len(verts_np) < 3:
 #                         continue
 #                     count = len(verts_np)
@@ -19378,7 +19378,7 @@ def _update_snt_line_actor_entities(actor, entities):
     valid = [e for e in entities if isinstance(e, dict) and len(e.get("points", [])) >= 2]
     if not valid:
         return False
-    dtype = np.float64 if any(e.get("_boundary_precision_corrected") for e in valid) else np.float32
+    dtype = np.float64
     prepared = []
     total = 0
     for e in valid:
@@ -19428,11 +19428,11 @@ def _update_snt_point_actor_entities(actor, entities):
     valid = [e for e in entities if isinstance(e, dict) and e.get("position") is not None]
     if not valid:
         return False
-    pts_np = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in valid], dtype=np.float32)
+    pts_np = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in valid], dtype=np.float64)
     if pts_np.ndim != 2:
         return False
     if pts_np.shape[1] == 2:
-        pts_np = np.column_stack((pts_np, np.zeros(len(pts_np), dtype=np.float32)))
+        pts_np = np.column_stack((pts_np, np.zeros(len(pts_np), dtype=np.float64)))
     vtk_points = vtk.vtkPoints()
     vtk_points.SetData(numpy_support.numpy_to_vtk(pts_np[:, :3], deep=True))
     cells_np = np.empty(len(valid) * 2, dtype=np.int64)
@@ -25344,54 +25344,96 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         return out
 
     def _resolve_snt_crs_from_adjacent_prj(self, fpath):
-        """Resolve this SNT/DGN's source CRS and establish/confirm the ONE
-        authoritative canvas CRS (gui.crs_manager: first trustworthy dataset
-        wins - a later SNT in a different CRS never silently replaces an
-        already-established canvas). Without a resolved CRS here, location
-        -aware code (the basemap plugin) has nothing to align tiles against.
+        """Resolve SNT source CRS without ever stealing the project CRS.
 
-        Delegates the actual resolution chain (adjacent OGC WKT .prj ->
-        TerraScan .prj ProjectionSystem=<EPSG> -> TerraScan block-referenced
-        LAZ/LAS WKT VLR / GeoKey Directory) to gui.crs_manager.resolve_snt_crs
-        so there is exactly one implementation of that chain in the app.
+        SNT is a custom vector format and commonly relies on a companion PRJ,
+        DGN spatial reference, or LAS/LAZ metadata.  The first trustworthy
+        source may establish an empty Naksha project CRS.  Once a project CRS
+        exists, later SNT files are transformed into it for display; their
+        source coordinates and source CRS remain untouched for round-trip
+        export.
 
-        Returns True when this SNT's source CRS was resolved (regardless of
-        whether it matched/established the canvas CRS). Safe to call
-        repeatedly - gui.crs_manager.ensure_canvas_crs() is idempotent.
+        Returns ``(source_crs, source_label)`` or ``(None, None)``.
         """
         try:
-            from gui.crs_manager import (resolve_snt_crs, set_canvas_crs,
+            from gui.crs_manager import (resolve_snt_crs, ensure_canvas_crs,
                                          get_canvas_crs, log_dataset_crs)
         except Exception as e:
             print(f"[SNT CRS] gui.crs_manager unavailable: {e}")
-            return False
+            return None, None
 
         crs, label = resolve_snt_crs(fpath)
         filename = os.path.basename(str(fpath))
-        if crs is None:
-            log_dataset_crs(filename, "SNT", None, None)
-            return False
+        canvas_before = get_canvas_crs(self.app)
 
-        prev_canvas = get_canvas_crs(self.app)
-        set_canvas_crs(self.app, crs, source=label, dataset=fpath, force=True)
+        if crs is None and canvas_before is not None:
+            # SNT is a custom format and some legacy files have no embedded or
+            # companion CRS. Never silently assume that their raw coordinates
+            # equal the project CRS. Ask the operator explicitly.
+            answer = QMessageBox.question(
+                self,
+                "SNT Coordinate System",
+                f"No machine-readable coordinate system was found for:\n{filename}\n\n"
+                f"Project CRS: {canvas_before.name}\n\n"
+                "Are this SNT file's coordinates already in the Project CRS?\n\n"
+                "Yes = use the Project CRS for this SNT\n"
+                "No = choose the SNT source CRS\n"
+                "Cancel = do not attach it",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                crs = canvas_before
+                label = "User confirmed SNT uses Project CRS"
+            elif answer == QMessageBox.No:
+                try:
+                    from gui.crs_selector_dialog import choose_crs
+                    picked = choose_crs(
+                        self, initial_crs=canvas_before,
+                        title=f"Source CRS for {filename}",
+                    )
+                except Exception as exc:
+                    print(f"[SNT CRS] source CRS selector failed: {exc}")
+                    picked = None
+                if picked is not None:
+                    crs = picked
+                    label = "User selected SNT source CRS"
+                else:
+                    raise RuntimeError(
+                        f"SNT attach cancelled: coordinate system for '{filename}' remains unresolved."
+                    )
+            else:
+                raise RuntimeError(
+                    f"SNT attach cancelled: coordinate system for '{filename}' remains unresolved."
+                )
+
+        if crs is None:
+            # No project exists yet and no source CRS could be resolved. Keep the
+            # SNT usable as a local/engineering coordinate source, but make the
+            # unresolved state explicit. The first georeferenced source loaded
+            # later will not silently relabel these coordinates.
+            log_dataset_crs(filename, "SNT", None, None, canvas_crs=canvas_before)
+            print(
+                f"[SNT CRS] '{filename}' has unknown/local coordinates. "
+                "World/UTM alignment is unavailable until a CRS is assigned."
+            )
+            return None, None
+
+        if canvas_before is None:
+            ensure_canvas_crs(self.app, crs, source=label or "SNT spatial reference", dataset=fpath)
         canvas = get_canvas_crs(self.app)
         log_dataset_crs(filename, "SNT", crs, label, canvas_crs=canvas)
 
-        if prev_canvas is not None and canvas is not None:
+        if canvas is not None:
             try:
-                if crs.to_epsg() != canvas.to_epsg():
+                if not crs.equals(canvas):
                     print(
-                        f"[SNT CRS] WARNING: '{filename}' source CRS "
-                        f"EPSG:{crs.to_epsg() or 'n/a'} differs from the canvas CRS "
-                        f"EPSG:{canvas.to_epsg() or 'n/a'} already established by an "
-                        f"earlier dataset. Canvas CRS is kept (not overwritten); SNT "
-                        f"block/entity geometry is currently rendered in its own "
-                        f"source coordinates and is not yet reprojected into the "
-                        f"canvas CRS, so it may not align with other layers."
+                        f"[SNT CRS] '{filename}' will be reprojected for display: "
+                        f"{crs.name} -> {canvas.name}. Native SNT coordinates remain unchanged."
                     )
             except Exception:
                 pass
-        return True
+        return crs, label
 
     def _render_snt_in_vtk(self, attachment: Dict) -> None:
         try:
@@ -25407,13 +25449,76 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             item: Optional[SNTFileItem] = attachment.get("_snt_item")
             source_entities = attachment.get("entities", [])
             fpath = str(Path(attachment.get("full_path", attachment["filename"])).resolve())
-            prj_blocks = _parse_snt_adjacent_prj_blocks(fpath)
+            prj_blocks_source = _parse_snt_adjacent_prj_blocks(fpath)
             parsed_metadata = attachment.get("parsed") or {}
-            entities = _apply_prj_precision_to_block_entities(
+
+            # Precision correction must happen in the SNT's native coordinate
+            # space before any CRS operation.
+            corrected_source_entities = _apply_prj_precision_to_block_entities(
                 source_entities,
-                prj_blocks,
+                prj_blocks_source,
                 snt_uses_float64=bool(parsed_metadata.get("use_float64", False)),
             )
+
+            source_crs, source_crs_label = self._resolve_snt_crs_from_adjacent_prj(fpath)
+            try:
+                from gui.crs_manager import get_canvas_crs
+                canvas_crs = get_canvas_crs(self.app)
+            except Exception:
+                canvas_crs = None
+
+            attachment["source_crs"] = source_crs
+            attachment["source_crs_wkt"] = source_crs.to_wkt() if source_crs is not None else None
+            attachment["source_crs_label"] = source_crs_label
+            attachment["project_crs_wkt"] = canvas_crs.to_wkt() if canvas_crs is not None else None
+
+            def _tx_points(seq):
+                if not seq or source_crs is None or canvas_crs is None:
+                    return list(seq or [])
+                try:
+                    if source_crs.equals(canvas_crs):
+                        return list(seq)
+                except Exception:
+                    pass
+                try:
+                    from gui.projection_engine import transform_point_sequence
+                    return transform_point_sequence(seq, source_crs, canvas_crs)
+                except Exception as exc:
+                    print(f"[SNT CRS] coordinate transform failed: {exc}")
+                    return list(seq)
+
+            def _tx_entity(ent):
+                if not isinstance(ent, dict):
+                    return ent
+                out = dict(ent)
+                for key in ("points", "vertices"):
+                    vals = ent.get(key)
+                    if vals:
+                        out[key] = _tx_points(vals)
+                boundaries = ent.get("boundaries")
+                if isinstance(boundaries, list):
+                    out["boundaries"] = [_tx_points(ring) if isinstance(ring, list) else ring for ring in boundaries]
+                for key in ("position", "center", "insert"):
+                    pos = ent.get(key)
+                    if isinstance(pos, (tuple, list)) and len(pos) >= 2:
+                        transformed = _tx_points([pos])
+                        if transformed:
+                            out[key] = transformed[0]
+                return out
+
+            # Render entities are project-space copies.  The attachment's native
+            # entities remain in source coordinates so SNT can round-trip without
+            # accumulating reprojection error.
+            entities = [_tx_entity(e) for e in corrected_source_entities]
+            attachment["_render_entities"] = entities
+
+            prj_blocks = []
+            for block in prj_blocks_source:
+                b = dict(block)
+                pts2 = block.get("points_2d") or []
+                if pts2:
+                    b["points_2d"] = [tuple(p[:2]) for p in _tx_points(pts2)]
+                prj_blocks.append(b)
 
             line_groups: Dict = defaultdict(list)
             text_ents: List = []
@@ -25534,7 +25639,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 point_dtype = (
                     np.float64
                     if any(e.get("_boundary_precision_corrected") for e in valid)
-                    else np.float32
+                    else np.float64
                 )
 
                 # Preserve closed-polyline topology by explicitly repeating the
@@ -25619,7 +25724,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 if not chunk:
                     return
 
-                pts_data = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in chunk], dtype=np.float32)
+                pts_data = np.asarray([e.get("position", (0.0, 0.0, 0.0)) for e in chunk], dtype=np.float64)
                 if pts_data.size == 0:
                     return
                 _update_bounds_np(pts_data)
@@ -25674,14 +25779,14 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     total_pts += n_v
                     total_poly_items += (n_v + 1)
 
-                combined_pts = np.empty((total_pts, 3), dtype=np.float32)
+                combined_pts = np.empty((total_pts, 3), dtype=np.float64)
                 combined_polys = np.empty(total_poly_items, dtype=np.int64)
 
                 p_off = 0
                 c_off = 0
                 for e in valid:
                     n_v = 3 if e.get("is_triangle", False) else min(4, len(e.get("vertices", [])))
-                    verts_np = np.asarray(e.get("vertices", [])[:n_v], dtype=np.float32)
+                    verts_np = np.asarray(e.get("vertices", [])[:n_v], dtype=np.float64)
                     if len(verts_np) < 3:
                         continue
                     count = len(verts_np)
@@ -25812,7 +25917,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 point_dtype = (
                     np.float64
                     if ent.get("_boundary_precision_corrected")
-                    else np.float32
+                    else np.float64
                 )
                 pts_np = np.asarray(pts, dtype=point_dtype)
                 if bool(ent.get("closed", False)) and len(pts_np) >= 3:
@@ -26031,15 +26136,6 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 pass
 
             attachment["actors"] = actors
-
-            # Resolve this SNT's source CRS and establish/confirm the canvas
-            # CRS via gui.crs_manager (first trustworthy dataset wins). This
-            # also notifies plugins (basemap) and updates the status bar - see
-            # _resolve_snt_crs_from_adjacent_prj().
-            try:
-                self._resolve_snt_crs_from_adjacent_prj(fpath)
-            except Exception as e:
-                print(f"[SNT CRS] resolution failed: {e}")
 
             if not getattr(renderer, "_skip_camera_reset", False):
                 camera_xy_bounds = fit_bounds or actor_entry.get("bounds")

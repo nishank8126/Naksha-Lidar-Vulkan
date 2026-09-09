@@ -1,4 +1,4 @@
-﻿"""
+"""
 orthogonal_polygon_tool.py
 --------------------------
 Port of the QGIS OrthogonalPolygonTool to the NakshaAI-Lidar VTK/PySide6 pipeline.
@@ -728,6 +728,8 @@ class OrthogonalPolygonTool:
             'original_style': lstyle,
         }
         self.dig.drawings.append(entry)
+        if hasattr(self.dig, "_emit_drawing_finalized"):
+            self.dig._emit_drawing_finalized(entry)
 
         # Hide vertex markers immediately on finalization.
         for m in perm_markers:

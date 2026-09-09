@@ -19,7 +19,7 @@ installer_output/
 
 # Standalone app-plugin development/build output (installed manually in NakshaAI)
 /plugin_build/
-
+/plugins
 # Proprietary local converter payload; install it before building the app.
 /snt_v2-1.0.2-cp310-cp310-win_amd64.whl
 

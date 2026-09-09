@@ -25,7 +25,9 @@ def test_three_real_tiffs_import_and_refresh(tmp_path, monkeypatch):
     app.vtk_widget = SimpleNamespace(renderer=ren, GetRenderWindow=lambda: rw, render=lambda: None)
     monkeypatch.setattr(vector_export, "_infer_import_scene_z", lambda app: 0)
     monkeypatch.setattr(vector_export, "_geotiff_texture_pixel_budget", lambda *a, **kw: 4000000)
-    monkeypatch.setattr(gis_layers, "get_layer_epsg", lambda path: None)
+    monkeypatch.setattr(
+        gis_layers, "get_layer_epsg", lambda path, layer_name=None: None
+    )
     try:
         for i in range(3):
             path = tmp_path / f"tile{i}.tif"

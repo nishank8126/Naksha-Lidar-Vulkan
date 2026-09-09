@@ -194,13 +194,21 @@ def _restore_overview(actor):
     meta = getattr(actor, "_raster_lod_meta", None)
     if not meta or not meta.get("_last_window") or meta.get("_preview_image") is None:
         return False
-    plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
-    left, right, bottom, top = meta["native_bounds"]
-    plane.SetOrigin(left, bottom, meta["z"])
-    plane.SetPoint1(right, bottom, meta["z"])
-    plane.SetPoint2(left, top, meta["z"])
-    plane.Update()
-    actor.GetTexture().SetInputData(meta["_preview_image"])
+    # Called from the render-window StartEvent observer (_prepare_frame) on
+    # every render, with no caller-side guard - unlike the identical pipeline
+    # dereference in _apply_texture (which is try/except-wrapped), a detached
+    # mapper/texture here (actor mid-teardown from a concurrent style/layer
+    # swap) would raise straight out of a native VTK callback.
+    try:
+        plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
+        left, right, bottom, top = meta["native_bounds"]
+        plane.SetOrigin(left, bottom, meta["z"])
+        plane.SetPoint1(right, bottom, meta["z"])
+        plane.SetPoint2(left, top, meta["z"])
+        plane.Update()
+        actor.GetTexture().SetInputData(meta["_preview_image"])
+    except Exception:
+        return False
     meta.pop("_last_window", None)
     return True
 
@@ -234,13 +242,15 @@ def _request_for(app, actor, view):
     style = deepcopy(_style_for(app, meta["path"], actor))
     last = meta.get("_last_window")
     # Demand no more than native resolution, including at the raster edges.
-    density_x = min(screen_w / (vmaxx - vminx), meta["native_size"][0] / (bounds[1] - bounds[0]))
-    density_y = min(screen_h / (vmaxy - vminy), meta["native_size"][1] / (bounds[3] - bounds[2]))
+    density_x = min(screen_w / max(1e-9, vmaxx - vminx), meta["native_size"][0] / max(1e-9, bounds[1] - bounds[0]))
+    density_y = min(screen_h / max(1e-9, vmaxy - vminy), meta["native_size"][1] / max(1e-9, bounds[3] - bounds[2]))
     if (last and meta.get("_last_style") == style
             and _already_covers(last, clipped, density_x * (clipped[1] - clipped[0]))
-            and last["out_h"] / (last["wy1"] - last["wy0"]) >= density_y / _ZOOM_TOLERANCE):
+            and last["out_h"] / max(1e-9, last["wy1"] - last["wy0"]) >= density_y / _ZOOM_TOLERANCE):
         return None
     window = _pixel_window_for_world(bounds, meta["native_size"], view[:4], _REFETCH_MARGIN)
+    if window is None:
+        return None
     target_w = min(window["width"], max(1, math.ceil((window["wx1"] - window["wx0"]) * density_x)))
     target_h = min(window["height"], max(1, math.ceil((window["wy1"] - window["wy0"]) * density_y)))
     if (vmaxx - vminx) <= _TIGHT_ZOOM_EXTENT_M:
@@ -379,7 +389,7 @@ class _Loader:
         self.failed_keys = {}
         self.cursor = 0
         self.observers = []
-        self.poll = QTimer()
+        self.poll = QTimer(app if hasattr(app, "children") else None)
         self.poll.setInterval(30)
         self.poll.timeout.connect(self.finish)
         qt_app = QCoreApplication.instance()
@@ -393,7 +403,10 @@ class _Loader:
             return
         self.closed = True
         for obj, tag in self.observers:
-            obj.RemoveObserver(tag)
+            try:
+                obj.RemoveObserver(tag)
+            except Exception:
+                pass
         self.observers.clear()
         for timer in (self.poll, getattr(self.app, "_raster_lod_timer", None)):
             try:

@@ -25,10 +25,15 @@ class FileLoaderWorker(QThread):
     error          = Signal(str)        # human-readable error on failure
     cancelled      = Signal()           # user cancelled
 
-    def __init__(self, filenames, import_options, parent=None):
+    def __init__(self, filenames, import_options, parent=None, target_project_crs_wkt=None):
         super().__init__(parent)
         self.filenames      = filenames
         self.import_options = import_options
+        # When Naksha already has a project CRS (for example SNT was attached
+        # first), LiDAR is reprojected into that world coordinate system in
+        # this worker.  If None, the first trustworthy LiDAR CRS establishes
+        # the runtime/project CRS and later tiles are transformed into it.
+        self.target_project_crs_wkt = target_project_crs_wkt
         self._cancel        = False
 
     # ── public API ─────────────────────────────────────────────────────
@@ -62,6 +67,15 @@ class FileLoaderWorker(QThread):
         file_info    = []
         total_points = 0
 
+        target_crs = None
+        try:
+            from gui.projection_engine import parse_crs
+            target_crs = parse_crs(self.target_project_crs_wkt)
+        except Exception:
+            target_crs = None
+
+        unknown_crs_seen = False
+
         for i, filename in enumerate(filenames):
             if self._cancel:
                 self.cancelled.emit()
@@ -84,6 +98,65 @@ class FileLoaderWorker(QThread):
                 if not tile_data:
                     print(f"   ⚠️ Skipping: {os.path.basename(filename)}")
                     continue
+
+                # ---- Unified projection engine ---------------------------------
+                # Keep the source CRS as metadata, but make runtime XYZ live in
+                # one project/world CRS before arrays are merged.  This is the
+                # critical path that lets SNT, LiDAR and GIS align even when
+                # they arrive in different coordinate systems.
+                source_crs = None
+                source_crs_wkt = None
+                source_crs_epsg = tile_data.get("crs_epsg")
+                projection_report = None
+                reprojected = False
+                try:
+                    from gui.projection_engine import parse_crs, transform_points, crs_identifier
+                    if tile_data.get("crs_wkt"):
+                        source_crs = parse_crs(tile_data.get("crs_wkt"))
+                    elif source_crs_epsg:
+                        source_crs = parse_crs(source_crs_epsg)
+                    if source_crs is None:
+                        if target_crs is not None:
+                            raise RuntimeError(
+                                f"[CRS] {os.path.basename(filename)} has no trustworthy CRS, but the project CRS is already established. "
+                                "Naksha will not guess or mix raw coordinates into the project."
+                            )
+                        unknown_crs_seen = True
+                    else:
+                        if unknown_crs_seen and target_crs is None:
+                            raise RuntimeError(
+                                f"[CRS] Mixed unresolved and referenced LiDAR sources were selected. "
+                                f"{os.path.basename(filename)} has a CRS but an earlier tile did not. "
+                                "Assign/repair the missing CRS before merging."
+                            )
+                        source_crs_wkt = source_crs.to_wkt()
+                        if target_crs is None:
+                            target_crs = source_crs
+                        if target_crs is not None and not source_crs.equals(target_crs):
+                            tile_data["xyz"], projection_report = transform_points(
+                                tile_data["xyz"], source_crs, target_crs,
+                                copy=False, chunk_size=1_000_000,
+                            )
+                            reprojected = True
+                            print(
+                                f"   🌐 Reprojected {os.path.basename(filename)}: "
+                                f"{crs_identifier(source_crs)} -> {crs_identifier(target_crs)}"
+                            )
+                            if projection_report and projection_report.warnings:
+                                for warning in projection_report.warnings:
+                                    print(f"      ⚠️ {warning}")
+                except Exception as proj_exc:
+                    if str(proj_exc).startswith("[CRS]"):
+                        raise
+                    raise RuntimeError(
+                        f"[CRS] Projection failed for {os.path.basename(filename)}: {proj_exc}"
+                    ) from proj_exc
+
+                tile_data["_source_crs_wkt"] = source_crs_wkt
+                tile_data["_source_crs_epsg"] = source_crs_epsg
+                tile_data["_runtime_crs_wkt"] = target_crs.to_wkt() if target_crs is not None else None
+                tile_data["_runtime_reprojected"] = bool(reprojected)
+                tile_data["_projection_report"] = projection_report.to_dict() if projection_report is not None else None
 
                 n          = len(tile_data.get("xyz", []))
                 has_rgb    = tile_data.get("rgb")       is not None
@@ -116,6 +189,9 @@ class FileLoaderWorker(QThread):
                 import traceback
                 print(f"   ❌ Failed to scan {os.path.basename(filename)}: {exc}")
                 traceback.print_exc()
+                if str(exc).startswith("[CRS]"):
+                    self.error.emit(str(exc))
+                    return
 
             # Incremental progress for scan phase (2-10%)
             pct = 2 + int((i + 1) / len(filenames) * 8)
@@ -142,12 +218,21 @@ class FileLoaderWorker(QThread):
                 "classification" : td["classification"],
                 "crs_epsg"       : td.get("crs_epsg"),
                 "crs_wkt"        : td.get("crs_wkt"),
+                "source_crs_wkt" : td.get("_source_crs_wkt"),
+                "runtime_crs_wkt": td.get("_runtime_crs_wkt"),
+                "runtime_reprojected": bool(td.get("_runtime_reprojected")),
+                "projection_report": td.get("_projection_report"),
                 "input_format_version": td.get("input_format_version"),
                 "first_file"     : only["filename"],
                 "layer_info_list": [{
                     "filename" : only["filename"],
                     "n_points" : only["n_points"],
                     "crs_epsg" : td.get("crs_epsg"),
+                    "source_crs_wkt": td.get("_source_crs_wkt"),
+                    "runtime_crs_wkt": td.get("_runtime_crs_wkt"),
+                    "runtime_reprojected": bool(td.get("_runtime_reprojected")),
+                    "point_start": 0,
+                    "point_end": only["n_points"],
                 }],
                 "total_points"   : only["n_points"],
                 "num_files"      : 1,
@@ -194,6 +279,8 @@ class FileLoaderWorker(QThread):
         first_input_format_version = None
         first_file       = file_info[0]["filename"]
         layer_info_list  = []   # serialisable metadata for main thread
+        source_crs_keys  = set()
+        any_reprojected  = False
 
         for i, info in enumerate(file_info):
             if self._cancel:
@@ -229,10 +316,24 @@ class FileLoaderWorker(QThread):
                 first_input_format_version = td.get("input_format_version")
 
             # Collect layer metadata (lightweight — no large arrays)
+            src_wkt = td.get("_source_crs_wkt")
+            if src_wkt:
+                try:
+                    from gui.projection_engine import parse_crs, crs_identifier
+                    source_crs_keys.add(crs_identifier(parse_crs(src_wkt)))
+                except Exception:
+                    source_crs_keys.add(src_wkt)
+            any_reprojected = any_reprojected or bool(td.get("_runtime_reprojected"))
             layer_info_list.append({
                 "filename"  : info["filename"],
                 "n_points"  : n,
                 "crs_epsg"  : td.get("crs_epsg"),
+                "source_crs_wkt": src_wkt,
+                "runtime_crs_wkt": td.get("_runtime_crs_wkt"),
+                "runtime_reprojected": bool(td.get("_runtime_reprojected")),
+                "projection_report": td.get("_projection_report"),
+                "point_start": offset,
+                "point_end": offset + n,
             })
 
             offset += n
@@ -251,6 +352,10 @@ class FileLoaderWorker(QThread):
             "classification" : merged_cls,
             "crs_epsg"       : first_crs_epsg,
             "crs_wkt"        : first_crs_wkt,
+            "source_crs_wkt" : layer_info_list[0].get("source_crs_wkt") if layer_info_list else first_crs_wkt,
+            "runtime_crs_wkt": target_crs.to_wkt() if target_crs is not None else None,
+            "runtime_reprojected": bool(any_reprojected),
+            "source_crs_consistent": len(source_crs_keys) <= 1,
             "input_format_version": first_input_format_version,
             "first_file"     : first_file,
             "layer_info_list": layer_info_list,
