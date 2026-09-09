@@ -646,7 +646,7 @@ class RibbonSection(QWidget):
 
     _POINT_SYNC_EXCLUSIVE_BUTTONS = {
         "ToolsRibbon": {"Cross", "Cut"},
-        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Vertex", "AccuDraw", "Select", "Parallel", "Centerline", "Curve"},
+        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Vertex", "Angle", "Select", "Parallel", "Centerline", "Curve"},
         "ClassifyRibbon": {"Above", "Below", "Parallel", "Rect", "Circle", "Polygon", "Free", "Brush", "Point", "Fence"},
         "MeasurementRibbon": {"Line", "Path", "Block", "Grid"},
         "IdentificationRibbon": {"Identify", "Zoom", "Select"},
@@ -2077,7 +2077,7 @@ class DrawRibbon(QWidget):
         self.vertex_btn = tools.add_button("Vertex", "🔵", lambda: self._handle_vertex_click())
         tools.add_button("Curve", "〰️", lambda: self._handle_curve_click())
         tools.add_button("Hatch", "▦", lambda: self._handle_hatch_click())
-        tools.add_button("AccuDraw", "XYZ", lambda: self._handle_accudraw_click())
+        tools.add_button("Angle", "XYZ", lambda: self._handle_accudraw_click())
         layout.addWidget(tools)
 
         controls_section = RibbonSection("Controls", self)

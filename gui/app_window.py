@@ -145,9 +145,12 @@ class MainWheelZoomEventFilter(QObject):
         self._owned_main_pan_button = None
         # MicroStation-style "tap-tap" (dynamic) pan state: one tap starts
         # panning, the view follows the cursor without holding any button,
-        # and a second tap / Esc / right-click ends it.
+        # and a second tap / Esc / right-click ends it. The toggle flips on
+        # PRESS, unconditionally - matching MicroStation's own toggle-pan,
+        # confirmed against Bentley's docs (state flips on the button-down
+        # itself, no distance/timing check). No press-position or arm-time
+        # tracking is needed for that model.
         self._tap_session = False
-        self._tap_press_pos = None
         self._tap_swallow_release_button = None
 
     @staticmethod
@@ -183,7 +186,6 @@ class MainWheelZoomEventFilter(QObject):
         """End an open tap-pan session cleanly (second tap, Esc, right-click,
         a key press, or a tool taking over the canvas)."""
         self._tap_session = False
-        self._tap_press_pos = None
         self._owns_main_pan = False
         self._owned_main_pan_button = None
         release = getattr(app, "_handle_fast_main_pan_release", None)
@@ -287,8 +289,23 @@ class MainWheelZoomEventFilter(QObject):
         # Main 2D middle-pan is owned at the Qt boundary. This prevents the
         # same physical drag from reaching both the digitizer's manual camera
         # path and VTK's interactor style.
+        # QEvent.MouseButtonDblClick is included and treated as an ordinary
+        # press below. Confirmed with a captured real session: a genuine
+        # fast tap-tap's second click sometimes arrives as
+        # MouseButtonDblClick, not a second MouseButtonPress, because it
+        # falls inside Qt/Windows' own double-click time+distance window.
+        # Before this, that DblClick fell straight through unhandled, and
+        # its paired MouseButtonRelease then got misrouted through the
+        # plain hold-drag release path (since _tap_session was never ended
+        # by a real press) - which clears _owned_main_pan_button and
+        # _qt_main_pan_active but NOT _tap_session, leaving it stuck True.
+        # Every following MouseMove then bails out at "not active" and the
+        # camera stops following the cursor entirely - frozen - until the
+        # next physical click happens to finish the session via the
+        # "new press while _tap_session is True" branch below.
         if event_type in (
             QEvent.MouseButtonPress,
+            QEvent.MouseButtonDblClick,
             QEvent.MouseMove,
             QEvent.MouseButtonRelease,
         ):
@@ -326,7 +343,7 @@ class MainWheelZoomEventFilter(QObject):
             active = bool(getattr(app, "_qt_main_pan_active", False))
             tap_mode = self._tap_mode(app)
             try:
-                if event_type == QEvent.MouseButtonPress:
+                if event_type in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
                     pressed_button = event.button()
                     # A new press supersedes a pending release-swallow (the OS
                     # normally delivers the matching release first, so this
@@ -358,7 +375,17 @@ class MainWheelZoomEventFilter(QObject):
                                 self._finish_tap_session(app)
                             return False
                         if self._tap_session:
-                            # Second tap/click ends the MicroStation-style pan.
+                            # Second tap immediately ends the MicroStation-
+                            # style pan. No distance/timing check: real
+                            # MicroStation flips its toggle-pan state on
+                            # every button-down, unconditionally (confirmed
+                            # against Bentley's own docs) - trying to infer
+                            # "was that really a deliberate second tap" from
+                            # movement or timing was the source of every
+                            # tap-tap bug this session chased (DblClick
+                            # coalescing, the zombie freeze, arm-then-end
+                            # racing on fast clicks). A plain press-toggle
+                            # has none of those failure modes.
                             self._finish_tap_session(app)
                             self._tap_swallow_release_button = pressed_button
                             handled = True
@@ -374,25 +401,14 @@ class MainWheelZoomEventFilter(QObject):
                             if handled:
                                 self._owns_main_pan = True
                                 self._owned_main_pan_button = pan_button
-                                # Tap-vs-drag detection is a Left-button-only
-                                # feature (it exists to let the configured
-                                # primary pan button skip holding it down).
-                                # Physical middle-click pan must always stay
-                                # plain hold-drag, per _eligible_pan_button's
-                                # own contract above ("Physical middle is
-                                # always pan, irrespective of which
-                                # configurable primary pan button is
-                                # selected") -- without this button check, a
-                                # quick middle-click tap (little movement
-                                # before release) would have been
-                                # misclassified as a tap and started a
-                                # dynamic pan session bound to the middle
-                                # button instead of ending normally.
+                                # Tap-Tap arms the dynamic-pan session right
+                                # here, on this press - not after measuring
+                                # movement at release. Physical middle-click
+                                # pan and "Left Click Pan" mode both stay
+                                # plain hold-drag: only the Left button under
+                                # the Tap-Tap setting ever becomes a toggle.
                                 if tap_mode and pan_button == Qt.LeftButton:
-                                    self._tap_press_pos = (
-                                        event.position().x(),
-                                        event.position().y(),
-                                    )
+                                    self._tap_session = True
                 elif event_type == QEvent.MouseMove:
                     if not active:
                         # A right-click grid load can block Qt long enough for
@@ -415,7 +431,13 @@ class MainWheelZoomEventFilter(QObject):
                     if self._tap_session:
                         # MicroStation dynamic pan: no button needs to stay
                         # held - the view keeps following the cursor until the
-                        # second tap / Esc / right-click / key ends the session.
+                        # second tap / Esc / right-click / key ends the
+                        # session. Tap-Tap arms this at press time (see the
+                        # press-handling branch above), so it is already
+                        # True for every move that follows - including any
+                        # movement while the arming button is still
+                        # physically held, which is correct: Tap-Tap has no
+                        # separate hold-drag phase to bleed in from.
                         pan_button_down = True
                     else:
                         pan_button_down = bool(event.buttons() & pan_button)
@@ -437,6 +459,18 @@ class MainWheelZoomEventFilter(QObject):
                             handled = True
                         else:
                             return False
+                    elif tap_mode and self._tap_session:
+                        # Tap-Tap already flipped its state on the matching
+                        # press (arming or re-confirming the open session) -
+                        # there is nothing left to decide at release, so
+                        # just consume it without touching ownership/session
+                        # state. Clearing them here (as the plain hold-drag
+                        # path below does) would tear the still-open session
+                        # down mid-pan.
+                        if event.button() == self._owned_main_pan_button:
+                            handled = True
+                        else:
+                            return False
                     else:
                         pan_button = self._owned_main_pan_button
                         if pan_button is None:
@@ -445,62 +479,15 @@ class MainWheelZoomEventFilter(QObject):
                             active or self._owns_main_pan
                         ):
                             return False
-                        started_tap_session = False
                         if active:
-                            if (
-                                tap_mode
-                                and not self._tap_session
-                                and self._tap_press_pos is not None
-                            ):
-                                # Decide tap vs hold-drag on release: a release
-                                # with (almost) no movement means the user
-                                # tapped once -> stay in a dynamic pan session.
-                                # A real physical mouse click routinely jitters
-                                # more than 4px between press and release, so
-                                # that radius misclassified many genuine taps
-                                # as a hold-drag -- falling through to the
-                                # ordinary press-drag-release pan below, which
-                                # looks and feels identical to left-click-pan.
-                                # 10px matches typical OS click-vs-drag
-                                # tolerance and still sits far below any
-                                # deliberate drag gesture (tens/hundreds of
-                                # pixels), so genuine drags are unaffected.
-                                pos = (event.position().x(), event.position().y())
-                                dx = pos[0] - self._tap_press_pos[0]
-                                dy = pos[1] - self._tap_press_pos[1]
-                                if (dx * dx + dy * dy) <= 100.0:  # ~10 px radius
-                                    self._tap_session = True
-                                    started_tap_session = True
-                                    handled = True  # swallow the release
-                                else:
-                                    handler = getattr(
-                                        app, "_handle_fast_main_pan_release", None
-                                    )
-                                    handled = bool(handler()) if callable(handler) else False
-                            else:
-                                handler = getattr(
-                                    app, "_handle_fast_main_pan_release", None
-                                )
-                                handled = bool(handler()) if callable(handler) else False
+                            handler = getattr(
+                                app, "_handle_fast_main_pan_release", None
+                            )
+                            handled = bool(handler()) if callable(handler) else False
                         else:
                             handled = True
-                        # A tap session that just started must keep "owning"
-                        # the pan button so the next MouseMove (see the
-                        # `active` branch above, which reads
-                        # _owned_main_pan_button to decide whether to call
-                        # _handle_fast_main_pan_move) still runs -- clearing
-                        # it here unconditionally (as before) made the view
-                        # never follow the cursor after the first tap, since
-                        # every move event bailed out at "pan_button is
-                        # None" before ever reaching the move handler.
-                        # Middle-click pan and "left" mode never set
-                        # started_tap_session (tap_mode is only true for the
-                        # "tap" panning-button setting), so both keep
-                        # resetting exactly as before.
-                        if not started_tap_session:
-                            self._owns_main_pan = False
-                            self._owned_main_pan_button = None
-                        self._tap_press_pos = None
+                        self._owns_main_pan = False
+                        self._owned_main_pan_button = None
             except Exception:
                 handled = False
 

@@ -796,7 +796,7 @@ class GlobalSettingsDialog(QDialog):
         self.panning_button_combo = QComboBox()
         self.panning_button_combo.addItem("Scroll Button (Middle Click)", "scroll")
         self.panning_button_combo.addItem("Left Mouse Button", "left")
-        self.panning_button_combo.addItem("Tap-Tap Pan (MicroStation)", "tap")
+        self.panning_button_combo.addItem("Tap-Tap Pan", "tap")
         self.panning_button_combo.currentIndexChanged.connect(self._update_navigation_summary)
         form.addRow("Panning button:", self.panning_button_combo)
 
