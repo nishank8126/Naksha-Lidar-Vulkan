@@ -1811,31 +1811,71 @@ class NakshaApp(QMainWindow):
         Opens the SNT dialog, adds the files, and auto-attaches them.
         """
         from pathlib import Path
-        from PySide6.QtWidgets import QMessageBox
 
         valid_paths = []
+        request_keys = set()
+        pending_keys = getattr(self, "_pending_snt_auto_attach_keys", None)
+        if pending_keys is None:
+            pending_keys = set()
+            self._pending_snt_auto_attach_keys = pending_keys
+
+        attached_keys = set()
+        for attachment in getattr(self, "snt_attachments", []) or []:
+            if not isinstance(attachment, dict):
+                continue
+            raw_path = attachment.get("full_path") or attachment.get("filename")
+            if not raw_path:
+                continue
+            try:
+                attached_keys.add(str(Path(raw_path).resolve()).lower())
+            except Exception:
+                attached_keys.add(str(raw_path).lower())
+
         for p in file_paths:
             try:
                 pp = Path(p)
-                if pp.is_file() and pp.suffix.lower() == ".snt":
-                    valid_paths.append(str(pp))
+                if not pp.is_file() or pp.suffix.lower() != ".snt":
+                    continue
+                key = str(pp.resolve()).lower()
+                # Converter completion, shell-open and Qt's nested modal event
+                # loop can enqueue the same path more than once. Reserve each
+                # path before the deferred loader is scheduled so only one
+                # request can ever reach the confirmation/render pipeline.
+                if key in request_keys or key in pending_keys or key in attached_keys:
+                    continue
+                request_keys.add(key)
+                valid_paths.append(str(pp))
             except Exception:
                 continue
 
         if not valid_paths:
             return
 
+        pending_keys.update(request_keys)
+
         from gui.snt_attachment import show_snt_attachment_dialog
         dlg = show_snt_attachment_dialog(self)
 
-        QTimer.singleShot(300, lambda paths=valid_paths, d=dlg: self._shell_load_snt_files(paths, d))
+        QTimer.singleShot(
+            300,
+            lambda paths=valid_paths, keys=request_keys, d=dlg:
+                self._shell_load_snt_files(paths, d, keys),
+        )
 
-    def _shell_load_snt_files(self, file_paths: list, dlg):
+    def _shell_load_snt_files(self, file_paths: list, dlg, request_keys=None):
         """Load SNT files into dialog and auto-attach."""
         from pathlib import Path
         from gui.snt_attachment import SNTFileItem, SNTLoadWorker
 
+        reserved_keys = set(request_keys or ())
+
+        def release_reservations():
+            pending = getattr(self, "_pending_snt_auto_attach_keys", None)
+            if pending is not None:
+                pending.difference_update(reserved_keys)
+
         if dlg is None or not hasattr(dlg, 'file_list_layout'):
+            release_reservations()
             return
 
         if dlg._load_worker is not None and dlg._load_worker.isRunning():
@@ -1859,7 +1899,10 @@ class NakshaApp(QMainWindow):
                 new_paths.append(p)
 
         if not new_paths:
-            dlg._attach_all()
+            try:
+                dlg._attach_all()
+            finally:
+                release_reservations()
             return
 
         from PySide6.QtWidgets import QProgressDialog
@@ -1921,6 +1964,8 @@ class NakshaApp(QMainWindow):
                 dlg._attach_all()
             except RuntimeError:
                 pass
+            finally:
+                release_reservations()
 
         def on_error(msg):
             try:
@@ -1930,10 +1975,12 @@ class NakshaApp(QMainWindow):
                 QMessageBox.critical(dlg, "Load Failed", msg)
             except RuntimeError:
                 pass
+            finally:
+                release_reservations()
 
         worker.progress.connect(on_progress)
         worker.file_loaded.connect(on_file_loaded)
-        worker.finished.connect(on_finished)
+        worker.load_succeeded.connect(on_finished)
         worker.error.connect(on_error)
         worker.start()
 

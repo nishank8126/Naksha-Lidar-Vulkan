@@ -148,6 +148,8 @@ _DGN_TO_ACI: Dict[int, int] = {
 # clearly distinct instead of everything rendering as white (ACI 7).
 _LEVEL_COLOR_CYCLE = [1, 3, 4, 5, 6, 2]   # R, G, C, B, M, Y
 _MAX_BRIDGE_TEXT_HEIGHT = 80.0
+_FALLBACK_BRIDGE_TEXT_HEIGHT = 5.0
+_FALLBACK_BRIDGE_BLOCK_TEXT_HEIGHT = 0.1
 
 # -- DGN element type numbers (from g_typeNames in dgn_reader.c) ---------------
 DGN_CELL_HDR        = 1
@@ -1035,13 +1037,39 @@ def detect_scale_from_grid_labels(elements: list, model_idx: int, current_scale:
     return current_scale
 
 
-def _scale_bridge_text_height(height: float, scale: float) -> float:
-    """Convert Bentley UOR text height to the bounded SNT world height."""
+def _scale_bridge_text_height(
+    height: float,
+    scale: float,
+    layer_name: str = "",
+) -> float:
+    """Convert Bentley UOR text height to a plausible SNT world height.
+
+    Some Bentley SDK text records report corrupt text heights (for example
+    500,000,000 UOR at 10,000 UOR/m = 50,000 m). Clamping that value to the
+    former 80 m ceiling still produced enormous glyph geometry and made a
+    later 1 pt label edit remain visibly oversized. The desktop converter's
+    established fallback for such invalid records is 5 world units. Preserve
+    every valid source height and use that fallback only beyond the plausibility
+    ceiling.
+    """
     if not math.isfinite(height) or height <= 0.0:
         return 1.0
     if not math.isfinite(scale) or scale <= 0.0:
         scale = 1.0
-    return min(height / scale, _MAX_BRIDGE_TEXT_HEIGHT)
+    world_height = height / scale
+    if not math.isfinite(world_height) or world_height <= 0.0:
+        return 1.0
+    if world_height > _MAX_BRIDGE_TEXT_HEIGHT:
+        normalized_layer = "".join(
+            ch for ch in str(layer_name or "").upper() if ch.isalnum()
+        )
+        if normalized_layer in {
+            "BL", "BLOCKS", "BLOCKLABEL", "BLOCKLABELS",
+            "FILENAMES", "FEATUREATTRIBS",
+        }:
+            return _FALLBACK_BRIDGE_BLOCK_TEXT_HEIGHT
+        return _FALLBACK_BRIDGE_TEXT_HEIGHT
+    return world_height
 
 
 def _parse_dgn_nm_levels(dgn_path: Path) -> dict:
@@ -1565,7 +1593,12 @@ def _try_bridge_scan(dgn_path: Path) -> Optional[Tuple[List[dict], Dict[Tuple[in
         if 'height' in elem:
             if elem.get('height_in_uor', True):
                 elem['height'] = _scale_bridge_text_height(
-                    elem['height'], scale
+                    elem['height'],
+                    scale,
+                    level_names.get(
+                        (elem.get('model_idx'), elem.get('level')),
+                        '',
+                    ),
                 )
             
     return (elements, level_names) if elements else None

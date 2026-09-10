@@ -6445,6 +6445,26 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush
 from gui.popup_guard import InputPopupMixin
 
 
+def _lidar_block_stem(value):
+    """Return a block filename without only a terminal LAS/LAZ suffix.
+
+    ``os.path.splitext`` cannot be used for extensionless TerraScan block
+    labels such as ``S. PIETRO000025``: it interprets everything from the
+    embedded dot onward as an extension and returns just ``S``.
+    """
+    name = os.path.basename(str(value or '').strip())
+    lower_name = name.lower()
+    for suffix in ('.laz', '.las'):
+        if lower_name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def _lidar_block_key(value):
+    """Return a case/punctuation-insensitive key for a LAS/LAZ block."""
+    return ''.join(ch.lower() for ch in _lidar_block_stem(value) if ch.isalnum())
+
+
 def _point_in_polygon_xy(px, py, polygon_xy, eps: float = 1e-9):
     """Return True when a point lies inside or on the edge of a polygon."""
     pts = [(float(x), float(y)) for x, y in polygon_xy]
@@ -8271,7 +8291,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     try:
                         for fp in prj_root.iterdir():
                             if fp.is_file() and fp.suffix.lower() in ('.laz', '.las'):
-                                prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                                prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
                     except OSError as exc:
                         print(f"  ⚠️ Could not scan PRJ directory directly: {exc}")
 
@@ -8281,7 +8301,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                         for fp in prj_root.rglob('*'):
                             if not fp.is_file() or fp.suffix.lower() not in ('.laz', '.las'):
                                 continue
-                            prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                            prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
                     except OSError as exc:
                         print(f"  ⚠️ Could not recursively scan PRJ directory: {exc}")
 
@@ -8306,8 +8326,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 block_label = data['label']
                 # Resolve strictly from the currently loaded PRJ's own
                 # directory tree.  This deliberately ignores loaded SNT folders.
-                block_stem = os.path.splitext(os.path.basename(block_label))[0].upper()
-                found_laz_path = prj_lidar_index.get(block_stem)
+                block_key = _lidar_block_key(block_label)
+                found_laz_path = prj_lidar_index.get(block_key)
 
                 # Column 0: Block Label  — store original prj_data index in UserRole
                 label_item = QTableWidgetItem(block_label)
@@ -8809,11 +8829,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     def _find_loaded_snt_block_polygon(self, block_label, prj_boundary=None):
         """Return a loaded-SNT polygon by label, then by PRJ spatial overlap."""
-        def _key(value):
-            stem = os.path.splitext(os.path.basename(str(value or '').strip()))[0]
-            return ''.join(ch.lower() for ch in stem if ch.isalnum())
-
-        wanted = _key(block_label)
+        wanted = _lidar_block_key(block_label)
         if not wanted:
             return None
 
@@ -8821,7 +8837,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         for entry in entries:
             names = [entry.get('grid_name'), entry.get('block_file')]
             names.extend(entry.get('alt_names') or [])
-            if not any(_key(name) == wanted for name in names):
+            if not any(_lidar_block_key(name) == wanted for name in names):
                 continue
 
             points = entry.get('points_2d') or []

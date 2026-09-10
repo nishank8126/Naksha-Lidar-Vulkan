@@ -862,7 +862,13 @@ class GoogleEarthBasemapPlugin(QObject):
 
         self._refresh_generation += 1
         generation = self._refresh_generation
-        self._abort_non_session_replies()
+        # Only cancel tiles that actually scrolled out of view. The old code
+        # aborted EVERY in-flight tile here, so a wide (up to 36-tile) view -
+        # which takes longer to download than the 300ms debounce window - was
+        # killed and restarted by the next camera tick before it could ever
+        # finish. That is what made zoomed-out loading loop forever while
+        # zoomed-in (few tiles) resolved fine.
+        self._abort_unwanted_tile_replies()
 
         provider = self._provider()
         if provider == "esri_world_imagery":
@@ -1106,6 +1112,9 @@ class GoogleEarthBasemapPlugin(QObject):
         self._tile_actor_signature = (crs_sig, round(float(z_plane), 3), provider)
         self._current_z_plane = float(z_plane)
         self._active_ids = set(tiles)
+        # The wanted set just changed; drop anything in flight that is no
+        # longer part of it before queueing the new requests.
+        self._abort_unwanted_tile_replies()
         sep = self._basemap_z_sep()
 
         # Active (current-zoom) tiles sit exactly on the basemap plane. Still-needed
@@ -1198,8 +1207,15 @@ class GoogleEarthBasemapPlugin(QObject):
         if not meta:
             reply.deleteLater()
             return
-        _, generation, context = meta
-        if self._unloaded or generation != self._refresh_generation or not self._active:
+        _kind, generation, context = meta
+        if self._unloaded or not self._active:
+            reply.deleteLater()
+            return
+        # Drop a tile only when it is genuinely no longer wanted (scrolled out
+        # of view / zoomed past). Matching against _refresh_generation here
+        # threw away valid tiles whenever a newer refresh ticked mid-download.
+        tile_id = context.get("tile_id") if isinstance(context, dict) else None
+        if tile_id is not None and tile_id not in (self._active_ids or set()):
             reply.deleteLater()
             return
         if context.get("provider") != self._provider():
@@ -2166,8 +2182,8 @@ class GoogleEarthBasemapPlugin(QObject):
         # Active tiles sit on the basemap plane (depth ordering vs placeholders is
         # handled by the negative Z offset applied to placeholders in _prepare_tile_set).
         actor.SetPosition(0.0, 0.0, 0.0)
-        from gui.scene_render_pipeline import add_raster_actor
-        add_raster_actor(self.app, actor)
+        if not self._pipeline_add(self.app, actor):
+            self.app.vtk_widget.renderer.AddActor(actor)
         self._tile_actors[tile_id] = actor
         self._try_remove_parent(tile_id)
         self._maybe_purge_retired()
@@ -2459,12 +2475,43 @@ class GoogleEarthBasemapPlugin(QObject):
         if render:
             self._render(reset_clipping=True)
 
+    # --- scene routing -------------------------------------------------
+    # Newer app builds expose gui.scene_render_pipeline, which keeps raster
+    # (basemap) actors in their own renderer/layer so they cannot reorder
+    # themselves above LiDAR/vector data.  Older builds have no such module,
+    # so fall back to the plain renderer rather than dropping tiles on add
+    # or leaking actors on remove.
+
+    @staticmethod
+    def _pipeline_add(app, actor):
+        try:
+            from gui.scene_render_pipeline import add_raster_actor
+        except Exception:
+            return False
+        try:
+            add_raster_actor(app, actor)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pipeline_remove(app, actor):
+        try:
+            from gui.scene_render_pipeline import remove_actor_from_pipeline
+        except Exception:
+            return False
+        try:
+            remove_actor_from_pipeline(app, actor)
+            return True
+        except Exception:
+            return False
+
     def _remove_actor(self, actor):
         if self.app is None or actor is None:
             return
         try:
-            from gui.scene_render_pipeline import remove_actor_from_pipeline
-            remove_actor_from_pipeline(self.app, actor)
+            if not self._pipeline_remove(self.app, actor):
+                self.app.vtk_widget.renderer.RemoveActor(actor)
         except Exception:
             pass
 
@@ -2496,6 +2543,37 @@ class GoogleEarthBasemapPlugin(QObject):
     def _abort_non_session_replies(self):
         for reply, meta in list(self._reply_meta.items()):
             if meta and meta[0] in {"session", "esri_meta"}:
+                continue
+            try:
+                reply.abort()
+                reply.deleteLater()
+            except Exception:
+                pass
+            self._reply_meta.pop(reply, None)
+
+    def _abort_unwanted_tile_replies(self):
+        """Cancel only the in-flight tiles that are no longer wanted.
+
+        Staleness is decided by *"is this tile still in the current view"*
+        (membership in ``_active_ids``), NOT by *"which refresh cycle asked for
+        it"*. The old rule - abort everything, and drop any reply whose
+        generation tag is not the newest - meant a single camera tick landing
+        mid-download invalidated a whole batch of perfectly good tiles. On a
+        wide view (up to 36 tiles) that happens almost every time, so loading
+        restarted from zero forever; zoomed in with only a handful of tiles it
+        usually finished inside one debounce window and looked fine.
+        """
+        active = self._active_ids or set()
+        for reply, meta in list(self._reply_meta.items()):
+            if not meta:
+                continue
+            kind = meta[0]
+            if kind in {"session", "esri_meta"}:
+                continue
+            context = meta[2] if len(meta) > 2 else None
+            tile_id = context.get("tile_id") if isinstance(context, dict) else None
+            if tile_id is not None and tile_id in active:
+                # Still on screen - let it finish instead of restarting it.
                 continue
             try:
                 reply.abort()
