@@ -5803,13 +5803,8 @@ class GridLabelManager:
             return True
 
         try:
-            from gui.save_pointcloud import has_fenced_parent_writeback, save_pointcloud, save_pointcloud_quick
-
-            if has_fenced_parent_writeback(self.app):
-                saved = save_pointcloud(self.app, path=None, show_dialog=False)
-            else:
-                save_path = getattr(self.app, "last_save_path", None) or getattr(self.app, "loaded_file", None)
-                saved = save_pointcloud_quick(self.app, save_path) if save_path else False
+            from gui.save_pointcloud import save_current_pointcloud_in_place
+            saved = save_current_pointcloud_in_place(self.app)
             if saved:
                 return True
         except Exception as exc:
@@ -6929,7 +6924,9 @@ class GridLabelManager:
             if is_text_actor3d:
                 text_prop = actor.GetTextProperty()
                 text = actor.GetInput() or getattr(actor, 'grid_name', '') or ''
-                raw_size = text_prop.GetFontSize()
+                raw_size = getattr(
+                    actor, '_naksha_label_font_size', text_prop.GetFontSize()
+                )
                 size = int(75 if raw_size is None else raw_size)
             else:
                 text = (
@@ -6983,8 +6980,24 @@ class GridLabelManager:
             if is_text_actor3d:
                 text_prop = actor.GetTextProperty()
                 actor.SetInput(text)
-                text_prop.SetFontSize(size)
+                base_scale = getattr(actor, '_naksha_base_scale', None)
+                if base_scale is None:
+                    base_scale = float(actor.GetScale()[0])
+                    actor._naksha_base_scale = base_scale
+                base_size = float(
+                    getattr(actor, '_naksha_base_font_size',
+                            text_prop.GetFontSize() or 75) or 75
+                )
+                actor._naksha_base_font_size = base_size
+                # vtkTextActor3D does not reliably change its world footprint
+                # from SetFontSize alone. Keep glyph rasterization stable and
+                # resize the actor transform from the immutable import scale.
+                text_prop.SetFontSize(max(8, int(round(base_size))))
+                factor = float(size) / base_size if base_size > 0 else 1.0
+                new_scale = float(base_scale) * factor
+                actor.SetScale(new_scale, new_scale, new_scale)
                 text_prop.SetColor(*color)
+                actor._naksha_label_font_size = size
             else:
                 # vtkFollower labels are built either from a live vtkVectorText
                 # pipeline connection (DXF path: SetInputConnection) or from a
@@ -7019,12 +7032,7 @@ class GridLabelManager:
                         actor._naksha_base_scale = base_scale
                     base_size = float(getattr(actor, '_naksha_base_font_size', 75) or 75)
                     if base_size > 0:
-                        # SNT/DXF follower glyphs are world geometry rather
-                        # than screen text. A strong display multiplier keeps
-                        # labels readable across kilometre-scale grid cells:
-                        # 999 pt is intentionally very large, while 50 pt is
-                        # still clearly visible.
-                        new_scale = base_scale * (float(size) / base_size) * 8.0
+                        new_scale = base_scale * (float(size) / base_size)
                         actor.SetScale(new_scale, new_scale, new_scale)
                 except Exception as _scale_err:
                     print(f"⚠️ Could not rescale grid label: {_scale_err}")
@@ -8374,7 +8382,10 @@ class GridLabelManager:
         # ============================================================================
         _reset_interaction_state()
         if hasattr(self.app, 'data') and self.app.data is not None:
+            from gui.save_pointcloud import has_fenced_parent_writeback
             save_path = getattr(self.app, 'last_save_path', None) or getattr(self.app, 'loaded_file', None)
+            if not save_path and has_fenced_parent_writeback(self.app):
+                save_path = "__fenced_parent_writeback__"
 
             # Only save if there are points (prevent saving empty cleared state)
             current_point_count = len(self.app.data.get('xyz', [])) if self.app.data else 0

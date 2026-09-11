@@ -26140,6 +26140,9 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             actor._text_font_size = font_size_pt
             actor._text_scale_base = world_scale
             actor._text_parallel_scale_ref = 100.0
+            actor._naksha_base_scale = world_scale
+            actor._naksha_base_font_size = font_size_pt
+            actor._naksha_label_font_size = font_size_pt
 
             actor.PickableOn()
             actor.text_content = text_content
@@ -26238,6 +26241,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     pass
 
         actor.SetScale(scale, scale, scale)
+        # Stable baseline used by label editing. Keeping the immutable import
+        # scale separate prevents repeated edits from accumulating scale.
+        actor._naksha_base_scale = float(scale)
+        actor._naksha_base_font_size = 75
+        actor._naksha_label_font_size = 75
 
         # Rotation is stored in the SNT TEXT body in degrees.  Rotate around
         # the glyph centre so a rotated label keeps the same anchor position
