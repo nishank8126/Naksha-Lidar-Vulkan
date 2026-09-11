@@ -450,3 +450,32 @@ class CRSSelectorDialog(QDialog):
 
 def choose_crs(parent=None, initial_crs=None, area_of_interest=None, title="Select Coordinate Reference System") -> Optional[CRS]:
     return CRSSelectorDialog.select_crs(parent, initial_crs=initial_crs, area_of_interest=area_of_interest, title=title)
+
+
+def prompt_missing_source_crs(parent, filename, layer_type, canvas_crs) -> Optional[CRS]:
+    """Resolve a layer whose file carries no machine-readable CRS.
+
+    Mirrors the SNT attach flow: never silently assume raw coordinates equal
+    the project CRS once a canvas CRS exists.  Returns the CRS to use, or
+    ``None`` when the operator cancelled (caller should not attach the layer).
+    """
+    answer = QMessageBox.question(
+        parent,
+        f"{layer_type} Coordinate System",
+        f"No machine-readable coordinate system was found for:\n{filename}\n\n"
+        f"Project CRS: {canvas_crs.name}\n\n"
+        f"Is this {layer_type} file already in the Project CRS?\n\n"
+        "Yes = use the Project CRS for this file\n"
+        "No = choose the source CRS\n"
+        "Cancel = do not attach it",
+        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+        QMessageBox.Yes,
+    )
+    if answer == QMessageBox.Yes:
+        return canvas_crs
+    if answer == QMessageBox.No:
+        return choose_crs(
+            parent, initial_crs=canvas_crs,
+            title=f"Source CRS for {filename}",
+        )
+    return None

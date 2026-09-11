@@ -38,7 +38,24 @@ The plugin defaults to **Esri World Imagery** using the public ArcGIS World Imag
 The plugin also requests the ArcGIS service metadata and displays the returned copyright/source text when available. If metadata cannot be retrieved, it displays `Esri | World Imagery` as a fallback. Public service access is still subject to Esri's service terms and operational limits; "no API key" does not mean unlimited/offline redistribution.
 
 ### OpenStreetMap (street / roadmap) — no API key
-The **OpenStreetMap** provider pulls standard OSM slippy tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`) plus the `a/b/c` tile subdomains as fallbacks. No key is needed. Attribution is shown as `© OpenStreetMap contributors` per OSM's usage policy. OSM tiles are capped at zoom 19.
+The **OpenStreetMap** provider pulls standard OSM slippy tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`) using the policy-required main `tile.openstreetmap.org` hostname. No key is needed. Attribution is shown as `© OpenStreetMap contributors` per OSM's usage policy. OSM tiles are capped at zoom 19.
+
+## v1.1.30 — automatic CRS release and standalone restoration
+
+- Reconciles dataset-derived canvas CRS after actual scene content removal while preserving explicitly selected project CRS.
+- Saves the geographic camera view before releasing the last dataset CRS, then restores standalone Web Mercator without numerically reinterpreting projected coordinates.
+- Clears old projected actors, replies, geometry cache, and clipping state on projected-to-standalone transitions.
+- Treats EPSG `area_of_use` as an accuracy hint rather than a hard black render boundary; actual finite/overflow/singularity checks remain active.
+
+## v1.1.29 — deterministic exact projected tile meshes
+
+- Removed camera-local affine placement from the active Esri/OSM projected path.
+- XYZ geometry is cached by canonical canvas CRS, tile id, and adaptive regular-grid subdivision.
+- A shared 1/2/4/8/16/32 subdivision level is selected per visible XYZ zoom to keep midpoint interpolation error at or below 0.35 screen pixels.
+- Network replies carry a canvas-CRS signature and cannot cross a CRS change; older camera-generation replies remain reusable.
+- The authoritative `gui.crs_manager.get_canvas_crs()` wins over attached SNT source CRS, and data-object identity changes no longer clear reusable actors.
+- CRS area-of-use rejection and clipping are active in the projected tile path. Outside-domain canvas space remains the neutral renderer background.
+- Optional `debug=true` settings output emits one `BASEMAP_REFRESH` record per settled refresh, including raster clipping and tile lifecycle counts.
 
 ## Auto-refresh on zoom / pan
 
@@ -73,7 +90,7 @@ Plugins ribbon → **Basemap** section:
 - Renders tiles directly inside the existing Naksha VTK main canvas.
 - Uses the app's normal pan/zoom controls — no embedded browser or QtWebEngine.
 - Works in 2D Top/Plan view and pauses outside that view.
-- Reprojects tile geometry from WGS84/Web Mercator into the loaded project CRS with `pyproj`.
+- In projected (non-Web-Mercator) canvases, places each tile individually using a locally-linear rotation+scale approximation of the project CRS around the current camera focal point (v1.1.28) — see the v1.1.28 changelog entry below. Web-Mercator canvases place tiles with the exact, unapproximated transform (it's already an identity/no-op in that case).
 - Places the basemap below existing project actors and disables its VTK bounds contribution so it does not corrupt fit/zoom extents.
 - Keeps only the visible viewport tile set in memory, plus a small set of lower-resolution placeholder tiles (parent zoom levels) that are retired automatically once their higher-resolution children load. An on-disk tile cache (`%LOCALAPPDATA%/NakshaAI/basemap_cache`, 7-day TTL) makes re-viewed areas re-appear instantly instead of flashing blank.
 - If data is loaded without a known CRS, Go To falls back to Web Mercator (tiles will not align with unreferenced data) rather than silently doing nothing.
@@ -81,8 +98,8 @@ Plugins ribbon → **Basemap** section:
 ## Install / update
 
 1. Open **Plugins → Plugins Manager → Install from ZIP**.
-2. Select `naksha_basemap-1.1.6.zip`.
-3. Your current PluginManager will unload the older `Google Earth Basemap` version if active, replace its plugin directory, and immediately load v1.1.6.
+2. Select `naksha_basemap-1.1.28.zip`.
+3. Plugin Manager will unload the older `Google Earth Basemap`, replace its plugin directory, and immediately load v1.1.28.
 4. Open **Plugins** and pick a provider: **Esri World Imagery (No API Key)** for satellite or **OpenStreetMap (No API Key)** for street/roadmap.
 5. Turn **Basemap** on. Tiles refresh automatically as you zoom and pan.
 
@@ -113,7 +130,7 @@ For a PyInstaller build, `PySide6.QtNetwork` must exist in the host bundle becau
 - Emits the final failed tile URL/error to Naksha status/console for easier diagnosis.
 
 ## v1.1.3 — free street map + auto-refresh
-- Added **OpenStreetMap** as a no-key street/roadmap provider (with `a/b/c` subdomain fallbacks).
+- Added **OpenStreetMap** as a no-key street/roadmap provider (using the official main tile hostname).
 - Provider picker now lists: Esri World Imagery, OpenStreetMap, Google Satellite, Google Roadmap, Google Terrain.
 - Basemap tiles auto-refresh on every camera pan/zoom via the camera `ModifiedEvent` observer (covers programmatic zoom done by the host app), with a transform-signature guard to avoid render loops.
 - Version bump 1.1.2 → 1.1.3.
@@ -158,3 +175,127 @@ For a PyInstaller build, `PySide6.QtNetwork` must exist in the host bundle becau
   4. Set `app.project_crs_wkt` on the host programmatically.
 - **REUSABLE LESSON:** always check for `ProjectionSystem=<EPSG>` in TerraScan `.prj` files, and parse LAZ projection VLRs directly (2112 = WKT, 34735 = GeoKeys) before assuming a CRS is missing. Also: differently-stemmed `.prj` files are a valid TerraScan delivery convention.
 - Version bump 1.1.5 → 1.1.6.
+
+
+## v1.1.28 — the wedge is gone: local-affine tile placement replaces per-pixel warp
+
+The 1.1.27 note below said the wedge/fan shape at extreme zoom-out in a local
+project CRS (EPSG:3301 was the reported case) "needs a host-level display-CRS
+change, not a plugin patch." That turned out to be true only for a *pixel-exact*
+fix; a much cheaper, plugin-only fix gets the practical result (a basemap that
+always looks like a basemap, never a wedge) without touching `crs_manager.py`,
+`projection_engine.py`, or any loader.
+
+- **What changed:** `_start_projected_free_refresh()` no longer warps every
+  output pixel through pyproj and composites the result into one texture.
+  Each basemap tile is now placed individually using a **locally-linear
+  (rotation + scale) approximation** of the project CRS around the current
+  camera focal point — see `_local_canvas_to_mercator_affine()` in
+  `google_earth_basemap.py` for the full derivation. Both the project CRS and
+  Web Mercator are conformal projections, so within one screen's worth of
+  view the map between them is, to very good approximation, a single
+  similarity transform; a locally-linear map of a rectangle is always a
+  parallelogram, so the basemap can no longer degenerate into a wedge no
+  matter how far the CRS's *true* global shape would distort.
+- **Which tiles to fetch** (the geographic bbox and zoom level) still uses
+  the exact, CRS-domain-clipped math from 1.1.25/1.1.27 — only *placement* of
+  each already-selected tile changed. The plugin still never requests
+  imagery for a region the project CRS cannot meaningfully represent.
+- **Accuracy:** near the camera's focal point (i.e. the normal case — a
+  basemap under a local LiDAR/GIS survey area) alignment is visually exact.
+  It degrades gracefully with distance from the focal point — independently
+  verified against EPSG:3301 for this release: ~0.1% positional error at
+  10 km from center, ~0.7% at 50 km, ~2% at 150 km, growing further at
+  continental/global zoom-out where a single local scale factor necessarily
+  stops being representative. That is the same trade-off every Web Mercator
+  map already makes, and it is recomputed from the live camera on every
+  refresh, so it re-centers continuously as you pan rather than degrading
+  further the longer you stay in one place.
+- **Side effects, all improvements:** the old per-pixel compose pass ran
+  synchronously on the Qt GUI thread (forced there in 1.1.26 after a
+  background attempt access-violated inside PROJ on Windows) and could block
+  interaction for a noticeable time on a wide view; that entire pass is gone
+  from this path, so there is nothing left to stall the UI or trip that
+  Windows PROJ crash. The "shows nothing, then a small wrong patch" cold-start
+  symptom 1.1.27 patched around (98.5%/20%/1.6x thresholds) cannot occur
+  either, because there is no composited texture with a coverage percentage
+  left in this path - tiles simply appear as they arrive, the same way the
+  plain Web-Mercator-canvas path already worked.
+- **Not changed:** `app.canvas_crs` / the "first georeferenced dataset wins"
+  rule, GeoTIFF rendering, `gui/scene_render_pipeline.py`, and the Google
+  Maps Platform provider path are all untouched. The Web-Mercator-canvas
+  case (no GIS file loaded, or a project already in EPSG:3857) is unaffected
+  — it never needed the projected path in the first place.
+- **Please verify on your machine** (this can't be exercised without a live
+  Qt/VTK session): load a local-CRS GIS/LiDAR file (EPSG:3301 or otherwise),
+  turn the basemap on, and confirm (a) the basemap now stays a normal
+  rectangle at every zoom level instead of collapsing into a wedge/patch,
+  (b) it lines up with the loaded data at the data's own scale, and (c)
+  panning/zooming stays smooth with no stalls. If alignment drifts
+  noticeably during continuous fast panning before the next refresh lands,
+  that's the expected recompute lag described above — it should snap back
+  into alignment within one debounce cycle (~300 ms) once the camera settles.
+
+## v1.1.27 — stale-preview and cold-start fix for the projected viewport
+
+- **No more "shows nothing, then a small wrong patch" on activate/zoom-out:**
+  the composed projected-basemap texture used to replace the one on screen
+  only once it reached 98.5% coverage, with no exception for "there is no
+  texture on screen yet." On a fresh `activate()` that meant nothing rendered
+  until coverage cleared the bar; during continuous zoom-out the *old* texture
+  (still sized for its original camera scale) simply kept shrinking on screen
+  while a replacement that could miss the bar again sat unfinished.
+- **Stale-actor clearing:** if the live camera's world-space width has moved
+  more than 1.6x away from the scale the on-screen texture was composed for,
+  it's cleared immediately instead of being left in place looking like a
+  stuck, wrongly-scaled leftover.
+- **Lower first-paint bar:** when there is no current viewport actor, 20%
+  coverage is enough to show a first image; refinement passes on an existing,
+  reasonably current actor still require the original 98.5% to avoid flicker.
+- **Compose debounce 55ms → 90ms**, reducing how often the synchronous
+  NumPy/PROJ compose pass (still on the Qt GUI thread — see the 1.1.26 note
+  below) runs back-to-back during a burst of tile arrivals.
+- **Manifest changelog correction:** the 1.1.25 bullet list in `manifest.json`
+  still claimed composition ran on a `QThreadPool` after 1.1.26 reverted that
+  for the Windows PROJ crash reason below. This README already had it right;
+  `manifest.json`'s copy did not. Fixed.
+- Does **not** change the wedge/fan shape you get after loading a local-CRS
+  (e.g. EPSG:3301) GIS file at extreme zoom-out — that's the correct
+  projected image of the CRS's valid area, not a rendering bug. See the
+  "Important projection rule" note under v1.1.25 below; turning that back
+  into a rectangular whole-world view needs a host-level display-CRS change,
+  not a plugin patch.
+
+## v1.1.26 — Windows PROJ crash fix
+
+- Keeps the v1.1.25 projected-CRS/domain and rendering corrections.
+- Runs projected composition on the Qt thread because concurrent pyproj work can
+  access-violate inside the bundled PROJ DLL while the host imports GIS data.
+- Retains the 1024-pixel projected-texture cap to bound UI-thread work.
+
+## v1.1.25 — projected-CRS stability + smooth background reprojection
+
+- **Root cause fixed for EPSG:3301 extreme zoom-out:** v1.1.24 sampled the full projected camera rectangle on a fixed 9×9 grid. Once the view became very large, only its center sample was still inside EPSG:3301's official Estonia area-of-use, so the geographic request collapsed to a point and the plugin selected an absurdly detailed tile zoom. The previous texture then remained on screen as a tiny rectangle.
+- **CRS-domain clipping:** the plugin now densifies and projects the CRS area-of-use boundary, intersects the camera with that valid projected envelope, and renders only the overlap. If the camera is completely outside the valid domain, the old actor is removed instead of being left behind as a stale fragment.
+- **Correct LOD at huge zoom-out:** tile zoom and output texture size are based on how many screen pixels the valid CRS footprint actually occupies, not on the entire application window.
+- **No forward-projected OSM amoebas:** OpenStreetMap now uses the same inverse-resampled flat viewport renderer as Esri whenever the project canvas is not Web Mercator.
+- **Transparent invalid pixels:** areas that are mathematically outside the target CRS are alpha-transparent rather than black, eliminating black wedges/fans at domain edges.
+- **No GUI-thread reprojection freeze:** the expensive NumPy + PROJ pixel composition runs in a `QThreadPool` worker. Only the final VTK texture/actor swap happens on the UI thread. Stale worker results are generation/token checked and discarded after a newer pan/zoom.
+- **Responsive raster budget:** projected textures are capped to 1024 pixels on the longest edge and use a small overscan buffer, providing a stable preview while the user keeps scrolling.
+- **Camera-roll race removed:** the plugin camera repair observer now runs before the host raster-camera mirror, preventing a transient tilted/rolled camera state from being copied into the raster renderer during interaction.
+- **OSM policy update:** standard raster tiles now use exactly `https://tile.openstreetmap.org/{z}/{x}/{y}.png`; legacy `a/b/c` subdomains were removed, and the application User-Agent now reports v1.1.25.
+
+**Important projection rule:** a whole rectangular Web-Mercator world cannot be represented faithfully inside a local CRS such as EPSG:3301. In local-CRS mode the basemap is intentionally clipped to that CRS's valid geographic domain. To reproduce QGIS/ArcGIS's rectangular whole-world behavior, the application's *display/map CRS* must be EPSG:3857 and loaded GIS data must be reprojected into that display CRS.
+
+## v1.1.24 — strict flat 2D projected basemap
+
+- Fixes the curved globe/fan wedges seen after loading the real `1.ecw`
+  raster in EPSG:3301 and zooming out.
+- Normal Esri tiles are selected only from the canvas CRS valid footprint,
+  then inverse-resampled locally into one north-up rectangular VTK texture.
+  The private dataset bounds are not sent to an image-export endpoint.
+- Coarse parent tiles provide full-canvas coverage first; sharper tiles
+  replace them in the same texture. The last complete texture remains visible
+  during refresh, so partial tile arrivals cannot create scattered black gaps.
+- Top/Plan mode continuously repairs the VTK camera to parallel, north-up
+  orientation and uses the 2D image interactor so orbit and roll cannot persist.

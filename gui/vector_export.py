@@ -3846,12 +3846,35 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                     )
                     canvas_crs = get_canvas_crs(app)
                     if canvas_crs is not None and not source_pycrs.equals(canvas_crs):
-                        from rasterio.vrt import WarpedVRT
-                        src = _raster_stack.enter_context(
-                            WarpedVRT(base_src, crs=canvas_crs.to_wkt(), resampling=Resampling.bilinear)
-                        )
-                        raster_warped = True
-                        print(f"   🔄 Raster warped on-the-fly: {source_pycrs.name} -> {canvas_crs.name}")
+                        try:
+                            from rasterio.vrt import WarpedVRT
+                            src = _raster_stack.enter_context(
+                                WarpedVRT(base_src, crs=canvas_crs.to_wkt(), resampling=Resampling.bilinear)
+                            )
+                            raster_warped = True
+                            print(f"   🔄 Raster warped on-the-fly: {source_pycrs.name} -> {canvas_crs.name}")
+                        except Exception as _warp_err:
+                            # Some readers (e.g. a plugin-supplied dataset that proxies
+                            # an isolated helper process, like the ECW native plugin)
+                            # have no real GDAL handle for rasterio to wrap, so a pixel
+                            # warp is impossible. Reproject just the corner points
+                            # instead — correct placement, no per-pixel resample.
+                            if gcp_corners is None and world_bounds is None:
+                                from rasterio.warp import transform as _transform_pts
+                                sb = base_src.bounds
+                                xs, ys = _transform_pts(
+                                    source_pycrs, canvas_crs,
+                                    [sb.left, sb.right, sb.left],
+                                    [sb.bottom, sb.bottom, sb.top],
+                                )
+                                gcp_corners = list(zip(xs, ys))
+                                print(f"   🔄 Raster pixels not warpable ({_warp_err}); "
+                                      f"reprojected corners instead: {source_pycrs.name} -> {canvas_crs.name}")
+                            else:
+                                # Caller already placed the image (gcp_corners/world_bounds
+                                # are already in the Project CRS) — pixels can be used as-is.
+                                print(f"   🔄 Raster pixels not warpable ({_warp_err}); "
+                                      f"using caller-supplied placement as-is")
                 except Exception as _crs_err:
                     try:
                         from PySide6.QtWidgets import QMessageBox

@@ -21,7 +21,10 @@ import vtk
 from pyproj import CRS, Transformer
 from vtk.util import numpy_support
 
-from PySide6.QtCore import QByteArray, QEvent, QObject, QSettings, QTimer, QUrl, Qt
+from PySide6.QtCore import (
+    QByteArray, QEvent, QObject, QRunnable, QSettings, QThreadPool, QTimer,
+    QUrl, Qt, Signal,
+)
 from PySide6.QtGui import QKeySequence, QShortcut
 try:
     from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -88,9 +91,6 @@ ESRI_MAX_ZOOM_DEFAULT = 22
 
 OSM_TILE_URLS = (
     "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "https://b.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "https://c.tile.openstreetmap.org/{z}/{x}/{y}.png",
 )
 OSM_ATTRIBUTION = "© OpenStreetMap contributors"
 OSM_MAX_ZOOM = 19
@@ -100,6 +100,142 @@ FREE_PROVIDERS = {
     "esri_world_imagery": (ESRI_TILE_URLS, ESRI_ATTRIBUTION_FALLBACK, ESRI_MAX_ZOOM_DEFAULT),
     "openstreetmap": (OSM_TILE_URLS, OSM_ATTRIBUTION, OSM_MAX_ZOOM),
 }
+
+
+class _ProjectedComposeSignals(QObject):
+    """Queued hand-off from a background raster reprojection task to Qt UI.
+
+    Retired as of v1.1.28 - GoogleEarthBasemapPlugin._start_projected_free_refresh()
+    no longer calls into this class or the compose pipeline below it. Kept in
+    the file (unused) as a reference/fallback rather than deleted outright;
+    see _local_canvas_to_mercator_affine() for the replacement approach and
+    its docstring for why the per-pixel composite this class performed was
+    itself the cause of the reported "basemap becomes a wedge" symptom.
+    """
+
+    finished = Signal(object)
+
+
+class _ProjectedComposeTask(QRunnable):
+    """CPU-heavy inverse reprojection/composition, deliberately off the GUI thread.
+
+    Unused as of v1.1.28 - see the note on _ProjectedComposeSignals above.
+
+    QGIS uses background render jobs and a render cache while the user pans/zooms.
+    The old plugin performed a pyproj transform for up to ~4 million pixels directly
+    in the Qt GUI thread, which could block wheel interaction for a noticeable time.
+    This worker keeps VTK/Qt actor creation on the GUI thread but moves all NumPy +
+    PROJ pixel work off it.
+    """
+
+    def __init__(self, payload):
+        super().__init__()
+        self.payload = payload
+        self.signals = _ProjectedComposeSignals()
+
+    def run(self):
+        try:
+            result = self._compose(self.payload)
+        except Exception as exc:  # never let a render worker kill the plugin
+            result = {
+                "token": self.payload.get("token"),
+                "error": str(exc),
+            }
+        self.signals.finished.emit(result)
+
+    @staticmethod
+    def _compose(payload):
+        width, height = map(int, payload["size"])
+        xmin, ymin, xmax, ymax = map(float, payload["bounds"])
+        available = payload.get("available", {})
+        if width <= 0 or height <= 0 or not available:
+            return None
+
+        x_values = xmin + (np.arange(width, dtype=np.float64) + 0.5) * (
+            (xmax - xmin) / width
+        )
+        y_values = ymax - (np.arange(height, dtype=np.float64) + 0.5) * (
+            (ymax - ymin) / height
+        )
+        grid_x, grid_y = np.meshgrid(x_values, y_values)
+
+        current_crs = CRS.from_wkt(payload["crs_wkt"])
+        transform = Transformer.from_crs(
+            current_crs, CRS.from_epsg(4326), always_xy=True
+        )
+        lon, lat = transform.transform(grid_x, grid_y)
+        valid = (
+            np.isfinite(lon)
+            & np.isfinite(lat)
+            & (lon >= -180.0)
+            & (lon <= 180.0)
+            & (lat >= -MAX_MERCATOR_LAT)
+            & (lat <= MAX_MERCATOR_LAT)
+        )
+        area_bounds = payload.get("area_bounds")
+        if area_bounds is not None:
+            west, south, east, north = map(float, area_bounds)
+            valid &= (
+                (lon >= west)
+                & (lon <= east)
+                & (lat >= south)
+                & (lat <= north)
+            )
+
+        # RGBA, not RGB. Pixels outside the mathematically valid CRS domain are
+        # transparent, so they can never become black wedges/fans/amoebas.
+        output = np.zeros((height, width, 4), dtype=np.uint8)
+        remaining = valid.copy()
+        safe_lon = np.where(valid, lon, 0.0)
+        safe_lat = np.where(valid, lat, 0.0)
+
+        levels = sorted({tile_id[0] for tile_id in available}, reverse=True)
+        for level in levels:
+            n = float(2 ** level)
+            world_x = ((safe_lon + 180.0) / 360.0) * n
+            latitude = np.radians(
+                np.clip(safe_lat, -MAX_MERCATOR_LAT, MAX_MERCATOR_LAT)
+            )
+            world_y = (
+                1.0 - np.arcsinh(np.tan(latitude)) / math.pi
+            ) * 0.5 * n
+            tile_x = np.floor(world_x).astype(np.int64)
+            tile_y = np.floor(world_y).astype(np.int64)
+
+            for tile_id, rgb in available.items():
+                if tile_id[0] != level:
+                    continue
+                mask = (
+                    remaining
+                    & (tile_x == tile_id[1])
+                    & (tile_y == tile_id[2])
+                )
+                if not np.any(mask):
+                    continue
+                tile_height, tile_width = rgb.shape[:2]
+                px = np.clip(
+                    ((world_x[mask] - tile_id[1]) * tile_width).astype(np.int64),
+                    0,
+                    tile_width - 1,
+                )
+                py = np.clip(
+                    ((world_y[mask] - tile_id[2]) * tile_height).astype(np.int64),
+                    0,
+                    tile_height - 1,
+                )
+                output[mask, :3] = rgb[py, px]
+                output[mask, 3] = 255
+                remaining[mask] = False
+
+        valid_count = int(valid.sum())
+        covered_count = int((valid & ~remaining).sum())
+        coverage = float(covered_count) / valid_count if valid_count else 0.0
+        return {
+            "token": payload.get("token"),
+            "image": output,
+            "coverage": coverage,
+            "valid_count": valid_count,
+        }
 
 
 class _SettingsDialog(QDialog):
@@ -245,6 +381,7 @@ class GoogleEarthBasemapPlugin(QObject):
         self._refresh_timer = None
         self._state_timer = None
         self._reply_meta = {}
+        self._tile_retry_counts = {}
         self._session_reply = None
         self._session_token = None
         self._session_expiry = 0
@@ -256,9 +393,34 @@ class GoogleEarthBasemapPlugin(QObject):
         self._refresh_generation = 0
         self._pending_refresh_after_session = False
         self._tile_actors = {}
+        self._viewport_actor = None
+        self._viewport_signature = None
+        self._projected_tile_images = {}
+        self._projected_view = None
+        self._projected_compose_timer = None
+        self._projected_extent_cache = {}
+        self._tile_geometry_cache = {}
+        self._refresh_mesh_subdivisions = 1
+        self._domain_rejected = 0
+        self._projected_compose_running = False
+        self._projected_compose_pending = False
+        self._projected_compose_task = None
+        self._projected_compose_serial = 0
         self._tile_actor_signature = None
         self._current_z_plane = None
         self._attribution_actor = None
+        # v1.1.27: world-space camera width captured at the moment the
+        # projected viewport actor currently on screen was placed. Used to
+        # detect "this texture is now stale relative to the live camera" so
+        # it can be cleared proactively instead of sitting there looking like
+        # a wrong/shrunken patch while a slow-to-arrive replacement is still
+        # being composed. See _viewport_is_stale_for_camera().
+        # v1.1.28: the single-texture viewport-actor path this supported is
+        # retired (see _local_canvas_to_mercator_affine / the rewritten
+        # _start_projected_free_refresh); kept only because _viewport_actor
+        # itself stays around as a defensive no-op for old saved state / any
+        # leftover call site, and this field travels with it.
+        self._viewport_camera_width = None
         # Anti-blink architecture (v1.1.4):
         # - _tile_actors is now the UNIFIED set of every tile currently drawn
         #   (any zoom). _active_ids marks the tiles wanted at the current zoom;
@@ -279,6 +441,7 @@ class GoogleEarthBasemapPlugin(QObject):
         self._coalesce_timer = None
         self._coalesce_reset_clip = False
         self._placeholder_sep = 1e-3
+        self._tile_clip_planes = None
         self._camera_observer_tags = []
         self._last_project_signature = None
         self._standalone_view_initialized = False
@@ -288,6 +451,7 @@ class GoogleEarthBasemapPlugin(QObject):
         # ResetCameraClippingRange() during render, while still catching every
         # genuine user pan/zoom (including programmatic zoom done by the host app).
         self._last_camera_sig = None
+        self._enforcing_2d_plan_view = False
 
     # ------------------------------------------------------------------
     # Plugin lifecycle expected by gui.plugin_manager.PluginManager
@@ -517,6 +681,7 @@ class GoogleEarthBasemapPlugin(QObject):
             )
             return
 
+        self._enforce_2d_plan_view()
         self._active = True
         self._capture_camera_sig()
 
@@ -532,7 +697,12 @@ class GoogleEarthBasemapPlugin(QObject):
         self._status(f"{self._provider_label()} enabled", 2200)
 
     def deactivate(self, silent=False):
-        if not self._active and not self._tile_actors and self._attribution_actor is None:
+        if (
+            not self._active
+            and not self._tile_actors
+            and self._viewport_actor is None
+            and self._attribution_actor is None
+        ):
             return
         self._active = False
         if self._coalesce_timer is not None:
@@ -541,6 +711,8 @@ class GoogleEarthBasemapPlugin(QObject):
             except Exception:
                 pass
             self._coalesce_timer = None
+        if self._projected_compose_timer is not None:
+            self._projected_compose_timer.stop()
         if self._refresh_timer is not None:
             self._refresh_timer.stop()
         self._abort_non_session_replies()
@@ -663,9 +835,7 @@ class GoogleEarthBasemapPlugin(QObject):
             renderer = getattr(vtk_widget, "renderer", None) if vtk_widget is not None else None
             camera = getattr(renderer, "GetActiveCamera", lambda: None)() if renderer is not None else None
             if camera is not None:
-                tag = camera.AddObserver("ModifiedEvent", self._on_vtk_camera_event, -5.0)
-                self._camera_observer_tags.append((camera, tag))
-                self._capture_camera_sig()
+                self._add_camera_hook(camera)
         except Exception as exc:
             print(f"Basemap camera hook warning: {exc}")
 
@@ -691,9 +861,9 @@ class GoogleEarthBasemapPlugin(QObject):
     def _current_camera_sig(self):
         """Return the camera transform signature, or None if not readable.
 
-        Captures focal point, parallel scale and camera-Z. Deliberately excludes
-        the clipping range, because our own ResetCameraClippingRange() updates
-        that on every render and must NOT be treated as a user pan/zoom.
+        Captures the complete camera transform except clipping range. Position,
+        view-up and projection mode are included so orbit/roll is detected even
+        when focal point and zoom did not change.
         """
         try:
             vtk_widget = getattr(self.app, "vtk_widget", None)
@@ -702,8 +872,10 @@ class GoogleEarthBasemapPlugin(QObject):
                 return None
             cam = renderer.GetActiveCamera()
             fp = tuple(float(v) for v in cam.GetFocalPoint())
+            pos = tuple(float(v) for v in cam.GetPosition())
+            view_up = tuple(float(v) for v in cam.GetViewUp())
             ps = float(cam.GetParallelScale())
-            pos_z = float(cam.GetPosition()[2])
+            parallel = bool(cam.GetParallelProjection())
         except Exception:
             return None
         return (
@@ -711,7 +883,9 @@ class GoogleEarthBasemapPlugin(QObject):
             round(fp[1], 6),
             round(fp[2], 6),
             round(ps, 9),
-            round(pos_z, 6),
+            *(round(value, 6) for value in pos),
+            *(round(value, 6) for value in view_up),
+            parallel,
         )
 
     def _capture_camera_sig(self):
@@ -721,19 +895,62 @@ class GoogleEarthBasemapPlugin(QObject):
     def _on_vtk_camera_event(self, obj=None, event=None):
         if not self._active:
             return
+        repaired = self._enforce_2d_plan_view()
         sig = self._current_camera_sig()
         if sig is None or sig == self._last_camera_sig:
             return
         self._last_camera_sig = sig
+        if repaired:
+            self._render(reset_clipping=True)
         self.schedule_refresh(300)
+
+    def _enforce_2d_plan_view(self):
+        if self._enforcing_2d_plan_view or not self._is_top_view():
+            return False
+        self._enforcing_2d_plan_view = True
+        try:
+            changed = self._repair_plan_camera()
+            return self._repair_plan_interactor() or changed
+        finally:
+            self._enforcing_2d_plan_view = False
+
+    def _repair_plan_camera(self):
+        camera = self.app.vtk_widget.renderer.GetActiveCamera()
+        focal = tuple(map(float, camera.GetFocalPoint()))
+        position = tuple(map(float, camera.GetPosition()))
+        distance = math.dist(position, focal)
+        if not math.isfinite(distance) or distance < 1e-9:
+            distance = 1.0
+        target = (focal[0], focal[1], focal[2] + distance)
+        tilted = math.dist(position, target) > max(1e-9, distance * 1e-10)
+        rolled = math.dist(tuple(camera.GetViewUp()), (0.0, 1.0, 0.0)) > 1e-9
+        changed = not camera.GetParallelProjection() or tilted or rolled
+        if not changed:
+            return False
+        camera.ParallelProjectionOn()
+        camera.SetPosition(*target)
+        camera.SetViewUp(0.0, 1.0, 0.0)
+        camera.OrthogonalizeViewUp()
+        return True
+
+    def _repair_plan_interactor(self):
+        interactor = getattr(self.app.vtk_widget, "interactor", None)
+        if interactor is None:
+            return False
+        style = interactor.GetInteractorStyle()
+        if style is not None and style.GetClassName() == "vtkInteractorStyleImage":
+            return False
+        from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+        interactor.SetInteractorStyle(vtkInteractorStyleImage())
+        return True
 
     def _watch_project_state(self):
         if not self._active or self.app is None:
             return
+        self._ensure_live_camera_hook()
+        self._enforce_2d_plan_view()
         sig = (
-            getattr(self.app, "project_crs_epsg", None),
-            bool(getattr(self.app, "project_crs_wkt", None)),
-            id(getattr(self.app, "data", None)),
+            self._canonical_crs_signature(self._project_crs()),
             bool(getattr(self.app, "is_3d_mode", False)),
             str(getattr(self.app, "current_view", "top") or "top").lower(),
         )
@@ -746,6 +963,24 @@ class GoogleEarthBasemapPlugin(QObject):
                 self._remove_attribution_actor()
                 self._render(reset_clipping=True)
             self.schedule_refresh(100)
+
+    def _ensure_live_camera_hook(self):
+        widget = getattr(self.app, "vtk_widget", None)
+        renderer = getattr(widget, "renderer", None)
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        if camera is None:
+            return
+        if any(obj is camera for obj, _tag in self._camera_observer_tags):
+            return
+        self._add_camera_hook(camera)
+
+    def _add_camera_hook(self, camera):
+        # Run before the host raster-camera mirror (default VTK priority 0).
+        # If another tool briefly tilts/rolls the main camera, we repair it first,
+        # so the raster renderer never copies that transient bad orientation.
+        tag = camera.AddObserver("ModifiedEvent", self._on_vtk_camera_event, 1.0)
+        self._camera_observer_tags.append((camera, tag))
+        self._capture_camera_sig()
 
     def go_to_lonlat(self, lon: float, lat: float, zoom: int, schedule=True):
         if self.app is None:
@@ -813,6 +1048,7 @@ class GoogleEarthBasemapPlugin(QObject):
             cam.SetPosition(float(center_x), float(center_y), old_focal_z + z_distance)
             cam.SetViewUp(0.0, 1.0, 0.0)
             cam.SetParallelScale(max(1e-9, parallel_scale))
+            self._enforce_2d_plan_view()
             vtk_widget.renderer.ResetCameraClippingRange()
             self._capture_camera_sig()
             self._render()
@@ -850,7 +1086,36 @@ class GoogleEarthBasemapPlugin(QObject):
         The 1s _watch_project_state() poll would catch this too, but the
         authoritative canvas CRS notification is instant - no reason to wait.
         """
+        new_sig = self._canonical_crs_signature(self._project_crs())
+        old_sig = self._tile_active_sig[0] if self._tile_active_sig else None
         self._tile_actor_signature = None
+        if new_sig is None and old_sig is not None:
+            try:
+                from gui.crs_manager import scene_has_spatial_content
+                empty = not scene_has_spatial_content(self.app)
+            except Exception:
+                empty = not self._has_project_data()
+            if empty:
+                view = getattr(self.app, "_released_canvas_view", None) or {}
+                lon = float(view.get("lon", self._settings.value("center_lon", 0.0, type=float)))
+                lat = float(view.get("lat", self._settings.value("center_lat", 0.0, type=float)))
+                zoom = int(view.get("zoom", self._settings.value("center_zoom", 3, type=int)))
+                self._active_ids = set()
+                self._abort_unwanted_tile_replies()
+                self._clear_tiles(render=False)
+                self._tile_clip_planes = None
+                self._projected_extent_cache.clear()
+                self._tile_geometry_cache.clear()
+                self._tile_active_sig = None
+                self._standalone_view_initialized = False
+                self.go_to_lonlat(lon, lat, zoom, schedule=False)
+                print("BASEMAP_MODE_CHANGE old_mode=projected "
+                      "new_mode=standalone_webmercator "
+                      f"old_crs={old_sig} geographic_center=({lon:.8f},{lat:.8f}) zoom={zoom}")
+                self.schedule_refresh(0)
+                return
+        if old_sig is not None and old_sig != new_sig:
+            self._clear_tiles(render=False)
         self.schedule_refresh(0)
 
     def _refresh_now(self):
@@ -900,13 +1165,32 @@ class GoogleEarthBasemapPlugin(QObject):
 
     def _start_esri_refresh(self, generation):
         self._ensure_esri_attribution()
-        self._start_free_refresh(generation, "esri_world_imagery", int(self._esri_max_zoom))
+        target_crs = self._project_crs()
+        if target_crs is not None and not self._is_web_mercator(target_crs):
+            if self._start_projected_free_refresh(
+                generation,
+                target_crs,
+                "esri_world_imagery",
+                int(self._esri_max_zoom),
+            ):
+                return
+        self._start_free_refresh(
+            generation, "esri_world_imagery", int(self._esri_max_zoom)
+        )
 
     def _start_osm_refresh(self, generation):
         self._set_attribution_text(OSM_ATTRIBUTION)
+        target_crs = self._project_crs()
+        if target_crs is not None and not self._is_web_mercator(target_crs):
+            if self._start_projected_free_refresh(
+                generation, target_crs, "openstreetmap", OSM_MAX_ZOOM
+            ):
+                return
         self._start_free_refresh(generation, "openstreetmap", OSM_MAX_ZOOM)
 
     def _start_free_refresh(self, generation, provider, max_zoom):
+        self._projected_view = None
+        self._clear_viewport_actor(render=False)
         view = self._compute_viewport_request()
         if view is None:
             return
@@ -921,6 +1205,153 @@ class GoogleEarthBasemapPlugin(QObject):
         if len(tiles) > max_tiles:
             tiles = tiles[:max_tiles]
         self._prepare_tile_set(generation, tiles, target_crs, z_plane, provider)
+
+    def _start_projected_esri_refresh(self, generation, target_crs):
+        """Backward-compatible wrapper retained for older host/plugin hooks."""
+        return self._start_projected_free_refresh(
+            generation,
+            target_crs,
+            "esri_world_imagery",
+            int(self._esri_max_zoom),
+        )
+
+    def _start_projected_free_refresh(
+        self, generation, target_crs, provider, max_zoom
+    ):
+        """Render an XYZ basemap into a non-Web-Mercator project CRS.
+
+        v1.1.29: every tile vertex is transformed exactly from WGS84 into the
+        authoritative canvas CRS. Camera state controls only deterministic
+        mesh density, never the location of a geographic sample.
+
+        Which lon/lat area to fetch, and at what zoom, still uses the exact
+        CRS-domain-clipped math below (unchanged from 1.1.25/1.1.27) - only
+        *placement* of each already-selected tile changed. That keeps the
+        plugin from ever requesting imagery for a region the project CRS
+        cannot meaningfully represent, while placement itself stays cheap
+        and always renders a plain rectangle/parallelogram, never a wedge.
+        """
+        if provider not in FREE_PROVIDERS:
+            return False
+
+        # Small overscan gives QGIS-style preview coverage during a short pan,
+        # but it is clipped immediately to the valid projected CRS footprint.
+        view = self._canvas_view_state(target_crs, overscan=1.12)
+        if view is None:
+            return True
+        camera_bounds, z_plane, width, height = view
+
+        # EPSG area_of_use is an accuracy hint, not a mathematical clip.
+        # Actual non-finite/overflow/singularity rejection happens per mesh.
+        self._tile_clip_planes = None
+        bounds = camera_bounds
+
+        geographic = self._projected_lonlat_bounds(bounds, target_crs)
+        if geographic is None:
+            self._projected_view = None
+            self._active_ids = set()
+            self._abort_unwanted_tile_replies()
+            self._clear_tile_actors_only(render=False)
+            self._render(reset_clipping=True)
+            return True
+        west, south, east, north = geographic
+
+        output_size = self._projected_output_size(
+            camera_bounds, bounds, width, height
+        )
+        max_tiles = self._settings.value("max_tiles", 36, type=int)
+        zoom = choose_zoom(
+            west,
+            south,
+            east,
+            north,
+            output_size[0],
+            output_size[1],
+            max_zoom=int(max_zoom),
+            max_tiles=max_tiles,
+            margin=0,
+        )
+        tiles = enumerate_tiles(west, south, east, north, zoom, margin=0)
+        before_validity = len(tiles)
+        tiles = [t for t in tiles if self._tile_intersects_crs_area(t, target_crs)]
+        self._domain_rejected = before_validity - len(tiles)
+        if len(tiles) > max_tiles:
+            tiles = tiles[:max_tiles]
+
+        # The old single-texture viewport actor is retired for this path;
+        # make sure nothing left over from it (or from a previous CRS/mode)
+        # is still on screen.
+        self._clear_viewport_actor(render=False)
+        self._projected_view = None
+
+        if not tiles:
+            self._clear_tile_actors_only(render=True)
+            return True
+
+        # Reuses the same per-tile pipeline as the plain Web-Mercator-canvas
+        # path (cache, placeholder-while-loading, retry, center-out ordering,
+        # purge); projected placement uses exact cached tessellated geometry.
+        world_per_pixel = max(
+            abs(camera_bounds[2] - camera_bounds[0]) / max(1, width),
+            abs(camera_bounds[3] - camera_bounds[1]) / max(1, height),
+        )
+        self._refresh_mesh_subdivisions = self._choose_common_subdivisions(
+            tiles, target_crs, world_per_pixel
+        )
+        self._prepare_tile_set(generation, tiles, target_crs, z_plane, provider)
+        return True
+
+    def _inflight_tile_ids(self, provider):
+        ids = set()
+        for meta in self._reply_meta.values():
+            context = meta[2] if meta and len(meta) > 2 else None
+            if isinstance(context, dict) and context.get("provider") == provider:
+                tile_id = context.get("tile_id")
+                if tile_id is not None:
+                    ids.add(tile_id)
+        return ids
+
+    @staticmethod
+    def _coarse_parent_ids(tiles):
+        parents = set()
+        for z, x, y in tiles:
+            parent_z = max(0, z - 2)
+            shift = z - parent_z
+            parent = (parent_z, x >> shift, y >> shift)
+            if parent != (z, x, y):
+                parents.add(parent)
+        return parents
+
+    def _schedule_tile_retry(self, context):
+        provider = context.get("provider")
+        tile_id = context.get("tile_id")
+        key = (provider, tile_id)
+        attempt = self._tile_retry_counts.get(key, 0) + 1
+        if tile_id is None or attempt > 4:
+            return
+        self._tile_retry_counts[key] = attempt
+        retry = dict(context)
+        retry.pop("request_url", None)
+        retry["esri_url_index"] = 0
+        retry["osm_url_index"] = 0
+        delay = min(5000, 500 * (2 ** (attempt - 1)))
+        QTimer.singleShot(delay, lambda c=retry: self._retry_tile_if_needed(c))
+
+    def _retry_tile_if_needed(self, context):
+        tile_id = context.get("tile_id")
+        provider = context.get("provider")
+        key = (provider, tile_id)
+        if not self._active or tile_id not in self._active_ids:
+            self._tile_retry_counts.pop(key, None)
+            return
+        if (
+            tile_id in self._tile_actors
+            or tile_id in self._projected_tile_images
+        ):
+            self._tile_retry_counts.pop(key, None)
+            return
+        if tile_id not in self._inflight_tile_ids(provider):
+            self._start_tile_request(self._refresh_generation, context)
 
     def _ensure_esri_attribution(self):
         self._set_attribution_text(ESRI_ATTRIBUTION_FALLBACK)
@@ -1102,7 +1533,7 @@ class GoogleEarthBasemapPlugin(QObject):
             reply.deleteLater()
 
     def _prepare_tile_set(self, generation, tiles, target_crs, z_plane, provider):
-        crs_sig = target_crs.to_string()
+        crs_sig = self._canonical_crs_signature(target_crs)
         # A hard clear only when the CRS or provider changes - those make old
         # tiles geometrically wrong. A pure zoom/pan keeps the previous tiles on
         # screen as lower-res placeholders, which is what removes the blink.
@@ -1148,7 +1579,10 @@ class GoogleEarthBasemapPlugin(QObject):
             # Instant hit from the on-disk cache = no network, no flash.
             cached = self._read_cache(provider, *tile_id)
             if cached is not None:
-                if self._ingest_tile(tile_id, cached, target_crs, z_plane, provider, from_cache=True):
+                if self._ingest_tile(
+                    tile_id, cached, target_crs, z_plane, provider,
+                    from_cache=True,
+                ):
                     continue
                 if (provider,) + tile_id in self._dead_tile_ids:
                     # Confirmed placeholder from a stale cache entry - already
@@ -1160,6 +1594,7 @@ class GoogleEarthBasemapPlugin(QObject):
                 "target_crs": target_crs,
                 "z_plane": float(z_plane),
                 "provider": provider,
+                "canvas_crs_signature": crs_sig,
             }
             if provider == "esri_world_imagery":
                 # Split requests across Esri's two mirror hostnames (domain
@@ -1175,6 +1610,29 @@ class GoogleEarthBasemapPlugin(QObject):
 
         self._maybe_purge_retired()
         self._render_coalesced()
+        self._debug_refresh_record(generation, provider, crs_sig, tiles)
+
+    def _debug_refresh_record(self, generation, provider, crs_sig, tiles):
+        if not self._settings.value("debug", False, type=bool):
+            return
+        camera = self.app.vtk_widget.renderer.GetActiveCamera()
+        raster = getattr(self.app, "_raster_renderer", None)
+        clip = raster.GetActiveCamera().GetClippingRange() if raster is not None else (None, None)
+        inflight = len(self._inflight_tile_ids(provider))
+        active = len(set(tiles) & set(self._tile_actors))
+        placeholders = len(set(self._tile_actors) - set(tiles))
+        print(
+            "BASEMAP_REFRESH "
+            f"generation={generation} provider={provider} canvas_crs={crs_sig} "
+            f"camera_center={tuple(round(float(v), 3) for v in camera.GetFocalPoint()[:2])} "
+            f"parallel_scale={float(camera.GetParallelScale()):.6g} "
+            f"xyz_zoom={tiles[0][0] if tiles else None} requested_tiles={len(tiles)} "
+            f"cached_tiles={len(self._tile_actors)} inflight_tiles={inflight} "
+            f"active_tiles={active} placeholder_tiles={placeholders} "
+            f"mesh_subdivisions={self._refresh_mesh_subdivisions} "
+            f"domain_rejected={self._domain_rejected} z_plane={self._current_z_plane} "
+            f"raster_clip_near={clip[0]} raster_clip_far={clip[1]}"
+        )
 
     def _start_tile_request(self, generation, context):
         if self._nam is None or self._unloaded or not self._active:
@@ -1221,6 +1679,9 @@ class GoogleEarthBasemapPlugin(QObject):
         if context.get("provider") != self._provider():
             reply.deleteLater()
             return
+        if context.get("canvas_crs_signature") != self._canonical_crs_signature(self._project_crs()):
+            reply.deleteLater()
+            return
         try:
             status = self._http_status(reply)
             body = bytes(reply.readAll())
@@ -1248,8 +1709,10 @@ class GoogleEarthBasemapPlugin(QObject):
                         f"{provider} tile load failed after all hosts: {exc}"
                         + (f" | {url}" if url else "")
                     )
+                    self._schedule_tile_retry(context)
             else:
                 self._show_error_once(f"{self._provider_label()} tile load failed: {exc}")
+                self._schedule_tile_retry(context)
             reply.deleteLater()
             return
 
@@ -1259,6 +1722,10 @@ class GoogleEarthBasemapPlugin(QObject):
         try:
             tile_id = context["tile_id"]
             provider = context.get("provider")
+            if context.get("render_mode") == "projected_viewport":
+                if self._ingest_projected_tile(tile_id, body, from_cache=False):
+                    self._tile_retry_counts.pop((provider, tile_id), None)
+                return
             if tile_id in self._tile_actors:
                 reply.deleteLater()
                 return
@@ -1268,6 +1735,7 @@ class GoogleEarthBasemapPlugin(QObject):
             )
         except Exception as exc:
             self._show_error_once(f"Basemap tile decode failed: {exc}")
+            self._schedule_tile_retry(context)
         finally:
             reply.deleteLater()
 
@@ -1277,13 +1745,13 @@ class GoogleEarthBasemapPlugin(QObject):
         try:
             request.setHeader(
                 QNetworkRequest.KnownHeaders.UserAgentHeader,
-                "NakshaAI-LiDAR Basemap Plugin/1.1.6",
+                "NakshaAI-LiDAR-Basemap/1.1.30",
             )
         except AttributeError:
             try:
                 request.setHeader(
                     QNetworkRequest.UserAgentHeader,
-                    "NakshaAI-LiDAR Basemap Plugin/1.1.6",
+                    "NakshaAI-LiDAR-Basemap/1.1.30",
                 )
             except Exception:
                 pass
@@ -1340,9 +1808,6 @@ class GoogleEarthBasemapPlugin(QObject):
     def _project_crs(self):
         if self.app is None:
             return None
-        has_snt, snt_crs = self._attached_snt_crs()
-        if has_snt:
-            return snt_crs
         # Prefer the host app's single authoritative canvas CRS object
         # (gui.crs_manager) when available. It is kept in sync with the
         # legacy project_crs_* fields below, but going straight to the
@@ -1356,15 +1821,15 @@ class GoogleEarthBasemapPlugin(QObject):
         except Exception:
             pass
         try:
-            epsg = getattr(self.app, "project_crs_epsg", None)
-            if epsg:
-                return CRS.from_epsg(int(str(epsg).split(":")[-1]))
-        except Exception:
-            pass
-        try:
             wkt = getattr(self.app, "project_crs_wkt", None)
             if wkt:
                 return CRS.from_wkt(wkt)
+        except Exception:
+            pass
+        try:
+            epsg = getattr(self.app, "project_crs_epsg", None)
+            if epsg:
+                return CRS.from_epsg(int(str(epsg).split(":")[-1]))
         except Exception:
             pass
         try:
@@ -1385,6 +1850,16 @@ class GoogleEarthBasemapPlugin(QObject):
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _canonical_crs_signature(crs):
+        """Stable authority/WKT-equivalent signature for actor validity."""
+        if crs is None:
+            return None
+        try:
+            return crs.to_json()
+        except Exception:
+            return CRS.from_user_input(crs).to_wkt()
 
     def _attached_snt_paths(self):
         """Return the de-duplicated paths of SNT/DGN geometry on the canvas."""
@@ -1793,6 +2268,300 @@ class GoogleEarthBasemapPlugin(QObject):
         except Exception:
             return None
 
+    def _canvas_view_state(self, target_crs=None, overscan=1.0):
+        """Return exact axis-aligned canvas bounds in the current canvas CRS."""
+        vtk_widget = getattr(self.app, "vtk_widget", None)
+        if vtk_widget is None:
+            return None
+        try:
+            rw = self._get_render_window(vtk_widget)
+            if rw is None:
+                return None
+            width, height = rw.GetSize()
+            width = max(1, int(width))
+            height = max(1, int(height))
+            renderer = vtk_widget.renderer
+            cam = renderer.GetActiveCamera()
+            if not cam.GetParallelProjection():
+                self._status("Basemap requires 2D parallel Top View", 1800)
+                return None
+            fx, fy, _fz = map(float, cam.GetFocalPoint())
+            half_h = max(1e-9, float(cam.GetParallelScale())) * max(
+                1.0, float(overscan)
+            )
+            half_w = half_h * width / float(height)
+            bounds = (fx - half_w, fy - half_h, fx + half_w, fy + half_h)
+            if not all(math.isfinite(value) for value in bounds):
+                return None
+            if target_crs is None:
+                target_crs = self._project_crs()
+            if target_crs is None:
+                return None
+            z_plane = self._choose_background_z(renderer, cam)
+            return bounds, z_plane, width, height
+        except Exception as exc:
+            self._show_error_once(f"Could not calculate 2D canvas bounds: {exc}")
+            return None
+
+    def _viewport_is_stale_for_camera(self, camera_bounds, ratio=1.6):
+        """True if the on-screen viewport actor no longer matches the live
+        camera scale closely enough to keep showing while a replacement
+        composes (see _start_projected_free_refresh)."""
+        if self._viewport_actor is None or self._viewport_camera_width is None:
+            return False
+        try:
+            live_width = abs(float(camera_bounds[2]) - float(camera_bounds[0]))
+        except Exception:
+            return False
+        if not math.isfinite(live_width) or live_width <= 0:
+            return False
+        prior_width = float(self._viewport_camera_width)
+        if prior_width <= 0:
+            return False
+        scale_change = max(live_width / prior_width, prior_width / live_width)
+        return scale_change > float(ratio)
+
+    @staticmethod
+    def _intersect_bounds(a, b):
+        ax0, ay0, ax1, ay1 = map(float, a)
+        bx0, by0, bx1, by1 = map(float, b)
+        xmin = max(ax0, bx0)
+        ymin = max(ay0, by0)
+        xmax = min(ax1, bx1)
+        ymax = min(ay1, by1)
+        if not all(map(math.isfinite, (xmin, ymin, xmax, ymax))):
+            return None
+        if xmax <= xmin or ymax <= ymin:
+            return None
+        return (xmin, ymin, xmax, ymax)
+
+    def _projected_crs_valid_extent(self, target_crs):
+        """Projected envelope of the CRS's official geographic area-of-use.
+
+        Densifying all four geographic edges avoids the classic mistake of
+        projecting only four corners of a curved projection domain. The result is
+        cached because a project's CRS normally stays fixed for the session.
+        """
+        try:
+            signature = target_crs.to_wkt()
+            if signature in self._projected_extent_cache:
+                return self._projected_extent_cache[signature]
+            area = getattr(target_crs, "area_of_use", None)
+            if area is None:
+                self._projected_extent_cache[signature] = None
+                return None
+            west = float(area.west)
+            south = float(area.south)
+            east = float(area.east)
+            north = float(area.north)
+            if not all(map(math.isfinite, (west, south, east, north))):
+                self._projected_extent_cache[signature] = None
+                return None
+            if east <= west or north <= south:
+                self._projected_extent_cache[signature] = None
+                return None
+
+            n = 129
+            lon_axis = np.linspace(west, east, n, dtype=np.float64)
+            lat_axis = np.linspace(south, north, n, dtype=np.float64)
+            lons = np.concatenate(
+                (lon_axis, lon_axis, np.full(n, west), np.full(n, east))
+            )
+            lats = np.concatenate(
+                (np.full(n, south), np.full(n, north), lat_axis, lat_axis)
+            )
+            forward = Transformer.from_crs(
+                CRS.from_epsg(4326), target_crs, always_xy=True
+            )
+            xs, ys = forward.transform(lons, lats)
+            xs = np.asarray(xs, dtype=np.float64)
+            ys = np.asarray(ys, dtype=np.float64)
+            valid = np.isfinite(xs) & np.isfinite(ys)
+            # PROJ can return enormous finite values near a projection
+            # singularity. They are not useful map-domain coordinates.
+            valid &= (np.abs(xs) < 1.0e12) & (np.abs(ys) < 1.0e12)
+            if not np.any(valid):
+                self._projected_extent_cache[signature] = None
+                return None
+            extent = (
+                float(xs[valid].min()),
+                float(ys[valid].min()),
+                float(xs[valid].max()),
+                float(ys[valid].max()),
+            )
+            if extent[2] <= extent[0] or extent[3] <= extent[1]:
+                extent = None
+            self._projected_extent_cache[signature] = extent
+            return extent
+        except Exception:
+            return None
+
+    @staticmethod
+    def _projected_output_size(camera_bounds, render_bounds, width, height):
+        """Pixel budget based on the *visible CRS overlap*, not full canvas.
+
+        If Estonia occupies 25 pixels after a huge zoom-out, requesting an
+        1800-pixel texture for the whole camera is both wrong LOD and wasted CPU.
+        A 1024-pixel edge cap keeps settled imagery crisp while allowing the
+        background reprojection job to finish quickly.
+        """
+        cx0, cy0, cx1, cy1 = map(float, camera_bounds)
+        rx0, ry0, rx1, ry1 = map(float, render_bounds)
+        camera_w = max(1e-12, cx1 - cx0)
+        camera_h = max(1e-12, cy1 - cy0)
+        fraction_x = max(0.0, min(1.0, (rx1 - rx0) / camera_w))
+        fraction_y = max(0.0, min(1.0, (ry1 - ry0) / camera_h))
+        pixel_w = max(1.0, float(width) * fraction_x)
+        pixel_h = max(1.0, float(height) * fraction_y)
+        supersample = 1.12
+        max_edge = 1024.0
+        scale = min(
+            supersample,
+            max_edge / max(1.0, pixel_w),
+            max_edge / max(1.0, pixel_h),
+        )
+        return (
+            max(32, int(round(pixel_w * scale))),
+            max(32, int(round(pixel_h * scale))),
+        )
+
+    def _projected_lonlat_bounds(self, bounds, target_crs):
+        """Dense inverse footprint for a *domain-clipped* projected rectangle.
+
+        The v1.1.24 9x9 grid degenerates to one valid center point for EPSG:3301
+        once the camera is zoomed far enough out. Dense vectorized sampling on a
+        rectangle already clipped to the official CRS domain guarantees enough
+        valid samples and prevents a zero-area geographic bbox / z22 tile burst.
+        """
+        xmin, ymin, xmax, ymax = map(float, bounds)
+        try:
+            values = np.linspace(0.0, 1.0, 33, dtype=np.float64)
+            xs = xmin + (xmax - xmin) * values
+            ys = ymin + (ymax - ymin) * values
+            grid_x, grid_y = np.meshgrid(xs, ys)
+            transform = Transformer.from_crs(
+                target_crs, CRS.from_epsg(4326), always_xy=True
+            )
+            lon, lat = transform.transform(grid_x, grid_y)
+            lon = np.asarray(lon, dtype=np.float64)
+            lat = np.asarray(lat, dtype=np.float64)
+            valid = (
+                np.isfinite(lon)
+                & np.isfinite(lat)
+                & (lon >= -180.0)
+                & (lon <= 180.0)
+                & (lat >= -MAX_MERCATOR_LAT)
+                & (lat <= MAX_MERCATOR_LAT)
+            )
+            if not np.any(valid):
+                return None
+            lons = lon[valid]
+            lats = lat[valid]
+            result = (
+                float(lons.min()), float(lats.min()),
+                float(lons.max()), float(lats.max()),
+            )
+            # A truly tiny view can legitimately have a tiny geographic span;
+            # what is forbidden is an exact zero-area bbox caused by one sparse
+            # sample surviving. Add a sub-pixel epsilon only in that rare case.
+            west, south, east, north = result
+            eps = 1e-10
+            if east - west < eps:
+                west -= eps
+                east += eps
+            if north - south < eps:
+                south -= eps
+                north += eps
+            return west, south, east, north
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # v1.1.28: locally-linear project-CRS <-> Web Mercator alignment.
+    #
+    # The old projected-basemap path (still present below, unused - see the
+    # note on _ProjectedComposeTask) rendered a basemap into a non-Web-
+    # Mercator project CRS by transforming every output pixel through pyproj
+    # and compositing the result into one texture. That is exact, but "exact"
+    # is exactly the problem at global scale: a CRS like EPSG:3301 (Estonia,
+    # Lambert Conformal Conic) truly IS a wedge once you plot it outside its
+    # area of use, so zooming out made the basemap visibly shrink into a
+    # wedge/patch no matter how correct the math was. It was also a
+    # synchronous NumPy/PROJ sweep over up to ~4 million pixels on the Qt GUI
+    # thread (forced there in 1.1.26 after a background attempt
+    # access-violated inside PROJ on Windows).
+    #
+    # This replaces that with per-tile placement using a *local* linear
+    # approximation of the project CRS around the current view's focal
+    # point. Both the project CRS and Web Mercator are conformal projections
+    # (they preserve local angles/shape by construction), so within one
+    # screen's worth of view the map between them is, to very good
+    # approximation, a single rotation+scale - no shear, no curvature. That
+    # local map is cheap (2-3 point transforms, not a pixel sweep) and is
+    # recomputed every refresh from the live focal point, so the basemap is
+    # always a plain rectangle/parallelogram on screen: never a wedge,
+    # regardless of what the CRS's true global shape looks like. Accuracy is
+    # excellent near the view center and degrades gracefully toward the
+    # edges of a very wide view or at extreme global zoom-out - the same
+    # trade-off every web map already makes by using Web Mercator at all.
+    # ------------------------------------------------------------------
+    def _local_canvas_to_mercator_affine(self, target_crs, fx, fy, probe):
+        """Return the local canvas_crs -> Web Mercator map at (fx, fy).
+
+        The result lets a caller take any point already expressed in Web
+        Mercator meters (e.g. a basemap tile corner) and place it into
+        canvas-CRS world space with one multiply-add, instead of a real
+        pyproj transform per point. Returns None if the CRS's own transform
+        is not usable at this point (e.g. exactly on a projection
+        singularity) - callers should skip this refresh and retry once the
+        camera has moved rather than reuse a stale/invalid map.
+        """
+        try:
+            to_wgs84 = Transformer.from_crs(target_crs, CRS.from_epsg(4326), always_xy=True)
+            lon0, lat0 = to_wgs84.transform(fx, fy)
+            if not (math.isfinite(lon0) and math.isfinite(lat0)):
+                return None
+            mx0, my0 = lonlat_to_web_mercator(lon0, lat0)
+
+            # Sample one probe step along each canvas axis. The full 2x2
+            # Jacobian (not an assumed pure scale) is kept so any local
+            # rotation - grid convergence between the project CRS's north and
+            # Mercator's north - is captured for free, along with a small
+            # amount of protection against numerical noise.
+            lon1, lat1 = to_wgs84.transform(fx + probe, fy)
+            lon2, lat2 = to_wgs84.transform(fx, fy + probe)
+            if not all(math.isfinite(v) for v in (lon1, lat1, lon2, lat2)):
+                return None
+            mx1, my1 = lonlat_to_web_mercator(lon1, lat1)
+            mx2, my2 = lonlat_to_web_mercator(lon2, lat2)
+
+            a = (mx1 - mx0) / probe
+            c = (my1 - my0) / probe
+            b = (mx2 - mx0) / probe
+            d = (my2 - my0) / probe
+            det = a * d - b * c
+            if not math.isfinite(det) or abs(det) < 1e-9:
+                return None
+            return {
+                "fx": float(fx), "fy": float(fy),
+                "mx0": float(mx0), "my0": float(my0),
+                # Inverse Jacobian: maps a Web-Mercator-meter delta back to a
+                # canvas-CRS delta, which is the direction tile placement
+                # actually needs (tiles are naturally given in Mercator).
+                "inv_a": d / det, "inv_b": -b / det,
+                "inv_c": -c / det, "inv_d": a / det,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _affine_mercator_to_canvas(affine, mx, my):
+        dmx = mx - affine["mx0"]
+        dmy = my - affine["my0"]
+        dcx = affine["inv_a"] * dmx + affine["inv_b"] * dmy
+        dcy = affine["inv_c"] * dmx + affine["inv_d"] * dmy
+        return affine["fx"] + dcx, affine["fy"] + dcy
+
     def _compute_viewport_request(self):
         vtk_widget = getattr(self.app, "vtk_widget", None)
         if vtk_widget is None:
@@ -1944,6 +2713,83 @@ class GoogleEarthBasemapPlugin(QObject):
         view = str(getattr(self.app, "current_view", "top") or "top").lower()
         return view in {"top", "plan", "2d", "plan_view", "top_view"}
 
+    @staticmethod
+    def _crs_area_bounds(crs):
+        area = getattr(crs, "area_of_use", None)
+        if area is None:
+            return None
+        bounds = (area.west, area.south, area.east, area.north)
+        if not all(math.isfinite(float(value)) for value in bounds):
+            return None
+        west, south, east, north = map(float, bounds)
+        return bounds if west < east and south < north else None
+
+    @staticmethod
+    def _inside_area(lon, lat, bounds):
+        if bounds is None:
+            return True
+        west, south, east, north = bounds
+        return west <= lon <= east and south <= lat <= north
+
+    @staticmethod
+    def _is_web_mercator(crs):
+        epsg = getattr(crs, "to_epsg", lambda: None)()
+        name = getattr(crs, "name", "").lower()
+        return (
+            epsg in (3857, 900913)
+            or "pseudo-mercator" in name
+            or "web mercator" in name
+        )
+
+    def _project_view_bounds(self, bounds, target_crs):
+        if not bounds or self._is_web_mercator(target_crs):
+            return None
+        west, south, east, north = map(float, bounds)
+        lons = (west, (west + east) / 2.0, east)
+        lats = (south, (south + north) / 2.0, north)
+        transform = Transformer.from_crs(
+            CRS.from_epsg(4326), target_crs, always_xy=True
+        )
+        points = [
+            transform.transform(lon, lat) for lon in lons for lat in lats
+        ]
+        points = [
+            (x, y)
+            for x, y in points
+            if math.isfinite(x) and math.isfinite(y)
+        ]
+        if not points:
+            return None
+        xs, ys = zip(*points)
+        return min(xs), max(xs), min(ys), max(ys)
+
+    def _make_tile_clip_planes(self, bounds, target_crs):
+        projected = self._project_view_bounds(bounds, target_crs)
+        if projected is None:
+            return None
+        xmin, xmax, ymin, ymax = projected
+        planes = vtk.vtkPlaneCollection()
+        specs = (
+            ((xmin, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            ((xmax, 0.0, 0.0), (-1.0, 0.0, 0.0)),
+            ((0.0, ymin, 0.0), (0.0, 1.0, 0.0)),
+            ((0.0, ymax, 0.0), (0.0, -1.0, 0.0)),
+        )
+        for origin, normal in specs:
+            plane = vtk.vtkPlane()
+            plane.SetOrigin(*origin)
+            plane.SetNormal(*normal)
+            planes.AddItem(plane)
+        return planes
+
+    def _apply_tile_clip(self, actor):
+        mapper = actor.GetMapper() if actor is not None else None
+        if mapper is None:
+            return
+        mapper.RemoveAllClippingPlanes()
+        if self._tile_clip_planes is not None:
+            mapper.SetClippingPlanes(self._tile_clip_planes)
+
     def _choose_background_z(self, renderer, cam):
         """Place the basemap just below the loaded 3D data without affecting fit bounds.
 
@@ -1985,7 +2831,11 @@ class GoogleEarthBasemapPlugin(QObject):
             n = actors.GetNumberOfItems() if actors is not None else 0
             for i in range(n):
                 prop = actors.GetItemAsObject(i)
-                if prop is None or prop in self._tile_actors.values():
+                if (
+                    prop is None
+                    or prop in self._tile_actors.values()
+                    or prop is self._viewport_actor
+                ):
                     continue
                 bb = prop.GetBounds()
                 if not bb or bb[0] > bb[1] or bb[4] > bb[5]:
@@ -2144,6 +2994,8 @@ class GoogleEarthBasemapPlugin(QObject):
         this zoom" placeholder - then reject it, remember not to ask again
         (and drop any stale cached copy), and leave whatever coarser tile is
         already on screen there. Returns True if a real tile was added.
+
+        Geometry is an exact, camera-independent function of CRS and tile id.
         """
         z = tile_id[0]
         if provider == "esri_world_imagery" and self._tile_looks_unavailable(image_bytes, z):
@@ -2159,7 +3011,10 @@ class GoogleEarthBasemapPlugin(QObject):
             return False
         if not from_cache:
             self._write_cache(provider, *tile_id, image_bytes)
-        return self._add_tile_actor(tile_id, image_bytes, target_crs, z_plane, provider, from_cache=from_cache)
+        return self._add_tile_actor(
+            tile_id, image_bytes, target_crs, z_plane, provider,
+            from_cache=from_cache,
+        )
 
     def _add_tile_actor(self, tile_id, image_bytes, target_crs, z_plane, provider, from_cache=False):
         """Decode + add one tile. Returns True if it was added.
@@ -2184,6 +3039,7 @@ class GoogleEarthBasemapPlugin(QObject):
         actor.SetPosition(0.0, 0.0, 0.0)
         if not self._pipeline_add(self.app, actor):
             self.app.vtk_widget.renderer.AddActor(actor)
+        self._apply_tile_clip(actor)
         self._tile_actors[tile_id] = actor
         self._try_remove_parent(tile_id)
         self._maybe_purge_retired()
@@ -2249,10 +3105,309 @@ class GoogleEarthBasemapPlugin(QObject):
             for tid in placeholders[:excess]:
                 self._remove_actor(self._tile_actors.pop(tid))
 
-    # ------------------------------------------------------------------
-    # VTK rendering
-    # ------------------------------------------------------------------
-    def _build_tile_actor(self, tile_id, image_bytes, target_crs, z_plane):
+    def _decode_tile_rgb(self, image_bytes):
+        from PySide6.QtGui import QImage
+
+        image = QImage()
+        if not image.loadFromData(bytes(image_bytes or b"")):
+            return None
+        image = image.convertToFormat(QImage.Format.Format_RGB888)
+        width = int(image.width())
+        height = int(image.height())
+        stride = int(image.bytesPerLine())
+        raw = np.frombuffer(bytes(image.constBits()), dtype=np.uint8)
+        return raw.reshape(height, stride)[:, : width * 3].reshape(
+            height, width, 3
+        ).copy()
+
+    def _ingest_projected_tile(self, tile_id, image_bytes, from_cache):
+        view = self._projected_view
+        if (
+            view is None
+            or tile_id not in view.get("wanted", set())
+        ):
+            return False
+        provider = view.get("provider")
+        zoom = int(tile_id[0])
+        if (
+            provider == "esri_world_imagery"
+            and self._tile_looks_unavailable(image_bytes, zoom)
+        ):
+            self._dead_tile_ids.add((provider,) + tile_id)
+            return False
+        rgb = self._decode_tile_rgb(image_bytes)
+        if rgb is None:
+            return False
+        if not from_cache:
+            self._write_cache(provider, *tile_id, image_bytes)
+        self._projected_tile_images[tile_id] = rgb
+        wanted = view.get("wanted", set())
+        if len(self._projected_tile_images) > 160:
+            self._projected_tile_images = {
+                key: value
+                for key, value in self._projected_tile_images.items()
+                if key in wanted
+            }
+        self._schedule_projected_compose()
+        return True
+
+    def _schedule_projected_compose(self):
+        if self._projected_compose_running:
+            self._projected_compose_pending = True
+            return
+        if self._projected_compose_timer is None:
+            self._projected_compose_timer = QTimer(self)
+            self._projected_compose_timer.setSingleShot(True)
+            self._projected_compose_timer.timeout.connect(
+                self._compose_projected_view
+            )
+        # 90ms (was 55ms in 1.1.25/1.1.26): _compose_projected_view() runs the
+        # NumPy/PROJ work synchronously on the Qt GUI thread (see the safety
+        # note there), so every extra compose pass during a burst of tiles
+        # landing close together is time the UI can't process camera/mouse
+        # events. Widening the debounce trades a little first-paint latency
+        # for noticeably fewer synchronous stalls during rapid zoom.
+        self._projected_compose_timer.start(90)
+
+    def _compose_projected_view(self):
+        view = self._projected_view
+        if not self._active or not isinstance(view, dict):
+            return
+        if self._projected_compose_running:
+            self._projected_compose_pending = True
+            return
+        current_crs = self._project_crs()
+        if (
+            current_crs is None
+            or current_crs.to_string() != view.get("crs_signature")
+            or self._provider() != view.get("provider")
+        ):
+            return
+        wanted = view.get("wanted", set())
+        available = {
+            tile_id: self._projected_tile_images[tile_id]
+            for tile_id in wanted
+            if tile_id in self._projected_tile_images
+        }
+        if not available:
+            return
+
+        self._projected_compose_serial += 1
+        token = (view.get("token"), int(self._projected_compose_serial))
+        payload = {
+            "token": token,
+            "crs_wkt": view["crs_wkt"],
+            "area_bounds": view.get("area_bounds"),
+            "bounds": tuple(view["bounds"]),
+            "size": tuple(view["size"]),
+            "available": available,
+        }
+        # pyproj/PROJ in the supported Windows runtime can access-violate when a
+        # background transform overlaps CRS work performed by the host during a
+        # GIS import. Windows reports the fault in proj_9-*.dll (0xc0000005), so
+        # Python exception handling cannot contain it. Keep composition on the
+        # Qt thread until the host and plugin can share a process-wide PROJ lock.
+        # The v1.1.25 1024 px cap still bounds the cost of this safe path.
+        self._projected_compose_running = True
+        self._projected_compose_pending = False
+        self._projected_compose_task = None
+        try:
+            result = _ProjectedComposeTask._compose(payload)
+        except Exception as exc:
+            # Pre-existing bug fixed in passing (was `{token: token, error: str(exc)}`,
+            # referencing an undefined name `error` - a NameError waiting to
+            # happen). Harmless in practice only because this whole method is
+            # unreachable as of v1.1.28; fixed anyway for anyone who re-enables it.
+            result = {"token": token, "error": str(exc)}
+        self._on_projected_compose_finished(result)
+
+    def _on_projected_compose_finished(self, result):
+        self._projected_compose_running = False
+        self._projected_compose_task = None
+        try:
+            if not result or not self._active:
+                return
+            if result.get("error"):
+                print(f"Basemap: projected compose warning: {result['error']}")
+                return
+            token = result.get("token")
+            view_token = token[0] if isinstance(token, tuple) and token else None
+            view = self._projected_view
+            if not isinstance(view, dict) or view.get("token") != view_token:
+                return  # stale background job after a newer pan/zoom
+            if self._provider() != view.get("provider"):
+                return
+            coverage = float(result.get("coverage", 0.0))
+            # Keep the last complete preview while exact/parent tiles arrive -
+            # but only when there IS a usable last preview to keep. On a cold
+            # start (no viewport actor yet, e.g. right after activate()) the
+            # "keep the old one" rule has nothing to keep, so it was silently
+            # showing nothing at all until coverage crossed 98.5%. Accept a
+            # much lower first-paint bar so *something* correct appears fast,
+            # then let later compose passes (still gated at 0.985) refine it.
+            required_coverage = 0.985 if self._viewport_actor is not None else 0.20
+            if coverage < required_coverage:
+                return
+            image_data = self._rgb_array_to_vtk(result["image"])
+            self._replace_viewport_actor(
+                image_data, view["bounds"], view["z_plane"]
+            )
+            self._viewport_camera_width = abs(
+                float(view["camera_bounds"][2]) - float(view["camera_bounds"][0])
+            )
+            self._viewport_signature = (
+                view["crs_signature"],
+                tuple(round(value, 4) for value in view["bounds"]),
+                int(view["zoom"]),
+                round(coverage, 6),
+            )
+        finally:
+            if self._projected_compose_pending and self._active:
+                self._projected_compose_pending = False
+                QTimer.singleShot(20, self._schedule_projected_compose)
+
+    @staticmethod
+    def _rgb_array_to_vtk(rgb):
+        height, width = rgb.shape[:2]
+        channels = int(rgb.shape[2]) if rgb.ndim == 3 else 1
+        if channels not in (3, 4):
+            raise ValueError("Basemap texture must be RGB or RGBA")
+        image = vtk.vtkImageData()
+        image.SetDimensions(int(width), int(height), 1)
+        image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, channels)
+        vtk_array = numpy_support.vtk_to_numpy(
+            image.GetPointData().GetScalars()
+        ).reshape(height, width, channels)
+        vtk_array[:] = np.ascontiguousarray(rgb[::-1])
+        image.Modified()
+        return image
+
+    def _build_viewport_actor(self, image_bytes, bounds, z_plane):
+        image_data = (
+            image_bytes
+            if isinstance(image_bytes, vtk.vtkImageData)
+            else self._image_bytes_to_vtk(image_bytes)
+        )
+        if image_data is None:
+            raise RuntimeError("Esri export image could not be decoded")
+
+        texture = vtk.vtkTexture()
+        texture.SetInputData(image_data)
+        texture.InterpolateOn()
+        texture.RepeatOff()
+
+        xmin, ymin, xmax, ymax = map(float, bounds)
+        plane = vtk.vtkPlaneSource()
+        plane.SetOrigin(xmin, ymin, float(z_plane))
+        plane.SetPoint1(xmax, ymin, float(z_plane))
+        plane.SetPoint2(xmin, ymax, float(z_plane))
+        plane.SetXResolution(1)
+        plane.SetYResolution(1)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(plane.GetOutputPort())
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetTexture(texture)
+        actor.GetProperty().LightingOff()
+        actor.GetProperty().SetOpacity(self._opacity())
+        actor.SetPickable(False)
+        try:
+            actor.SetUseBounds(False)
+        except Exception:
+            pass
+        actor._naksha_basemap = True
+        actor._naksha_basemap_provider = self._provider()
+        actor._naksha_basemap_viewport = True
+        actor._naksha_basemap_bounds = tuple(bounds)
+        return actor
+
+    def _replace_viewport_actor(self, image_bytes, bounds, z_plane):
+        actor = self._build_viewport_actor(image_bytes, bounds, z_plane)
+        old_actor = self._viewport_actor
+        if not self._pipeline_add(self.app, actor):
+            self.app.vtk_widget.renderer.AddActor(actor)
+        self._viewport_actor = actor
+        self._viewport_signature = (
+            tuple(round(float(value), 6) for value in bounds),
+            self._project_crs().to_string(),
+        )
+        self._current_z_plane = float(z_plane)
+        if old_actor is not None:
+            self._remove_actor(old_actor)
+        self._render(reset_clipping=True)
+
+    @staticmethod
+    def _tile_intersects_crs_area(tile_id, target_crs):
+        """Actual finite-transform safety check; area_of_use is not a clip."""
+        z, x, y = tile_id
+        transform = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
+        points = [transform.transform(tile_x_to_lon(x + fx, z), tile_y_to_lat(y + fy, z))
+                  for fy in (0.0, 0.5, 1.0) for fx in (0.0, 0.5, 1.0)]
+        if not all(math.isfinite(v) and abs(v) < 1.0e12 for p in points for v in p):
+            return False
+        xs, ys = zip(*points)
+        return max(xs) - min(xs) <= 2.5e7 and max(ys) - min(ys) <= 2.5e7
+
+    def _exact_tile_vertices(self, tile_id, target_crs, subdivisions):
+        """Return exact projected regular-grid vertices, cached by stable inputs."""
+        z, x, y = tile_id
+        subdivisions = int(subdivisions)
+        key = (self._canonical_crs_signature(target_crs), z, x, y, subdivisions)
+        cached = self._tile_geometry_cache.get(key)
+        if cached is not None:
+            return cached
+        fractions = np.linspace(0.0, 1.0, subdivisions + 1)
+        lons = np.tile([tile_x_to_lon(x + f, z) for f in fractions], subdivisions + 1)
+        lats = np.repeat([tile_y_to_lat(y + f, z) for f in fractions], subdivisions + 1)
+        transform = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
+        xs, ys = transform.transform(lons, lats)
+        result = tuple(
+            (float(wx), float(wy), float(i) / subdivisions, 1.0 - float(j) / subdivisions)
+            for j in range(subdivisions + 1)
+            for i, (wx, wy) in enumerate(zip(
+                xs[j * (subdivisions + 1):(j + 1) * (subdivisions + 1)],
+                ys[j * (subdivisions + 1):(j + 1) * (subdivisions + 1)],
+            ))
+        )
+        self._tile_geometry_cache[key] = result
+        return result
+
+    @staticmethod
+    def _tile_interpolation_error(tile_id, target_crs, subdivisions):
+        """Maximum exact midpoint error against bilinear cell interpolation."""
+        z, x, y = tile_id
+        transform = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
+        maximum = 0.0
+        for j in range(subdivisions):
+            for i in range(subdivisions):
+                f0, f1 = i / subdivisions, (i + 1) / subdivisions
+                g0, g1 = j / subdivisions, (j + 1) / subdivisions
+                samples = ((f0, g0), (f1, g0), (f0, g1), (f1, g1),
+                           ((f0 + f1) / 2.0, (g0 + g1) / 2.0))
+                projected = [transform.transform(tile_x_to_lon(x + fx, z), tile_y_to_lat(y + fy, z)) for fx, fy in samples]
+                if not all(math.isfinite(v) for point in projected for v in point):
+                    return float("inf")
+                predicted = ((projected[0][0] + projected[1][0] + projected[2][0] + projected[3][0]) / 4.0,
+                             (projected[0][1] + projected[1][1] + projected[2][1] + projected[3][1]) / 4.0)
+                maximum = max(maximum, math.dist(predicted, projected[4]))
+        return maximum
+
+    def _choose_common_subdivisions(self, tiles, target_crs, world_per_pixel):
+        """One crack-free grid density for all visible tiles at an XYZ zoom."""
+        threshold = max(1e-12, float(world_per_pixel)) * 0.35
+        allowed = (1, 2, 4, 8, 16, 32)
+        configured = max(1, min(32, self._settings.value("mesh_max_subdivisions", 32, type=int)))
+        max_subdivisions = max(v for v in allowed if v <= configured)
+        for subdivisions in allowed:
+            if subdivisions >= max_subdivisions:
+                return max_subdivisions
+            if all(self._tile_interpolation_error(t, target_crs, subdivisions) <= threshold for t in tiles):
+                return subdivisions
+        return 32
+
+    def _build_tile_actor(self, tile_id, image_bytes, target_crs, z_plane, subdivisions=None):
         z, x, y = tile_id
         image_data = self._image_bytes_to_vtk(image_bytes)
         if image_data is None:
@@ -2263,17 +3418,8 @@ class GoogleEarthBasemapPlugin(QObject):
         texture.InterpolateOn()
         texture.RepeatOff()
 
-        subdivisions = 6
-        from_wgs84 = Transformer.from_crs(CRS.from_epsg(4326), target_crs, always_xy=True)
-        raw_pts = []
-        for j in range(subdivisions + 1):
-            fy = j / float(subdivisions)
-            lat = tile_y_to_lat(y + fy, z)
-            for i in range(subdivisions + 1):
-                fx = i / float(subdivisions)
-                lon = tile_x_to_lon(x + fx, z)
-                wx, wy = from_wgs84.transform(lon, lat)
-                raw_pts.append((wx, wy, fx, 1.0 - fy))
+        subdivisions = int(subdivisions or self._refresh_mesh_subdivisions or 1)
+        raw_pts = self._exact_tile_vertices(tile_id, target_crs, subdivisions)
 
         # Check for non-finite numbers or extreme projective distortion (amoeba rejection)
         xs = [p[0] for p in raw_pts if math.isfinite(p[0])]
@@ -2331,6 +3477,11 @@ class GoogleEarthBasemapPlugin(QObject):
         actor._naksha_basemap = True
         actor._naksha_basemap_provider = self._provider()
         actor._naksha_basemap_tile_id = tile_id
+        actor._naksha_canvas_crs_signature = self._canonical_crs_signature(target_crs)
+        actor._naksha_basemap_subdivision = subdivisions
+        actor._naksha_geometry_signature = (
+            actor._naksha_canvas_crs_signature, z, x, y, subdivisions
+        )
         return actor
 
     def _image_bytes_to_vtk(self, image_bytes):
@@ -2427,7 +3578,10 @@ class GoogleEarthBasemapPlugin(QObject):
 
     def _apply_opacity(self):
         opacity = self._opacity()
-        for actor in self._tile_actors.values():
+        actors = list(self._tile_actors.values())
+        if self._viewport_actor is not None:
+            actors.append(self._viewport_actor)
+        for actor in actors:
             try:
                 actor.GetProperty().SetOpacity(opacity)
             except Exception:
@@ -2466,11 +3620,33 @@ class GoogleEarthBasemapPlugin(QObject):
                 pass
             self._attribution_actor = None
 
-    def _clear_tiles(self, render=True):
+    def _clear_tile_actors_only(self, render=True):
         for actor in list(self._tile_actors.values()):
             self._remove_actor(actor)
         self._tile_actors.clear()
         self._active_ids = set()
+        self._tile_active_sig = None
+        if render:
+            self._render(reset_clipping=True)
+
+    def _clear_viewport_actor(self, render=True):
+        if self._viewport_actor is not None:
+            self._remove_actor(self._viewport_actor)
+        self._viewport_actor = None
+        self._viewport_signature = None
+        self._viewport_camera_width = None
+        if render:
+            self._render(reset_clipping=True)
+
+    def _clear_tiles(self, render=True):
+        self._clear_tile_actors_only(render=False)
+        self._clear_viewport_actor(render=False)
+        self._projected_view = None
+        self._projected_tile_images.clear()
+        self._projected_compose_pending = False
+        self._tile_retry_counts.clear()
+        if self._projected_compose_timer is not None:
+            self._projected_compose_timer.stop()
         self._current_z_plane = None
         if render:
             self._render(reset_clipping=True)

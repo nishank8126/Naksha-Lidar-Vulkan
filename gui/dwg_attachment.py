@@ -1258,11 +1258,20 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
     def _detect_crs(self):
         app = self.app
         crs = None
-        for attr in ('crs', 'project_crs', 'point_cloud_crs'):
-            c = getattr(app, attr, None)
-            if c is not None:
-                crs = c
-                break
+        # Authoritative source first: the canvas CRS established by whichever
+        # georeferenced dataset was loaded first.
+        try:
+            from gui.crs_manager import get_canvas_crs
+            crs = get_canvas_crs(app)
+        except Exception:
+            crs = None
+        if crs is None:
+            # Legacy fallback for older app objects without canvas_crs.
+            for attr in ('crs', 'project_crs', 'point_cloud_crs'):
+                c = getattr(app, attr, None)
+                if c is not None:
+                    crs = c
+                    break
         self._project_crs = crs
         if crs:
             self.crs_lbl.setText(f"Project CRS: {crs.name}")
@@ -1339,6 +1348,7 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
             self._worker = None
             prog.setValue(total if not single else 0)
             prog.close()
+            self._prompt_missing_crs_for_rows()
             self._set_status(f"{total} file(s) ready")
             if self._close_requested_while_loading:
                 self._close_requested_while_loading = False
@@ -1369,6 +1379,47 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
 
         worker.start()
 
+    def _prompt_missing_crs_for_rows(self):
+        """Ask once for a CRS to apply to every loaded DWG that has no .prj.
+
+        Runs on the main thread after the reader worker finishes, so the modal
+        dialog is safe. Rows whose CRS stays unresolved are simply left in raw
+        coordinates (and will be reported as 'raw coords' at attach time).
+        """
+        canvas_crs = getattr(self, "_project_crs", None)
+        if canvas_crs is None:
+            try:
+                from gui.crs_manager import get_canvas_crs
+                canvas_crs = get_canvas_crs(self.app)
+            except Exception:
+                canvas_crs = None
+        if canvas_crs is None:
+            return
+
+        missing = [r for r in self.items if r.doc is not None and r.crs is None]
+        if not missing:
+            return
+
+        try:
+            from gui.crs_selector_dialog import prompt_missing_source_crs
+            picked = prompt_missing_source_crs(
+                self,
+                f"{len(missing)} DWG file(s) without a .prj",
+                "DWG",
+                canvas_crs,
+            )
+        except Exception as exc:
+            print(f"  ⚠️ DWG CRS prompt failed: {exc}")
+            return
+
+        if picked is None:
+            print("ℹ️ DWG: source CRS left unresolved for CRS-less file(s)")
+            return
+
+        for row in missing:
+            row.crs = picked
+        print(f"  ✅ Assigned {picked.name} to {len(missing)} DWG file(s)")
+
     # ── File Management ────────────────────────────────────
 
     def _remove_item(self, row: DWGFileItem):
@@ -1398,6 +1449,13 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
         row.deleteLater()
         self.items.remove(row)
         self._update_count()
+        try:
+            from gui.crs_manager import reconcile_canvas_crs_after_content_change
+            reconcile_canvas_crs_after_content_change(
+                self.app, reason="DWG attachment removed"
+            )
+        except Exception as exc:
+            print(f"[CRS] reconciliation after DWG removal failed: {exc}")
 
     def _clear_all(self):
         for row in list(self.items):
@@ -1435,6 +1493,20 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
                                  "Make sure a point cloud is loaded first.")
             return
 
+        # Establish the canvas CRS from the first checked DWG that carries a
+        # .prj, then read it back so every row reprojects into the same CRS.
+        try:
+            from gui.crs_manager import ensure_canvas_crs, get_canvas_crs, log_dataset_crs
+            for _row in checked:
+                if _row.crs is not None:
+                    ensure_canvas_crs(self.app, _row.crs,
+                                      source="DWG adjacent WKT .prj",
+                                      dataset=str(_row.dwg_path))
+                    break
+            self._project_crs = get_canvas_crs(self.app)
+        except Exception as _crs_exc:
+            print(f"  ⚠️ DWG canvas CRS update failed: {_crs_exc}")
+
         origin  = _get_point_cloud_origin(self.app)  # always None — no offset needed
         cloud_z = self._cloud_z_max()
         z_lift  = cloud_z + _Z_LIFT
@@ -1462,6 +1534,13 @@ class MultiDWGDialog(MinimizableDialogMixin, QDialog):
 
             # Build transformer
             transformer = _make_transformer(row.crs, self._project_crs)
+            try:
+                from gui.crs_manager import log_dataset_crs
+                log_dataset_crs(row.dwg_path.name, "DWG", row.crs,
+                                "DWG adjacent WKT .prj",
+                                canvas_crs=self._project_crs)
+            except Exception:
+                pass
 
             # Extract geometry (pure data — fast)
             self._set_status(f"⏳ Extracting {row.dwg_path.name}…")

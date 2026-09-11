@@ -197,7 +197,7 @@ def _sync_legacy_fields(app, crs):
 
 
 def set_canvas_crs(app, crs, source="unknown", dataset=None, notify=True,
-                   force=False):
+                   force=False, persistent=None):
     """Set (or replace) the authoritative canvas CRS.
 
     ``force=False`` (default) means: if a canvas CRS already exists, keep it.
@@ -218,6 +218,8 @@ def set_canvas_crs(app, crs, source="unknown", dataset=None, notify=True,
         "dataset": dataset,
         "epsg": extract_epsg_code(crs),
         "name": getattr(crs, "name", None),
+        "persistent": (str(source).strip().lower() == "user-selected project crs"
+                       if persistent is None else bool(persistent)),
     }
     try:
         setattr(app, CANVAS_CRS_INFO_ATTR, info)
@@ -247,10 +249,11 @@ def ensure_canvas_crs(app, crs, source="unknown", dataset=None):
                           notify=True, force=False)
 
 
-def clear_canvas_crs(app):
-    """Reset all canvas/project CRS state (used by Clear Project)."""
+def clear_canvas_crs(app, reason="project reset", notify=True):
+    """Complete canvas-CRS transition, including UI and one plugin notice."""
     if app is None:
         return
+    old = get_canvas_crs(app)
     for attr in (CANVAS_CRS_ATTR, CANVAS_CRS_INFO_ATTR,
                  "crs", "project_crs_epsg", "project_crs_wkt"):
         try:
@@ -261,7 +264,96 @@ def clear_canvas_crs(app):
         setattr(app, CANVAS_CRS_INFO_ATTR, {})
     except Exception:
         pass
-    print("[CRS] canvas CRS cleared (project reset)")
+    label = None
+    try:
+        auth = old.to_authority() if old is not None else None
+        label = f"{auth[0]}:{auth[1]}" if auth else (old.name if old is not None else "None")
+    except Exception:
+        label = str(old)
+    print(f"[CRS] canvas CRS released: {label} reason={reason}")
+    if hasattr(app, "update_epsg_display"):
+        try:
+            app.update_epsg_display()
+        except Exception:
+            pass
+    if notify:
+        notify_plugins_crs_changed(app)
+
+
+def spatial_content_summary(app):
+    """Single authoritative inventory used for CRS lifetime decisions."""
+    summary = {"gis": 0, "snt": 0, "pointcloud": 0, "cad": 0,
+               "rasters": 0, "drawings": 0}
+    if app is None:
+        return summary
+    try:
+        data = getattr(app, "data", None)
+        xyz = data.get("xyz") if isinstance(data, dict) else None
+        summary["pointcloud"] = int(xyz is not None and len(xyz) > 0)
+    except Exception:
+        pass
+    summary["gis"] = len(getattr(app, "gis_layers", None) or [])
+    summary["snt"] = max(len(getattr(app, "snt_attachments", None) or []),
+                         len(getattr(app, "snt_actors", None) or []))
+    cad_stores = ("dxf_attachments", "dxf_actors", "dwg_attachments",
+                  "dwg_actors", "dgn_attachments", "dgn_actors")
+    summary["cad"] = max([len(getattr(app, n, None) or []) for n in cad_stores] or [0])
+    raster_stores = ("geotiff_actors", "raster_actors", "ecw_actors")
+    summary["rasters"] = max([len(getattr(app, n, None) or []) for n in raster_stores] or [0])
+    try:
+        summary["drawings"] = len(getattr(getattr(app, "digitizer", None), "drawings", None) or [])
+    except Exception:
+        pass
+    return summary
+
+
+def scene_has_spatial_content(app):
+    return any(spatial_content_summary(app).values())
+
+
+def _capture_geographic_camera_state(app, old_crs):
+    """Capture lon/lat and approximate slippy zoom before old-CRS release."""
+    try:
+        from pyproj import CRS, Transformer
+        renderer = app.vtk_widget.renderer
+        camera = renderer.GetActiveCamera()
+        rw = app.vtk_widget.GetRenderWindow()
+        width, height = rw.GetSize()
+        aspect = max(1, width) / max(1, height)
+        half_h = float(camera.GetParallelScale())
+        cx, cy = map(float, camera.GetFocalPoint()[:2])
+        inverse = Transformer.from_crs(old_crs, CRS.from_epsg(4326), always_xy=True)
+        lon, lat = inverse.transform(cx, cy)
+        edge_lon, edge_lat = inverse.transform(cx + half_h * aspect, cy + half_h)
+        if not all(math.isfinite(v) for v in (lon, lat, edge_lon, edge_lat)):
+            return None
+        geographic_width = max(1e-9, 2.0 * abs(edge_lon - lon))
+        zoom = int(round(math.log2(360.0 * max(1, width) / (256.0 * geographic_width))))
+        return {"lon": lon, "lat": lat, "zoom": max(0, min(22, zoom))}
+    except Exception:
+        return None
+
+
+def reconcile_canvas_crs_after_content_change(app, reason=""):
+    """Release only an automatic CRS after the final spatial object is gone."""
+    old = get_canvas_crs(app)
+    info = get_canvas_crs_info(app)
+    summary = spatial_content_summary(app)
+    released = False
+    if old is not None and not any(summary.values()) and not info.get("persistent", False):
+        try:
+            app._released_canvas_view = _capture_geographic_camera_state(app, old)
+        except Exception:
+            app._released_canvas_view = None
+        clear_canvas_crs(app, reason=reason or "last spatial layer removed", notify=True)
+        released = True
+    new = get_canvas_crs(app)
+    print("CRS_STATE action=layer_removed "
+          f"remaining_gis={summary['gis']} remaining_snt={summary['snt']} "
+          f"remaining_pointcloud={summary['pointcloud']} remaining_cad={summary['cad']} "
+          f"remaining_drawings={summary['drawings']} old_canvas_crs={old} "
+          f"new_canvas_crs={new} provenance={info.get('source')} released={released}")
+    return released
 
 
 def has_geospatial_data(app):
@@ -269,21 +361,7 @@ def has_geospatial_data(app):
 
     Used to decide whether an EPSG:3857 basemap-only canvas CRS is allowed.
     """
-    if app is None:
-        return False
-    try:
-        d = getattr(app, "data", None)
-        if d is not None and d.get("xyz") is not None and len(d["xyz"]) > 0:
-            return True
-    except Exception:
-        pass
-    for attr in ("snt_actors", "dxf_actors", "gis_layers"):
-        try:
-            if getattr(app, attr, None):
-                return True
-        except Exception:
-            pass
-    return False
+    return scene_has_spatial_content(app)
 
 
 # --------------------------------------------------------------------------

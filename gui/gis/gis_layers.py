@@ -590,6 +590,11 @@ def _remove_layer(app, entry: dict, *, update_scene: bool = True):
             app.update_epsg_display()
         except Exception:
             pass
+    try:
+        from gui.crs_manager import reconcile_canvas_crs_after_content_change
+        reconcile_canvas_crs_after_content_change(app, reason="GIS layer removed")
+    except Exception as exc:
+        print(f"[CRS] reconciliation after GIS removal failed: {exc}")
 
 
 def _move_layer(app, entry: dict, delta: int):

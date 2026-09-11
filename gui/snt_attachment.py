@@ -24465,41 +24465,14 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                 except Exception:
                     pass
 
-            # 10) Restore or clear canvas CRS if SNT attachments changed
+            # Reconcile only after all SNT actors/metadata have been removed.
+            # Existing spatial actors are already in the current canvas CRS,
+            # so attachment removal must never select a replacement CRS.
             try:
-                remaining_snts = [
-                    a for a in getattr(self.app, "snt_attachments", [])
-                    if a.get("type", "snt").lower() == "snt"
-                ]
-                if not remaining_snts:
-                    loaded = getattr(self.app, "loaded_file", None)
-                    p_data = getattr(self.app, "data", None)
-                    restored = False
-                    if loaded and p_data is not None and p_data.get("xyz") is not None:
-                        try:
-                            from gui.crs_manager import resolve_point_cloud_crs, set_canvas_crs
-                            p_crs, p_lbl = resolve_point_cloud_crs(loaded)
-                            if p_crs is not None:
-                                set_canvas_crs(self.app, p_crs, source=p_lbl, dataset=loaded, force=True)
-                                restored = True
-                        except Exception:
-                            restored = False
-                    if not restored:
-                        try:
-                            from gui.crs_manager import clear_canvas_crs
-                            clear_canvas_crs(self.app)
-                        except Exception:
-                            pass
-                else:
-                    survivor = remaining_snts[0].get("full_path") or remaining_snts[0].get("filename")
-                    if survivor:
-                        try:
-                            from gui.crs_manager import resolve_snt_crs, set_canvas_crs
-                            s_crs, s_lbl = resolve_snt_crs(survivor)
-                            if s_crs is not None:
-                                set_canvas_crs(self.app, s_crs, source=s_lbl, dataset=survivor, force=True)
-                        except Exception:
-                            pass
+                from gui.crs_manager import reconcile_canvas_crs_after_content_change
+                reconcile_canvas_crs_after_content_change(
+                    self.app, reason="SNT attachment removed"
+                )
             except Exception as _crs_clean_err:
                 print(f"  [warn] CRS cleanup after SNT remove failed: {_crs_clean_err}")
 
@@ -24854,7 +24827,16 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             bounds_list.append((min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)))
 
         for attachment in attachments or []:
-            fit_bounds = self._compute_dense_fit_bounds(attachment.get("entities", []))
+            fit_bounds = attachment.get("fit_bounds")
+            if not fit_bounds:
+                # Prefer the canvas-space render copies so the fit range matches
+                # the reprojected geometry actually being drawn.
+                fit_src = (
+                    attachment.get("_render_entities")
+                    or attachment.get("entities")
+                    or []
+                )
+                fit_bounds = self._compute_dense_fit_bounds(fit_src)
             if fit_bounds:
                 _add_bounds(fit_bounds)
                 continue
@@ -26070,10 +26052,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
 
             fit_bounds = attachment.get("fit_bounds")
             if fit_bounds is None:
-                # Keep camera framing based on the original SNT data. The PRJ
-                # substitution is intentionally limited to boundary rendering
-                # and block hit-testing.
-                fit_bounds = self._compute_dense_fit_bounds(source_entities)
+                # 'entities' are the canvas-space copies reprojected at render
+                # time; frame the camera to what is actually drawn, not the
+                # native source extent (which differs when the SNT source CRS
+                # is not the canvas CRS, leaving the file off-screen).
+                fit_bounds = self._compute_dense_fit_bounds(entities)
                 if fit_bounds is not None:
                     attachment["fit_bounds"] = fit_bounds
 
