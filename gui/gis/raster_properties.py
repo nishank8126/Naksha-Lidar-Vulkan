@@ -33,10 +33,10 @@ def default_raster_style(band_count: int) -> dict:
         "enhancement": "none" if multiband else "minmax",      # "none" | "minmax"
         "min": None,                  # None → auto per-band; or float
         "max": None,
-        "brightness": 0,              # -255..255
-        "contrast": 0,                # -100..100
-        "gamma": 1.0,                 # 0.1..5.0
-        "saturation": 0,              # -100..100
+        "brightness": 5,              # subtle lift for dark orthophotos
+        "contrast": 4,                # clearer building/road edges
+        "gamma": 1.10,                # visible shadow/mid-tone brightening
+        "saturation": 14,             # natural color separation
         "opacity": 100,               # 0..100 (opaque so list-order stacking works)
         "resampling": "nearest",      # "nearest" | "bilinear" — QGIS-default parity
     }

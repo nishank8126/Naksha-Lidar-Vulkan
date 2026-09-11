@@ -4594,13 +4594,51 @@ class NakshaApp(QMainWindow):
        
         # Set active view in controller
         self.section_controller.active_view = selected_index
-        print(f"✅ Cross-section mode enabled - Target: View {selected_index + 1}")
-       
-        # Attach main interactor
+        print(
+            f"✅ Cross-section mode enabled - "
+            f"Target: View {selected_index + 1}"
+        )
+
+        # Attach main CrossSectionInteractor.
+        # This sets self.cross_section_active = True.
         self._attach_cross_section_interactor()
+
+        # Restore Cut View point-locate observers which CutFromCut may
+        # have removed.
+        try:
+            cut_ctrl = getattr(
+                self,
+                "cut_section_controller",
+                None,
+            )
+
+            if (
+                cut_ctrl is not None
+                and getattr(cut_ctrl, "cut_vtk", None) is not None
+                and hasattr(
+                    cut_ctrl,
+                    "restore_cut_locate_observers_for_cross_section",
+                )
+            ):
+                restored = (
+                    cut_ctrl.restore_cut_locate_observers_for_cross_section()
+                )
+
+                if restored:
+                    print(
+                        "✅ CrossSectionRect locate restored on Cut View"
+                    )
+
+        except Exception as e:
+            print(
+                f"⚠️ Cut View locate restoration skipped: {e}"
+            )
+
         self.set_cross_cursor_active(True, "cross_section")
+
         self.statusBar().showMessage(
-            f"✅ Ready: Draw line → View {selected_index + 1} (change dropdown to switch)",
+            f"✅ Ready: Draw line → View {selected_index + 1} "
+            "(change dropdown to switch)",
             5000
         )
 

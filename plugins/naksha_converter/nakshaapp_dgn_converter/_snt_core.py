@@ -35,6 +35,7 @@ import struct
 import sys
 import tempfile
 import time
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -996,9 +997,128 @@ def detect_uor_scale(samples: list, reported_scale: Optional[float] = None) -> f
 
     return best_scale
 
-def detect_scale_from_grid_labels(elements: list, model_idx: int, current_scale: float) -> float:
-    """Scan TEXT elements for standalone 6- or 7-digit coordinate labels."""
+
+def _normalise_block_identifier(value: str) -> str:
+    """Return a filename-independent Unicode key for a PRJ/SNT block name."""
+    key = unicodedata.normalize("NFKC", str(value or "")).strip().strip("\"'")
+    key = key.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    key = re.sub(r"(?i)\.(?:las|laz)\s*$", "", key)
+    return key.casefold()
+
+
+def _read_companion_prj_centers(dgn_path: Path) -> Dict[str, List[Tuple[float, float]]]:
+    """Read block centres from every adjacent TerraScan PRJ, losslessly."""
+    result: Dict[str, List[Tuple[float, float]]] = {}
+    coord_re = re.compile(
+        r"^\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+        r"\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$"
+    )
+    for prj_path in sorted(dgn_path.parent.glob("*.prj")):
+        current_name = ""
+        points: List[Tuple[float, float]] = []
+
+        def store_current() -> None:
+            if not current_name or not points:
+                return
+            key = _normalise_block_identifier(current_name)
+            if not key:
+                return
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            center = (0.5 * (min(xs) + max(xs)), 0.5 * (min(ys) + max(ys)))
+            result.setdefault(key, []).append(center)
+
+        try:
+            raw = prj_path.read_bytes()
+            if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+                text = raw.decode("utf-16")
+            else:
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw.decode("cp1252")
+            for line in text.splitlines():
+                block_match = re.match(
+                    r"^\s*Block\s+(.+?)\s*$", line, re.IGNORECASE
+                )
+                if block_match:
+                    store_current()
+                    current_name = block_match.group(1)
+                    points = []
+                    continue
+                if not current_name:
+                    continue
+                coord_match = coord_re.match(line)
+                if coord_match:
+                    points.append((
+                        float(coord_match.group(1)),
+                        float(coord_match.group(2)),
+                    ))
+            store_current()
+        except OSError as exc:
+            log.warning("Could not read companion PRJ %s: %s", prj_path.name, exc)
+    return result
+
+
+def detect_scale_from_prj_blocks(
+    elements: list,
+    model_idx: int,
+    dgn_path: Path,
+) -> Optional[float]:
+    """Return a PRJ-authoritative UOR scale when named blocks correspond."""
+    block_centers = _read_companion_prj_centers(Path(dgn_path))
+    if not block_centers:
+        return None
+
     votes: Dict[float, int] = {}
+    matched_labels = set()
+    for element in elements:
+        if element.get("model_idx") != model_idx or element.get("type") != DGN_TEXT:
+            continue
+        origin = element.get("origin")
+        key = _normalise_block_identifier(element.get("text", ""))
+        if not origin or not key or key not in block_centers:
+            continue
+        ox, oy = float(origin[0]), float(origin[1])
+        for center_x, center_y in block_centers[key]:
+            if abs(center_x) < 1e-12 or abs(center_y) < 1e-12:
+                continue
+            for candidate in _STANDARD_UOR_SCALES:
+                x_ratio = abs(ox / center_x)
+                y_ratio = abs(oy / center_y)
+                if (
+                    abs(x_ratio - candidate) / candidate < 0.02
+                    and abs(y_ratio - candidate) / candidate < 0.02
+                ):
+                    votes[candidate] = votes.get(candidate, 0) + 1
+                    matched_labels.add(key)
+
+    if not votes:
+        return None
+    scale, _support = max(votes.items(), key=lambda item: item[1])
+    log.info(
+        "PRJ authority selected scale %.12g from %d matching block label(s)",
+        scale,
+        len(matched_labels),
+    )
+    return scale
+
+def detect_scale_from_grid_labels(elements: list, model_idx: int, current_scale: float) -> float:
+    """Use projected-coordinate text labels to validate the model UOR scale.
+
+    Besides standalone ordinates, survey drawings often put the coordinate
+    pair in a tile name such as ``51000_216000``. Such labels can correct a
+    bridge-reported scale when the DGN uses customised working units.
+    """
+    votes: Dict[float, int] = {}
+
+    def vote(raw_coord: float, labelled_coord: float) -> None:
+        if abs(labelled_coord) < 10000.0:
+            return
+        ratio = abs(raw_coord / labelled_coord)
+        for candidate in _STANDARD_UOR_SCALES:
+            if abs(ratio - candidate) / candidate < 0.02:
+                votes[candidate] = votes.get(candidate, 0) + 1
     for el in elements:
         if el.get('model_idx') != model_idx or el.get('type') != 18:  # Text type
             continue
@@ -1007,21 +1127,34 @@ def detect_scale_from_grid_labels(elements: list, model_idx: int, current_scale:
         if not text or not origin:
             continue
 
-        # Ignore embedded file/block names like "DJ2010103_003789" and tiny
-        # zero-padded IDs such as "000638".
-        if not re.fullmatch(r"\d{6,7}", text):
-            continue
-
-        val = float(text)
-        if val < 100000.0:
-            continue
-
         ox, oy = origin[0], origin[1]
-        for coord in (ox, oy):
-            ratio = coord / val
-            for candidate in _STANDARD_UOR_SCALES:
-                if abs(ratio - candidate) / candidate < 0.01:
-                    votes[candidate] = votes.get(candidate, 0) + 1
+        if re.fullmatch(r"\d{6,7}", text):
+            val = float(text)
+            if val >= 100000.0:
+                vote(ox, val)
+                vote(oy, val)
+            continue
+
+        # Extract every separated numeric field: project prefixes are often
+        # numeric too (for example 8114_587500_5917000). Accept a scale clue
+        # only when *both* insertion coordinates agree with the same scale.
+        # This rejects accidental one-axis matches involving project IDs.
+        fields = [
+            float(match.group(0))
+            for match in re.finditer(r"(?<!\d)\d{4,8}(?!\d)", text)
+            if float(match.group(0)) >= 10000.0
+        ]
+        for first_idx, first in enumerate(fields):
+            for second in fields[first_idx + 1:]:
+                for x_label, y_label in ((first, second), (second, first)):
+                    for candidate in _STANDARD_UOR_SCALES:
+                        x_ratio = abs(ox / x_label)
+                        y_ratio = abs(oy / y_label)
+                        if (
+                            abs(x_ratio - candidate) / candidate < 0.02
+                            and abs(y_ratio - candidate) / candidate < 0.02
+                        ):
+                            votes[candidate] = votes.get(candidate, 0) + 2
 
     if not votes:
         return current_scale
@@ -1560,8 +1693,13 @@ def _try_bridge_scan(dgn_path: Path) -> Optional[Tuple[List[dict], Dict[Tuple[in
     for model_idx, samples in model_samples.items():
         reported_scale = uor_scales.get(model_idx)
         scale_val = detect_uor_scale(samples, reported_scale)
-        # Apply grid text label clue adjustment
-        scale_val = detect_scale_from_grid_labels(elements, model_idx, scale_val)
+        # PRJ block coordinates are authoritative whenever named DGN labels
+        # provide a verifiable correspondence. Heuristics are fallback-only.
+        prj_scale = detect_scale_from_prj_blocks(elements, model_idx, dgn_path)
+        if prj_scale is not None:
+            scale_val = prj_scale
+        else:
+            scale_val = detect_scale_from_grid_labels(elements, model_idx, scale_val)
         detected_scales[model_idx] = scale_val
         if reported_scale is not None and reported_scale > 0:
             if math.isclose(scale_val, reported_scale):

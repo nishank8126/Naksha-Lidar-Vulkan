@@ -56,9 +56,20 @@ def test_three_real_tiffs_import_and_refresh(tmp_path, monkeypatch):
             loader.finish()
         assert all(a._raster_lod_meta.get("_last_window") for a in app.geotiff_actors)
         from vtk.util.numpy_support import vtk_to_numpy
+        from gui.gis.raster_properties import (
+            default_raster_style, process_raster_array,
+        )
+        expected_colors = []
         for i, actor in enumerate(app.geotiff_actors):
             colors = vtk_to_numpy(actor.GetTexture().GetInput().GetPointData().GetScalars())
-            assert np.all(colors == 60 + 30*i)
+            source_value = 60 + 30 * i
+            source = np.full((1, 1), source_value, dtype=np.uint8)
+            expected = process_raster_array(
+                {1: source, 2: source, 3: source},
+                default_raster_style(3),
+            )[0, 0]
+            expected_colors.append(expected)
+            assert np.all(colors == expected)
         # Actual offscreen VTK draw: all three distinct tile colors must appear.
         rw.Render()
         capture = vtk.vtkWindowToImageFilter()
@@ -66,8 +77,10 @@ def test_three_real_tiffs_import_and_refresh(tmp_path, monkeypatch):
         capture.ReadFrontBufferOff()
         capture.Update()
         pixels = vtk_to_numpy(capture.GetOutput().GetPointData().GetScalars()).astype(int)
-        for value in (60, 90, 120):
-            assert np.count_nonzero(np.all(abs(pixels[:, :3] - value) <= 2, axis=1)) > 100
+        for value in expected_colors:
+            assert np.count_nonzero(
+                np.all(abs(pixels[:, :3] - value) <= 2, axis=1)
+            ) > 100
     finally:
         if hasattr(app, "_raster_lod_loader"):
             app._raster_lod_loader.close()
