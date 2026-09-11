@@ -507,8 +507,37 @@ class GlobalShortcutFilter(QObject):
                         )
                     except Exception:
                         focus_in_cross_selector = False
+
+                # ClassPicker is a persistent classification companion window, not
+                # a text-editing dialog. Its To-class control is a QComboBox, so
+                # the generic input-field guard below used to consume Ctrl+Z/Y
+                # before the centralized undo/redo dispatcher could see them.
+                # Let only classification history keys fall through; every other
+                # combo/text-field rule stays unchanged.
+                focus_in_class_picker = False
+                class_picker = self._get_live_qt_attr("class_picker")
+                if class_picker is not None and focus_widget is not None:
+                    try:
+                        focus_in_class_picker = (
+                            class_picker.isVisible()
+                            and (
+                                focus_widget is class_picker
+                                or class_picker.isAncestorOf(focus_widget)
+                            )
+                        )
+                    except Exception:
+                        focus_in_class_picker = False
+
+                allow_classification_history_from_picker = (
+                    focus_in_class_picker
+                    and self._is_classification_active()
+                    and bool(event.modifiers() & Qt.ControlModifier)
+                    and event.key() in (Qt.Key_Z, Qt.Key_Y)
+                )
+
                 if (
                     not focus_in_cross_selector
+                    and not allow_classification_history_from_picker
                     and isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox))
                 ):
                     # Some search fields must always own their keystrokes, even

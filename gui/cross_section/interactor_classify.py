@@ -16297,6 +16297,73 @@ class ClassificationInteractor:
 
      # ======== MAIN-VIEW CLASSIFIERS (Plan View: XY) ========
 
+    def _queue_main_view_focus_after_classification_commit(self):
+        """
+        Re-assert keyboard focus on the main VTK canvas after a successful
+        MAIN-view classification commit.
+
+        Why this exists:
+        - Cross-section docks and the persistent cross-view selector are
+          top-level Qt windows. After they have been opened, section refreshes
+          performed by a main-view classify can leave keyboard focus owned by
+          one of those companion windows even though the classify itself was
+          drawn on the main canvas.
+        - The classification undo record is already valid at this point; only
+          Ctrl+Z/Ctrl+Y routing is lost until another tool/shortcut explicitly
+          calls the established main-view focus handoff.
+
+        The handoff is queued for the next Qt event-loop turn so the current
+        VTK mouse-release callback can finish first. It is intentionally
+        main-view-only and does not activate/close/reconfigure Cross Section,
+        Cut Section, ClassPicker, or any classification tool.
+        """
+        try:
+            if not self._is_main_view():
+                return
+        except Exception:
+            return
+
+        app = self.app
+
+        def _restore_focus():
+            try:
+                # Do not steal focus after classification has been stood down.
+                if getattr(app, "active_classify_tool", None) is None:
+                    return
+
+                vtk_widget = getattr(app, "vtk_widget", None)
+                if vtk_widget is None:
+                    return
+
+                # A real modal input owns focus.  Main-view classification does
+                # not need to fight a dialog that appeared after the commit.
+                from PySide6.QtWidgets import QApplication
+                if QApplication.activeModalWidget() is not None:
+                    return
+
+                before = QApplication.focusWidget()
+                before_name = type(before).__name__ if before is not None else "None"
+
+                # Mirror gui.execute_tool._return_focus_to_main_view(), which is
+                # already the proven path that makes the next shortcut work.
+                vtk_widget.setFocus(Qt.OtherFocusReason)
+
+                after = QApplication.focusWidget()
+                after_name = type(after).__name__ if after is not None else "None"
+                print(
+                    "MAIN_CLASSIFY_FOCUS_HANDOFF "
+                    f"reason=main_view_commit before={before_name} "
+                    f"after={after_name}"
+                )
+            except (RuntimeError, ReferenceError):
+                pass
+            except Exception as _focus_err:
+                # Focus recovery must never turn a successful classification
+                # into a failed operation.
+                print(f"MAIN_CLASSIFY_FOCUS_HANDOFF status=skipped error={_focus_err}")
+
+        QTimer.singleShot(0, _restore_focus)
+
     def _active_flight_line_slot(self):
         """Map the active classification interactor to its Display Mode slot."""
         if self._is_main_view():
@@ -16519,6 +16586,12 @@ class ClassificationInteractor:
             # gen-2 GC while the user is mid-streak.
             self.app._last_classify_ts = time.time()
 
+            # Main-view classify must leave keyboard ownership on the main
+            # canvas. This is queued until after the current VTK mouse-release
+            # event completes; otherwise Qt/VTK can overwrite an immediate
+            # setFocus() when Cross Section companion windows are open.
+            self._queue_main_view_focus_after_classification_commit()
+
             # The guarantee above is the sole shaded-class updater and presenter
             # for this commit, and it also refreshes every open section's
             # Shaded/Surface mesh itself (centralized there since every
@@ -16529,6 +16602,7 @@ class ClassificationInteractor:
             import traceback
             traceback.print_exc()
             self._refresh_all_views_after_classification(to_class)
+            self._queue_main_view_focus_after_classification_commit()
             return True
 
         return True

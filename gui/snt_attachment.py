@@ -15957,7 +15957,7 @@ def _read_snt_file(filepath: str) -> Dict:
 class SNTLoadWorker(QThread):
     progress    = Signal(int, str, bool)
     file_loaded = Signal(object, object)
-    finished    = Signal()
+    load_succeeded = Signal()
     error       = Signal(str)
 
     def __init__(self, file_paths: List[str]) -> None:
@@ -16002,7 +16002,10 @@ class SNTLoadWorker(QThread):
                     self.file_loaded.emit(item_data, None)
             
             if not self._cancelled:
-                self.finished.emit()
+                # Keep application success separate from QThread.finished.
+                # Redeclaring and emitting finished caused both the manual and
+                # automatic emissions to invoke attachment callbacks.
+                self.load_succeeded.emit()
         except Exception as exc:
             if not self._cancelled:
                 self.error.emit(f"SNT loading failed: {exc}\n{traceback.format_exc()}")
@@ -24123,7 +24126,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
 
         self._load_worker.progress.connect(on_progress)
         self._load_worker.file_loaded.connect(on_file_loaded)
-        self._load_worker.finished.connect(on_finished)
+        self._load_worker.load_succeeded.connect(on_finished)
         self._load_worker.error.connect(on_error)
         progress.canceled.connect(on_canceled)
         self._load_worker.start()

@@ -5616,16 +5616,17 @@ def build_unified_actor(
         print("      ℹ️ All flight lines are off — main point cloud hidden")
         return None
 
-    cloud     = pv.PolyData(vis_xyz)
+    cloud = pv.PolyData(vis_xyz)
+    cloud_bounds = tuple(float(v) for v in cloud.GetBounds())
     print(
         "      COORD_TRACE PRE-VTK/POLYDATA: "
-        f"X=[{vis_xyz[:, 0].min():.3f}, {vis_xyz[:, 0].max():.3f}] "
-        f"Y=[{vis_xyz[:, 1].min():.3f}, {vis_xyz[:, 1].max():.3f}] "
-        f"polydata={tuple(float(v) for v in cloud.GetBounds())}"
+        f"X=[{cloud_bounds[0]:.3f}, {cloud_bounds[1]:.3f}] "
+        f"Y=[{cloud_bounds[2]:.3f}, {cloud_bounds[3]:.3f}] "
+        f"polydata={cloud_bounds}"
     )
-    # Keep main classification array independent of temporary NumPy views.
-    class_vtk = numpy_support.numpy_to_vtk(vis_class.astype(np.float32, copy=False),
-                                            deep=True)
+    # One zero-copy float32 mirror serves both VTK and later GPU updates.
+    _cls_np_f32 = vis_class.astype(np.float32, copy=False)
+    class_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
 
@@ -5661,7 +5662,10 @@ def build_unified_actor(
     cloud.GetPointData().SetScalars(rgb_vtk)
 
     lut = _get_lut("main")
-    np.copyto(app._rgb_buffer, lut.map_classes(vis_class, palette))
+    np.take(
+        lut.build(palette, int(vis_class.max()) + 1),
+        vis_class, axis=0, out=app._rgb_buffer, mode="clip",
+    )
 
     n_pts             = len(xyz)
     actual_point_size = _BASE_POINT_SIZE
@@ -5717,13 +5721,9 @@ def build_unified_actor(
             raise RuntimeError("build_unified_actor: mesh scalars missing")
 
         _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)
-        np.copyto(_vtk_rgb, app._rgb_buffer)
+        if not np.shares_memory(_vtk_rgb, app._rgb_buffer):
+            np.copyto(_vtk_rgb, app._rgb_buffer)
         vtk_ca.Modified()
-
-        _cls_np_f32 = vis_class.astype(np.float32)
-        _cls_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
-        _cls_vtk.SetName("Classification")
-        mesh.GetPointData().AddArray(_cls_vtk)
 
         actor._naksha_rgb_ptr         = _vtk_rgb
         actor._naksha_point_count     = len(vis_xyz)
@@ -5749,7 +5749,7 @@ def build_unified_actor(
             actor._naksha_boundary_point_count = len(vis_class)
             _step = max(1, len(vis_class) // 2000)
             actor._naksha_boundary_checksum = int(
-                vis_class.astype(np.int32)[::_step].sum()
+                vis_class[::_step].astype(np.int64, copy=False).sum()
             )
         app._unified_actor            = actor
 
@@ -7855,8 +7855,8 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
     has_class = classification is not None
     if has_class:
         class_grid = np.full((gx_max, gy_max), -1, dtype=np.int32)
-        class_grid[gx, gy] = classification.astype(np.int32)
-        my_class = classification.astype(np.int32)
+        my_class = np.asarray(classification, dtype=np.int32)
+        class_grid[gx, gy] = my_class
 
     _DIRS = [(-1, -1), (-1, 0), (-1, 1),
              ( 0, -1),          ( 0, 1),

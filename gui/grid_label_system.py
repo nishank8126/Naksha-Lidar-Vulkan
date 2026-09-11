@@ -8607,6 +8607,7 @@ class GridLabelManager:
                     update_progress._last_update = time.time()
 
         load_start = time.time()
+        self.app._dataset_load_in_progress = True
 
         try:
             # ============================================================================
@@ -8821,15 +8822,36 @@ class GridLabelManager:
             # BUILD SPATIAL INDEX - SAME AS MENU BAR
             # ============================================================================
             if total_points > 50_000:
-                try:
-                    update_progress(70, "Building spatial index...", force=True)
-                    from gui.performance_optimizations import SpatialIndex
-                    self.app.spatial_index = SpatialIndex(self.app.data["xyz"])
-                    print(f"   ✅ Spatial index built")
-                except Exception as e:
-                    print(f"   ⚠️ Spatial index failed: {e}")
-                    self.app.spatial_index = None
-            
+                # Build the same full-resolution KD-tree after the visible load.
+                # Existing tools retain their vectorized fallback until ready.
+                self.app.spatial_index = None
+                indexed_xyz = self.app.data["xyz"]
+                indexed_xyz_id = id(indexed_xyz)
+
+                def _start_deferred_spatial_index():
+                    import threading
+
+                    def _worker():
+                        try:
+                            from gui.performance_optimizations import SpatialIndex
+                            built_index = SpatialIndex(indexed_xyz)
+                            current_data = getattr(self.app, "data", None) or {}
+                            if id(current_data.get("xyz")) == indexed_xyz_id:
+                                self.app.spatial_index = built_index
+                                print("   Deferred spatial index installed")
+                            else:
+                                print("   Deferred spatial index discarded: data replaced")
+                        except Exception as exc:
+                            print(f"   Deferred spatial index failed: {exc}")
+
+                    threading.Thread(
+                        target=_worker, name="NakshaSpatialIndex", daemon=True
+                    ).start()
+
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(1500, _start_deferred_spatial_index)
+                print("   Full-resolution spatial index scheduled after load")
+
             # ============================================================================
             # RESTORE DISPLAY SETTINGS - SAME AS MENU BAR
             # ============================================================================
@@ -8842,7 +8864,7 @@ class GridLabelManager:
                 from gui.display_mode import restore_display_settings_for_file
                 self.app._prefer_session_display_restore = True
                 try:
-                    restore_display_settings_for_file(self.app, str(las_file))
+                    restore_display_settings_for_file(self.app, str(las_file), refresh=False)
                 finally:
                     self.app._prefer_session_display_restore = False
             except Exception:
@@ -9058,7 +9080,7 @@ class GridLabelManager:
             # ============================================================================
             # TRACK GRID (additional for grid system)
             # ============================================================================
-            grid_indices = np.arange(total_points)
+            grid_indices = np.arange(total_points, dtype=np.int32)
             self.loaded_grids[owner_label] = grid_indices
             if owner_label != grid_name:
                 self.grid_aliases[grid_name] = owner_label
@@ -9107,6 +9129,8 @@ class GridLabelManager:
             traceback.print_exc()
             progress.finish_error(f"Load failed: {e}")
             QMessageBox.critical(self.app, "Load Error", f"Failed to load: {e}")
+        finally:
+            self.app._dataset_load_in_progress = False
 
     def _save_folder_to_settings(self, folder_path):
         """Save LAZ/LAS folder to settings for future use"""
