@@ -284,6 +284,26 @@ def has_fenced_parent_writeback(app) -> bool:
     return bool(is_fence_mode and session is not None)
 
 
+def save_current_pointcloud_in_place(app) -> bool:
+    """Silently save the currently editable dataset to its real source."""
+    data = getattr(app, "data", None)
+    if not isinstance(data, dict) or data.get("xyz") is None:
+        return False
+
+    session, error, is_fence_mode = _inspect_fenced_parent_session(app)
+    if is_fence_mode:
+        if session is None:
+            if error:
+                print(f"Fence in-place save skipped: {error}")
+            return False
+        return _save_fenced_parent_files(
+            app, session, output_dir=None, in_place=True, show_messages=False,
+        )
+
+    path = getattr(app, "last_save_path", None) or getattr(app, "loaded_file", None)
+    return save_pointcloud_quick(app, path) if path else False
+
+
 def _prompt_fenced_save_mode(app, session):
     source_count = len(session.get("source_files") or [])
     first_source = os.path.basename(session["source_files"][0]) if source_count else "parent file"
