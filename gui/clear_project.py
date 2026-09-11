@@ -1383,11 +1383,18 @@ def clear_project(app):
         # ============================================================================
         if should_save and hasattr(app, 'data') and app.data is not None:
             save_path = None
+
+            # A buffered/fenced dataset has multiple owning source files and
+            # intentionally no single loaded_file. The quick-save routine
+            # recognizes its ownership metadata before examining this marker.
+            from .save_pointcloud import has_fenced_parent_writeback
+            if has_fenced_parent_writeback(app):
+                save_path = "__fenced_parent_writeback__"
             
             # Determine save path
-            if hasattr(app, 'last_save_path') and app.last_save_path:
+            if save_path is None and hasattr(app, 'last_save_path') and app.last_save_path:
                 save_path = app.last_save_path
-            elif hasattr(app, 'loaded_file') and app.loaded_file:
+            elif save_path is None and hasattr(app, 'loaded_file') and app.loaded_file:
                 save_path = app.loaded_file
             
             if save_path:
