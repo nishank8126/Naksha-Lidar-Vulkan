@@ -13962,6 +13962,157 @@ def _apply_prj_precision_to_block_entities(
     return corrected
 
 
+def _coordinate_shape(seq) -> Optional[Tuple[int, int]]:
+    """Return ``(point_count, component_count)`` for a coordinate sequence."""
+    try:
+        count = len(seq)
+    except TypeError:
+        return None
+    if count == 0:
+        return None
+    try:
+        components = len(seq[0])
+    except TypeError:
+        return None
+    if components < 2:
+        return None
+    return count, components
+
+
+def _slot_sequence(entity, key, ring_index):
+    if key == "boundaries":
+        return entity["boundaries"][ring_index]
+    return entity.get(key)
+
+
+def _transform_slot_block(slots, entities, out, source_crs, canvas_crs, totals):
+    """Transform one bounded block of coordinate sequences in a few PROJ calls."""
+    from gui.projection_engine import transform_points
+
+    buffers = {
+        components: np.empty((total, components), dtype=np.float64)
+        for components, total in totals.items()
+    }
+    offsets = {components: 0 for components in buffers}
+    starts = [0] * len(slots)
+    failed = set()
+
+    for local, slot in enumerate(slots):
+        index, key, ring_index, count, components = slot
+        sequence = _slot_sequence(entities[index], key, ring_index)
+        start = offsets[components]
+        starts[local] = start
+        try:
+            buffers[components][start:start + count] = np.asarray(
+                sequence, dtype=np.float64
+            )
+        except Exception:
+            failed.add(local)
+        offsets[components] = start + count
+
+    for components, buffer in buffers.items():
+        if buffer.size:
+            transform_points(
+                buffer, source_crs, canvas_crs, copy=False,
+                chunk_size=max(1, len(buffer)),
+            )
+
+    for local, slot in enumerate(slots):
+        if local in failed:
+            continue
+        index, key, ring_index, count, components = slot
+        buffer = buffers[components]
+        start = starts[local]
+        values = [tuple(row) for row in buffer[start:start + count].tolist()]
+        if key == "boundaries":
+            out[index]["boundaries"][ring_index] = values
+        elif key in ("position", "center", "insert"):
+            out[index][key] = values[0]
+        else:
+            out[index][key] = values
+
+
+def _reproject_entities_for_render(
+    entities,
+    source_crs,
+    canvas_crs,
+    *,
+    chunk_points: int = 1_000_000,
+):
+    """Return canvas-space copies of ``entities`` using batched transforms.
+
+    Transforming per entity rebuilt a PROJ ``TransformerGroup`` for every single
+    feature, which for a multi-million feature SNT took hours of blocked GUI
+    thread.  Every coordinate sequence is gathered here and transformed in a few
+    vectorised calls instead; the resulting geometry is identical.
+    """
+    entities = list(entities or [])
+    if source_crs is None or canvas_crs is None:
+        return entities
+    try:
+        if source_crs.equals(canvas_crs):
+            return entities
+    except Exception:
+        pass
+
+    out = [dict(e) if isinstance(e, dict) else e for e in entities]
+
+    # (output index, field, boundary ring index, point count, component count)
+    slots: List[Tuple[int, str, Optional[int], int, int]] = []
+    for index, entity in enumerate(entities):
+        if not isinstance(entity, dict):
+            continue
+        for key in ("points", "vertices"):
+            shape = _coordinate_shape(entity.get(key))
+            if shape is not None:
+                slots.append((index, key, None, shape[0], shape[1]))
+        boundaries = entity.get("boundaries")
+        if isinstance(boundaries, list):
+            rings = []
+            for ring_index, ring in enumerate(boundaries):
+                if not isinstance(ring, list):
+                    continue
+                shape = _coordinate_shape(ring)
+                if shape is not None:
+                    rings.append((ring_index, shape))
+            if rings:
+                # Copy-on-write: the source entity must keep its native rings.
+                out[index]["boundaries"] = list(boundaries)
+                for ring_index, (count, components) in rings:
+                    slots.append((index, "boundaries", ring_index, count, components))
+        for key in ("position", "center", "insert"):
+            position = entity.get(key)
+            if isinstance(position, (tuple, list)) and len(position) >= 2:
+                shape = _coordinate_shape([position])
+                if shape is not None:
+                    slots.append((index, key, None, shape[0], shape[1]))
+
+    if not slots:
+        return out
+
+    cursor = 0
+    while cursor < len(slots):
+        end = cursor
+        totals: Dict[int, int] = {}
+        total_points = 0
+        while end < len(slots):
+            count, components = slots[end][3], slots[end][4]
+            if end > cursor and total_points + count > chunk_points:
+                break
+            totals[components] = totals.get(components, 0) + count
+            total_points += count
+            end += 1
+        try:
+            _transform_slot_block(
+                slots[cursor:end], entities, out, source_crs, canvas_crs, totals
+            )
+        except Exception as exc:
+            print(f"[SNT CRS] coordinate transform failed: {exc}")
+            return out
+        cursor = end
+    return out
+
+
 def build_snt_block_polygons(
     app,
     entities: list,
@@ -21015,8 +21166,13 @@ class SNTFileItem(QWidget):
         self.checkbox.stateChanged.connect(self._on_checkbox_changed)
         layout.addWidget(self.checkbox)
 
+        self.setToolTip("Double-click a file to relocate the canvas to it")
+
         self.name_label = QLabel(self.snt_path.name)
         self.name_label.setObjectName("sntNameLabel")
+        # The row, not the label, owns the mouse so double-clicking the file
+        # name can relocate the main view to that file.
+        self.name_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         layout.addWidget(self.name_label, 1)
 
         # 2. SNT Badge
@@ -21156,6 +21312,19 @@ class SNTFileItem(QWidget):
 
     def is_checked(self) -> bool:
         return self.checkbox.isChecked()
+
+    def mouseDoubleClickEvent(self, event):
+        """Relocate the main view to this file when its row is double-clicked."""
+        try:
+            if event.button() == Qt.LeftButton:
+                parent_dlg = self._find_parent_dialog()
+                relocate = getattr(parent_dlg, "_relocate_to_snt_item", None)
+                if relocate is not None and relocate(self):
+                    event.accept()
+                    return
+        except Exception as exc:
+            print(f"  [warn] SNT row double-click failed: {exc}")
+        super().mouseDoubleClickEvent(event)
 
     def _on_checkbox_changed(self, state: int):
         try:
@@ -24810,6 +24979,38 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             progress.close()
             QMessageBox.critical(self, "Attachment Failed", str(exc))
 
+    def _relocate_to_snt_item(self, item) -> bool:
+        """Relocate the main view to a single SNT row (double-click a file).
+
+        The canvas keeps one shared camera, so revealing a file that sits in a
+        different location leaves the view looking empty until the camera
+        actually moves to it.
+        """
+        if item is None:
+            return False
+
+        # A hidden file has nothing on screen to relocate to, so reveal it first.
+        try:
+            if not item.is_checked():
+                item.checkbox.setChecked(True)
+        except Exception:
+            pass
+
+        attachment = getattr(item, "attachment", None)
+        if not isinstance(attachment, dict):
+            print(
+                "SNT ZOOM SKIPPED: "
+                f"'{getattr(getattr(item, 'snt_path', None), 'name', item)}' is not attached"
+            )
+            return False
+
+        if not self._fit_view_to_snt_attachments([attachment]):
+            print(f"SNT ZOOM SKIPPED: no bounds for '{attachment.get('filename')}'")
+            return False
+
+        print(f"SNT ZOOM TO FILE: {attachment.get('filename')}")
+        return True
+
     def _fit_view_to_snt_attachments(self, attachments: List[Dict]) -> bool:
         """Fit the main canvas to the SNT files just attached."""
         bounds_list: List[Tuple[float, float, float, float]] = []
@@ -25472,29 +25673,13 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     print(f"[SNT CRS] coordinate transform failed: {exc}")
                     return list(seq)
 
-            def _tx_entity(ent):
-                if not isinstance(ent, dict):
-                    return ent
-                out = dict(ent)
-                for key in ("points", "vertices"):
-                    vals = ent.get(key)
-                    if vals:
-                        out[key] = _tx_points(vals)
-                boundaries = ent.get("boundaries")
-                if isinstance(boundaries, list):
-                    out["boundaries"] = [_tx_points(ring) if isinstance(ring, list) else ring for ring in boundaries]
-                for key in ("position", "center", "insert"):
-                    pos = ent.get(key)
-                    if isinstance(pos, (tuple, list)) and len(pos) >= 2:
-                        transformed = _tx_points([pos])
-                        if transformed:
-                            out[key] = transformed[0]
-                return out
-
-            # Render entities are project-space copies.  The attachment's native
-            # entities remain in source coordinates so SNT can round-trip without
-            # accumulating reprojection error.
-            entities = [_tx_entity(e) for e in corrected_source_entities]
+            # Render entities are project-space copies produced with one batched
+            # transform per file.  The attachment's native entities remain in
+            # source coordinates so SNT can round-trip without accumulating
+            # reprojection error.
+            entities = _reproject_entities_for_render(
+                corrected_source_entities, source_crs, canvas_crs
+            )
             attachment["_render_entities"] = entities
 
             prj_blocks = []

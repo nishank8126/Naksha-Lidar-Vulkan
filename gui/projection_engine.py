@@ -26,6 +26,7 @@ from functools import lru_cache
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -384,6 +385,60 @@ def _collect_missing_grids(group: TransformerGroup) -> tuple[str, ...]:
     return tuple(names)
 
 
+_TRANSFORMER_CACHE_LIMIT = 64
+_TRANSFORMER_CACHE_STATE = threading.local()
+
+
+def _transformer_cache() -> dict:
+    """Per-thread transformer cache.
+
+    ``TransformerGroup`` operation selection is expensive (several milliseconds
+    per call, mostly PROJ database work) and callers routinely re-resolve the
+    same CRS pair for every feature in a dataset.  Caching is per thread because
+    a pyproj ``Transformer``/PROJ context must not be shared across threads.
+    """
+    cache = getattr(_TRANSFORMER_CACHE_STATE, "cache", None)
+    if cache is None:
+        cache = {}
+        _TRANSFORMER_CACHE_STATE.cache = cache
+    return cache
+
+
+def _area_of_interest_key(area_of_interest: Optional[AreaOfInterest]):
+    if area_of_interest is None:
+        return None
+    try:
+        return (
+            round(float(area_of_interest.west), 9),
+            round(float(area_of_interest.south), 9),
+            round(float(area_of_interest.east), 9),
+            round(float(area_of_interest.north), 9),
+        )
+    except Exception:
+        return repr(area_of_interest)
+
+
+def _transformer_cache_key(src: CRS, dst: CRS,
+                           area_of_interest: Optional[AreaOfInterest],
+                           allow_ballpark: bool,
+                           accuracy: Optional[float]):
+    try:
+        src_key = src.to_wkt()
+    except Exception:
+        src_key = str(src)
+    try:
+        dst_key = dst.to_wkt()
+    except Exception:
+        dst_key = str(dst)
+    return (
+        src_key,
+        dst_key,
+        _area_of_interest_key(area_of_interest),
+        bool(allow_ballpark),
+        None if accuracy is None else float(accuracy),
+    )
+
+
 def build_transformer(
     source_crs: Any,
     target_crs: Any,
@@ -404,6 +459,12 @@ def build_transformer(
     except Exception:
         pass
 
+    cache = _transformer_cache()
+    cache_key = _transformer_cache_key(src, dst, area_of_interest, allow_ballpark, accuracy)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     warnings = []
     try:
         group = TransformerGroup(
@@ -421,43 +482,49 @@ def build_transformer(
         if missing:
             warnings.append("One or more higher-accuracy transformation grids are not installed.")
         if transformer is None:
-            return None, TransformReport(
+            result = (None, TransformReport(
                 src_id, dst_id, best_available=bool(group.best_available),
                 missing_grids=missing,
                 warnings=tuple(warnings + ["No coordinate operation is available."]),
-            )
-        desc = str(getattr(transformer, "description", None) or getattr(transformer, "name", None) or "PROJ transformation")
-        acc = getattr(transformer, "accuracy", None)
-        try:
-            acc = float(acc) if acc is not None and float(acc) >= 0 else None
-        except Exception:
-            acc = None
-        ballpark = "ballpark" in desc.casefold()
-        if ballpark:
-            warnings.append("The selected operation is a ballpark transformation.")
-        return transformer, TransformReport(
-            src_id,
-            dst_id,
-            operation=desc,
-            accuracy_m=acc,
-            best_available=bool(group.best_available),
-            ballpark=ballpark,
-            missing_grids=missing,
-            warnings=tuple(warnings),
-        )
+            ))
+        else:
+            desc = str(getattr(transformer, "description", None) or getattr(transformer, "name", None) or "PROJ transformation")
+            acc = getattr(transformer, "accuracy", None)
+            try:
+                acc = float(acc) if acc is not None and float(acc) >= 0 else None
+            except Exception:
+                acc = None
+            ballpark = "ballpark" in desc.casefold()
+            if ballpark:
+                warnings.append("The selected operation is a ballpark transformation.")
+            result = (transformer, TransformReport(
+                src_id,
+                dst_id,
+                operation=desc,
+                accuracy_m=acc,
+                best_available=bool(group.best_available),
+                ballpark=ballpark,
+                missing_grids=missing,
+                warnings=tuple(warnings),
+            ))
     except Exception as exc:
         # Last-resort pyproj transformer. This preserves compatibility with
         # older PROJ builds while still reporting that operation selection was
         # degraded.
         try:
             t = Transformer.from_crs(src, dst, always_xy=True)
-            return t, TransformReport(
+            result = (t, TransformReport(
                 src_id, dst_id,
                 operation=str(getattr(t, "description", None) or "PROJ transformation"),
                 warnings=(f"TransformerGroup selection failed: {exc}",),
-            )
+            ))
         except Exception as exc2:
-            return None, TransformReport(src_id, dst_id, warnings=(str(exc2),))
+            result = (None, TransformReport(src_id, dst_id, warnings=(str(exc2),)))
+
+    if len(cache) >= _TRANSFORMER_CACHE_LIMIT:
+        cache.clear()
+    cache[cache_key] = result
+    return result
 
 
 def transform_xy(
