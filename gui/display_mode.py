@@ -2165,7 +2165,9 @@ class DisplayModeDialog(QDialog):
     def on_add(self):
         dlg = EditClassDialog(parent=self)
         if dlg.exec() == QDialog.Accepted:
-            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color())
+            # EditClassDialog stores the selected QColor as an attribute.
+            # Calling it raises: TypeError: 'QColor' object is not callable.
+            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color)
 
     def on_edit(self):
         row = self.table.currentRow()
