@@ -1185,6 +1185,10 @@ class NakshaApp(QMainWindow):
         self.view_palettes = {}     # per-view palette isolation
 
         self.is_3d_mode = False
+        # Persistent authority for perspective/orbit mode. This is set only
+        # by an explicit 3D UI action or Shift+P; loaders and render refreshes
+        # must never infer permission from stale camera/current_view state.
+        self._main_view_3d_user_enabled = False
         self.cut_section_controller = CutSectionController(self)
         self._suppress_main_view_updates = False  #-----------------------------------------------code added by bala--------
         
@@ -1357,6 +1361,7 @@ class NakshaApp(QMainWindow):
         self.vtk_widget.renderer.ResetCamera()
         self.vtk_widget.render()
         self._main_view_2d_locked = True
+        self._install_main_view_2d_policy_guard()
         # self.vtk_widget.interactor.AddObserver("RightButtonPressEvent", self.on_grid_label_right_click)
         print("✅ Grid label detection enabled (right-click)")
         
@@ -3546,12 +3551,15 @@ class NakshaApp(QMainWindow):
             cam.SetPosition(*state["pos"])
             cam.SetFocalPoint(*state["fp"])
             cam.SetViewUp(*state["up"])
-            if state.get("pp", 1):
+            allow_3d = bool(getattr(self, "_main_view_3d_user_enabled", False))
+            if state.get("pp", 1) or not allow_3d:
                 cam.ParallelProjectionOn()
                 cam.SetParallelScale(state.get("ps", cam.GetParallelScale()))
             else:
                 cam.ParallelProjectionOff()
                 cam.SetViewAngle(state.get("va", cam.GetViewAngle()))
+            if not allow_3d:
+                self._normalize_main_view_2d_camera(cam)
             renderer.ResetCameraClippingRange()
             self.vtk_widget.render()
         except Exception:
@@ -3888,7 +3896,10 @@ class NakshaApp(QMainWindow):
                 pass
 
             # pp = 0 means perspective projection, so this is a 3D view state.
-            target_is_3d = int(state.get("pp", 1)) == 0
+            target_is_3d = (
+                int(state.get("pp", 1)) == 0
+                and bool(getattr(self, "_main_view_3d_user_enabled", False))
+            )
 
             self._restore_main_camera(state)
 
@@ -3914,6 +3925,7 @@ class NakshaApp(QMainWindow):
             # 2D restore path
             from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
 
+            self._main_view_3d_user_enabled = False
             interactor.SetInteractorStyle(vtkInteractorStyleImage())
             camera.ParallelProjectionOn()
 
@@ -6217,8 +6229,27 @@ class NakshaApp(QMainWindow):
  
         # ✅ STEP 2: Do the view mode switch
         if mode == "3d":
+            if not (
+                getattr(self, "_main_view_3d_user_enabled", False)
+                or getattr(self, "_allow_3d_switch", False)
+            ):
+                print("Blocked automatic 3D mode switch")
+                self.ensure_main_view_2d_interaction(
+                    preserve_camera=True,
+                    reason="blocked_toggle_view_mode_3d",
+                )
+                return False
+            try:
+                short_filter = getattr(self, "short_cut_filter", None)
+                if short_filter and hasattr(short_filter, "_clear_main_camera_lock_observer"):
+                    short_filter._clear_main_camera_lock_observer(
+                        self.vtk_widget.renderer.GetActiveCamera()
+                    )
+            except Exception:
+                pass
             self.is_3d_mode = True
             self._main_view_2d_locked = False
+            self.current_view = "3d"
             print("🌀 Switching to 3D view (tools disabled)")
  
             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
@@ -6233,8 +6264,13 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage("3D Mode: tools disabled", 4000)
  
         elif mode == "2d":
+            self._main_view_3d_user_enabled = False
             self.is_3d_mode = False
             self._main_view_2d_locked = True
+            # Clear stale logical 3D state as well as the VTK style. Without
+            # this, update_pointcloud() can later call set_view("3d").
+            if not preserve_camera or getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
             view_label = "2D orthographic view" if preserve_camera else "2D Plan View"
             print(f"📐 Switching to {view_label} (tools enabled)")
  
@@ -14098,6 +14134,10 @@ class NakshaApp(QMainWindow):
         """
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
         interactor = self.vtk_widget.interactor
+        self._main_view_3d_user_enabled = False
+        self.is_3d_mode = False
+        self._main_view_2d_locked = True
+        self.current_view = "top"
 
         # Force orthographic projection
         cam = self.vtk_widget.renderer.GetActiveCamera()
@@ -14116,6 +14156,10 @@ class NakshaApp(QMainWindow):
         """
         Restore normal 3D orbit controls (trackball).
         """
+        self._main_view_3d_user_enabled = True
+        self.is_3d_mode = True
+        self._main_view_2d_locked = False
+        self.current_view = "3d"
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
         interactor = self.vtk_widget.interactor
         style = vtkInteractorStyleTrackballCamera()
@@ -14411,7 +14455,11 @@ class NakshaApp(QMainWindow):
 
     def handle_view_change(self, mode):
         """Handle view mode changes from visual panel or sidebar"""
-        
+
+        # This signal comes from a direct ribbon/sidebar action. Grant 3D only
+        # for that action and revoke it for every orthographic view.
+        self._main_view_3d_user_enabled = mode == '3d'
+
         # ✅ NEW: Store DXF visibility state
         dxf_visibility = {}
         if hasattr(self, 'dxf_actors'):
@@ -17698,26 +17746,11 @@ class NakshaApp(QMainWindow):
 
     def _main_view_3d_unlocked(self) -> bool:
         """True only when user explicitly unlocked main view for 3D orbit."""
-        return not bool(getattr(self, "_main_view_2d_locked", True))
+        return bool(getattr(self, "_main_view_3d_user_enabled", False))
 
     def _should_enforce_main_2d_policy(self) -> bool:
         """Guard to keep main canvas in 2D unless explicitly unlocked."""
-        if getattr(self, "is_3d_mode", False):
-            return False
-        if self._main_view_3d_unlocked():
-            return False
-        if bool(getattr(self, "cross_section_active", False)):
-            return False
-        if getattr(self, "cross_interactor", None) is not None:
-            return False
-        cross_action = getattr(self, "cross_action", None)
-        if cross_action is not None and hasattr(cross_action, "isChecked"):
-            try:
-                if cross_action.isChecked():
-                    return False
-            except Exception:
-                pass
-        return True
+        return not self._main_view_3d_unlocked()
 
     def _on_main_left_press_2d_guard(self, obj, evt):
         """Repair accidental trackball style leaks before normal click handlers run."""
@@ -18235,6 +18268,10 @@ class NakshaApp(QMainWindow):
         try:
             if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
                 return
+
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
             
             renderer = self.vtk_widget.renderer
             camera = renderer.GetActiveCamera()
@@ -18242,7 +18279,7 @@ class NakshaApp(QMainWindow):
             if camera is None:
                 return
 
-            camera.ParallelProjectionOn()
+            self._normalize_main_view_2d_camera(camera)
             lock_params = {
                 'position': camera.GetPosition(),
                 'focal_point': camera.GetFocalPoint(),
@@ -18731,6 +18768,151 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ refresh_surface_after_classification failed: {e}")
             return False
 
+    def _normalize_main_view_2d_camera(self, camera=None):
+        """Force an exact orthographic axis while preserving pan and zoom."""
+        if getattr(self, "_main_view_3d_user_enabled", False):
+            return False
+        if getattr(self, "_main_2d_policy_enforcing", False):
+            return False
+
+        try:
+            if camera is None:
+                camera = self.vtk_widget.renderer.GetActiveCamera()
+            if camera is None:
+                return False
+
+            self._main_2d_policy_enforcing = True
+            focal = np.asarray(camera.GetFocalPoint(), dtype=float)
+            position = np.asarray(camera.GetPosition(), dtype=float)
+            distance = float(np.linalg.norm(position - focal))
+            if not np.isfinite(distance) or distance < 1e-6:
+                distance = 1.0
+
+            mode = getattr(self, "current_view", "top")
+            if mode not in ("top", "front", "side"):
+                mode = "top"
+                self.current_view = "top"
+
+            if mode == "front":
+                desired_position = focal + np.array((0.0, -distance, 0.0))
+                desired_up = np.array((0.0, 0.0, 1.0))
+            elif mode == "side":
+                desired_position = focal + np.array((distance, 0.0, 0.0))
+                desired_up = np.array((0.0, 0.0, 1.0))
+            else:
+                desired_position = focal + np.array((0.0, 0.0, distance))
+                desired_up = np.array((0.0, 1.0, 0.0))
+
+            old_up = np.asarray(camera.GetViewUp(), dtype=float)
+            changed = (
+                not bool(camera.GetParallelProjection())
+                or not np.allclose(position, desired_position, rtol=0.0, atol=1e-9)
+                or not np.allclose(old_up, desired_up, rtol=0.0, atol=1e-9)
+            )
+
+            camera.ParallelProjectionOn()
+            camera.SetFocalPoint(*focal)
+            camera.SetPosition(*desired_position)
+            camera.SetViewUp(*desired_up)
+            self.is_3d_mode = False
+            self._main_view_2d_locked = True
+            return changed
+        except Exception:
+            return False
+        finally:
+            self._main_2d_policy_enforcing = False
+
+    def _main_tool_owns_interactor_style(self, style):
+        """Do not replace a temporary tool style; the camera guard still locks it."""
+        if style is None:
+            return False
+        if style is getattr(self, "cross_interactor", None):
+            return True
+        if getattr(self, "active_classify_tool", None) is not None:
+            return True
+        measurement = getattr(self, "measurement_tool", None)
+        if measurement is not None and (
+            getattr(measurement, "active", False)
+            or getattr(measurement, "is_measuring", False)
+        ):
+            return True
+        digitizer = getattr(self, "digitizer", None)
+        return bool(digitizer is not None and getattr(digitizer, "active_tool", None))
+
+    def _repair_main_view_2d_style(self):
+        """Replace only a leaked raw trackball style, never an active tool style."""
+        if getattr(self, "_main_view_3d_user_enabled", False):
+            return False
+        try:
+            interactor = self.vtk_widget.interactor
+            style = interactor.GetInteractorStyle()
+            if (
+                style is None
+                or style.GetClassName() != "vtkInteractorStyleTrackballCamera"
+                or self._main_tool_owns_interactor_style(style)
+            ):
+                return False
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+            style_2d = vtkInteractorStyleImage()
+            try:
+                style_2d.SetInteractionModeToImage2D()
+            except Exception:
+                pass
+            interactor.SetInteractorStyle(style_2d)
+            return True
+        except Exception:
+            return False
+
+    def _install_main_view_2d_policy_guard(self):
+        """Install independently-owned guards that loaders/tools cannot remove."""
+        try:
+            renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+        except Exception:
+            return False
+
+        old_camera = getattr(self, "_main_2d_policy_camera", None)
+        old_camera_id = getattr(self, "_main_2d_policy_camera_observer_id", None)
+        if old_camera is not camera:
+            if old_camera is not None and old_camera_id is not None:
+                try:
+                    old_camera.RemoveObserver(old_camera_id)
+                except Exception:
+                    pass
+
+            def _camera_guard(_obj, _event):
+                if not getattr(self, "_main_view_3d_user_enabled", False):
+                    self._normalize_main_view_2d_camera()
+
+            self._main_2d_policy_camera_observer_id = camera.AddObserver(
+                "ModifiedEvent", _camera_guard
+            )
+            self._main_2d_policy_camera = camera
+            self._main_2d_policy_camera_callback = _camera_guard
+
+        old_renderer = getattr(self, "_main_2d_policy_renderer", None)
+        if old_renderer is not renderer:
+            old_renderer_id = getattr(self, "_main_2d_policy_render_observer_id", None)
+            if old_renderer is not None and old_renderer_id is not None:
+                try:
+                    old_renderer.RemoveObserver(old_renderer_id)
+                except Exception:
+                    pass
+
+            def _render_guard(_obj, _event):
+                if getattr(self, "_main_view_3d_user_enabled", False):
+                    return
+                self._install_main_view_2d_policy_guard()
+                self._normalize_main_view_2d_camera()
+                self._repair_main_view_2d_style()
+
+            self._main_2d_policy_render_observer_id = renderer.AddObserver(
+                "StartEvent", _render_guard
+            )
+            self._main_2d_policy_renderer = renderer
+            self._main_2d_policy_render_callback = _render_guard
+        return True
+
     def ensure_main_view_2d_interaction(self, preserve_camera=True, reason=None):
         """
         Force the main viewer back to 2D pan/zoom without refitting or losing zoom.
@@ -18750,6 +18932,10 @@ class NakshaApp(QMainWindow):
             camera = renderer.GetActiveCamera()
             if camera is None:
                 return False
+
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
 
             saved_camera = None
             if preserve_camera:
@@ -18773,7 +18959,10 @@ class NakshaApp(QMainWindow):
                         style.OnRightButtonUp()
                 except Exception:
                     pass
-            if style_name != "vtkInteractorStyleImage":
+            if (
+                style_name != "vtkInteractorStyleImage"
+                and not self._main_tool_owns_interactor_style(style)
+            ):
                 style_2d = vtkInteractorStyleImage()
                 try:
                     style_2d.SetInteractionModeToImageSlicing()
@@ -18781,12 +18970,10 @@ class NakshaApp(QMainWindow):
                     pass
                 interactor.SetInteractorStyle(style_2d)
 
-            camera.ParallelProjectionOn()
             if saved_camera:
-                camera.SetPosition(saved_camera['position'])
                 camera.SetFocalPoint(saved_camera['focal_point'])
-                camera.SetViewUp(saved_camera['view_up'])
                 camera.SetParallelScale(saved_camera['parallel_scale'])
+            self._normalize_main_view_2d_camera(camera)
 
             if renderer.VisibleActorCount() > 0:
                 renderer.ResetCameraClippingRange()
@@ -18806,6 +18993,7 @@ class NakshaApp(QMainWindow):
                 pass
             self.is_3d_mode = False
             self._main_view_2d_locked = True
+            self._install_main_view_2d_policy_guard()
             self.vtk_widget.render()
 
             suffix = f" ({reason})" if reason else ""

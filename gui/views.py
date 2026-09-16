@@ -1,17 +1,31 @@
 def set_view(app, mode):
     # do not touch the camera. Just record the requested view.
     preserve = getattr(app, "_preserve_view", False)
-    already_in_3d = getattr(app, "current_view", None) == "3d"
+
+    # current_view == "3d" is not authorization. That value can outlive
+    # a file load or forced return to 2D and used to make the next point-cloud
+    # refresh silently restore perspective mode. Only the explicit 3D action
+    # and Shift+P may grant persistent 3D authority.
+    allow_3d = bool(
+        getattr(app, "_allow_3d_switch", False)
+        or getattr(app, "_main_view_3d_user_enabled", False)
+    )
 
     # Hard block: prevent entering 3D unless explicitly allowed.
-    if mode == "3d" and not (
-        getattr(app, "_allow_3d_switch", False) or already_in_3d
-    ):
+    if mode == "3d" and not allow_3d:
         # Do not change current_view.
         print("Blocked auto-switch to 3D (use View -> 3D button)")
         try:
             if hasattr(app, "statusBar"):
                 app.statusBar().showMessage("3D blocked (use View -> 3D)", 2000)
+        except Exception:
+            pass
+        try:
+            if hasattr(app, "ensure_main_view_2d_interaction"):
+                app.ensure_main_view_2d_interaction(
+                    preserve_camera=True,
+                    reason="blocked_automatic_3d_view",
+                )
         except Exception:
             pass
         return

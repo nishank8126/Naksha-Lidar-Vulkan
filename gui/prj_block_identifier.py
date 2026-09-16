@@ -8542,13 +8542,15 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             block_label = block_data['label']
             print(f"\n🔍 Searching for block: '{block_label}'")
 
-            # The loaded SNT polygon is authoritative for viewport location.
-            # It exists independently of whether a matching LAZ/LAS file is
-            # present or whether its text label received a rendered actor.
-            snt_polygon = self._find_loaded_snt_block_polygon(
-                block_label,
-                block_data.get('boundary_coords') or [],
-            )
+            # Use the block actor that is actually rendered in the viewport.
+            # The cached SNT/PRJ index is only a fallback: its polygon can be
+            # in a different revision/coordinate space from the visible actor.
+            snt_polygon = self._find_rendered_snt_block_polygon(block_label)
+            if snt_polygon is None:
+                snt_polygon = self._find_loaded_snt_block_polygon(
+                    block_label,
+                    block_data.get('boundary_coords') or [],
+                )
             identify_data = dict(block_data)
             if snt_polygon is not None:
                 identify_data['boundary_coords'] = snt_polygon
@@ -8826,6 +8828,50 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 "Invalid PRJ Geometry",
                 "The selected block has no valid boundary coordinates in the PRJ file."
             )
+
+    def _find_rendered_snt_block_polygon(self, block_label):
+        """Return exact world XY points from the visible block-line actor."""
+        wanted = _lidar_block_key(block_label)
+        if not wanted:
+            return None
+
+        seen = set()
+        for collection_name in ('snt_actors', 'dxf_actors'):
+            for data_set in getattr(self.app, collection_name, []) or []:
+                for actor in data_set.get('actors', []) or []:
+                    actor_id = id(actor)
+                    if actor_id in seen:
+                        continue
+                    seen.add(actor_id)
+                    if not getattr(actor, 'is_block_polygon', False):
+                        continue
+                    if _lidar_block_key(getattr(actor, 'grid_name', '')) != wanted:
+                        continue
+
+                    try:
+                        mapper = actor.GetMapper()
+                        mapper.Update()
+                        poly_data = mapper.GetInput()
+                        vtk_points = poly_data.GetPoints()
+                        if vtk_points is None or vtk_points.GetNumberOfPoints() < 3:
+                            continue
+
+                        matrix = actor.GetMatrix()
+                        polygon = []
+                        for point_index in range(vtk_points.GetNumberOfPoints()):
+                            x, y, z = vtk_points.GetPoint(point_index)
+                            wx, wy, _wz, ww = matrix.MultiplyPoint((x, y, z, 1.0))
+                            if ww and ww != 1.0:
+                                wx, wy = wx / ww, wy / ww
+                            polygon.append((float(wx), float(wy)))
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+
+                    if polygon[0] == polygon[-1]:
+                        polygon = polygon[:-1]
+                    if len(polygon) >= 3:
+                        return polygon
+        return None
 
     def _find_loaded_snt_block_polygon(self, block_label, prj_boundary=None):
         """Return a loaded-SNT polygon by label, then by PRJ spatial overlap."""
