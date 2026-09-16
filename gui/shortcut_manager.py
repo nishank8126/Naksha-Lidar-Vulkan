@@ -1385,9 +1385,9 @@ class ClassVisibilityPicker(QDialog):
     def _save_col_widths(widths):
         QSettings("NakshaAI", "LidarApp").setValue(_COL_WIDTHS_KEY, widths)
 
-    def _resolve_shading_palette_source(self):
+    def _resolve_class_metadata_palette_source(self):
         """
-        Build a current palette with complete metadata for Shading and Surface.
+        Build a current palette with complete metadata for preset editors.
 
         The first live source defines the current class set and state. Later
         sources only backfill missing metadata, preventing a stale slot palette
@@ -2213,8 +2213,8 @@ class ClassVisibilityPicker(QDialog):
             self.class_checkboxes.clear()
             self.weight_spinboxes = {}
 
-            if self.mode in CLASS_VISIBILITY_PICKER_MODES:
-                palette_source = self._resolve_shading_palette_source()
+            if self.mode == "display" or self.mode in CLASS_VISIBILITY_PICKER_MODES:
+                palette_source = self._resolve_class_metadata_palette_source()
             else:
                 palette_source = getattr(self.app_window, 'class_palette', {}) or {}
 
@@ -2392,8 +2392,8 @@ class ClassVisibilityPicker(QDialog):
         """Return dict of selected classes with their info + updated weights"""
         result = {}
         palette_source = (
-            self._resolve_shading_palette_source()
-            if self.mode in CLASS_VISIBILITY_PICKER_MODES
+            self._resolve_class_metadata_palette_source()
+            if self.mode == "display" or self.mode in CLASS_VISIBILITY_PICKER_MODES
             else (getattr(self.app_window, "class_palette", {}) or {})
         )
         for code, checkbox in self.class_checkboxes.items():
