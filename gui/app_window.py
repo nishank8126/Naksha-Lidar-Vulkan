@@ -553,6 +553,21 @@ class MainWheelZoomEventFilter(QObject):
         if not callable(handler) or not handler(delta, display_position=display_position):
             return False
 
+        # Display Mode is deliberately never "always on top" (a click on the
+        # main window should naturally bring it forward), but scrolling here
+        # can also activate the main window and silently bury Display Mode
+        # behind it. Re-raise only, never activateWindow(): this keeps
+        # Display Mode visually on top without stealing focus back from the
+        # view being scrolled, and a later click on the main window still
+        # brings it forward exactly as before - the existing click-to-front
+        # design is unchanged.
+        try:
+            dlg = getattr(app, "display_mode_dialog", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+        except Exception:
+            pass
+
         try:
             event.accept()
         except Exception:
@@ -15004,7 +15019,23 @@ class NakshaApp(QMainWindow):
                     dock.raise_()
                     dock.activateWindow()
                     dock.setFocus()
-                    
+
+                    # This method is called by Display Mode's own view
+                    # selector, so the click that triggered it happened
+                    # from inside that dialog - but activateWindow() above
+                    # steals OS-level window focus and puts this dock in
+                    # front of everything, silently burying Display Mode
+                    # behind it. Re-raise only (never activateWindow again):
+                    # the dock keeps the real focus/activation it just got
+                    # (you still see and can interact with it), Display
+                    # Mode just doesn't end up hidden underneath.
+                    try:
+                        dlg = getattr(self, "display_mode_dialog", None)
+                        if dlg is not None and dlg.isVisible():
+                            dlg.raise_()
+                    except Exception:
+                        pass
+
                     # Set as active view in section controller
                     if hasattr(self, 'section_controller'):
                         self.section_controller.active_view = section_index
