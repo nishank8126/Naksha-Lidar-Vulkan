@@ -4,6 +4,7 @@ import pytest
 import vtk
 
 from gui.app_window import NakshaApp
+from gui.gpu_render_manager import GPURenderManager
 from gui.global_shortcuts import GlobalShortcutFilter
 from gui.views import set_view
 
@@ -60,6 +61,7 @@ def _policy_app(current_view="top"):
         "_main_tool_owns_interactor_style",
         "_repair_main_view_2d_style",
         "_install_main_view_2d_policy_guard",
+        "_refresh_main_view_clipping_after_navigation",
     ):
         setattr(app, name, MethodType(getattr(NakshaApp, name), app))
     return app
@@ -246,3 +248,82 @@ def test_shift_p_cross_unlock_does_not_unlock_main_view():
     assert app._main_view_3d_user_enabled is False
     assert app.current_view == "top"
     assert not cross_widget.renderer.GetActiveCamera().GetParallelProjection()
+
+
+def test_2d_navigation_rebuilds_clip_range_for_planar_snt_actor():
+    app = _policy_app()
+    renderer = app.vtk_widget.renderer
+    camera = renderer.GetActiveCamera()
+    camera.SetFocalPoint(0.0, 0.0, 0.0)
+    camera.SetPosition(0.0, 0.0, 100.0)
+    camera.ParallelProjectionOn()
+
+    source = vtk.vtkLineSource()
+    source.SetPoint1(-10.0, 0.0, 0.0)
+    source.SetPoint2(10.0, 0.0, 0.0)
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(source.GetOutputPort())
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    renderer.AddActor(actor)
+
+    camera.SetClippingRange(0.01, 0.02)
+    assert app._refresh_main_view_clipping_after_navigation(renderer)
+
+    near_value, far_value = camera.GetClippingRange()
+    assert near_value < 100.0 < far_value
+    assert near_value > 0.0
+
+
+def test_wheel_idle_repairs_clipping_before_final_render():
+    calls = []
+    app = SimpleNamespace(
+        _shutdown_in_progress=False,
+        _refresh_main_view_clipping_after_navigation=lambda: calls.append("clip"),
+    )
+    manager = SimpleNamespace(
+        _interaction_active=True,
+        app=app,
+        _restore_full_detail=lambda: calls.append("detail"),
+        force_render=lambda: calls.append("render"),
+    )
+
+    GPURenderManager._on_wheel_idle(manager)
+
+    assert manager._interaction_active is False
+    assert calls == ["detail", "clip", "render"]
+
+
+def test_top_cursor_zoom_cannot_drift_along_camera_depth_axis():
+    camera = SimpleNamespace(
+        position=[0.0, 0.0, 100.0],
+        focal=[0.0, 0.0, 0.0],
+        scale=50.0,
+        GetPosition=lambda: tuple(camera.position),
+        GetFocalPoint=lambda: tuple(camera.focal),
+        GetParallelScale=lambda: camera.scale,
+        GetViewAngle=lambda: 30.0,
+        GetParallelProjection=lambda: True,
+        SetPosition=lambda *value: setattr(camera, "position", list(value)),
+        SetFocalPoint=lambda *value: setattr(camera, "focal", list(value)),
+        SetParallelScale=lambda value: setattr(camera, "scale", value),
+        SetViewAngle=lambda _value: None,
+        ParallelProjectionOn=lambda: None,
+        ParallelProjectionOff=lambda: None,
+        Zoom=lambda factor: setattr(camera, "scale", camera.scale / factor),
+    )
+    renderer = SimpleNamespace(GetActiveCamera=lambda: camera)
+    interactor = SimpleNamespace(GetEventPosition=lambda: (10, 20))
+    widget = SimpleNamespace(renderer=renderer, interactor=interactor)
+    world_points = iter(((10.0, 20.0, 0.0), (8.0, 16.0, 25.0)))
+    app = SimpleNamespace(
+        current_view="top",
+        _display_to_world_on_focal_plane=lambda *_args: next(world_points),
+    )
+
+    assert NakshaApp._zoom_widget_at_cursor(
+        app, widget, 2.0, interactor=interactor, render=False
+    )
+
+    assert camera.position == pytest.approx((2.0, 4.0, 100.0))
+    assert camera.focal == pytest.approx((2.0, 4.0, 0.0))

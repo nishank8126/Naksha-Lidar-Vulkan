@@ -8545,7 +8545,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             # Use the block actor that is actually rendered in the viewport.
             # The cached SNT/PRJ index is only a fallback: its polygon can be
             # in a different revision/coordinate space from the visible actor.
-            snt_polygon = self._find_rendered_snt_block_polygon(block_label)
+            rendered_block_actor = self._find_rendered_snt_block_actor(block_label)
+            snt_polygon = self._rendered_actor_polygon(rendered_block_actor)
             if snt_polygon is None:
                 snt_polygon = self._find_loaded_snt_block_polygon(
                     block_label,
@@ -8555,6 +8556,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             if snt_polygon is not None:
                 identify_data['boundary_coords'] = snt_polygon
                 identify_data['identify_source'] = 'SNT'
+                if rendered_block_actor is not None:
+                    identify_data['_rendered_boundary_actor'] = rendered_block_actor
                 print(
                     f"  ✅ MATCH (SNT polygon): '{block_label}' "
                     f"({len(snt_polygon)} vertices)"
@@ -8829,12 +8832,14 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 "The selected block has no valid boundary coordinates in the PRJ file."
             )
 
-    def _find_rendered_snt_block_polygon(self, block_label):
-        """Return exact world XY points from the visible block-line actor."""
+    def _find_rendered_snt_block_actor(self, block_label):
+        """Return the visible renderer-owned block actor for this label."""
         wanted = _lidar_block_key(block_label)
         if not wanted:
             return None
 
+        vtk_widget = getattr(self.app, 'vtk_widget', None)
+        renderer = getattr(vtk_widget, 'renderer', None)
         seen = set()
         for collection_name in ('snt_actors', 'dxf_actors'):
             for data_set in getattr(self.app, collection_name, []) or []:
@@ -8847,31 +8852,55 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                         continue
                     if _lidar_block_key(getattr(actor, 'grid_name', '')) != wanted:
                         continue
-
                     try:
-                        mapper = actor.GetMapper()
-                        mapper.Update()
-                        poly_data = mapper.GetInput()
-                        vtk_points = poly_data.GetPoints()
-                        if vtk_points is None or vtk_points.GetNumberOfPoints() < 3:
+                        if not actor.GetVisibility():
                             continue
-
-                        matrix = actor.GetMatrix()
-                        polygon = []
-                        for point_index in range(vtk_points.GetNumberOfPoints()):
-                            x, y, z = vtk_points.GetPoint(point_index)
-                            wx, wy, _wz, ww = matrix.MultiplyPoint((x, y, z, 1.0))
-                            if ww and ww != 1.0:
-                                wx, wy = wx / ww, wy / ww
-                            polygon.append((float(wx), float(wy)))
-                    except (AttributeError, TypeError, ValueError):
+                        if renderer is not None and not renderer.HasViewProp(actor):
+                            # Actor collections can retain replaced/removed SNT
+                            # actors. Never build a preview from stale geometry.
+                            continue
+                    except (AttributeError, TypeError):
                         continue
-
-                    if polygon[0] == polygon[-1]:
-                        polygon = polygon[:-1]
-                    if len(polygon) >= 3:
-                        return polygon
+                    return actor
         return None
+
+    @staticmethod
+    def _rendered_actor_polygon(actor):
+        """Return world XY points for navigation; rendering clones the actor."""
+        if actor is None:
+            return None
+
+        try:
+            mapper = actor.GetMapper()
+            mapper.Update()
+            poly_data = mapper.GetInput()
+            vtk_points = poly_data.GetPoints()
+            if vtk_points is None or vtk_points.GetNumberOfPoints() < 3:
+                return None
+
+            matrix = actor.GetMatrix()
+            polygon = []
+            for point_index in range(vtk_points.GetNumberOfPoints()):
+                x, y, z = vtk_points.GetPoint(point_index)
+                wx, wy, _wz, ww = matrix.MultiplyPoint((x, y, z, 1.0))
+                if ww and ww != 1.0:
+                    wx, wy = wx / ww, wy / ww
+                polygon.append((float(wx), float(wy)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        if polygon[0] == polygon[-1]:
+            polygon = polygon[:-1]
+        return polygon if len(polygon) >= 3 else None
+
+    def _find_rendered_snt_block_polygon(self, block_label):
+        """Compatibility wrapper returning the visible actor's world points."""
+        actor = PRJBlockIdentifierDialog._find_rendered_snt_block_actor(
+            self, block_label
+        )
+        return PRJBlockIdentifierDialog._rendered_actor_polygon(
+            actor
+        )
 
     def _find_loaded_snt_block_polygon(self, block_label, prj_boundary=None):
         """Return a loaded-SNT polygon by label, then by PRJ spatial overlap."""
@@ -8971,6 +9000,35 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             for block in blocks:
                 coords = block.get("boundary_coords") or []
                 if len(coords) < 3:
+                    continue
+
+                rendered_actor = block.get('_rendered_boundary_actor')
+                if rendered_actor is not None:
+                    # Clone the exact visible SNT actor. Reconstructing a new
+                    # polyline from vtkPoints loses the mapper's cell topology
+                    # and can use a stale point order, producing the diverging
+                    # yellow segments visible only at deep zoom.
+                    boundary_actor = vtk.vtkActor()
+                    boundary_actor.ShallowCopy(rendered_actor)
+                    preview_property = vtk.vtkProperty()
+                    preview_property.DeepCopy(rendered_actor.GetProperty())
+                    preview_property.SetColor(1.0, 1.0, 0.0)
+                    preview_property.SetLineWidth(2.0)
+                    preview_property.SetOpacity(1.0)
+                    preview_property.SetLighting(False)
+                    boundary_actor.SetProperty(preview_property)
+                    boundary_actor.PickableOff()
+                    renderer.AddActor(boundary_actor)
+                    self._highlight_actors.append(boundary_actor)
+
+                    bounds = rendered_actor.GetBounds()
+                    if bounds is not None and len(bounds) >= 4:
+                        all_x.extend((float(bounds[0]), float(bounds[1])))
+                        all_y.extend((float(bounds[2]), float(bounds[3])))
+                    print(
+                        f"   Exact rendered SNT actor preview: "
+                        f"{block.get('label', '')}"
+                    )
                     continue
 
                 ring = [(float(x), float(y)) for x, y in coords]

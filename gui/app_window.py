@@ -16963,6 +16963,39 @@ class NakshaApp(QMainWindow):
             self.magnifier_combo.setCurrentText(f"{zoom_int}%")
             self.magnifier_combo.blockSignals(False)
 
+    def _refresh_main_view_clipping_after_navigation(self, renderer=None):
+        """Rebuild padded clip planes after a 2D pan/zoom camera mutation."""
+        try:
+            if renderer is None:
+                renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return False
+
+            renderer.ResetCameraClippingRange()
+            near_value, far_value = map(float, camera.GetClippingRange())
+            if not (
+                np.isfinite(near_value)
+                and np.isfinite(far_value)
+                and far_value > near_value
+            ):
+                return False
+
+            span = max(far_value - near_value, 1.0e-6)
+            margin = max(span * 0.10, 1.0e-4)
+            padded_near = max(1.0e-6, near_value - margin)
+            padded_far = max(padded_near + 1.0e-6, far_value + margin)
+            camera.SetClippingRange(padded_near, padded_far)
+
+            try:
+                from gui.unified_actor_manager import refresh_widget_camera_uniforms
+                refresh_widget_camera_uniforms(self.vtk_widget)
+            except Exception:
+                pass
+            return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+
     def _display_to_world_on_focal_plane(self, renderer, display_x, display_y):
         camera = renderer.GetActiveCamera()
         if camera is None:
@@ -17301,11 +17334,23 @@ class NakshaApp(QMainWindow):
             _restore_camera()
             return False
 
-        delta = (
+        delta = [
             world_before[0] - world_after[0],
             world_before[1] - world_after[1],
             world_before[2] - world_after[2],
-        )
+        ]
+        # DisplayToWorld can introduce a small component along the viewing
+        # axis, especially with large UTM coordinates and narrow planar SNT
+        # bounds. Repeated cursor zooms then walk the camera/focal plane out of
+        # the existing clip range. A 2D cursor zoom may pan only in its screen
+        # plane; it must never dolly along the view direction.
+        view_mode = getattr(self, "current_view", "top")
+        if view_mode == "front":
+            delta[1] = 0.0
+        elif view_mode == "side":
+            delta[0] = 0.0
+        else:
+            delta[2] = 0.0
         if not all(np.isfinite(value) for value in delta):
             _restore_camera()
             return False
@@ -17323,6 +17368,7 @@ class NakshaApp(QMainWindow):
         )
 
         if render:
+            self._refresh_main_view_clipping_after_navigation(renderer)
             vtk_widget.render()
         return True
 
@@ -17701,6 +17747,8 @@ class NakshaApp(QMainWindow):
             _restore_camera()
             return False
 
+        self._refresh_main_view_clipping_after_navigation(renderer)
+
         render_manager = getattr(self, "gpu_render_manager", None)
         if render_manager is not None:
             try:
@@ -17933,6 +17981,7 @@ class NakshaApp(QMainWindow):
         if camera is None:
             return False
         camera.Zoom(factor)
+        self._refresh_main_view_clipping_after_navigation(renderer)
         vtk_widget.render()
         return True
 
@@ -17959,6 +18008,9 @@ class NakshaApp(QMainWindow):
 
             cam = self.vtk_widget.renderer.GetActiveCamera()
             cam.Zoom(ratio)
+            self._refresh_main_view_clipping_after_navigation(
+                self.vtk_widget.renderer
+            )
             self.vtk_widget.render()
 
             self._schedule_main_view_history_commit("magnifier_zoom", delay_ms=120)
