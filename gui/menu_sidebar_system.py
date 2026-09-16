@@ -5191,7 +5191,11 @@ class ByClassRibbon(QWidget):
         QTimer.singleShot(0, self._refresh_dialog_zorder)
 
     def _refresh_dialog_zorder(self):
-        """Re-raise visible non-minimized By Class dialogs without changing minimize behavior."""
+        """Re-raise visible non-minimized By Class dialogs that fell behind main window.
+        
+        Only triggered on WindowActivate — not on every mouse click.
+        Raises only dialogs that are behind the host window.
+        """
         self._dialog_raise_scheduled = False
         host = self._dialog_guard_host
         if host is None:
@@ -5199,12 +5203,18 @@ class ByClassRibbon(QWidget):
         if hasattr(host, "isMinimized") and host.isMinimized():
             return
 
+        # Only raise dialogs that are actually behind the main window
+        from PySide6.QtWidgets import QApplication
+        focused = QApplication.activeWindow()
+
         for dialog in self._iter_byclass_dialogs():
             try:
                 if dialog.isHidden() or not dialog.isVisible():
                     continue
                 if dialog.isMinimized():
-                    # Respect existing minimize feature exactly.
+                    continue
+                # Don't steal focus from the dialog the user is working with
+                if focused is dialog:
                     continue
                 dialog.raise_()
             except Exception:
@@ -5224,8 +5234,6 @@ class ByClassRibbon(QWidget):
                     (obj is host or host.isAncestorOf(obj))
                 )
                 if et == QEvent.WindowActivate and is_host_event:
-                    self._schedule_dialog_zorder_refresh()
-                elif et in (QEvent.FocusIn, QEvent.MouseButtonPress) and is_host_child_event:
                     self._schedule_dialog_zorder_refresh()
         except Exception:
             pass
