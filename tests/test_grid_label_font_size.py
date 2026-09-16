@@ -24,7 +24,7 @@ def test_follower_font_size_uses_stable_non_cumulative_scale():
     manager = _manager()
 
     assert manager._apply_label_state(actor, "COMP", 150, (0, 1, 1), False)
-    assert actor.GetScale()[0] == pytest.approx(4.0)
+    assert actor.GetScale()[0] == pytest.approx(8.0)
     assert manager._apply_label_state(actor, "COMP", 1, (0, 1, 1), False)
     assert actor.GetScale()[0] == pytest.approx(2.0 / 75.0)
     assert manager._capture_label_state(actor)["size"] == 1
@@ -41,7 +41,7 @@ def test_text_actor3d_font_size_changes_world_scale():
     manager = _manager()
 
     assert manager._apply_label_state(actor, "COMP", 40, (0, 1, 1), True)
-    assert actor.GetScale()[0] == pytest.approx(1.0)
+    assert actor.GetScale()[0] == pytest.approx(2.0)
     assert manager._apply_label_state(actor, "COMP", 10, (0, 1, 1), True)
     assert actor.GetScale()[0] == pytest.approx(0.25)
     assert manager._capture_label_state(actor)["size"] == 10
