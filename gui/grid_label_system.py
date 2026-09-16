@@ -6950,6 +6950,17 @@ class GridLabelManager:
             'is_text_actor3d': is_text_actor3d,
         }
 
+    @staticmethod
+    def _label_font_scale_factor(size, base_size):
+        """Map UI point size to world-space label scale without accumulation.
+
+        Grid labels are geometry, so linear growth remains visually negligible
+        at PRJ/SNT overview scales. Preserve linear reduction below the import
+        size, but amplify increases quadratically while keeping the baseline
+        invariant (75 -> 75 is always factor 1).
+        """
+        ratio = float(size) / float(base_size) if base_size > 0 else 1.0
+        return ratio if ratio <= 1.0 else ratio * ratio
     def _apply_label_state(self, actor, text, size, color, is_text_actor3d=None):
         """Set a grid-label actor's rendered text/font-size/color.
 
@@ -6993,7 +7004,7 @@ class GridLabelManager:
                 # from SetFontSize alone. Keep glyph rasterization stable and
                 # resize the actor transform from the immutable import scale.
                 text_prop.SetFontSize(max(8, int(round(base_size))))
-                factor = float(size) / base_size if base_size > 0 else 1.0
+                factor = self._label_font_scale_factor(size, base_size)
                 new_scale = float(base_scale) * factor
                 actor.SetScale(new_scale, new_scale, new_scale)
                 text_prop.SetColor(*color)
@@ -7032,7 +7043,9 @@ class GridLabelManager:
                         actor._naksha_base_scale = base_scale
                     base_size = float(getattr(actor, '_naksha_base_font_size', 75) or 75)
                     if base_size > 0:
-                        new_scale = base_scale * (float(size) / base_size)
+                        new_scale = base_scale * self._label_font_scale_factor(
+                            size, base_size
+                        )
                         actor.SetScale(new_scale, new_scale, new_scale)
                 except Exception as _scale_err:
                     print(f"⚠️ Could not rescale grid label: {_scale_err}")
