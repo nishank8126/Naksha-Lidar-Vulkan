@@ -1161,6 +1161,16 @@ class CutSectionController:
             # Detach observers
             self._detach_all_view_observers()
             
+            # ✅ Clean up resize refit timer and filter
+            try:
+                t = getattr(self, '_cut_refit_timer', None)
+                if t is not None:
+                    t.stop()
+                self._cut_refit_timer = None
+                self._cut_resize_filter = None
+            except Exception:
+                pass
+
             # ✅ Close dock AFTER widget cleanup
             if self.cut_dock is not None:
                 try:
@@ -6356,6 +6366,42 @@ class CutSectionController:
 
             # ✅ SHOW DOCK
             self.cut_dock.show()
+
+            # ✅ Auto-refit camera when Cut Section dock is resized
+            from PySide6.QtCore import QTimer, QEvent
+            _cut_refit_timer = QTimer(self.app)
+            _cut_refit_timer.setSingleShot(True)
+            _cut_refit_timer.setInterval(200)  # debounce 200ms
+            def _do_cut_refit():
+                try:
+                    self.fit_cut_section_view()
+                except Exception:
+                    pass
+            _cut_refit_timer.timeout.connect(_do_cut_refit)
+            self._cut_refit_timer = _cut_refit_timer
+
+            _orig_cut_resize = self.cut_dock.resizeEvent
+            def _patched_cut_resize(event, _orig=_orig_cut_resize, _timer=_cut_refit_timer):
+                _orig(event)
+                try:
+                    _timer.start()
+                except Exception:
+                    pass
+            self.cut_dock.resizeEvent = _patched_cut_resize
+
+            # Also watch VTK interactor resize for layout-driven changes
+            from PySide6.QtCore import QObject as _QObject
+            class _CutVtkResizeFilter(_QObject):
+                def __init__(self, timer, parent=None):
+                    super().__init__(parent)
+                    self.timer = timer
+                def eventFilter(self, obj, event):
+                    if event.type() == QEvent.Resize:
+                        self.timer.start()
+                    return False
+            _cut_vtk_filter = _CutVtkResizeFilter(_cut_refit_timer, self.cut_vtk.interactor)
+            self.cut_vtk.interactor.installEventFilter(_cut_vtk_filter)
+            self._cut_resize_filter = _cut_vtk_filter
 
     def _plot_cut_to_dedicated_widget(self, points):
         """
