@@ -74,6 +74,35 @@ def _class_picker_is_visible(picker) -> bool:
         return False
 
 
+def _deactivate_pan_navigation_safely(app_window) -> None:
+    """Release latched pan state in main, cross, and cut viewports."""
+    app_window._left_pan_shortcut_active = False
+
+    release_main = getattr(app_window, "_handle_fast_main_pan_release", None)
+    if callable(release_main) and getattr(app_window, "_qt_main_pan_active", False):
+        try:
+            release_main()
+        except Exception:
+            pass
+
+    widgets = [getattr(app_window, "sec_vtk", None)]
+    widgets.extend(getattr(app_window, "section_vtks", {}).values())
+    cut = getattr(app_window, "cut_section_controller", None)
+    widgets.append(getattr(cut, "cut_vtk", None) if cut is not None else None)
+
+    seen = set()
+    for widget in widgets:
+        if widget is None or id(widget) in seen:
+            continue
+        seen.add(id(widget))
+        pan_filter = getattr(widget, "_naksha_section_wheel_filter", None)
+        finish = getattr(pan_filter, "_finish_tap_pan", None)
+        if callable(finish):
+            try:
+                finish()
+            except Exception:
+                pass
+
 def _apply_display_visibility_preset(app_window, preset) -> int:
     """Apply a saved class-visibility map without replacing live metadata."""
     if not isinstance(preset, dict):
@@ -1161,6 +1190,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # CROSS-SECTION TOOL (Non-classification)
     # ========================================================================
     if tool_name == "cross_section":
+        # The locator now owns input on the main view. Release any Pan
+        # shortcut/tap session left active in the viewport that had focus.
+        _deactivate_pan_navigation_safely(app_window)
         print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
 
         # Curve deactivation is handled inside the cross-section entry point.

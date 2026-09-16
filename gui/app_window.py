@@ -145,9 +145,12 @@ class MainWheelZoomEventFilter(QObject):
         self._owned_main_pan_button = None
         # MicroStation-style "tap-tap" (dynamic) pan state: one tap starts
         # panning, the view follows the cursor without holding any button,
-        # and a second tap / Esc / right-click ends it.
+        # and a second tap / Esc / right-click ends it. The toggle flips on
+        # PRESS, unconditionally - matching MicroStation's own toggle-pan,
+        # confirmed against Bentley's docs (state flips on the button-down
+        # itself, no distance/timing check). No press-position or arm-time
+        # tracking is needed for that model.
         self._tap_session = False
-        self._tap_press_pos = None
         self._tap_swallow_release_button = None
 
     @staticmethod
@@ -183,7 +186,6 @@ class MainWheelZoomEventFilter(QObject):
         """End an open tap-pan session cleanly (second tap, Esc, right-click,
         a key press, or a tool taking over the canvas)."""
         self._tap_session = False
-        self._tap_press_pos = None
         self._owns_main_pan = False
         self._owned_main_pan_button = None
         release = getattr(app, "_handle_fast_main_pan_release", None)
@@ -287,8 +289,23 @@ class MainWheelZoomEventFilter(QObject):
         # Main 2D middle-pan is owned at the Qt boundary. This prevents the
         # same physical drag from reaching both the digitizer's manual camera
         # path and VTK's interactor style.
+        # QEvent.MouseButtonDblClick is included and treated as an ordinary
+        # press below. Confirmed with a captured real session: a genuine
+        # fast tap-tap's second click sometimes arrives as
+        # MouseButtonDblClick, not a second MouseButtonPress, because it
+        # falls inside Qt/Windows' own double-click time+distance window.
+        # Before this, that DblClick fell straight through unhandled, and
+        # its paired MouseButtonRelease then got misrouted through the
+        # plain hold-drag release path (since _tap_session was never ended
+        # by a real press) - which clears _owned_main_pan_button and
+        # _qt_main_pan_active but NOT _tap_session, leaving it stuck True.
+        # Every following MouseMove then bails out at "not active" and the
+        # camera stops following the cursor entirely - frozen - until the
+        # next physical click happens to finish the session via the
+        # "new press while _tap_session is True" branch below.
         if event_type in (
             QEvent.MouseButtonPress,
+            QEvent.MouseButtonDblClick,
             QEvent.MouseMove,
             QEvent.MouseButtonRelease,
         ):
@@ -326,7 +343,7 @@ class MainWheelZoomEventFilter(QObject):
             active = bool(getattr(app, "_qt_main_pan_active", False))
             tap_mode = self._tap_mode(app)
             try:
-                if event_type == QEvent.MouseButtonPress:
+                if event_type in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
                     pressed_button = event.button()
                     # A new press supersedes a pending release-swallow (the OS
                     # normally delivers the matching release first, so this
@@ -358,7 +375,17 @@ class MainWheelZoomEventFilter(QObject):
                                 self._finish_tap_session(app)
                             return False
                         if self._tap_session:
-                            # Second tap/click ends the MicroStation-style pan.
+                            # Second tap immediately ends the MicroStation-
+                            # style pan. No distance/timing check: real
+                            # MicroStation flips its toggle-pan state on
+                            # every button-down, unconditionally (confirmed
+                            # against Bentley's own docs) - trying to infer
+                            # "was that really a deliberate second tap" from
+                            # movement or timing was the source of every
+                            # tap-tap bug this session chased (DblClick
+                            # coalescing, the zombie freeze, arm-then-end
+                            # racing on fast clicks). A plain press-toggle
+                            # has none of those failure modes.
                             self._finish_tap_session(app)
                             self._tap_swallow_release_button = pressed_button
                             handled = True
@@ -374,25 +401,14 @@ class MainWheelZoomEventFilter(QObject):
                             if handled:
                                 self._owns_main_pan = True
                                 self._owned_main_pan_button = pan_button
-                                # Tap-vs-drag detection is a Left-button-only
-                                # feature (it exists to let the configured
-                                # primary pan button skip holding it down).
-                                # Physical middle-click pan must always stay
-                                # plain hold-drag, per _eligible_pan_button's
-                                # own contract above ("Physical middle is
-                                # always pan, irrespective of which
-                                # configurable primary pan button is
-                                # selected") -- without this button check, a
-                                # quick middle-click tap (little movement
-                                # before release) would have been
-                                # misclassified as a tap and started a
-                                # dynamic pan session bound to the middle
-                                # button instead of ending normally.
+                                # Tap-Tap arms the dynamic-pan session right
+                                # here, on this press - not after measuring
+                                # movement at release. Physical middle-click
+                                # pan and "Left Click Pan" mode both stay
+                                # plain hold-drag: only the Left button under
+                                # the Tap-Tap setting ever becomes a toggle.
                                 if tap_mode and pan_button == Qt.LeftButton:
-                                    self._tap_press_pos = (
-                                        event.position().x(),
-                                        event.position().y(),
-                                    )
+                                    self._tap_session = True
                 elif event_type == QEvent.MouseMove:
                     if not active:
                         # A right-click grid load can block Qt long enough for
@@ -415,7 +431,13 @@ class MainWheelZoomEventFilter(QObject):
                     if self._tap_session:
                         # MicroStation dynamic pan: no button needs to stay
                         # held - the view keeps following the cursor until the
-                        # second tap / Esc / right-click / key ends the session.
+                        # second tap / Esc / right-click / key ends the
+                        # session. Tap-Tap arms this at press time (see the
+                        # press-handling branch above), so it is already
+                        # True for every move that follows - including any
+                        # movement while the arming button is still
+                        # physically held, which is correct: Tap-Tap has no
+                        # separate hold-drag phase to bleed in from.
                         pan_button_down = True
                     else:
                         pan_button_down = bool(event.buttons() & pan_button)
@@ -437,6 +459,18 @@ class MainWheelZoomEventFilter(QObject):
                             handled = True
                         else:
                             return False
+                    elif tap_mode and self._tap_session:
+                        # Tap-Tap already flipped its state on the matching
+                        # press (arming or re-confirming the open session) -
+                        # there is nothing left to decide at release, so
+                        # just consume it without touching ownership/session
+                        # state. Clearing them here (as the plain hold-drag
+                        # path below does) would tear the still-open session
+                        # down mid-pan.
+                        if event.button() == self._owned_main_pan_button:
+                            handled = True
+                        else:
+                            return False
                     else:
                         pan_button = self._owned_main_pan_button
                         if pan_button is None:
@@ -445,62 +479,15 @@ class MainWheelZoomEventFilter(QObject):
                             active or self._owns_main_pan
                         ):
                             return False
-                        started_tap_session = False
                         if active:
-                            if (
-                                tap_mode
-                                and not self._tap_session
-                                and self._tap_press_pos is not None
-                            ):
-                                # Decide tap vs hold-drag on release: a release
-                                # with (almost) no movement means the user
-                                # tapped once -> stay in a dynamic pan session.
-                                # A real physical mouse click routinely jitters
-                                # more than 4px between press and release, so
-                                # that radius misclassified many genuine taps
-                                # as a hold-drag -- falling through to the
-                                # ordinary press-drag-release pan below, which
-                                # looks and feels identical to left-click-pan.
-                                # 10px matches typical OS click-vs-drag
-                                # tolerance and still sits far below any
-                                # deliberate drag gesture (tens/hundreds of
-                                # pixels), so genuine drags are unaffected.
-                                pos = (event.position().x(), event.position().y())
-                                dx = pos[0] - self._tap_press_pos[0]
-                                dy = pos[1] - self._tap_press_pos[1]
-                                if (dx * dx + dy * dy) <= 100.0:  # ~10 px radius
-                                    self._tap_session = True
-                                    started_tap_session = True
-                                    handled = True  # swallow the release
-                                else:
-                                    handler = getattr(
-                                        app, "_handle_fast_main_pan_release", None
-                                    )
-                                    handled = bool(handler()) if callable(handler) else False
-                            else:
-                                handler = getattr(
-                                    app, "_handle_fast_main_pan_release", None
-                                )
-                                handled = bool(handler()) if callable(handler) else False
+                            handler = getattr(
+                                app, "_handle_fast_main_pan_release", None
+                            )
+                            handled = bool(handler()) if callable(handler) else False
                         else:
                             handled = True
-                        # A tap session that just started must keep "owning"
-                        # the pan button so the next MouseMove (see the
-                        # `active` branch above, which reads
-                        # _owned_main_pan_button to decide whether to call
-                        # _handle_fast_main_pan_move) still runs -- clearing
-                        # it here unconditionally (as before) made the view
-                        # never follow the cursor after the first tap, since
-                        # every move event bailed out at "pan_button is
-                        # None" before ever reaching the move handler.
-                        # Middle-click pan and "left" mode never set
-                        # started_tap_session (tap_mode is only true for the
-                        # "tap" panning-button setting), so both keep
-                        # resetting exactly as before.
-                        if not started_tap_session:
-                            self._owns_main_pan = False
-                            self._owned_main_pan_button = None
-                        self._tap_press_pos = None
+                        self._owns_main_pan = False
+                        self._owned_main_pan_button = None
             except Exception:
                 handled = False
 
@@ -565,6 +552,21 @@ class MainWheelZoomEventFilter(QObject):
         handler = getattr(app, "_handle_fast_main_wheel", None)
         if not callable(handler) or not handler(delta, display_position=display_position):
             return False
+
+        # Display Mode is deliberately never "always on top" (a click on the
+        # main window should naturally bring it forward), but scrolling here
+        # can also activate the main window and silently bury Display Mode
+        # behind it. Re-raise only, never activateWindow(): this keeps
+        # Display Mode visually on top without stealing focus back from the
+        # view being scrolled, and a later click on the main window still
+        # brings it forward exactly as before - the existing click-to-front
+        # design is unchanged.
+        try:
+            dlg = getattr(app, "display_mode_dialog", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+        except Exception:
+            pass
 
         try:
             event.accept()
@@ -902,6 +904,27 @@ class _VTKCrosshair:
 #  (after the _VTKCrosshair class, around line 178)
 # ═══════════════════════════════════════════════════════════════════════
 
+class _CRSStatusClickFilter(QObject):
+    """Make the footer CRS badge a discoverable project-CRS control."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            try:
+                if event.button() == Qt.LeftButton:
+                    opener = getattr(self.app, "open_project_crs_dialog", None)
+                    if callable(opener):
+                        opener()
+                        event.accept()
+                        return True
+            except Exception:
+                pass
+        return False
+
+
 class _BackupWorker(QThread):
     """
     Writes LAZ backup in a background thread.
@@ -913,7 +936,8 @@ class _BackupWorker(QThread):
 
     def __init__(self, snapshot, path, las_version, point_format,
                  crs_wkt=None, crs_epsg=None, drawing_data=b"",
-                 source_path=None, import_options=None):
+                 source_path=None, import_options=None,
+                 runtime_crs_wkt=None, output_crs_wkt=None):
         super().__init__()
         self.setObjectName("NakshaBackupWorker")
         self._snapshot = snapshot
@@ -925,6 +949,8 @@ class _BackupWorker(QThread):
         self._drawing_data = drawing_data
         self._source_path = source_path
         self._import_options = import_options
+        self._runtime_crs_wkt = runtime_crs_wkt
+        self._output_crs_wkt = output_crs_wkt or crs_wkt
 
     def run(self):
         try:
@@ -936,6 +962,30 @@ class _BackupWorker(QThread):
             )
 
             xyz = self._snapshot["xyz"]
+            # Runtime points may live in the Naksha project CRS even when the
+            # native LAS/LAZ source uses another CRS. Reverse-transform in this
+            # background thread so the UI stays responsive and backups remain
+            # faithful to the source coordinate system.
+            if self._runtime_crs_wkt and self._output_crs_wkt:
+                try:
+                    from gui.projection_engine import parse_crs, transform_points
+                    _src = parse_crs(self._runtime_crs_wkt)
+                    _dst = parse_crs(self._output_crs_wkt)
+                    if _src is not None and _dst is not None and not _src.equals(_dst):
+                        xyz, _ = transform_points(
+                            xyz, _src, _dst, copy=True, chunk_size=1_000_000
+                        )
+                except Exception as _proj_exc:
+                    # Never label project coordinates as native-source CRS when
+                    # reverse transformation fails. Fall back to runtime CRS.
+                    print(f"Backup CRS round-trip warning: {_proj_exc}")
+                    self._output_crs_wkt = self._runtime_crs_wkt
+                    self._crs_wkt = self._runtime_crs_wkt
+                    try:
+                        from pyproj import CRS as _CRS
+                        self._crs_epsg = _CRS.from_wkt(self._runtime_crs_wkt).to_epsg()
+                    except Exception:
+                        self._crs_epsg = None
             n = xyz.shape[0]
             classes_u8 = self._snapshot["classes"]
             rgb16 = self._snapshot["rgb"]
@@ -1150,6 +1200,10 @@ class NakshaApp(QMainWindow):
         self.view_palettes = {}     # per-view palette isolation
 
         self.is_3d_mode = False
+        # Persistent authority for perspective/orbit mode. This is set only
+        # by an explicit 3D UI action or Shift+P; loaders and render refreshes
+        # must never infer permission from stale camera/current_view state.
+        self._main_view_3d_user_enabled = False
         self.cut_section_controller = CutSectionController(self)
         self._suppress_main_view_updates = False  #-----------------------------------------------code added by bala--------
         
@@ -1162,6 +1216,14 @@ class NakshaApp(QMainWindow):
         self.project_crs_epsg = None
         self.project_crs_wkt = None
         self.crs = None
+        # Unified spatial-reference / coordinate-operation core.  The object is
+        # lightweight; PROJ's database is queried lazily by the CRS selector.
+        try:
+            from gui.projection_engine import get_projection_engine
+            self.projection_engine = get_projection_engine(self)
+        except Exception as _proj_exc:
+            self.projection_engine = None
+            print(f"Projection engine init warning: {_proj_exc}")
         self.active_classify_tool = None
         self.from_classes = None
         self.to_class = None
@@ -1314,6 +1376,7 @@ class NakshaApp(QMainWindow):
         self.vtk_widget.renderer.ResetCamera()
         self.vtk_widget.render()
         self._main_view_2d_locked = True
+        self._install_main_view_2d_policy_guard()
         # self.vtk_widget.interactor.AddObserver("RightButtonPressEvent", self.on_grid_label_right_click)
         print("✅ Grid label detection enabled (right-click)")
         
@@ -1593,6 +1656,12 @@ class NakshaApp(QMainWindow):
         # Globe Icon and EPSG projection label (far right side, QGIS style)
         self.epsg_widget = QWidget(self.status)
         self.epsg_widget.setObjectName("epsgWidget")
+        self.epsg_widget.setCursor(Qt.PointingHandCursor)
+        self.epsg_widget.setToolTip(
+            "Project Coordinate Reference System. Click to browse/search the installed CRS catalog."
+        )
+        self._crs_status_click_filter = _CRSStatusClickFilter(self)
+        self.epsg_widget.installEventFilter(self._crs_status_click_filter)
         
         epsg_layout = QHBoxLayout(self.epsg_widget)
         epsg_layout.setContentsMargins(0, 0, 0, 0)
@@ -1687,13 +1756,12 @@ class NakshaApp(QMainWindow):
         # Managed by the Overlay Control Center dock (Global-Mapper style).
         self.gis_layers = []                 # registry of imported overlay layers
         self._gis_layers_dock = None         # lazily created QDockWidget
-        self.shortcut_gis_layers = QShortcut(QKeySequence("Alt+C"), self)
-        self.shortcut_gis_layers.activated.connect(self.toggle_gis_layers_panel)
-        print("🗺️ Press Alt+C to open the Overlay Control Center")
+        self.active_gis_edit_layer = None    # selected writable vector target
+        self.active_gis_edit_subtype = None
 
-        self.shortcut_gdb = QShortcut(QKeySequence("Alt+G"), self)
-        self.shortcut_gdb.activated.connect(self.toggle_gdb_panel)
-        print("🗄️ Press Alt+G to open the GDB import panel")
+        self.shortcut_project_crs = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        self.shortcut_project_crs.activated.connect(self.open_project_crs_dialog)
+        print("🌐 Press Ctrl+Shift+P to select/view the Project CRS")
 
         # Allow GIS files to be dropped straight onto the window (Global-Mapper style).
         self.setAcceptDrops(True)
@@ -1824,31 +1892,71 @@ class NakshaApp(QMainWindow):
         Opens the SNT dialog, adds the files, and auto-attaches them.
         """
         from pathlib import Path
-        from PySide6.QtWidgets import QMessageBox
 
         valid_paths = []
+        request_keys = set()
+        pending_keys = getattr(self, "_pending_snt_auto_attach_keys", None)
+        if pending_keys is None:
+            pending_keys = set()
+            self._pending_snt_auto_attach_keys = pending_keys
+
+        attached_keys = set()
+        for attachment in getattr(self, "snt_attachments", []) or []:
+            if not isinstance(attachment, dict):
+                continue
+            raw_path = attachment.get("full_path") or attachment.get("filename")
+            if not raw_path:
+                continue
+            try:
+                attached_keys.add(str(Path(raw_path).resolve()).lower())
+            except Exception:
+                attached_keys.add(str(raw_path).lower())
+
         for p in file_paths:
             try:
                 pp = Path(p)
-                if pp.is_file() and pp.suffix.lower() == ".snt":
-                    valid_paths.append(str(pp))
+                if not pp.is_file() or pp.suffix.lower() != ".snt":
+                    continue
+                key = str(pp.resolve()).lower()
+                # Converter completion, shell-open and Qt's nested modal event
+                # loop can enqueue the same path more than once. Reserve each
+                # path before the deferred loader is scheduled so only one
+                # request can ever reach the confirmation/render pipeline.
+                if key in request_keys or key in pending_keys or key in attached_keys:
+                    continue
+                request_keys.add(key)
+                valid_paths.append(str(pp))
             except Exception:
                 continue
 
         if not valid_paths:
             return
 
+        pending_keys.update(request_keys)
+
         from gui.snt_attachment import show_snt_attachment_dialog
         dlg = show_snt_attachment_dialog(self)
 
-        QTimer.singleShot(300, lambda paths=valid_paths, d=dlg: self._shell_load_snt_files(paths, d))
+        QTimer.singleShot(
+            300,
+            lambda paths=valid_paths, keys=request_keys, d=dlg:
+                self._shell_load_snt_files(paths, d, keys),
+        )
 
-    def _shell_load_snt_files(self, file_paths: list, dlg):
+    def _shell_load_snt_files(self, file_paths: list, dlg, request_keys=None):
         """Load SNT files into dialog and auto-attach."""
         from pathlib import Path
         from gui.snt_attachment import SNTFileItem, SNTLoadWorker
 
+        reserved_keys = set(request_keys or ())
+
+        def release_reservations():
+            pending = getattr(self, "_pending_snt_auto_attach_keys", None)
+            if pending is not None:
+                pending.difference_update(reserved_keys)
+
         if dlg is None or not hasattr(dlg, 'file_list_layout'):
+            release_reservations()
             return
 
         if dlg._load_worker is not None and dlg._load_worker.isRunning():
@@ -1872,7 +1980,10 @@ class NakshaApp(QMainWindow):
                 new_paths.append(p)
 
         if not new_paths:
-            dlg._attach_all()
+            try:
+                dlg._attach_all()
+            finally:
+                release_reservations()
             return
 
         from PySide6.QtWidgets import QProgressDialog
@@ -1934,6 +2045,8 @@ class NakshaApp(QMainWindow):
                 dlg._attach_all()
             except RuntimeError:
                 pass
+            finally:
+                release_reservations()
 
         def on_error(msg):
             try:
@@ -1943,10 +2056,12 @@ class NakshaApp(QMainWindow):
                 QMessageBox.critical(dlg, "Load Failed", msg)
             except RuntimeError:
                 pass
+            finally:
+                release_reservations()
 
         worker.progress.connect(on_progress)
         worker.file_loaded.connect(on_file_loaded)
-        worker.finished.connect(on_finished)
+        worker.load_succeeded.connect(on_finished)
         worker.error.connect(on_error)
         worker.start()
 
@@ -2720,6 +2835,74 @@ class NakshaApp(QMainWindow):
             except Exception:
                 pass
 
+    def open_project_crs_dialog(self):
+        """Open the unified project/world CRS selector.
+
+        The project CRS may be selected freely before data are loaded.  Once
+        geometry is active, changing it is deliberately blocked here because a
+        true project reprojection must update *every* subsystem (LiDAR, SNT,
+        CAD, raster and GIS) atomically.  Individual source layers are already
+        transformed into the established project CRS on load.
+        """
+        try:
+            from gui.crs_manager import get_canvas_crs, set_canvas_crs
+            from gui.crs_selector_dialog import choose_crs
+            from gui.projection_engine import crs_identifier
+
+            current = get_canvas_crs(self)
+            chosen = choose_crs(self, current_crs=current, title="Project Coordinate Reference System")
+            if chosen is None:
+                return False
+            if current is not None:
+                try:
+                    if current.equals(chosen):
+                        self.update_epsg_display()
+                        return True
+                except Exception:
+                    pass
+
+            # Changing the display/project CRS after data are active can only be
+            # safe when every loaded source is transformed in one transaction.
+            # For now, sources are reprojected ON LOAD into the established CRS,
+            # so prevent accidental coordinate relabelling of an active scene.
+            has_data = bool(
+                (isinstance(getattr(self, "data", None), dict) and getattr(self, "data", {}).get("xyz") is not None)
+                or getattr(self, "snt_attachments", None)
+                or getattr(self, "dxf_attachments", None)
+                or getattr(self, "dwg_attachments", None)
+                or getattr(self, "gis_layers", None)
+                or (getattr(getattr(self, "digitizer", None), "drawings", None))
+            )
+            if current is not None and has_data:
+                QMessageBox.information(
+                    self,
+                    "Project CRS",
+                    "The project already contains geospatial data.\n\n"
+                    f"Current: {crs_identifier(current)} - {current.name}\n"
+                    f"Selected: {crs_identifier(chosen)} - {chosen.name}\n\n"
+                    "Naksha will not merely relabel active coordinates, because that would move/misalign "
+                    "LiDAR, SNT, GIS and CAD data. Clear the project and select the desired Project CRS "
+                    "first, then load your sources; each source will be transformed into it automatically."
+                )
+                return False
+
+            set_canvas_crs(
+                self, chosen,
+                source="User-selected project CRS",
+                dataset=None, force=True,
+            )
+            self.update_epsg_display()
+            try:
+                self.statusBar().showMessage(
+                    f"Project CRS: {crs_identifier(chosen)} - {chosen.name}", 5000
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Project CRS", f"Could not open/set project CRS:\n{exc}")
+            return False
+
     def update_epsg_display(self):
         if not hasattr(self, "epsg_label"):
             return
@@ -2729,12 +2912,24 @@ class NakshaApp(QMainWindow):
         # that created a false impression that the project/canvas CRS was known
         # (and silently misreported it for mixed-CRS projects).
         epsg = None
+        _prefix = "EPSG:"
+        _tooltip = "Project Coordinate Reference System. Click to select/view."
         try:
-            from gui.crs_manager import get_canvas_crs, extract_epsg_code
+            from gui.crs_manager import get_canvas_crs
+            from gui.projection_engine import crs_authority
             canvas = get_canvas_crs(self)
             if canvas is not None:
-                code = extract_epsg_code(canvas)
-                epsg = str(code) if code else (getattr(canvas, "name", None) or "custom")
+                auth, code = crs_authority(canvas)
+                if auth and code:
+                    _prefix = f"{auth}:"
+                    epsg = str(code)
+                else:
+                    _prefix = "CRS:"
+                    epsg = getattr(canvas, "name", None) or "Custom"
+                _tooltip = (
+                    f"Project CRS: {auth + ':' + code if auth and code else 'Custom'}\n"
+                    f"{getattr(canvas, 'name', '')}\n\nClick to browse/search coordinate systems."
+                )
         except Exception:
             epsg = None
 
@@ -2745,10 +2940,14 @@ class NakshaApp(QMainWindow):
 
         if epsg:
             self.epsg_label.setText(epsg)
+            self.epsg_label.setToolTip(_tooltip)
+            if hasattr(self, "epsg_widget"):
+                self.epsg_widget.setToolTip(_tooltip)
             self.epsg_label.show()
             if hasattr(self, "epsg_icon_label") and self.epsg_icon_label:
                 self.epsg_icon_label.show()
             if hasattr(self, "epsg_prefix_label") and self.epsg_prefix_label:
+                self.epsg_prefix_label.setText(_prefix)
                 self.epsg_prefix_label.show()
         else:
             self.epsg_label.setText("-")
@@ -2882,7 +3081,7 @@ class NakshaApp(QMainWindow):
         self._btn_layers.blockSignals(was_blocked)
 
         state_text = "Hide" if panel_visible else "Show"
-        self._btn_layers.setToolTip(f"{state_text} Overlay Control Center (Alt+C)")
+        self._btn_layers.setToolTip(f"{state_text} Overlay Control Center")
         self._btn_layers.setStatusTip(f"{state_text} Overlay Control Center")
         self._refresh_activity_bar_theme()
 
@@ -2901,7 +3100,7 @@ class NakshaApp(QMainWindow):
         import_action = menu.addAction("Import Overlay...")
         zoom_action = menu.addAction("Zoom To GIS Layers")
         zoom_action.setEnabled(has_layers)
-        gdb_action = menu.addAction("Open GDB Import Panel")
+        gdb_action = menu.addAction("Open GIS Catalog")
         menu.addSeparator()
         refresh_action = menu.addAction("Refresh Activity Bar")
 
@@ -3293,7 +3492,7 @@ class NakshaApp(QMainWindow):
         self._btn_layers.setObjectName("ActivityBtn")
         self._btn_layers.setFixedSize(24, 24)
         self._btn_layers.setIconSize(QSize(16, 16))
-        self._btn_layers.setToolTip("Toggle Overlay Control Center (Alt+C)")
+        self._btn_layers.setToolTip("Toggle Overlay Control Center")
         self._btn_layers.setCursor(Qt.PointingHandCursor)
         self._btn_layers.setCheckable(True)
         self._btn_layers.clicked.connect(self.toggle_gis_layers_panel)
@@ -3367,12 +3566,15 @@ class NakshaApp(QMainWindow):
             cam.SetPosition(*state["pos"])
             cam.SetFocalPoint(*state["fp"])
             cam.SetViewUp(*state["up"])
-            if state.get("pp", 1):
+            allow_3d = bool(getattr(self, "_main_view_3d_user_enabled", False))
+            if state.get("pp", 1) or not allow_3d:
                 cam.ParallelProjectionOn()
                 cam.SetParallelScale(state.get("ps", cam.GetParallelScale()))
             else:
                 cam.ParallelProjectionOff()
                 cam.SetViewAngle(state.get("va", cam.GetViewAngle()))
+            if not allow_3d:
+                self._normalize_main_view_2d_camera(cam)
             renderer.ResetCameraClippingRange()
             self.vtk_widget.render()
         except Exception:
@@ -3709,7 +3911,10 @@ class NakshaApp(QMainWindow):
                 pass
 
             # pp = 0 means perspective projection, so this is a 3D view state.
-            target_is_3d = int(state.get("pp", 1)) == 0
+            target_is_3d = (
+                int(state.get("pp", 1)) == 0
+                and bool(getattr(self, "_main_view_3d_user_enabled", False))
+            )
 
             self._restore_main_camera(state)
 
@@ -3735,6 +3940,7 @@ class NakshaApp(QMainWindow):
             # 2D restore path
             from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
 
+            self._main_view_3d_user_enabled = False
             interactor.SetInteractorStyle(vtkInteractorStyleImage())
             camera.ParallelProjectionOn()
 
@@ -4560,13 +4766,51 @@ class NakshaApp(QMainWindow):
        
         # Set active view in controller
         self.section_controller.active_view = selected_index
-        print(f"✅ Cross-section mode enabled - Target: View {selected_index + 1}")
-       
-        # Attach main interactor
+        print(
+            f"✅ Cross-section mode enabled - "
+            f"Target: View {selected_index + 1}"
+        )
+
+        # Attach main CrossSectionInteractor.
+        # This sets self.cross_section_active = True.
         self._attach_cross_section_interactor()
+
+        # Restore Cut View point-locate observers which CutFromCut may
+        # have removed.
+        try:
+            cut_ctrl = getattr(
+                self,
+                "cut_section_controller",
+                None,
+            )
+
+            if (
+                cut_ctrl is not None
+                and getattr(cut_ctrl, "cut_vtk", None) is not None
+                and hasattr(
+                    cut_ctrl,
+                    "restore_cut_locate_observers_for_cross_section",
+                )
+            ):
+                restored = (
+                    cut_ctrl.restore_cut_locate_observers_for_cross_section()
+                )
+
+                if restored:
+                    print(
+                        "✅ CrossSectionRect locate restored on Cut View"
+                    )
+
+        except Exception as e:
+            print(
+                f"⚠️ Cut View locate restoration skipped: {e}"
+            )
+
         self.set_cross_cursor_active(True, "cross_section")
+
         self.statusBar().showMessage(
-            f"✅ Ready: Draw line → View {selected_index + 1} (change dropdown to switch)",
+            f"✅ Ready: Draw line → View {selected_index + 1} "
+            "(change dropdown to switch)",
             5000
         )
 
@@ -6000,8 +6244,27 @@ class NakshaApp(QMainWindow):
  
         # ✅ STEP 2: Do the view mode switch
         if mode == "3d":
+            if not (
+                getattr(self, "_main_view_3d_user_enabled", False)
+                or getattr(self, "_allow_3d_switch", False)
+            ):
+                print("Blocked automatic 3D mode switch")
+                self.ensure_main_view_2d_interaction(
+                    preserve_camera=True,
+                    reason="blocked_toggle_view_mode_3d",
+                )
+                return False
+            try:
+                short_filter = getattr(self, "short_cut_filter", None)
+                if short_filter and hasattr(short_filter, "_clear_main_camera_lock_observer"):
+                    short_filter._clear_main_camera_lock_observer(
+                        self.vtk_widget.renderer.GetActiveCamera()
+                    )
+            except Exception:
+                pass
             self.is_3d_mode = True
             self._main_view_2d_locked = False
+            self.current_view = "3d"
             print("🌀 Switching to 3D view (tools disabled)")
  
             self.vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
@@ -6016,8 +6279,13 @@ class NakshaApp(QMainWindow):
             self.statusBar().showMessage("3D Mode: tools disabled", 4000)
  
         elif mode == "2d":
+            self._main_view_3d_user_enabled = False
             self.is_3d_mode = False
             self._main_view_2d_locked = True
+            # Clear stale logical 3D state as well as the VTK style. Without
+            # this, update_pointcloud() can later call set_view("3d").
+            if not preserve_camera or getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
             view_label = "2D orthographic view" if preserve_camera else "2D Plan View"
             print(f"📐 Switching to {view_label} (tools enabled)")
  
@@ -6485,7 +6753,19 @@ class NakshaApp(QMainWindow):
         #   Main thread is now FREE — the event loop keeps running.
         from gui.file_loader_worker import FileLoaderWorker
 
-        worker = FileLoaderWorker(filenames, batch_import_options, parent=None)
+        _target_project_crs_wkt = None
+        try:
+            from gui.crs_manager import get_canvas_crs
+            _existing_project_crs = get_canvas_crs(self)
+            if _existing_project_crs is not None:
+                _target_project_crs_wkt = _existing_project_crs.to_wkt()
+        except Exception:
+            _target_project_crs_wkt = None
+
+        worker = FileLoaderWorker(
+            filenames, batch_import_options, parent=None,
+            target_project_crs_wkt=_target_project_crs_wkt,
+        )
         self._file_loader_worker = worker
         self._batch_import_options_last = batch_import_options  # read by _on_load_finished
 
@@ -6566,6 +6846,15 @@ class NakshaApp(QMainWindow):
         self.data = {"xyz": result["xyz"], "classification": result["classification"]}
         if "rgb"       in result: self.data["rgb"]       = result["rgb"]
         if "intensity" in result: self.data["intensity"] = result["intensity"]
+        # Source coordinates are preserved logically through this metadata even
+        # when runtime XYZ was reprojected into the Naksha project CRS by the
+        # background loader. Save/export uses this to transform back safely.
+        self.data["_source_crs_wkt"] = result.get("source_crs_wkt") or result.get("crs_wkt")
+        self.data["_runtime_crs_wkt"] = result.get("runtime_crs_wkt")
+        self.data["_runtime_reprojected"] = bool(result.get("runtime_reprojected"))
+        self.data["_source_crs_consistent"] = bool(result.get("source_crs_consistent", True))
+        self.data["_projection_report"] = result.get("projection_report")
+        self.data["_layer_crs_info"] = list(result.get("layer_info_list") or [])
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
         # Track whether this load was class-filtered so auto-save skips the file.
@@ -6586,60 +6875,76 @@ class NakshaApp(QMainWindow):
         rgb_mb = result.get("rgb",       np.array([])).nbytes / (1024**2)
         print(f"   Memory used: {xyz_mb + cls_mb + rgb_mb:.1f} MB")
 
-        # ── CRS ────────────────────────────────────────────────────────
+        # ── CRS / unified project coordinates ──────────────────────────
         try:
             from pyproj import CRS as _CRS
             from gui.crs_manager import (
-                set_canvas_crs,
-                ensure_canvas_crs,
-                clear_canvas_crs,
-                resolve_point_cloud_crs,
+                set_canvas_crs, ensure_canvas_crs, clear_canvas_crs,
+                get_canvas_crs, resolve_point_cloud_crs,
             )
             source_crs = None
+            runtime_crs = None
             source_label = "LAZ/LAS header"
 
-            if result.get("crs_wkt"):
+            if result.get("source_crs_wkt"):
+                try:
+                    source_crs = _CRS.from_wkt(result["source_crs_wkt"])
+                    source_label = "LAZ/LAS source CRS"
+                except Exception:
+                    source_crs = None
+            if source_crs is None and result.get("crs_wkt"):
                 try:
                     source_crs = _CRS.from_wkt(result["crs_wkt"])
                     source_label = "LAZ/LAS header WKT"
                 except Exception:
                     source_crs = None
-
             if source_crs is None and result.get("crs_epsg"):
                 try:
                     source_crs = _CRS.from_epsg(int(result["crs_epsg"]))
                     source_label = "LAZ/LAS header EPSG"
                 except Exception:
                     source_crs = None
-
             if source_crs is None and first_file:
                 try:
                     source_crs, source_label = resolve_point_cloud_crs(first_file)
                 except Exception:
                     source_crs = None
 
-            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
-            if source_crs is not None:
-                if not has_snt:
+            if result.get("runtime_crs_wkt"):
+                try:
+                    runtime_crs = _CRS.from_wkt(result["runtime_crs_wkt"])
+                except Exception:
+                    runtime_crs = None
+            if runtime_crs is None:
+                runtime_crs = source_crs
+
+            existing = get_canvas_crs(self)
+            if runtime_crs is not None:
+                if existing is None:
                     set_canvas_crs(
-                        self,
-                        source_crs,
-                        source=source_label or "LAZ/LAS metadata",
-                        dataset=first_file,
-                        force=True,
+                        self, runtime_crs, source="LiDAR project/runtime CRS",
+                        dataset=first_file, force=True,
                     )
                 else:
                     ensure_canvas_crs(
-                        self,
-                        source_crs,
-                        source=source_label or "LAZ/LAS metadata",
+                        self, runtime_crs, source="LiDAR project/runtime CRS",
                         dataset=first_file,
                     )
-                print(f"   📐 CRS: {source_crs.name} ({source_label})")
+
+                if source_crs is not None:
+                    try:
+                        if source_crs.equals(runtime_crs):
+                            print(f"   📐 LiDAR CRS: {source_crs.name} ({source_label})")
+                        else:
+                            print(f"   🌐 LiDAR source CRS: {source_crs.name}")
+                            print(f"   🌐 Project CRS:      {runtime_crs.name}")
+                            print("   ✅ XYZ is stored in project coordinates for this session; source CRS is preserved for save/export")
+                    except Exception:
+                        pass
             else:
-                if not has_snt:
+                if existing is None:
                     clear_canvas_crs(self)
-                print("   ⚠️ CRS unresolved: basemap alignment remains disabled")
+                print("   ⚠️ CRS unresolved: coordinates are kept unchanged; no CRS is guessed")
         except Exception as _crs_err:
             print(f"   ⚠️ CRS registration failed: {_crs_err}")
 
@@ -6653,6 +6958,11 @@ class NakshaApp(QMainWindow):
                 "rgb"       : self.data.get("rgb"),
                 "intensity" : self.data.get("intensity"),
                 "crs_epsg"  : fi.get("crs_epsg"),
+                "source_crs_wkt": fi.get("source_crs_wkt"),
+                "runtime_crs_wkt": fi.get("runtime_crs_wkt"),
+                "runtime_reprojected": bool(fi.get("runtime_reprojected")),
+                "point_start": fi.get("point_start"),
+                "point_end": fi.get("point_end"),
                 "visible"   : True,
             }
             if hasattr(self, "layers"):
@@ -6695,7 +7005,7 @@ class NakshaApp(QMainWindow):
         _prog(92, "Restoring settings…")
         try:
             from gui.display_mode import restore_display_settings_for_file
-            restore_display_settings_for_file(self, first_file)
+            restore_display_settings_for_file(self, first_file, refresh=False)
         except Exception:
             pass
 
@@ -6993,11 +7303,49 @@ class NakshaApp(QMainWindow):
                 prompt_user=False,
             )
             if laz_data:
+                _src_crs = None
+                _dst_crs = None
+                try:
+                    from pyproj import CRS as _CRS
+                    from gui.crs_manager import get_canvas_crs, set_canvas_crs, resolve_point_cloud_crs
+                    from gui.projection_engine import transform_points, crs_identifier
+
+                    if laz_data.get("crs_wkt"):
+                        try:
+                            _src_crs = _CRS.from_wkt(laz_data["crs_wkt"])
+                        except Exception:
+                            _src_crs = None
+                    if _src_crs is None and laz_data.get("crs_epsg"):
+                        try:
+                            _src_crs = _CRS.from_epsg(int(laz_data["crs_epsg"]))
+                        except Exception:
+                            _src_crs = None
+                    if _src_crs is None:
+                        try:
+                            _src_crs, _ = resolve_point_cloud_crs(laz)
+                        except Exception:
+                            _src_crs = None
+
+                    _dst_crs = get_canvas_crs(self)
+                    if _dst_crs is None and _src_crs is not None:
+                        set_canvas_crs(self, _src_crs, source="TerraScan tile CRS", dataset=laz, force=True)
+                        _dst_crs = get_canvas_crs(self) or _src_crs
+                    if _src_crs is not None and _dst_crs is not None and not _src_crs.equals(_dst_crs):
+                        laz_data["xyz"], _rep = transform_points(
+                            laz_data["xyz"], _src_crs, _dst_crs,
+                            copy=False, chunk_size=1_000_000,
+                        )
+                        print(f"TerraScan tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
+                except Exception as _crs_exc:
+                    print(f"TerraScan tile CRS warning ({laz}): {_crs_exc}")
+
                 layer = {
                     "type": "laz_tile",
                     "filename": laz,
                     "xyz": laz_data["xyz"],
                     "crs_epsg": laz_data.get("crs_epsg"),
+                    "source_crs_wkt": _src_crs.to_wkt() if _src_crs is not None else laz_data.get("crs_wkt"),
+                    "runtime_crs_wkt": _dst_crs.to_wkt() if _dst_crs is not None else laz_data.get("crs_wkt"),
                     "visible": True,
                 }
                 self.layers.append(layer)
@@ -7020,14 +7368,15 @@ class NakshaApp(QMainWindow):
         self.last_save_path = filename
         self._refresh_footer_file_label()
        
-        # Set CRS
-        if self.project_crs_epsg and not hasattr(self, 'crs'):
-            try:
-                from pyproj import CRS
-                self.crs = CRS.from_epsg(self.project_crs_epsg)
-                print(f"✅ Project CRS set: {self.crs.name}")
-            except Exception as e:
-                print(f"⚠️ Could not create CRS object: {e}")
+        # Project CRS is established by the first trustworthy tile above.
+        try:
+            from gui.crs_manager import get_canvas_crs
+            _pc = get_canvas_crs(self)
+            if _pc is not None:
+                self.crs = _pc
+                print(f"Project CRS: {_pc.name}")
+        except Exception as e:
+            print(f"Could not report TerraScan project CRS: {e}")
        
         from .display_mode import restore_display_settings_for_file
         restore_display_settings_for_file(self, filename)
@@ -7084,7 +7433,88 @@ class NakshaApp(QMainWindow):
        
         update_progress(35, f"Processing {n_points:,} points...")
        
-        # Set main data
+        # Resolve native source CRS and bring coordinates into the ONE project CRS
+        # BEFORE spatial indexing / VTK.  This is the same policy used by GIS
+        # layers and SNT attachments: source coordinates stay documented, while
+        # runtime geometry lives in app.canvas_crs.
+        _source_crs = None
+        _source_crs_label = None
+        _runtime_crs = None
+        _projection_report = None
+        try:
+            from pyproj import CRS as _CRS
+            from gui.crs_manager import get_canvas_crs, set_canvas_crs, resolve_point_cloud_crs
+            from gui.projection_engine import transform_points, crs_identifier
+
+            if lidar_data.get("crs_wkt"):
+                try:
+                    _source_crs = _CRS.from_wkt(lidar_data["crs_wkt"])
+                    _source_crs_label = "LAZ/LAS header WKT"
+                except Exception:
+                    _source_crs = None
+            if _source_crs is None and lidar_data.get("crs_epsg"):
+                try:
+                    _source_crs = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
+                    _source_crs_label = "LAZ/LAS header EPSG"
+                except Exception:
+                    _source_crs = None
+            if _source_crs is None and filename:
+                try:
+                    _source_crs, _source_crs_label = resolve_point_cloud_crs(filename)
+                except Exception:
+                    _source_crs = None
+
+            _runtime_crs = get_canvas_crs(self)
+            if _runtime_crs is not None and _source_crs is None:
+                raise RuntimeError(
+                    "[CRS] This LiDAR file has no trustworthy coordinate reference system, "
+                    "while the Naksha project CRS is already established. Assign/repair the LiDAR CRS first; "
+                    "Naksha will not guess and mix raw coordinates into the project."
+                )
+            if _runtime_crs is None and _source_crs is not None:
+                set_canvas_crs(
+                    self, _source_crs,
+                    source=_source_crs_label or "LiDAR source CRS",
+                    dataset=filename, force=True,
+                )
+                _runtime_crs = get_canvas_crs(self) or _source_crs
+
+            if _source_crs is not None and _runtime_crs is not None and not _source_crs.equals(_runtime_crs):
+                update_progress(42, f"Reprojecting LiDAR to project CRS {crs_identifier(_runtime_crs)}...")
+                _xyz, _projection_report = transform_points(
+                    lidar_data["xyz"], _source_crs, _runtime_crs,
+                    copy=False, chunk_size=1_000_000,
+                )
+                lidar_data["xyz"] = _xyz
+                print(
+                    f"LiDAR reprojected for project display: "
+                    f"{crs_identifier(_source_crs)} -> {crs_identifier(_runtime_crs)}"
+                )
+
+            if _source_crs is not None:
+                lidar_data["_source_crs_wkt"] = _source_crs.to_wkt()
+                try:
+                    lidar_data["_source_crs_epsg"] = _source_crs.to_epsg()
+                except Exception:
+                    lidar_data["_source_crs_epsg"] = None
+            if _runtime_crs is not None:
+                lidar_data["_runtime_crs_wkt"] = _runtime_crs.to_wkt()
+            lidar_data["_runtime_reprojected"] = bool(
+                _source_crs is not None and _runtime_crs is not None and not _source_crs.equals(_runtime_crs)
+            )
+            lidar_data["_source_crs_consistent"] = True
+            if _projection_report is not None:
+                lidar_data["_projection_report"] = (
+                    _projection_report.to_dict() if hasattr(_projection_report, "to_dict") else str(_projection_report)
+                )
+        except Exception as _crs_exc:
+            print(f"Could not resolve/reproject LiDAR CRS: {_crs_exc}")
+            if str(_crs_exc).startswith("[CRS]"):
+                progress.finish_error(str(_crs_exc))
+                QMessageBox.warning(self, "LiDAR Coordinate System", str(_crs_exc))
+                return
+
+        # Set main data only after coordinates are in project space.
         self.data = lidar_data
         self.data_bounds = None  # invalidate stale SNT z-offset cache for new dataset
 
@@ -7105,62 +7535,19 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ Spatial index failed: {e}")
                 self.spatial_index = None
        
-        # Set CRS - route through the authoritative canvas CRS manager.
+        # Project CRS was already established above before spatial indexing.
+        # Never overwrite it here: first trustworthy source wins; later sources
+        # are transformed into that project/world coordinate system.
         try:
-            from pyproj import CRS as _CRS
-            from gui.crs_manager import (
-                set_canvas_crs,
-                ensure_canvas_crs,
-                clear_canvas_crs,
-                resolve_point_cloud_crs,
-            )
-            _crs_obj = None
-            _crs_source = "LAZ/LAS header"
-
-            if lidar_data.get("crs_wkt"):
-                try:
-                    _crs_obj = _CRS.from_wkt(lidar_data["crs_wkt"])
-                    _crs_source = "LAZ/LAS header WKT"
-                except Exception:
-                    _crs_obj = None
-
-            if _crs_obj is None and lidar_data.get("crs_epsg"):
-                try:
-                    _crs_obj = _CRS.from_epsg(int(lidar_data["crs_epsg"]))
-                    _crs_source = "LAZ/LAS header EPSG"
-                except Exception:
-                    _crs_obj = None
-
-            if _crs_obj is None and filename:
-                try:
-                    _crs_obj, _crs_source = resolve_point_cloud_crs(filename)
-                except Exception:
-                    _crs_obj = None
-
-            has_snt = bool(getattr(self, "snt_actors", None) or getattr(self, "snt_attachments", None))
-            if _crs_obj is not None:
-                if not has_snt:
-                    set_canvas_crs(
-                        self,
-                        _crs_obj,
-                        source=_crs_source or "LAZ/LAS metadata",
-                        dataset=filename,
-                        force=True,
-                    )
-                else:
-                    ensure_canvas_crs(
-                        self,
-                        _crs_obj,
-                        source=_crs_source or "LAZ/LAS metadata",
-                        dataset=filename,
-                    )
-                print(f"Project CRS: {_crs_obj.name} ({_crs_source})")
+            from gui.crs_manager import get_canvas_crs
+            from gui.projection_engine import crs_identifier
+            _canvas_now = get_canvas_crs(self)
+            if _canvas_now is not None:
+                print(f"Project CRS: {crs_identifier(_canvas_now)} - {_canvas_now.name}")
             else:
-                if not has_snt:
-                    clear_canvas_crs(self)
-                print("Could not create CRS object from lidar metadata: basemap alignment disabled")
+                print("Project CRS unresolved: source coordinates will be treated as local/unknown")
         except Exception as e:
-            print(f"Could not set canvas CRS: {e}")
+            print(f"Could not report project CRS: {e}")
        
         self.loaded_file = filename
         self.last_save_path = filename
@@ -7169,7 +7556,7 @@ class NakshaApp(QMainWindow):
         # Restore settings
         update_progress(55, "Checking for saved settings...")
         from .display_mode import restore_display_settings_for_file
-        restore_display_settings_for_file(self, filename)
+        restore_display_settings_for_file(self, filename, refresh=False)
         from gui.unified_actor_manager import reset_border_logic_to_structured
         reset_border_logic_to_structured(self)
        
@@ -12344,6 +12731,10 @@ class NakshaApp(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
     def _auto_backup(self):
         """Trigger a background auto-backup without blocking the UI."""
+        if getattr(self, "_dataset_load_in_progress", False):
+            print("Auto-backup deferred - dataset load is still in progress")
+            return
+
         # Guard: prevent overlapping backups
         if self._backup_worker_running:
             print("⏭️ Auto-backup skipped — previous still writing")
@@ -12410,8 +12801,17 @@ class NakshaApp(QMainWindow):
             from .save_pointcloud import _serialize_drawings
             drawing_data = _serialize_drawings(self)
 
-            crs_wkt = getattr(self, "project_crs_wkt", None)
-            crs_epsg = getattr(self, "project_crs_epsg", None)
+            runtime_crs_wkt = data.get("_runtime_crs_wkt") or getattr(self, "project_crs_wkt", None)
+            source_crs_wkt = data.get("_source_crs_wkt") if bool(data.get("_source_crs_consistent", True)) else None
+            output_crs_wkt = source_crs_wkt or runtime_crs_wkt
+            crs_wkt = output_crs_wkt
+            crs_epsg = None
+            if output_crs_wkt:
+                try:
+                    from pyproj import CRS as _CRS
+                    crs_epsg = _CRS.from_wkt(output_crs_wkt).to_epsg()
+                except Exception:
+                    crs_epsg = None
 
             snapshot = {
                 "xyz": xyz,
@@ -12435,6 +12835,8 @@ class NakshaApp(QMainWindow):
             drawing_data=drawing_data,
             source_path=getattr(self, "loaded_file", None),
             import_options=data.get("import_options"),
+            runtime_crs_wkt=runtime_crs_wkt,
+            output_crs_wkt=output_crs_wkt,
         )
         worker.finished_ok.connect(self._on_backup_finished)
         worker.failed.connect(self._on_backup_failed)
@@ -12599,7 +13001,7 @@ class NakshaApp(QMainWindow):
             # Keep defaults if load fails
 
     def toggle_gis_layers_panel(self):
-        """Show/hide the Overlay Control Center for imported GIS layers (Alt+C)."""
+        """Show/hide the Overlay Control Center for imported GIS layers."""
         try:
             from gui.gis.gis_layers import toggle_gis_layers_panel
             result = toggle_gis_layers_panel(self)
@@ -12612,7 +13014,7 @@ class NakshaApp(QMainWindow):
             return None
 
     def toggle_gdb_panel(self):
-        """Show/hide the GDB import panel for ESRI File Geodatabases."""
+        """Show/hide the universal GIS Catalog."""
         try:
             from gui.gis.gdb import toggle_gdb_panel
             return toggle_gdb_panel(self)
@@ -12625,7 +13027,12 @@ class NakshaApp(QMainWindow):
     # ── Drag-and-drop import of GIS overlays ────────────────────────────────
     # Supported extensions that we will accept on a drop. Anything else is
     # ignored so we don't interfere with other drop targets.
-    _GIS_DROP_EXTS = (".shp", ".tif", ".tiff", ".geojson", ".json", ".gdb")
+    _GIS_DROP_EXTS = (
+        ".shp", ".geojson", ".json", ".gpkg", ".gdb", ".kml", ".kmz",
+        ".gpx", ".gml", ".fgb", ".sqlite", ".db", ".csv",
+        ".tif", ".tiff", ".jp2", ".j2k", ".ecw", ".img", ".vrt",
+        ".png", ".jpg", ".jpeg", ".mbtiles",
+    )
 
     def _gis_paths_from_event(self, event):
         """Return the list of droppable GIS file paths from a drag/drop event."""
@@ -13084,18 +13491,6 @@ class NakshaApp(QMainWindow):
                 "The application has not closed. Please try again shortly.",
             )
             return
-
-        # Past this point the close is committed - stop the raster refinement
-        # loader before VTK teardown below, since its timer/executor could
-        # otherwise deliver a texture upload after the render window is
-        # finalized (_shutdown_in_progress also guards this loader directly).
-        try:
-            _raster_loader = getattr(self, "_raster_lod_loader", None)
-            if _raster_loader is not None:
-                _raster_loader.close()
-        except Exception as _e:
-            print(f"⚠️ Raster LOD loader shutdown failed: {_e}")
-
         active_classification_dialog = getattr(
             self,
             "_lidar_classification_active_dialog",
@@ -13754,6 +14149,10 @@ class NakshaApp(QMainWindow):
         """
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
         interactor = self.vtk_widget.interactor
+        self._main_view_3d_user_enabled = False
+        self.is_3d_mode = False
+        self._main_view_2d_locked = True
+        self.current_view = "top"
 
         # Force orthographic projection
         cam = self.vtk_widget.renderer.GetActiveCamera()
@@ -13772,6 +14171,10 @@ class NakshaApp(QMainWindow):
         """
         Restore normal 3D orbit controls (trackball).
         """
+        self._main_view_3d_user_enabled = True
+        self.is_3d_mode = True
+        self._main_view_2d_locked = False
+        self.current_view = "3d"
         from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
         interactor = self.vtk_widget.interactor
         style = vtkInteractorStyleTrackballCamera()
@@ -14067,7 +14470,11 @@ class NakshaApp(QMainWindow):
 
     def handle_view_change(self, mode):
         """Handle view mode changes from visual panel or sidebar"""
-        
+
+        # This signal comes from a direct ribbon/sidebar action. Grant 3D only
+        # for that action and revoke it for every orthographic view.
+        self._main_view_3d_user_enabled = mode == '3d'
+
         # ✅ NEW: Store DXF visibility state
         dxf_visibility = {}
         if hasattr(self, 'dxf_actors'):
@@ -14612,7 +15019,23 @@ class NakshaApp(QMainWindow):
                     dock.raise_()
                     dock.activateWindow()
                     dock.setFocus()
-                    
+
+                    # This method is called by Display Mode's own view
+                    # selector, so the click that triggered it happened
+                    # from inside that dialog - but activateWindow() above
+                    # steals OS-level window focus and puts this dock in
+                    # front of everything, silently burying Display Mode
+                    # behind it. Re-raise only (never activateWindow again):
+                    # the dock keeps the real focus/activation it just got
+                    # (you still see and can interact with it), Display
+                    # Mode just doesn't end up hidden underneath.
+                    try:
+                        dlg = getattr(self, "display_mode_dialog", None)
+                        if dlg is not None and dlg.isVisible():
+                            dlg.raise_()
+                    except Exception:
+                        pass
+
                     # Set as active view in section controller
                     if hasattr(self, 'section_controller'):
                         self.section_controller.active_view = section_index
@@ -16328,7 +16751,7 @@ class NakshaApp(QMainWindow):
                     from gui.display_mode import restore_display_settings_for_file
                     self._prefer_session_display_restore = True
                     try:
-                        restore_display_settings_for_file(self, str(las_file))
+                        restore_display_settings_for_file(self, str(las_file), refresh=False)
                     finally:
                         self._prefer_session_display_restore = False
                 except Exception:
@@ -16570,6 +16993,39 @@ class NakshaApp(QMainWindow):
             self.magnifier_combo.blockSignals(True)
             self.magnifier_combo.setCurrentText(f"{zoom_int}%")
             self.magnifier_combo.blockSignals(False)
+
+    def _refresh_main_view_clipping_after_navigation(self, renderer=None):
+        """Rebuild padded clip planes after a 2D pan/zoom camera mutation."""
+        try:
+            if renderer is None:
+                renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+            if camera is None:
+                return False
+
+            renderer.ResetCameraClippingRange()
+            near_value, far_value = map(float, camera.GetClippingRange())
+            if not (
+                np.isfinite(near_value)
+                and np.isfinite(far_value)
+                and far_value > near_value
+            ):
+                return False
+
+            span = max(far_value - near_value, 1.0e-6)
+            margin = max(span * 0.10, 1.0e-4)
+            padded_near = max(1.0e-6, near_value - margin)
+            padded_far = max(padded_near + 1.0e-6, far_value + margin)
+            camera.SetClippingRange(padded_near, padded_far)
+
+            try:
+                from gui.unified_actor_manager import refresh_widget_camera_uniforms
+                refresh_widget_camera_uniforms(self.vtk_widget)
+            except Exception:
+                pass
+            return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
 
     def _display_to_world_on_focal_plane(self, renderer, display_x, display_y):
         camera = renderer.GetActiveCamera()
@@ -16909,11 +17365,23 @@ class NakshaApp(QMainWindow):
             _restore_camera()
             return False
 
-        delta = (
+        delta = [
             world_before[0] - world_after[0],
             world_before[1] - world_after[1],
             world_before[2] - world_after[2],
-        )
+        ]
+        # DisplayToWorld can introduce a small component along the viewing
+        # axis, especially with large UTM coordinates and narrow planar SNT
+        # bounds. Repeated cursor zooms then walk the camera/focal plane out of
+        # the existing clip range. A 2D cursor zoom may pan only in its screen
+        # plane; it must never dolly along the view direction.
+        view_mode = getattr(self, "current_view", "top")
+        if view_mode == "front":
+            delta[1] = 0.0
+        elif view_mode == "side":
+            delta[0] = 0.0
+        else:
+            delta[2] = 0.0
         if not all(np.isfinite(value) for value in delta):
             _restore_camera()
             return False
@@ -16931,6 +17399,7 @@ class NakshaApp(QMainWindow):
         )
 
         if render:
+            self._refresh_main_view_clipping_after_navigation(renderer)
             vtk_widget.render()
         return True
 
@@ -17309,6 +17778,8 @@ class NakshaApp(QMainWindow):
             _restore_camera()
             return False
 
+        self._refresh_main_view_clipping_after_navigation(renderer)
+
         render_manager = getattr(self, "gpu_render_manager", None)
         if render_manager is not None:
             try:
@@ -17354,26 +17825,11 @@ class NakshaApp(QMainWindow):
 
     def _main_view_3d_unlocked(self) -> bool:
         """True only when user explicitly unlocked main view for 3D orbit."""
-        return not bool(getattr(self, "_main_view_2d_locked", True))
+        return bool(getattr(self, "_main_view_3d_user_enabled", False))
 
     def _should_enforce_main_2d_policy(self) -> bool:
         """Guard to keep main canvas in 2D unless explicitly unlocked."""
-        if getattr(self, "is_3d_mode", False):
-            return False
-        if self._main_view_3d_unlocked():
-            return False
-        if bool(getattr(self, "cross_section_active", False)):
-            return False
-        if getattr(self, "cross_interactor", None) is not None:
-            return False
-        cross_action = getattr(self, "cross_action", None)
-        if cross_action is not None and hasattr(cross_action, "isChecked"):
-            try:
-                if cross_action.isChecked():
-                    return False
-            except Exception:
-                pass
-        return True
+        return not self._main_view_3d_unlocked()
 
     def _on_main_left_press_2d_guard(self, obj, evt):
         """Repair accidental trackball style leaks before normal click handlers run."""
@@ -17556,6 +18012,7 @@ class NakshaApp(QMainWindow):
         if camera is None:
             return False
         camera.Zoom(factor)
+        self._refresh_main_view_clipping_after_navigation(renderer)
         vtk_widget.render()
         return True
 
@@ -17582,6 +18039,9 @@ class NakshaApp(QMainWindow):
 
             cam = self.vtk_widget.renderer.GetActiveCamera()
             cam.Zoom(ratio)
+            self._refresh_main_view_clipping_after_navigation(
+                self.vtk_widget.renderer
+            )
             self.vtk_widget.render()
 
             self._schedule_main_view_history_commit("magnifier_zoom", delay_ms=120)
@@ -17891,6 +18351,10 @@ class NakshaApp(QMainWindow):
         try:
             if not hasattr(self, 'vtk_widget') or not self.vtk_widget:
                 return
+
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
             
             renderer = self.vtk_widget.renderer
             camera = renderer.GetActiveCamera()
@@ -17898,7 +18362,7 @@ class NakshaApp(QMainWindow):
             if camera is None:
                 return
 
-            camera.ParallelProjectionOn()
+            self._normalize_main_view_2d_camera(camera)
             lock_params = {
                 'position': camera.GetPosition(),
                 'focal_point': camera.GetFocalPoint(),
@@ -18387,6 +18851,151 @@ class NakshaApp(QMainWindow):
                 print(f"⚠️ refresh_surface_after_classification failed: {e}")
             return False
 
+    def _normalize_main_view_2d_camera(self, camera=None):
+        """Force an exact orthographic axis while preserving pan and zoom."""
+        if getattr(self, "_main_view_3d_user_enabled", False):
+            return False
+        if getattr(self, "_main_2d_policy_enforcing", False):
+            return False
+
+        try:
+            if camera is None:
+                camera = self.vtk_widget.renderer.GetActiveCamera()
+            if camera is None:
+                return False
+
+            self._main_2d_policy_enforcing = True
+            focal = np.asarray(camera.GetFocalPoint(), dtype=float)
+            position = np.asarray(camera.GetPosition(), dtype=float)
+            distance = float(np.linalg.norm(position - focal))
+            if not np.isfinite(distance) or distance < 1e-6:
+                distance = 1.0
+
+            mode = getattr(self, "current_view", "top")
+            if mode not in ("top", "front", "side"):
+                mode = "top"
+                self.current_view = "top"
+
+            if mode == "front":
+                desired_position = focal + np.array((0.0, -distance, 0.0))
+                desired_up = np.array((0.0, 0.0, 1.0))
+            elif mode == "side":
+                desired_position = focal + np.array((distance, 0.0, 0.0))
+                desired_up = np.array((0.0, 0.0, 1.0))
+            else:
+                desired_position = focal + np.array((0.0, 0.0, distance))
+                desired_up = np.array((0.0, 1.0, 0.0))
+
+            old_up = np.asarray(camera.GetViewUp(), dtype=float)
+            changed = (
+                not bool(camera.GetParallelProjection())
+                or not np.allclose(position, desired_position, rtol=0.0, atol=1e-9)
+                or not np.allclose(old_up, desired_up, rtol=0.0, atol=1e-9)
+            )
+
+            camera.ParallelProjectionOn()
+            camera.SetFocalPoint(*focal)
+            camera.SetPosition(*desired_position)
+            camera.SetViewUp(*desired_up)
+            self.is_3d_mode = False
+            self._main_view_2d_locked = True
+            return changed
+        except Exception:
+            return False
+        finally:
+            self._main_2d_policy_enforcing = False
+
+    def _main_tool_owns_interactor_style(self, style):
+        """Do not replace a temporary tool style; the camera guard still locks it."""
+        if style is None:
+            return False
+        if style is getattr(self, "cross_interactor", None):
+            return True
+        if getattr(self, "active_classify_tool", None) is not None:
+            return True
+        measurement = getattr(self, "measurement_tool", None)
+        if measurement is not None and (
+            getattr(measurement, "active", False)
+            or getattr(measurement, "is_measuring", False)
+        ):
+            return True
+        digitizer = getattr(self, "digitizer", None)
+        return bool(digitizer is not None and getattr(digitizer, "active_tool", None))
+
+    def _repair_main_view_2d_style(self):
+        """Replace only a leaked raw trackball style, never an active tool style."""
+        if getattr(self, "_main_view_3d_user_enabled", False):
+            return False
+        try:
+            interactor = self.vtk_widget.interactor
+            style = interactor.GetInteractorStyle()
+            if (
+                style is None
+                or style.GetClassName() != "vtkInteractorStyleTrackballCamera"
+                or self._main_tool_owns_interactor_style(style)
+            ):
+                return False
+            from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage
+            style_2d = vtkInteractorStyleImage()
+            try:
+                style_2d.SetInteractionModeToImage2D()
+            except Exception:
+                pass
+            interactor.SetInteractorStyle(style_2d)
+            return True
+        except Exception:
+            return False
+
+    def _install_main_view_2d_policy_guard(self):
+        """Install independently-owned guards that loaders/tools cannot remove."""
+        try:
+            renderer = self.vtk_widget.renderer
+            camera = renderer.GetActiveCamera()
+        except Exception:
+            return False
+
+        old_camera = getattr(self, "_main_2d_policy_camera", None)
+        old_camera_id = getattr(self, "_main_2d_policy_camera_observer_id", None)
+        if old_camera is not camera:
+            if old_camera is not None and old_camera_id is not None:
+                try:
+                    old_camera.RemoveObserver(old_camera_id)
+                except Exception:
+                    pass
+
+            def _camera_guard(_obj, _event):
+                if not getattr(self, "_main_view_3d_user_enabled", False):
+                    self._normalize_main_view_2d_camera()
+
+            self._main_2d_policy_camera_observer_id = camera.AddObserver(
+                "ModifiedEvent", _camera_guard
+            )
+            self._main_2d_policy_camera = camera
+            self._main_2d_policy_camera_callback = _camera_guard
+
+        old_renderer = getattr(self, "_main_2d_policy_renderer", None)
+        if old_renderer is not renderer:
+            old_renderer_id = getattr(self, "_main_2d_policy_render_observer_id", None)
+            if old_renderer is not None and old_renderer_id is not None:
+                try:
+                    old_renderer.RemoveObserver(old_renderer_id)
+                except Exception:
+                    pass
+
+            def _render_guard(_obj, _event):
+                if getattr(self, "_main_view_3d_user_enabled", False):
+                    return
+                self._install_main_view_2d_policy_guard()
+                self._normalize_main_view_2d_camera()
+                self._repair_main_view_2d_style()
+
+            self._main_2d_policy_render_observer_id = renderer.AddObserver(
+                "StartEvent", _render_guard
+            )
+            self._main_2d_policy_renderer = renderer
+            self._main_2d_policy_render_callback = _render_guard
+        return True
+
     def ensure_main_view_2d_interaction(self, preserve_camera=True, reason=None):
         """
         Force the main viewer back to 2D pan/zoom without refitting or losing zoom.
@@ -18406,6 +19015,10 @@ class NakshaApp(QMainWindow):
             camera = renderer.GetActiveCamera()
             if camera is None:
                 return False
+
+            self._main_view_3d_user_enabled = False
+            if getattr(self, "current_view", None) == "3d":
+                self.current_view = "top"
 
             saved_camera = None
             if preserve_camera:
@@ -18429,7 +19042,10 @@ class NakshaApp(QMainWindow):
                         style.OnRightButtonUp()
                 except Exception:
                     pass
-            if style_name != "vtkInteractorStyleImage":
+            if (
+                style_name != "vtkInteractorStyleImage"
+                and not self._main_tool_owns_interactor_style(style)
+            ):
                 style_2d = vtkInteractorStyleImage()
                 try:
                     style_2d.SetInteractionModeToImageSlicing()
@@ -18437,12 +19053,10 @@ class NakshaApp(QMainWindow):
                     pass
                 interactor.SetInteractorStyle(style_2d)
 
-            camera.ParallelProjectionOn()
             if saved_camera:
-                camera.SetPosition(saved_camera['position'])
                 camera.SetFocalPoint(saved_camera['focal_point'])
-                camera.SetViewUp(saved_camera['view_up'])
                 camera.SetParallelScale(saved_camera['parallel_scale'])
+            self._normalize_main_view_2d_camera(camera)
 
             if renderer.VisibleActorCount() > 0:
                 renderer.ResetCameraClippingRange()
@@ -18462,6 +19076,7 @@ class NakshaApp(QMainWindow):
                 pass
             self.is_3d_mode = False
             self._main_view_2d_locked = True
+            self._install_main_view_2d_policy_guard()
             self.vtk_widget.render()
 
             suffix = f" ({reason})" if reason else ""

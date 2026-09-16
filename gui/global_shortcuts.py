@@ -507,8 +507,37 @@ class GlobalShortcutFilter(QObject):
                         )
                     except Exception:
                         focus_in_cross_selector = False
+
+                # ClassPicker is a persistent classification companion window, not
+                # a text-editing dialog. Its To-class control is a QComboBox, so
+                # the generic input-field guard below used to consume Ctrl+Z/Y
+                # before the centralized undo/redo dispatcher could see them.
+                # Let only classification history keys fall through; every other
+                # combo/text-field rule stays unchanged.
+                focus_in_class_picker = False
+                class_picker = self._get_live_qt_attr("class_picker")
+                if class_picker is not None and focus_widget is not None:
+                    try:
+                        focus_in_class_picker = (
+                            class_picker.isVisible()
+                            and (
+                                focus_widget is class_picker
+                                or class_picker.isAncestorOf(focus_widget)
+                            )
+                        )
+                    except Exception:
+                        focus_in_class_picker = False
+
+                allow_classification_history_from_picker = (
+                    focus_in_class_picker
+                    and self._is_classification_active()
+                    and bool(event.modifiers() & Qt.ControlModifier)
+                    and event.key() in (Qt.Key_Z, Qt.Key_Y)
+                )
+
                 if (
                     not focus_in_cross_selector
+                    and not allow_classification_history_from_picker
                     and isinstance(focus_widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox))
                 ):
                     # Some search fields must always own their keystrokes, even
@@ -3513,6 +3542,9 @@ class GlobalShortcutFilter(QObject):
             print(f"   🔒 Fresh camera lock observer installed (measurement)")
 
             self.app_window._main_view_2d_locked = True
+            self.app_window._main_view_3d_user_enabled = False
+            if getattr(self.app_window, "current_view", None) == "3d":
+                self.app_window.current_view = "top"
             # Symmetric with _unlock_main_view setting this True: re-locking
             # to 2D must hand button-claiming back to MainWheelZoomEventFilter
             # (Left/Tap-Tap panning-button settings), not leave it deferring
@@ -3671,6 +3703,9 @@ class GlobalShortcutFilter(QObject):
         # STEP 9: Mark as locked
         # ====================================================================
         self.app_window._main_view_2d_locked = True
+        self.app_window._main_view_3d_user_enabled = False
+        if getattr(self.app_window, "current_view", None) == "3d":
+            self.app_window.current_view = "top"
         # See matching comment in the measurement-lock branch above and in
         # _unlock_main_view: keep is_3d_mode in sync with the interactor
         # style actually in effect, so MainWheelZoomEventFilter resumes
@@ -3787,7 +3822,13 @@ class GlobalShortcutFilter(QObject):
             
             # Remove only our owned main-view camera lock observer.
             self._clear_main_camera_lock_observer(camera)
-            
+
+            # Shift+P explicitly authorizes main perspective/orbit mode. Set
+            # authority before modifying the camera so the persistent 2D
+            # policy observer deliberately steps aside.
+            self.app_window._main_view_3d_user_enabled = True
+            self.app_window.current_view = "3d"
+
             # Restore 3D trackball camera
             vtk_widget.interactor.SetInteractorStyle(vtkInteractorStyleTrackballCamera())
             camera.ParallelProjectionOff()

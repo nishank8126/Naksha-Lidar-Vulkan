@@ -6,8 +6,8 @@
 #   - browse all CodedValue + Range domains in the GDB
 #   - add / remove / rename codes (and ranges)
 #   - see which fields / subtypes use each domain
-#   - apply changes to the engine (in-memory; persisted via the engine's
-#     save_project_domain_overrides)
+#   - apply changes natively to a write-capable FileGDB when GDAL supports it
+#   - fall back to a clearly-labelled Naksha sidecar override when necessary
 # ─────────────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from .engine import GDBEngine
+from gui.gis.gis_style import apply_gis_dialog_style
+from gui.gis.catalog_events import catalog_events
 
 log = logging.getLogger("GDBEngine")
 
@@ -50,6 +52,7 @@ class WorkspaceDomainsDialog(QDialog):
         super().__init__(parent)
         self.engine = engine
         self._domains = [self._decorate(d) for d in engine.export_domains_meta()]
+        self._native_domain_names = {str(d.get("name", "")) for d in self._domains if d.get("name")}
         self._dirty = False
         self._current_name: str | None = None
 
@@ -59,15 +62,8 @@ class WorkspaceDomainsDialog(QDialog):
         self.resize(960, 640)
         self.setWindowFlags(self.windowFlags() | Qt.Tool)
         
-        try:
-            from gui.theme_manager import get_dialog_stylesheet, ThemeColors
-            self.setStyleSheet(get_dialog_stylesheet())
-            self.bg_sec = ThemeColors.get("bg_secondary") or "#ffffff"
-            self.bg_input = ThemeColors.get("bg_input") or "#f7f8fa"
-            self.text_prim = ThemeColors.get("text_primary") or "#1b2838"
-            self.border_col = ThemeColors.get("border") or "#d0d5dd"
-        except Exception:
-            self.bg_sec, self.bg_input, self.text_prim, self.border_col = "#ffffff", "#f7f8fa", "#1b2838", "#d0d5dd"
+        apply_gis_dialog_style(self)
+        self.bg_sec, self.bg_input, self.text_prim, self.border_col = "#ffffff", "#f7f8fa", "#1b2838", "#d0d5dd"
 
         self._setup_ui(gdb_name)
         self._load_domain_list()
@@ -100,10 +96,7 @@ class WorkspaceDomainsDialog(QDialog):
 
         # Title bar
         title = QLabel(f"  Domains  —  {gdb_name}")
-        title.setStyleSheet(
-            "background:#2c5f8a; color:white; padding:4px 8px; "
-            "font-weight:bold; font-size:12px; border-radius:2px;"
-        )
+        title.setProperty("sectionHeader", True)
         main.addWidget(title)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -340,6 +333,9 @@ class WorkspaceDomainsDialog(QDialog):
 
     def _load_domain_list(self):
         self.domain_table.blockSignals(True)
+        # Clear the current cell before dropping every row - otherwise Qt's
+        # selection model keeps referencing a row about to be deleted.
+        self.domain_table.setCurrentCell(-1, -1)
         self.domain_table.setRowCount(0)
         for d in self._domains:
             r = self.domain_table.rowCount()
@@ -593,23 +589,65 @@ class WorkspaceDomainsDialog(QDialog):
             domain["min_value"] = self.ed_min.text().strip() or None
             domain["max_value"] = self.ed_max.text().strip() or None
 
-        # Push to engine
+        # Push to engine and, whenever the runtime GDAL build supports it, to
+        # the ACTUAL FileGDB domain catalog. The old sidecar JSON is retained
+        # only as an explicit fallback for unsupported/unsafe schema changes.
+        native_message = ""
         try:
             self.engine.set_domains_meta(self._domains)
-            from .engine import save_project_domain_overrides
-            save_project_domain_overrides(self.engine.gdb_path, self.engine.export_domains_meta())
+            current_names = {str(d.get("name", "")) for d in self._domains if d.get("name")}
+            removed_or_renamed = bool(self._native_domain_names - current_names)
+
+            from .native_domains import apply_domains
+            native_ok, messages = apply_domains(
+                self.engine.gdb_path,
+                self.engine.export_domains_meta(),
+                delete_missing=False,  # never blindly delete a domain referenced by fields
+            )
+            if native_ok and not removed_or_renamed:
+                from .engine import clear_project_domain_overrides
+                clear_project_domain_overrides(self.engine.gdb_path)
+                self._native_domain_names = set(current_names)
+                native_message = "Changes were written into the File Geodatabase."
+            elif native_ok and removed_or_renamed:
+                # Renaming/removing a domain can require reassigning every field
+                # and subtype reference first. Keep that part as a local override
+                # instead of risking a destructive GDB schema edit.
+                from .engine import save_project_domain_overrides
+                save_project_domain_overrides(self.engine.gdb_path, self.engine.export_domains_meta())
+                native_message = (
+                    "New/updated domain definitions were written to the FileGDB. "
+                    "A rename/removal was also detected, so Naksha kept that reference change "
+                    "as a local override rather than deleting a potentially referenced domain."
+                )
+            else:
+                from .engine import save_project_domain_overrides
+                save_project_domain_overrides(self.engine.gdb_path, self.engine.export_domains_meta())
+                native_message = (
+                    "The installed GDAL build could not commit every domain definition natively. "
+                    "Naksha saved the edit as a local project override instead.\n\n" + "\n".join(messages[-8:])
+                )
         except Exception as exc:
-            QMessageBox.warning(self, "Apply", f"Could not save:\n{exc}")
-            return
+            try:
+                from .engine import save_project_domain_overrides
+                save_project_domain_overrides(self.engine.gdb_path, self.engine.export_domains_meta())
+                native_message = (
+                    "Native FileGDB domain editing is unavailable or the geodatabase is locked. "
+                    "The edit was saved as a Naksha local override.\n\n" + str(exc)
+                )
+            except Exception as fallback_exc:
+                QMessageBox.warning(self, "Apply", f"Could not save:\n{fallback_exc}")
+                return
 
         self._dirty = False
+        catalog_events().schemaChanged.emit(self.engine.gdb_path)
         self._load_domain_list()
         for r in range(self.domain_table.rowCount()):
             item = self.domain_table.item(r, 0)
             if item and item.text() == self._current_name:
                 self.domain_table.setCurrentCell(r, 0)
                 break
-        QMessageBox.information(self, "Apply", "Domain changes saved.")
+        QMessageBox.information(self, "Apply", native_message or "Domain changes saved.")
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

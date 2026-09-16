@@ -1,4 +1,4 @@
-﻿"""
+"""
 crash_reporter.py - crash reporting helpers for Naksha.
 
 Captures:
@@ -101,6 +101,7 @@ def _safe_repr(value) -> str:
 
 def _log_dir() -> Path:
     program_data = os.getenv("PROGRAMDATA", "C:/ProgramData")
+
  
     log_dir = (
         Path(program_data)
@@ -111,6 +112,44 @@ def _log_dir() -> Path:
  
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
+# --- Temporary notify-dispatch tracing (NAKSHA_NOTIFY_TRACE=<file>) ---
+_notify_trace_handle = None
+_notify_trace_skipped = {1, 12, 77, 110, 123, 183}  # timer/paint/hover-noise only; mouse events kept
+
+def _notify_trace(receiver, event) -> None:
+    """Log every non-noisy Qt event dispatch to diagnose native AVs."""
+    global _notify_trace_handle, _notify_trace_skipped
+    try:
+        if _notify_trace_handle is None:
+            trace_path = os.getenv("NAKSHA_NOTIFY_TRACE") or str(_log_dir() / "notify_trace.log")
+            _notify_trace_handle = open(trace_path, "a", encoding="utf-8", buffering=1)
+        etype = -1
+        try:
+            etype = event.type()
+        except Exception:
+            pass
+        if etype in _notify_trace_skipped:
+            return
+        cls = "?"
+        try:
+            mo = receiver.metaObject()
+            cls = mo.className() if mo is not None else type(receiver).__name__
+        except Exception:
+            try:
+                cls = type(receiver).__name__
+            except Exception:
+                pass
+        name = ""
+        try:
+            name = receiver.objectName() or ""
+        except Exception:
+            pass
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        _notify_trace_handle.write(f"{ts} {cls}[{name}] ev={etype} id={id(receiver):#x}\n")
+    except Exception:
+        pass
+
  
 def _collect_platform_info() -> dict:
     return {
@@ -480,8 +519,9 @@ class CrashReporter:
         original_notify = app.notify
 
         def safe_notify(receiver, event):
-            # During shutdown, avoid dispatching high-frequency UI events to
-            # objects that may already be in teardown (common source of VTK/Qt AVs).
+            if os.getenv("NAKSHA_NOTIFY_TRACE"):
+                _notify_trace(receiver, event)
+
             try:
                 if getattr(app, "_shutdown_in_progress", False):
                     try:

@@ -63,15 +63,15 @@ def _key(path):
     return os.path.normcase(os.path.abspath(str(path)))
 
 
-def test_unresolved_snt_blocks_stale_canvas_crs(tmp_path):
+def test_unresolved_snt_does_not_override_canvas_crs(tmp_path):
     snt = tmp_path / "unresolved.snt"
     snt.write_bytes(b"SNT")
     harness = _Harness(_app(31370, [snt]), {_key(snt): None})
 
-    assert GoogleEarthBasemapPlugin._project_crs(harness) is None
+    assert GoogleEarthBasemapPlugin._project_crs(harness).to_epsg() == 31370
 
 
-def test_resolved_snt_has_priority_over_las_canvas_crs(tmp_path):
+def test_resolved_snt_does_not_override_las_canvas_crs(tmp_path):
     snt = tmp_path / "priority.snt"
     snt.write_bytes(b"SNT")
     snt_crs = CRS.from_epsg(3812)
@@ -79,7 +79,7 @@ def test_resolved_snt_has_priority_over_las_canvas_crs(tmp_path):
 
     selected = GoogleEarthBasemapPlugin._project_crs(harness)
     assert selected is not None
-    assert selected.equals(snt_crs)
+    assert selected.to_epsg() == 31370
 
 
 def test_no_snt_keeps_host_canvas_crs():
@@ -90,7 +90,7 @@ def test_no_snt_keeps_host_canvas_crs():
     assert selected.to_epsg() == 31370
 
 
-def test_disagreeing_snt_crs_disables_basemap(tmp_path):
+def test_disagreeing_snt_crs_does_not_disable_canvas_basemap(tmp_path):
     first = tmp_path / "first.snt"
     second = tmp_path / "second.snt"
     first.write_bytes(b"SNT1")
@@ -101,7 +101,7 @@ def test_disagreeing_snt_crs_disables_basemap(tmp_path):
     }
     harness = _Harness(_app(31370, [first, second]), resolutions)
 
-    assert GoogleEarthBasemapPlugin._project_crs(harness) is None
+    assert GoogleEarthBasemapPlugin._project_crs(harness).to_epsg() == 31370
 
 
 def test_project_signature_tracks_snt_attachment_changes(tmp_path):
@@ -289,5 +289,4 @@ def test_extreme_zoom_out_singularity_tile_rejection():
 
     # The plugin's guard threshold (2.5e7) rejects it cleanly
     assert span_x > 2.5e7 or span_y > 2.5e7
-
 

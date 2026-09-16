@@ -5554,7 +5554,114 @@ class CutSectionController:
         except Exception:
             pass
         self._cut_locate_rb_actor = None
+        
+    def restore_cut_locate_observers_for_cross_section(self) -> bool:
+        """
+        Restore MicroStation-style CrossSectionRect locate interaction on the
+        existing Cut View.
 
+        CutFromCut intentionally owns LeftButtonPressEvent/MouseMoveEvent while
+        nested placement is active. Its fast path can remove the normal locate
+        observers. When CrossSectionRect takes ownership again, recreate only
+        those two observers without rebuilding the cut dataset, actor, camera,
+        classification interactor, palette or index mapping.
+
+        Safe to call repeatedly.
+        """
+        try:
+            if self.cut_vtk is None:
+                return False
+
+            if not self._has_valid_cut_dock():
+                return False
+
+            # This helper is specifically for CrossSectionRect ownership.
+            if not getattr(self.app, "cross_section_active", False):
+                return False
+
+            iren = getattr(self.cut_vtk, "interactor", None)
+            if iren is None:
+                return False
+
+            # Cross-section locate is active again.
+            sc = getattr(self.app, "section_controller", None)
+            if sc is not None and hasattr(sc, "set_section_locate_enabled"):
+                sc.set_section_locate_enabled(
+                    True,
+                    clear_state=True,
+                )
+
+            # --------------------------------------------------------------
+            # Remove the OLD tracked IDs first.
+            #
+            # CutFromCut may already have removed these through
+            # RemoveObservers(...). In that case RemoveObserver(stale_id)
+            # is simply best-effort cleanup.
+            # --------------------------------------------------------------
+            old_left = getattr(
+                self,
+                "_cut_locate_observer_id",
+                None,
+            )
+
+            if old_left is not None:
+                try:
+                    iren.RemoveObserver(old_left)
+                except Exception:
+                    pass
+
+            self._cut_locate_observer_id = None
+
+            old_move = getattr(
+                self,
+                "_cut_locate_move_observer_id",
+                None,
+            )
+
+            if old_move is not None:
+                try:
+                    iren.RemoveObserver(old_move)
+                except Exception:
+                    pass
+
+            self._cut_locate_move_observer_id = None
+
+            # --------------------------------------------------------------
+            # Reattach exactly the existing proven callbacks.
+            # Do NOT create another coordinate conversion implementation.
+            # --------------------------------------------------------------
+            self._cut_locate_observer_id = iren.AddObserver(
+                "LeftButtonPressEvent",
+                self._on_cut_view_left_click_locate,
+                1.0,
+            )
+
+            self._cut_locate_move_observer_id = iren.AddObserver(
+                "MouseMoveEvent",
+                self._on_cut_view_mouse_move_locate,
+                1.0,
+            )
+
+            print(
+                "CUT_LOCATE_OBSERVERS "
+                "action=restored "
+                f"left={self._cut_locate_observer_id} "
+                f"move={self._cut_locate_move_observer_id} "
+                "reason=cross_section_activate"
+            )
+
+            return True
+
+        except (RuntimeError, ReferenceError):
+            return False
+
+        except Exception as e:
+            print(
+                "CUT_LOCATE_OBSERVERS "
+                f"action=restore_failed error={e}"
+            )
+            return False
+    
     def _on_cut_view_left_click_locate(self, obj, event):
         if not getattr(self.app, "cross_section_active", False):
             return

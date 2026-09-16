@@ -831,6 +831,10 @@ class DigitizeManager:
         # Track our own VTK observer IDs so we can remove only ours
         # (not grid_label_system's or other tools' observers)
         self._draw_observer_ids = []
+        # Companion observers (key / middle-button / wheel) installed below.
+        # Tracked so _reinstall_all_observers() can remove-then-readd them
+        # instead of stacking duplicates.
+        self._aux_observer_ids = []
         # Text UI/session state
         self._text_dialog = None
         self._text_ui_editing = False
@@ -900,13 +904,23 @@ class DigitizeManager:
         self._draw_observer_ids.append(self.interactor.AddObserver("MouseMoveEvent", self._on_mouse_move))
         self._draw_observer_ids.append(self.interactor.AddObserver("LeftButtonReleaseEvent", self._on_left_release))
         self._draw_observer_ids.append(self.interactor.AddObserver("RightButtonPressEvent", self._on_right_press))
-        self.interactor.AddObserver("KeyPressEvent", self._on_key_press)
+        self._aux_observer_ids.append(
+            self.interactor.AddObserver("KeyPressEvent", self._on_key_press)
+        )
         # Middle mouse button for panning
-        self.interactor.AddObserver("MiddleButtonPressEvent", self._on_middle_press, 20.0)
-        self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 20.0)
+        self._aux_observer_ids.append(
+            self.interactor.AddObserver("MiddleButtonPressEvent", self._on_middle_press, 20.0)
+        )
+        self._aux_observer_ids.append(
+            self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 20.0)
+        )
         # After existing interactor.AddObserver calls (~line 91):
-        self.interactor.AddObserver("MouseWheelForwardEvent", self._on_zoom, 1.0)
-        self.interactor.AddObserver("MouseWheelBackwardEvent", self._on_zoom, 1.0)
+        self._aux_observer_ids.append(
+            self.interactor.AddObserver("MouseWheelForwardEvent", self._on_zoom, 1.0)
+        )
+        self._aux_observer_ids.append(
+            self.interactor.AddObserver("MouseWheelBackwardEvent", self._on_zoom, 1.0)
+        )
                 # Ensure interactor focus for key handling
         try:
             self.interactor.EnableRenderOn()
@@ -3016,6 +3030,41 @@ class DigitizeManager:
             self.interactor.AddObserver("RightButtonPressEvent", self._on_right_press, 1.0)
         )
 
+    def _reinstall_all_observers(self):
+        """Re-install every VTK interactor observer owned by the digitizer.
+
+        Idempotent: safe after ObserverRegistry.release_all(), after the
+        interactor is recreated, and after project / point-cloud / grid clears.
+        Call _check_and_update_renderers() FIRST so self.interactor points at
+        the live interactor before observers are attached.
+        """
+        if self.interactor is None:
+            return
+
+        # 1) digitizer-owned primary draw observers (self-removing → idempotent)
+        self._rebind_primary_draw_observers(include_left_release=True)
+
+        # 2) companion observers that __init__ installs (key/middle/wheel).
+        #    Remove our previously-tracked IDs first so repeated calls do not
+        #    stack duplicates (which would cause double pan / double zoom).
+        for oid in list(getattr(self, "_aux_observer_ids", []) or []):
+            try:
+                self.interactor.RemoveObserver(oid)
+            except Exception:
+                pass
+        self._aux_observer_ids = [
+            self.interactor.AddObserver("KeyPressEvent", self._on_key_press),
+            self.interactor.AddObserver("MiddleButtonPressEvent", self._on_middle_press, 20.0),
+            self.interactor.AddObserver("MiddleButtonReleaseEvent", self._on_middle_release, 20.0),
+            self.interactor.AddObserver("MouseWheelForwardEvent", self._on_zoom, 1.0),
+            self.interactor.AddObserver("MouseWheelBackwardEvent", self._on_zoom, 1.0),
+        ]
+
+        # 3) shared, non-digitizer observers (grid-label right-click + hover)
+        self._restore_shared_interactor_observers()
+
+        self._force_render()
+
     def _ensure_plan_view_interaction(self, reason="digitizer"):
         """Keep the main viewer in 2D plan interaction while digitizing."""
         if getattr(self.app, 'is_3d_mode', False):
@@ -4830,6 +4879,10 @@ class DigitizeManager:
                 self._select_actor(actor)
             return
 
+        # ============ GIS POINT ============
+        if self.active_tool == "gispoint":
+            self._finalize_gis_point(pos)
+            return
         # ============ FREEHAND ============
         if self.active_tool == "freehand":
             if not self.temp_points:
@@ -10564,6 +10617,41 @@ class DigitizeManager:
         return actor
 
     # ---------------- FINALIZE EXISTING SHAPES ----------------
+    def _finalize_gis_point(self, point):
+        """Create one point drawing; the GIS bridge persists it to the active layer."""
+        self._save_state()
+        style = self._get_draw_style("smartline")
+        points = vtk.vtkPoints()
+        points.SetDataType(vtk.VTK_DOUBLE)
+        points.InsertNextPoint(float(point[0]), float(point[1]), float(point[2]))
+        vertices = vtk.vtkCellArray()
+        vertices.InsertNextCell(1)
+        vertices.InsertCellPoint(0)
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetVerts(vertices)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*style["color"])
+        actor.GetProperty().SetPointSize(8.0)
+        actor.GetProperty().SetRenderPointsAsSpheres(True)
+        actor.PickableOn()
+        self._add_actor_to_overlay(actor)
+        drawing_entry = {
+            "type": "gispoint",
+            "coords": [tuple(point)],
+            "actor": actor,
+            "bounds": actor.GetBounds(),
+            "original_color": style["color"],
+            "original_width": 8.0,
+        }
+        self.drawings.append(drawing_entry)
+        self._emit_drawing_finalized(drawing_entry)
+        self.renderer.Modified()
+        self.app.vtk_widget.render()
+
     def _finalize_rectangle(self):
         """Finalize rectangle drawing immediately."""
         self._save_state()
@@ -14308,6 +14396,18 @@ class DigitizeManager:
                     'text': drawing_data.get('text', ''),
                     'radius': drawing_data.get('radius', 0)
                 }
+
+                # Preserve GIS source identity/schema metadata on the display/edit
+                # drawing. The VTK actor is only a render representation; these
+                # fields let higher-level GIS tools keep attributes and source
+                # provenance instead of reducing imported GIS features to lines.
+                for _meta_key in (
+                    'source_attributes', 'source_fid', 'source_layer', 'source_path',
+                    'source_driver', 'source_crs_wkt', 'source_geometry_type',
+                    'native_wkb', 'source_has_z', 'source_has_m',
+                ):
+                    if _meta_key in drawing_data:
+                        drawing[_meta_key] = drawing_data[_meta_key]
 
                 if shape_type == 'text':
                     drawing['original_text_color'] = color_vtk

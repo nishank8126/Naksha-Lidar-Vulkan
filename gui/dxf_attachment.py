@@ -4188,6 +4188,13 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
                         rw.Render()
                 except Exception:
                     pass
+            try:
+                from gui.crs_manager import reconcile_canvas_crs_after_content_change
+                reconcile_canvas_crs_after_content_change(
+                    self.app, reason="DXF attachment removed"
+                )
+            except Exception as exc:
+                print(f"[CRS] reconciliation after DXF removal failed: {exc}")
 
         except Exception as e:
             print(f"  ⚠️ Failed to remove DXF '{filename}' from VTK: {e}")
@@ -4350,6 +4357,42 @@ class MultiDXFAttachmentDialog(MinimizableDialogMixin, QDialog):
                 print("ℹ️ No save path - data won't be saved")
         else:
             print("ℹ️ No current data to save")
+
+        # ============================================================================
+        # ✅ STEP 1.5: RESOLVE MISSING CRS (QGIS-style prompt)
+        # ============================================================================
+        # Files without a .prj must not be silently dropped onto a georeferenced
+        # canvas in their raw coordinates. Ask once for the whole batch.
+        _canvas_crs = getattr(self, "project_crs", None)
+        if _canvas_crs is None:
+            try:
+                from gui.crs_manager import get_canvas_crs
+                _canvas_crs = get_canvas_crs(self.app)
+            except Exception:
+                _canvas_crs = None
+            if _canvas_crs is not None:
+                self.project_crs = _canvas_crs
+
+        if _canvas_crs is not None:
+            _no_crs = [it for it in selected_items if not it.dxf_crs]
+            if _no_crs:
+                try:
+                    from gui.crs_selector_dialog import prompt_missing_source_crs
+                    picked = prompt_missing_source_crs(
+                        self,
+                        f"{len(_no_crs)} DXF file(s) without a .prj",
+                        "DXF",
+                        _canvas_crs,
+                    )
+                except Exception as _pe:
+                    print(f"  ⚠️ DXF CRS prompt failed: {_pe}")
+                    picked = None
+                if picked is None:
+                    print("ℹ️ DXF attach cancelled — source CRS unresolved")
+                    return
+                for it in _no_crs:
+                    it.set_crs(picked)
+                print(f"  ✅ Assigned {picked.name} to {len(_no_crs)} DXF file(s)")
 
         # ============================================================================
         # ✅ STEP 2: CONFIRMATION DIALOG

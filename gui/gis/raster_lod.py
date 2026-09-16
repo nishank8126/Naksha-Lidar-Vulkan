@@ -29,7 +29,7 @@ from copy import deepcopy
 from functools import lru_cache
 import os
 
-_DEBOUNCE_MS = 250
+_DEBOUNCE_MS = 120
 # How far past the visible view to pre-load on each side, as a fraction of
 # the view's own width/height. Panning within this padded region reuses the
 # already-loaded texture with zero fetch - genuinely instant, not just fast.
@@ -95,8 +95,11 @@ def _visible_world_bounds(app):
         cam = renderer.GetActiveCamera()
         direction = cam.GetDirectionOfProjection()
         up = cam.GetViewUp()
-        if (not cam.GetParallelProjection() or abs(direction[2] + 1) > 1e-6
-                or abs(up[0]) > 1e-6 or up[1] < 0.999999):
+        # VTK tools can leave tiny floating-point drift in an otherwise 2D
+        # top camera. Reject genuinely tilted views, but do not disable native
+        # raster LOD because another operation caused insignificant drift.
+        if (not cam.GetParallelProjection() or abs(direction[2] + 1) > 1e-3
+                or abs(up[0]) > 1e-3 or up[1] < 0.999):
             return None
         width, height = rw.GetSize()
         if width <= 0 or height <= 0:
@@ -109,6 +112,50 @@ def _visible_world_bounds(app):
                 int(width), int(height))
     except Exception:
         return None
+
+
+def _same_visible_view(first, second):
+    """True when camera modifications did not change the 2D viewport.
+
+    ResetCameraClippingRange and classification rendering modify the VTK
+    camera too, but they do not change visible XY bounds or raster resolution.
+    Treating those events as navigation needlessly discards a sharp LOD crop.
+    """
+    if first is None or second is None:
+        return first is second
+    if first[4:] != second[4:]:
+        return False
+    return all(
+        math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-7)
+        for a, b in zip(first[:4], second[:4])
+    )
+
+
+def _camera_xy_zoom_signature(app):
+    """Cheap signature excluding focal Z and clipping-only camera changes."""
+    renderer = getattr(getattr(app, "vtk_widget", None), "renderer", None)
+    rw = _get_render_window(getattr(app, "vtk_widget", None))
+    if renderer is None or rw is None:
+        return None
+    try:
+        camera = renderer.GetActiveCamera()
+        focal = camera.GetFocalPoint()
+        return (
+            float(focal[0]), float(focal[1]),
+            float(camera.GetParallelScale()), tuple(rw.GetSize()),
+        )
+    except Exception:
+        return None
+
+
+def _same_camera_xy_zoom(first, second):
+    if first is None or second is None:
+        return first is second
+    return (
+        first[3] == second[3]
+        and all(math.isclose(a, b, rel_tol=1e-10, abs_tol=1e-7)
+                for a, b in zip(first[:3], second[:3]))
+    )
 
 
 def _pixel_window_for_world(native_bounds, native_size, view_bounds, margin):
@@ -194,15 +241,42 @@ def _restore_overview(actor):
     meta = getattr(actor, "_raster_lod_meta", None)
     if not meta or not meta.get("_last_window") or meta.get("_preview_image") is None:
         return False
-    plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
-    left, right, bottom, top = meta["native_bounds"]
-    plane.SetOrigin(left, bottom, meta["z"])
-    plane.SetPoint1(right, bottom, meta["z"])
-    plane.SetPoint2(left, top, meta["z"])
-    plane.Update()
-    actor.GetTexture().SetInputData(meta["_preview_image"])
+    # Called from the render-window StartEvent observer (_prepare_frame) on
+    # every render, with no caller-side guard - unlike the identical pipeline
+    # dereference in _apply_texture (which is try/except-wrapped), a detached
+    # mapper/texture here (actor mid-teardown from a concurrent style/layer
+    # swap) would raise straight out of a native VTK callback.
+    try:
+        plane = actor.GetMapper().GetInputConnection(0, 0).GetProducer()
+        left, right, bottom, top = meta["native_bounds"]
+        plane.SetOrigin(left, bottom, meta["z"])
+        plane.SetPoint1(right, bottom, meta["z"])
+        plane.SetPoint2(left, top, meta["z"])
+        plane.Update()
+        actor.GetTexture().SetInputData(meta["_preview_image"])
+    except Exception:
+        return False
     meta.pop("_last_window", None)
     return True
+
+
+def _restore_cropped_overviews(app):
+    """Restore full-extent previews before a new navigation frame is drawn.
+
+    A detail texture changes its actor's plane to a viewport-sized crop. If
+    the camera moves beyond that crop, keeping it until the debounced read
+    finishes exposes the renderer background as a black rectangle. The
+    overview is already resident, so restoring it synchronously is cheap and
+    guarantees continuous coverage while the sharper window is fetched.
+    """
+    restored = 0
+    for actor in list(getattr(app, "geotiff_actors", []) or []):
+        try:
+            if actor.GetVisibility() and _restore_overview(actor):
+                restored += 1
+        except (AttributeError, RuntimeError):
+            continue
+    return restored
 
 
 def _load_window_texture(path, window, target_w, target_h, style):
@@ -234,13 +308,15 @@ def _request_for(app, actor, view):
     style = deepcopy(_style_for(app, meta["path"], actor))
     last = meta.get("_last_window")
     # Demand no more than native resolution, including at the raster edges.
-    density_x = min(screen_w / (vmaxx - vminx), meta["native_size"][0] / (bounds[1] - bounds[0]))
-    density_y = min(screen_h / (vmaxy - vminy), meta["native_size"][1] / (bounds[3] - bounds[2]))
+    density_x = min(screen_w / max(1e-9, vmaxx - vminx), meta["native_size"][0] / max(1e-9, bounds[1] - bounds[0]))
+    density_y = min(screen_h / max(1e-9, vmaxy - vminy), meta["native_size"][1] / max(1e-9, bounds[3] - bounds[2]))
     if (last and meta.get("_last_style") == style
             and _already_covers(last, clipped, density_x * (clipped[1] - clipped[0]))
-            and last["out_h"] / (last["wy1"] - last["wy0"]) >= density_y / _ZOOM_TOLERANCE):
+            and last["out_h"] / max(1e-9, last["wy1"] - last["wy0"]) >= density_y / _ZOOM_TOLERANCE):
         return None
     window = _pixel_window_for_world(bounds, meta["native_size"], view[:4], _REFETCH_MARGIN)
+    if window is None:
+        return None
     target_w = min(window["width"], max(1, math.ceil((window["wx1"] - window["wx0"]) * density_x)))
     target_h = min(window["height"], max(1, math.ceil((window["wy1"] - window["wy0"]) * density_y)))
     if (vmaxx - vminx) <= _TIGHT_ZOOM_EXTENT_M:
@@ -329,7 +405,7 @@ def _load_in_progress(app):
     return (now - started) < _LOAD_SUPPRESS_MAX_S
 
 
-_INTERACTION_SUPPRESS_MAX_S = 5.0  # a real pan/zoom/interaction gesture finishes in well under this
+_INTERACTION_SUPPRESS_MAX_S = 0.75  # self-heal stale UI flags without visible multi-second blur
 
 
 def _raw_interaction_active(app):
@@ -379,7 +455,7 @@ class _Loader:
         self.failed_keys = {}
         self.cursor = 0
         self.observers = []
-        self.poll = QTimer()
+        self.poll = QTimer(app if hasattr(app, "children") else None)
         self.poll.setInterval(30)
         self.poll.timeout.connect(self.finish)
         qt_app = QCoreApplication.instance()
@@ -393,7 +469,10 @@ class _Loader:
             return
         self.closed = True
         for obj, tag in self.observers:
-            obj.RemoveObserver(tag)
+            try:
+                obj.RemoveObserver(tag)
+            except Exception:
+                pass
         self.observers.clear()
         for timer in (self.poll, getattr(self.app, "_raster_lod_timer", None)):
             try:
@@ -505,11 +584,18 @@ def ensure_installed(app):
     timer.setSingleShot(True)
     timer.timeout.connect(lambda: refresh_all(app))
     app._raster_lod_timer = timer  # keep alive
+    app._raster_lod_camera_signature = _camera_xy_zoom_signature(app)
 
     def _on_camera_changed(_obj=None, _evt=None):
-        # Cursor anchoring updates several camera fields per wheel event. Only
-        # invalidate here; coverage is evaluated against the final camera once
-        # per rendered frame, avoiding transient overview texture uploads.
+        current_signature = _camera_xy_zoom_signature(app)
+        previous_signature = getattr(app, "_raster_lod_camera_signature", None)
+        if _same_camera_xy_zoom(previous_signature, current_signature):
+            return
+        app._raster_lod_camera_signature = current_signature
+        # Do not discard a sharp crop here. _prepare_frame checks its world
+        # coverage immediately before drawing: zooming further into the crop
+        # keeps native pixels visible, while navigation beyond it restores the
+        # full overview so uncovered areas never become black.
         app._raster_lod_loader.generation += 1
         app._raster_lod_frame_dirty = True
         timer.start(_DEBOUNCE_MS)

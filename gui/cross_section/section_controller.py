@@ -1865,17 +1865,16 @@ class SectionController:
                 # ── STEP 2: Exact geometry — only on the candidate subset (float64 centering) ──
                 # ✅ PERFORMANCE: Only perform float64 subtraction on the small candidate subset.
                 # ✅ PRECISION: Center in float64 BEFORE casting to float32 to fix the 'scattering'.
-                cand_xy  = xyz[candidate_idx, :2]
-                rel      = cand_xy - P1[:2]
-                
-                # Now safe to cast to float32 for high-speed dot products
-                rel_f32  = rel.astype(np.float32)
-                dir_f    = dir_vec.astype(np.float32)
-                perp_f   = perp.astype(np.float32)
-                
-                along_c  = rel_f32 @ dir_f
-                across_c = rel_f32 @ perp_f
-                del rel, rel_f32, cand_xy
+                # Keep the inclusion test in float64. Reducing these centred
+                # values and unit vectors to float32 can move points across the
+                # section boundary. Only the final display coordinates are cast
+                # to float32 below, preserving the existing rendering contract.
+                cand_xy = np.asarray(xyz[candidate_idx, :2], dtype=np.float64)
+                rel = cand_xy - np.asarray(P1[:2], dtype=np.float64)
+
+                along_c = rel @ dir_vec
+                across_c = rel @ perp
+                del rel, cand_xy
 
                 core_local = (
                     (along_c >= 0.0) & (along_c <= length) &

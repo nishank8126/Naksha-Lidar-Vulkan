@@ -548,6 +548,12 @@ _EXTERNAL_RIBBON_ICON_FILES = {
     ("file", "save"): "save.svg",
     ("file", "save as..."): "save-as.svg",
 
+    ("gis data", "layers"): "layers.svg",
+    ("gis data", "catalog"): "catalog.svg",
+    ("gis data", "import"): "import.svg",
+    ("gis data", "export"): "export.svg",
+    ("gis data", "convert"): "convert-card.svg",
+
     ("vectors", "export"): "export.svg",
     ("vectors", "import"): "import.svg",
 

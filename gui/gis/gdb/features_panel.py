@@ -26,6 +26,7 @@ from PySide6.QtGui import QIntValidator, QDoubleValidator, QRegularExpressionVal
 
 from .engine import GDBEngine, get_engine
 from . import reader as gdb_reader
+from gui.gis.gis_style import apply_gis_dialog_style, compact_layout
 
 log = logging.getLogger("GDBEngine")
 
@@ -57,11 +58,7 @@ class CreateFeaturesPanel(QDialog):
         self.setWindowTitle(f"Create Features — {gdb_name}")
         self.setMinimumSize(500, 620)
         self.resize(540, 700)
-        try:
-            from gui.theme_manager import get_dialog_stylesheet
-            self.setStyleSheet(get_dialog_stylesheet())
-        except Exception:
-            pass
+        apply_gis_dialog_style(self)
         self._setup_ui()
         self._populate_layers()
 
@@ -69,12 +66,11 @@ class CreateFeaturesPanel(QDialog):
 
     def _setup_ui(self):
         main = QVBoxLayout(self)
-        main.setContentsMargins(10, 10, 10, 10)
-        main.setSpacing(8)
+        compact_layout(main)
 
         # Title
         title = QLabel("Create Feature")
-        title.setStyleSheet("font-size:14pt; font-weight:600; color:#e8eaed;")
+        title.setProperty("sectionHeader", True)
         main.addWidget(title)
 
         # Layer selector
@@ -399,7 +395,7 @@ class CreateFeaturesPanel(QDialog):
             elif esri_type == "esriFieldTypeBigInteger":
                 le = QLineEdit()
                 le.setValidator(QRegularExpressionValidator(QRegularExpression(r"[-+]?\d{0,19}")))
-                le.setPlaceholderText("64-bit integer / safe ArcGIS value")
+                le.setPlaceholderText("64-bit integer")
                 self._field_widgets[fname_lower] = le
                 label = fname
                 if not nullable:

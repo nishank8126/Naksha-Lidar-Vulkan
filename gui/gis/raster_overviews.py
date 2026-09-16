@@ -52,7 +52,15 @@ def _build_overviews_worker(path):
         return
 
     try:
-        gdal.UseExceptions()
+        # Deliberately NOT calling gdal.UseExceptions() here: it is a
+        # process-wide flag, not thread-local, and this runs on a background
+        # thread on every raster import. Flipping it here would silently
+        # turn every OTHER gdal.Open()/ogr.Open() in the app - including on
+        # the main thread - from "returns None on failure" (what the rest of
+        # this codebase checks for) into "raises an exception" from that
+        # point on. This function already handles failure via `if ds is
+        # None` and the outer try/except; it doesn't need exceptions mode.
+        #
         # Opened read-only: GDAL cannot write internal overviews into a
         # read-only-opened dataset, so BuildOverviews() below is routed to an
         # external <path>.ovr sidecar instead - the source file is never

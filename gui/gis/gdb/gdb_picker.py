@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
 )
+from gui.gis.gis_style import apply_gis_dialog_style, compact_layout, compact_view, configure_header
 
 log = logging.getLogger("GDBEngine")
 
@@ -228,7 +229,7 @@ def pick_and_import_gdb(app, gdb_path: str):
         import_gdb_layer,
         open_gdb_for_read,
     )
-    from gui.gis.gis_layers import show_gis_layers_panel, zoom_to_gis_entries
+    from gui.gis.gis_layers import show_gis_layers_panel
 
     engine = get_engine(gdb_path)
     if engine is None:
@@ -258,7 +259,7 @@ def pick_and_import_gdb(app, gdb_path: str):
             "cascaded": engine.is_cascaded_layer(name),
             "group": engine.get_layer_group(name),
             "catalog_path": engine.get_layer_catalog_path(name),
-            "internal": engine.is_internal_layer(name) or kind == "none",
+            "internal": engine.is_internal_layer(name),
         })
     ds = None
 
@@ -280,12 +281,11 @@ def pick_and_import_gdb(app, gdb_path: str):
     dlg.setWindowTitle(f"Select Items to Add | {os.path.splitext(os.path.basename(gdb_path))[0]}")
     dlg.setMinimumSize(650, 470)
     dlg.resize(700, 520)
-    dlg.setStyleSheet(_style(colors))
+    apply_gis_dialog_style(dlg)
     dlg.setModal(True)
 
     layout = QVBoxLayout(dlg)
-    layout.setContentsMargins(12, 12, 12, 10)
-    layout.setSpacing(8)
+    compact_layout(layout)
 
     title = QLabel(f"Select Items to Add | {os.path.splitext(os.path.basename(gdb_path))[0]}")
     title.setStyleSheet("font-size:11pt; font-weight:600;")
@@ -305,6 +305,8 @@ def pick_and_import_gdb(app, gdb_path: str):
     tree.setObjectName("pickerTree")
     tree.setColumnCount(2)
     tree.setHeaderLabels(["Item", "Description"])
+    compact_view(tree)
+    configure_header(tree.header(), stretch_column=0)
     tree.setRootIsDecorated(True)
     tree.setAlternatingRowColors(True)
     tree.setUniformRowHeights(True)
@@ -408,7 +410,10 @@ def pick_and_import_gdb(app, gdb_path: str):
         dlg.style().polish(status_label)
 
     def row_is_visible(info: dict, query: str) -> bool:
-        if info["kind"] == "none" and not opt_show_tables.isChecked():
+        # Ordinary non-spatial user tables are first-class GDB objects and are
+        # visible by default. Only actual system/internal catalog tables obey
+        # the advanced "Show system and internal tables" switch.
+        if info.get("internal") and not opt_show_tables.isChecked():
             return False
         if info["kind"] != "none" and (info.get("count") or 0) == 0 and not opt_show_empty.isChecked():
             return False
@@ -486,10 +491,6 @@ def pick_and_import_gdb(app, gdb_path: str):
             set_status("Could not add the selected items. Check the log for details.", error=True)
             return
 
-        try:
-            zoom_to_gis_entries(app, imported_entries)
-        except Exception:
-            pass
         try:
             show_gis_layers_panel(app)
         except Exception:

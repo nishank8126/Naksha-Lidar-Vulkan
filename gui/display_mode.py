@@ -157,7 +157,7 @@ def sync_palette_to_gpu_safe(app, slot, palette, reason=""):
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # restore_display_settings_for_file
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def restore_display_settings_for_file(app, filepath):
+def restore_display_settings_for_file(app, filepath, refresh=True):
     """
     Restore display settings for a file.
 
@@ -439,7 +439,9 @@ def restore_display_settings_for_file(app, filepath):
         else:
             print("   âš ï¸ No view_palettes[0] available - skipping weight sync")
 
-        if hasattr(app, 'data') and app.data is not None:
+        if not refresh:
+            print('   Classification refresh deferred to the load pipeline')
+        elif hasattr(app, 'data') and app.data is not None:
             print(f"\n   ðŸ”„ FORCING CLASSIFICATION REFRESH with restored weights...")
             try:
                 from gui.class_display import update_class_mode
@@ -2163,7 +2165,9 @@ class DisplayModeDialog(QDialog):
     def on_add(self):
         dlg = EditClassDialog(parent=self)
         if dlg.exec() == QDialog.Accepted:
-            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color())
+            # EditClassDialog stores the selected QColor as an attribute.
+            # Calling it raises: TypeError: 'QColor' object is not callable.
+            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color)
 
     def on_edit(self):
         row = self.table.currentRow()

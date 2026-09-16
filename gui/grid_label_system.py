@@ -5803,13 +5803,8 @@ class GridLabelManager:
             return True
 
         try:
-            from gui.save_pointcloud import has_fenced_parent_writeback, save_pointcloud, save_pointcloud_quick
-
-            if has_fenced_parent_writeback(self.app):
-                saved = save_pointcloud(self.app, path=None, show_dialog=False)
-            else:
-                save_path = getattr(self.app, "last_save_path", None) or getattr(self.app, "loaded_file", None)
-                saved = save_pointcloud_quick(self.app, save_path) if save_path else False
+            from gui.save_pointcloud import save_current_pointcloud_in_place
+            saved = save_current_pointcloud_in_place(self.app)
             if saved:
                 return True
         except Exception as exc:
@@ -6929,7 +6924,9 @@ class GridLabelManager:
             if is_text_actor3d:
                 text_prop = actor.GetTextProperty()
                 text = actor.GetInput() or getattr(actor, 'grid_name', '') or ''
-                raw_size = text_prop.GetFontSize()
+                raw_size = getattr(
+                    actor, '_naksha_label_font_size', text_prop.GetFontSize()
+                )
                 size = int(75 if raw_size is None else raw_size)
             else:
                 text = (
@@ -6953,6 +6950,17 @@ class GridLabelManager:
             'is_text_actor3d': is_text_actor3d,
         }
 
+    @staticmethod
+    def _label_font_scale_factor(size, base_size):
+        """Map UI point size to world-space label scale without accumulation.
+
+        Grid labels are geometry, so linear growth remains visually negligible
+        at PRJ/SNT overview scales. Preserve linear reduction below the import
+        size, but amplify increases quadratically while keeping the baseline
+        invariant (75 -> 75 is always factor 1).
+        """
+        ratio = float(size) / float(base_size) if base_size > 0 else 1.0
+        return ratio if ratio <= 1.0 else ratio * ratio
     def _apply_label_state(self, actor, text, size, color, is_text_actor3d=None):
         """Set a grid-label actor's rendered text/font-size/color.
 
@@ -6983,8 +6991,24 @@ class GridLabelManager:
             if is_text_actor3d:
                 text_prop = actor.GetTextProperty()
                 actor.SetInput(text)
-                text_prop.SetFontSize(size)
+                base_scale = getattr(actor, '_naksha_base_scale', None)
+                if base_scale is None:
+                    base_scale = float(actor.GetScale()[0])
+                    actor._naksha_base_scale = base_scale
+                base_size = float(
+                    getattr(actor, '_naksha_base_font_size',
+                            text_prop.GetFontSize() or 75) or 75
+                )
+                actor._naksha_base_font_size = base_size
+                # vtkTextActor3D does not reliably change its world footprint
+                # from SetFontSize alone. Keep glyph rasterization stable and
+                # resize the actor transform from the immutable import scale.
+                text_prop.SetFontSize(max(8, int(round(base_size))))
+                factor = self._label_font_scale_factor(size, base_size)
+                new_scale = float(base_scale) * factor
+                actor.SetScale(new_scale, new_scale, new_scale)
                 text_prop.SetColor(*color)
+                actor._naksha_label_font_size = size
             else:
                 # vtkFollower labels are built either from a live vtkVectorText
                 # pipeline connection (DXF path: SetInputConnection) or from a
@@ -7019,12 +7043,9 @@ class GridLabelManager:
                         actor._naksha_base_scale = base_scale
                     base_size = float(getattr(actor, '_naksha_base_font_size', 75) or 75)
                     if base_size > 0:
-                        # SNT/DXF follower glyphs are world geometry rather
-                        # than screen text. A strong display multiplier keeps
-                        # labels readable across kilometre-scale grid cells:
-                        # 999 pt is intentionally very large, while 50 pt is
-                        # still clearly visible.
-                        new_scale = base_scale * (float(size) / base_size) * 8.0
+                        new_scale = base_scale * self._label_font_scale_factor(
+                            size, base_size
+                        )
                         actor.SetScale(new_scale, new_scale, new_scale)
                 except Exception as _scale_err:
                     print(f"⚠️ Could not rescale grid label: {_scale_err}")
@@ -8374,7 +8395,10 @@ class GridLabelManager:
         # ============================================================================
         _reset_interaction_state()
         if hasattr(self.app, 'data') and self.app.data is not None:
+            from gui.save_pointcloud import has_fenced_parent_writeback
             save_path = getattr(self.app, 'last_save_path', None) or getattr(self.app, 'loaded_file', None)
+            if not save_path and has_fenced_parent_writeback(self.app):
+                save_path = "__fenced_parent_writeback__"
 
             # Only save if there are points (prevent saving empty cleared state)
             current_point_count = len(self.app.data.get('xyz', [])) if self.app.data else 0
@@ -8607,6 +8631,7 @@ class GridLabelManager:
                     update_progress._last_update = time.time()
 
         load_start = time.time()
+        self.app._dataset_load_in_progress = True
 
         try:
             # ============================================================================
@@ -8821,15 +8846,36 @@ class GridLabelManager:
             # BUILD SPATIAL INDEX - SAME AS MENU BAR
             # ============================================================================
             if total_points > 50_000:
-                try:
-                    update_progress(70, "Building spatial index...", force=True)
-                    from gui.performance_optimizations import SpatialIndex
-                    self.app.spatial_index = SpatialIndex(self.app.data["xyz"])
-                    print(f"   ✅ Spatial index built")
-                except Exception as e:
-                    print(f"   ⚠️ Spatial index failed: {e}")
-                    self.app.spatial_index = None
-            
+                # Build the same full-resolution KD-tree after the visible load.
+                # Existing tools retain their vectorized fallback until ready.
+                self.app.spatial_index = None
+                indexed_xyz = self.app.data["xyz"]
+                indexed_xyz_id = id(indexed_xyz)
+
+                def _start_deferred_spatial_index():
+                    import threading
+
+                    def _worker():
+                        try:
+                            from gui.performance_optimizations import SpatialIndex
+                            built_index = SpatialIndex(indexed_xyz)
+                            current_data = getattr(self.app, "data", None) or {}
+                            if id(current_data.get("xyz")) == indexed_xyz_id:
+                                self.app.spatial_index = built_index
+                                print("   Deferred spatial index installed")
+                            else:
+                                print("   Deferred spatial index discarded: data replaced")
+                        except Exception as exc:
+                            print(f"   Deferred spatial index failed: {exc}")
+
+                    threading.Thread(
+                        target=_worker, name="NakshaSpatialIndex", daemon=True
+                    ).start()
+
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(1500, _start_deferred_spatial_index)
+                print("   Full-resolution spatial index scheduled after load")
+
             # ============================================================================
             # RESTORE DISPLAY SETTINGS - SAME AS MENU BAR
             # ============================================================================
@@ -8842,7 +8888,7 @@ class GridLabelManager:
                 from gui.display_mode import restore_display_settings_for_file
                 self.app._prefer_session_display_restore = True
                 try:
-                    restore_display_settings_for_file(self.app, str(las_file))
+                    restore_display_settings_for_file(self.app, str(las_file), refresh=False)
                 finally:
                     self.app._prefer_session_display_restore = False
             except Exception:
@@ -9058,7 +9104,7 @@ class GridLabelManager:
             # ============================================================================
             # TRACK GRID (additional for grid system)
             # ============================================================================
-            grid_indices = np.arange(total_points)
+            grid_indices = np.arange(total_points, dtype=np.int32)
             self.loaded_grids[owner_label] = grid_indices
             if owner_label != grid_name:
                 self.grid_aliases[grid_name] = owner_label
@@ -9107,6 +9153,8 @@ class GridLabelManager:
             traceback.print_exc()
             progress.finish_error(f"Load failed: {e}")
             QMessageBox.critical(self.app, "Load Error", f"Failed to load: {e}")
+        finally:
+            self.app._dataset_load_in_progress = False
 
     def _save_folder_to_settings(self, folder_path):
         """Save LAZ/LAS folder to settings for future use"""

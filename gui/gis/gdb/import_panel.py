@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -32,6 +32,7 @@ from .engine import (
     check_gdal_version,
 )
 from . import reader as gdb_reader
+from gui.gis.gis_style import apply_gis_dock_style, compact_layout, compact_view, configure_header
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,11 +272,10 @@ class GdbImportDock:
         root = QWidget()
         root.setObjectName("GdbImportPanel")
         dock.setWidget(root)
-        dock.setStyleSheet(_build_panel_style())
+        apply_gis_dock_style(root)
 
         v = QVBoxLayout(root)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(8)
+        compact_layout(v)
 
         # ── Header: title + path ────────────────────────────────────────────
         title = QLabel("GDB Import")
@@ -296,12 +296,12 @@ class GdbImportDock:
         btn_open = QPushButton("  Open GDB…")
         btn_open.setObjectName("gdbOpen")
         btn_open.setIcon(_icon("gdb", cols["on_accent"], 14))
-        btn_open.setIconSize(Qt.QSize(14, 14))
+        btn_open.setIconSize(QSize(14, 14))
         btn_open.setCursor(Qt.PointingHandCursor)
         btn_import = QPushButton("  Import selected")
         btn_import.setObjectName("gdbImport")
         btn_import.setIcon(_icon("import", cols["on_accent"], 14))
-        btn_import.setIconSize(Qt.QSize(14, 14))
+        btn_import.setIconSize(QSize(14, 14))
         btn_import.setCursor(Qt.PointingHandCursor)
         btn_row.addWidget(btn_open)
         btn_row.addWidget(btn_import)
@@ -327,6 +327,8 @@ class GdbImportDock:
         tree = QTreeWidget()
         tree.setObjectName("gdbTree")
         tree.setHeaderLabels(["Feature class", "Geometry", "Features"])
+        compact_view(tree)
+        configure_header(tree.header(), stretch_column=0)
         tree.setRootIsDecorated(False)
         tree.setUniformRowHeights(False)
         tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -396,11 +398,12 @@ class GdbImportDock:
             if not path:
                 tree.blockSignals(False)
                 return
+            list_error = None
             try:
                 names = list_layer_names(path)
             except Exception as exc:
                 names = []
-                QMessageBox.warning(dock, "GDB", f"Could not list layers:\n{exc}")
+                list_error = exc
             ds = gdb_reader.open_gdb_for_read(path)
             try:
                 for name in names:
@@ -457,6 +460,12 @@ class GdbImportDock:
             finally:
                 ds = None
             tree.blockSignals(False)
+            # Shown only after the tree rebuild is fully done and signals are
+            # unblocked - a QMessageBox pumps a nested event loop, and doing
+            # that while the tree was still mid-rebuild/signal-blocked risked
+            # another queued rebuild landing on top of this one.
+            if list_error is not None:
+                QMessageBox.warning(dock, "GDB", f"Could not list layers:\n{list_error}")
 
         def _apply_filter(text: str):
             t = (text or "").strip().lower()
@@ -523,9 +532,7 @@ class GdbImportDock:
                     f"Failed:\n  " + "\n  ".join(fail))
             # Show the OCC panel
             try:
-                from gui.gis.gis_layers import show_gis_layers_panel, zoom_to_gis_entries
-                if imported_entries:
-                    zoom_to_gis_entries(app, imported_entries)
+                from gui.gis.gis_layers import show_gis_layers_panel
                 show_gis_layers_panel(app)
             except Exception:
                 pass
@@ -677,24 +684,38 @@ def QApplication_clipboard_set(app, text: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_gdb_import_panel(app) -> "QDockWidget":
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
     dock = getattr(app, "_gdb_import_dock", None)
     if dock is None:
         dock = GdbImportDock.create(app)
         setattr(app, "_gdb_import_dock", dock)
-        try:
-            app.addDockWidget(Qt.LeftDockWidgetArea, dock)
-        except Exception:
-            pass
+        # Deferred: GdbImportDock.create() just built a fresh toolbar/tree
+        # subtree (new QPushButtons, tooltips, icons) whose Qt-style-driven
+        # setup may still be settling. Reparenting it into the main window
+        # in the same tick raced a style animation's teardown against the
+        # reparent's ChildRemoved/ChildAdded events elsewhere in this app
+        # (0xc0000005 in Qt6Widgets.dll) - defer one event-loop tick.
+        def _deferred_dock(_dock=dock):
+            try:
+                app.addDockWidget(Qt.LeftDockWidgetArea, _dock)
+            except Exception:
+                pass
+            apply_gis_dock_style(_dock.widget())
+            _dock.show()
+            try:
+                if _dock.isFloating():
+                    _dock.raise_()
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _deferred_dock)
+        return dock
     else:
         try:
             dock.refresh_tree()
         except Exception:
             pass
-    try:
-        dock.setStyleSheet(_build_panel_style())
-    except Exception:
-        pass
+    apply_gis_dock_style(dock.widget())
     dock.show()
     try:
         if dock.isFloating():

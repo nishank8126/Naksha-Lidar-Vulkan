@@ -38,6 +38,7 @@ def _get_plugins_dir() -> Path:
 
 # Initialize with proper user-writable path
 PLUGINS_DIR = _get_plugins_dir()
+INSTALL_CACHE_DIRNAME = ".install-cache"
 
 
 class PluginManager:
@@ -92,6 +93,27 @@ class PluginManager:
                     print(f"Warning: Failed to parse manifest in {plugin_dir}: {e}")
         return found
 
+    @staticmethod
+    def _plugin_slug(name: str) -> str:
+        return re.sub(r'[^a-zA-Z0-9_-]', '_', name).lower()
+
+    def _cached_archive_path(self, name: str) -> Path:
+        return PLUGINS_DIR / INSTALL_CACHE_DIRNAME / f"{self._plugin_slug(name)}.zip"
+
+    @staticmethod
+    def _remove_bytecode(plugin_dir: Path) -> None:
+        for cache_dir in plugin_dir.rglob("__pycache__"):
+            if cache_dir.is_dir():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+
+    @staticmethod
+    def _validate_owned_plugin_dir(plugin_dir: Path) -> Path:
+        root = PLUGINS_DIR.resolve()
+        target = plugin_dir.resolve()
+        if target == root or target.parent != root:
+            raise ValueError(f"Refusing to delete plugin path outside '{root}': {target}")
+        return target
+
     def load_plugin(self, manifest, plugin_dir):
         name = manifest["name"]
         if name in self.loaded_plugins:
@@ -137,13 +159,20 @@ class PluginManager:
     def unload_plugin(self, name, *, rebuild_ribbon=True):
         if name not in self.loaded_plugins:
             return False, f"'{name}' not loaded."
+
+        info = self.loaded_plugins[name]
+        hook_error = None
         try:
-            info = self.loaded_plugins[name]
             info["instance"].on_unload()
-            
-            plugin_dir = info["dir"]
+        except Exception as exc:
+            # A faulty plugin hook must not make the plugin impossible to
+            # uninstall or repair. Continue with manager-owned cleanup.
+            hook_error = exc
+
+        try:
+            plugin_dir = Path(info["dir"])
             dir_str = str(plugin_dir.resolve())
-            if dir_str in sys.path:
+            while dir_str in sys.path:
                 sys.path.remove(dir_str)
 
             # Remove the entry module and every private submodule imported
@@ -156,23 +185,24 @@ class PluginManager:
                     continue
                 try:
                     module_path = Path(module_file).resolve()
-                    if (
-                        module_path == plugin_root
-                        or plugin_root in module_path.parents
-                    ):
+                    if module_path == plugin_root or plugin_root in module_path.parents:
                         sys.modules.pop(module_name, None)
                 except (OSError, RuntimeError, TypeError, ValueError):
                     continue
 
-            del self.loaded_plugins[name]
+            self.loaded_plugins.pop(name, None)
             sys.modules.pop(name, None)
+            importlib.invalidate_caches()
 
             if rebuild_ribbon:
                 self._rebuild_plugins_ribbon()
-            
+
+            if hook_error is not None:
+                print(f"Warning: Plugin '{name}' on_unload failed; forced cleanup completed: {hook_error}")
+                return True, f"'{name}' unloaded with a plugin cleanup warning: {hook_error}"
             return True, f"'{name}' unloaded."
-        except Exception as e:
-            return False, f"Unload failed: {e}"
+        except Exception as exc:
+            return False, f"Unload cleanup failed: {exc}"
 
     def uninstall_plugin(self, name):
         """Unload and permanently delete a plugin from the disk."""
@@ -192,13 +222,29 @@ class PluginManager:
         if not plugin_dir:
             return False, f"Plugin '{name}' not found."
 
+        delete_errors = []
         try:
+            plugin_dir = self._validate_owned_plugin_dir(Path(plugin_dir))
             if plugin_dir.exists():
                 shutil.rmtree(plugin_dir)
-            self._rebuild_plugins_ribbon()
-            return True, f"Plugin '{name}' successfully uninstalled."
-        except Exception as e:
-            return False, f"Failed to delete plugin files: {e}"
+        except Exception as exc:
+            delete_errors.append(f"plugin directory: {exc}")
+
+        cached_archive = self._cached_archive_path(name)
+        try:
+            if cached_archive.exists():
+                cached_archive.unlink()
+            try:
+                cached_archive.parent.rmdir()
+            except OSError:
+                pass
+        except Exception as exc:
+            delete_errors.append(f"installer cache: {exc}")
+
+        self._rebuild_plugins_ribbon()
+        if delete_errors:
+            return False, "Failed to delete " + "; ".join(delete_errors)
+        return True, f"Plugin '{name}' successfully uninstalled."
 
     def load_all(self):
         for manifest, plugin_dir in self.discover_plugins():
@@ -254,7 +300,7 @@ class PluginManager:
                         return False, msg
 
                 # Determine target directory under plugins/ (slugify name to make it safe)
-                slug = re.sub(r'[^a-zA-Z0-9_-]', '_', plugin_name).lower()
+                slug = self._plugin_slug(plugin_name)
                 dest_dir = PLUGINS_DIR / slug
 
                 # If destination directory already exists, attempt to remove it
@@ -282,10 +328,49 @@ class PluginManager:
                 if not ok:
                     return False, f"Installed successfully but failed to load: {msg}"
 
+                # Retain the original package outside the live plugin directory.
+                # Reinstall can then perform the same clean extraction again.
+                cache_path = self._cached_archive_path(plugin_name)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                if zip_path.resolve() != cache_path.resolve():
+                    temp_cache = cache_path.with_suffix(".zip.tmp")
+                    shutil.copy2(zip_path, temp_cache)
+                    temp_cache.replace(cache_path)
+
                 return True, f"Plugin '{plugin_name}' successfully installed and loaded."
 
         except Exception as e:
             return False, f"Plugin installation failed: {e}"
+
+    def reinstall_plugin(self, name):
+        """Re-extract a ZIP install, or cleanly reload a bundled plugin."""
+        cached_archive = self._cached_archive_path(name)
+        if cached_archive.exists():
+            return self.install_plugin_from_zip(cached_archive)
+
+        plugin_info = self.loaded_plugins.get(name)
+        manifest = plugin_info.get("manifest") if plugin_info else None
+        plugin_dir = Path(plugin_info["dir"]) if plugin_info else None
+        if manifest is None or plugin_dir is None:
+            for discovered_manifest, discovered_dir in self.discover_plugins():
+                if discovered_manifest.get("name") == name:
+                    manifest = discovered_manifest
+                    plugin_dir = discovered_dir
+                    break
+        if manifest is None or plugin_dir is None:
+            return False, f"Plugin '{name}' not found."
+
+        if name in self.loaded_plugins:
+            ok, msg = self.unload_plugin(name, rebuild_ribbon=False)
+            if not ok:
+                return False, msg
+        self._remove_bytecode(plugin_dir)
+        importlib.invalidate_caches()
+        ok, msg = self.load_plugin(manifest, plugin_dir)
+        if not ok:
+            self._rebuild_plugins_ribbon()
+            return False, f"Reinstall failed: {msg}"
+        return True, f"Plugin '{name}' successfully reinstalled and loaded."
 
     def _rebuild_plugins_ribbon(self):
         """Rebuild once, then resize after Qt has laid out the new sections."""
