@@ -614,6 +614,23 @@ class SectionWheelZoomEventFilter(QObject):
         ):
             return False
 
+        # Display Mode is deliberately never "always on top" (a click on the
+        # main/section window should naturally bring it forward), but this
+        # section/cut viewport is its own separate top-level window when
+        # undocked - scrolling in it (not just clicking) also activates that
+        # window, which silently buries Display Mode behind it. Re-raise
+        # only, never activateWindow(): this keeps Display Mode visually on
+        # top without stealing focus back from the view being scrolled, and
+        # a later click on this window still brings it forward exactly as
+        # before, so nothing about the existing click-to-front design changes.
+        try:
+            app = self._app_ref()
+            dlg = getattr(app, "display_mode_dialog", None) if app is not None else None
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+        except Exception:
+            pass
+
         try:
             event.accept()
         except Exception:

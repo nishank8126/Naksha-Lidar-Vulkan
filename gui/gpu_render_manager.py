@@ -338,6 +338,16 @@ class GPURenderManager(QObject):
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return
+        # The old settle path rendered without rebuilding clip planes, so
+        # planar SNT/DXF scenes could remain fully clipped until Shift+F.
+        refresh_clipping = getattr(
+            app, "_refresh_main_view_clipping_after_navigation", None
+        )
+        if callable(refresh_clipping):
+            try:
+                refresh_clipping()
+            except Exception:
+                pass
         self.force_render()
 
     def _engage_lod(self):

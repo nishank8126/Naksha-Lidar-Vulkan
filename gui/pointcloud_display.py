@@ -1306,7 +1306,10 @@ def force_interactor_ready(app, delay_ms=200):
                     current_style.GetClassName() if current_style is not None else "None"
                 )
 
-                if getattr(app, "is_3d_mode", False):
+                # A stale is_3d_mode value is not enough to authorize orbit
+                # after a loader has recreated/initialized the interactor.
+                # Only an explicit 3D action or Shift+P grants this flag.
+                if getattr(app, "_main_view_3d_user_enabled", False):
                     if current_style_name != "vtkInteractorStyleTrackballCamera":
                         if hasattr(plotter, "enable_trackball_style"):
                             plotter.enable_trackball_style()
