@@ -12965,6 +12965,17 @@ _ACI_RGB: Dict[int, Tuple[int, int, int]] = {
 _INVISIBLE_ACI: Set[int] = {0, 7, 256}
 _PRJ_BLOCK_PRECISION_TOLERANCE_M = 1.0
 
+# Absolute, in metres. A ring's closing vertex is a literal repeat of its first,
+# so it matches to float noise -- 1 mm is orders of magnitude below the spacing
+# of any real surveyed vertex. This MUST NOT be scaled by coordinate magnitude:
+# doing so (mag * 1e-6) yields 4.4 m on UTM northings, which silently deletes a
+# genuine final vertex from any ring that happens to close within 4.4 m of its
+# start. That truncation desynchronised a block's vertex count from its PRJ
+# twin, so _polygon_alignment_error returned inf, that one block alone missed
+# PRJ precision correction, and the edge it shared with its neighbour stopped
+# being coincident -- drawing the shared boundary as two separate lines.
+_CLOSING_VERTEX_TOL_M = 1e-3
+
 
 def _qt_object_is_alive(obj) -> bool:
     if obj is None:
@@ -13550,9 +13561,8 @@ def _open_polygon_xy(points) -> np.ndarray:
             clean.append((x, y))
     polygon = np.asarray(clean, dtype=np.float64)
     if len(polygon) >= 2:
-        mag = float(np.max(np.abs(polygon))) if polygon.size else 0.0
-        closure_tol = max(1e-6, mag * 1e-6)  # ~0.7mm at 700km-scale coords, was 1e-9
-        if np.allclose(polygon[0], polygon[-1], atol=closure_tol, rtol=0.0):
+        if np.allclose(polygon[0], polygon[-1],
+                       atol=_CLOSING_VERTEX_TOL_M, rtol=0.0):
             polygon = polygon[:-1]
     return polygon
 
@@ -13578,11 +13588,9 @@ def _is_closed_block_polygon_entity(entity: Dict) -> bool:
         last = raw_points[-1]
         if first is None or last is None or len(first) < 2 or len(last) < 2:
             return False
-        mag = max(abs(float(first[0])), abs(float(first[1])), 1.0)
-        closure_tol = max(1e-6, mag * 1e-6)
         return (
-            abs(float(first[0]) - float(last[0])) <= closure_tol
-            and abs(float(first[1]) - float(last[1])) <= closure_tol
+            abs(float(first[0]) - float(last[0])) <= _CLOSING_VERTEX_TOL_M
+            and abs(float(first[1]) - float(last[1])) <= _CLOSING_VERTEX_TOL_M
         )
     except Exception:
         return False
@@ -13779,7 +13787,16 @@ def _build_prj_spatial_index(prj_blocks):
     for block, center_x, center_y in records:
         key = (math.floor(center_x / cell_size), math.floor(center_y / cell_size))
         buckets[key].append(block)
-    return {"cell_size": cell_size, "buckets": buckets}
+    if records:
+        centers_x = [record[1] for record in records]
+        centers_y = [record[2] for record in records]
+        center_bounds = (
+            min(centers_x), min(centers_y), max(centers_x), max(centers_y)
+        )
+    else:
+        center_bounds = None
+    return {"cell_size": cell_size, "buckets": buckets,
+            "center_bounds": center_bounds}
 
 
 def _nearby_prj_blocks(poly_points, prj_blocks, spatial_index=None):
@@ -13791,6 +13808,16 @@ def _nearby_prj_blocks(poly_points, prj_blocks, spatial_index=None):
         return prj_blocks or []
     center_x, center_y = points.mean(axis=0)
     cell_size = spatial_index["cell_size"]
+    center_bounds = spatial_index.get("center_bounds")
+    if center_bounds is not None:
+        min_x, min_y, max_x, max_y = center_bounds
+        margin = 2.0 * cell_size
+        if not (min_x - margin <= center_x <= max_x + margin
+                and min_y - margin <= center_y <= max_y + margin):
+            # A full scan cannot find a spatial match when SNT and PRJ are in
+            # grossly different unit spaces. Avoid quadratic work on legacy
+            # mis-scaled files.
+            return []
     base_x = math.floor(float(center_x) / cell_size)
     base_y = math.floor(float(center_y) / cell_size)
     candidates = []
@@ -26385,6 +26412,9 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
             actor._text_font_size = font_size_pt
             actor._text_scale_base = world_scale
             actor._text_parallel_scale_ref = 100.0
+            actor._naksha_base_scale = world_scale
+            actor._naksha_base_font_size = font_size_pt
+            actor._naksha_label_font_size = font_size_pt
 
             actor.PickableOn()
             actor.text_content = text_content
@@ -26483,6 +26513,11 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
                     pass
 
         actor.SetScale(scale, scale, scale)
+        # Stable baseline used by label editing. Keeping the immutable import
+        # scale separate prevents repeated edits from accumulating scale.
+        actor._naksha_base_scale = float(scale)
+        actor._naksha_base_font_size = 75
+        actor._naksha_label_font_size = 75
 
         # Rotation is stored in the SNT TEXT body in degrees.  Rotate around
         # the glyph centre so a rotated label keeps the same anchor position

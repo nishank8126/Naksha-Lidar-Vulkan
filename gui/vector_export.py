@@ -3922,6 +3922,19 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
 
             if src.count >= 3:
                 rgb_data = src.read([1, 2, 3], **read_kwargs)
+                # Keep the initial overview visually consistent with the
+                # native-resolution crops loaded by raster_lod.py.
+                from gui.gis.raster_properties import (
+                    default_raster_style,
+                    process_raster_array,
+                )
+                initial_style = default_raster_style(band_count)
+                styled_rgb = process_raster_array(
+                    {1: rgb_data[0], 2: rgb_data[1], 3: rgb_data[2]},
+                    initial_style,
+                )
+                rgb_data = np.moveaxis(styled_rgb, -1, 0)
+                del styled_rgb
             else:
                 # Float single-band GeoTIFFs are normally elevation products.
                 # Rendering their metre values directly as uint8 clips nearly

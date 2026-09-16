@@ -12,6 +12,7 @@ from gui.grid_label_system import (
 from gui.save_pointcloud import (
     _inspect_fenced_parent_session,
     _save_fenced_parent_files,
+    save_current_pointcloud_in_place,
 )
 
 
@@ -107,3 +108,36 @@ def test_buffered_classifications_write_to_each_original_file(tmp_path):
     second_saved = laspy.read(second)
     assert np.asarray(first_saved.classification).tolist() == [1, 1, 11, 1]
     assert np.asarray(second_saved.classification).tolist() == [12, 2, 2, 13]
+
+
+def test_pathless_buffer_session_autosaves_to_parent_files(tmp_path):
+    first = tmp_path / "primary.las"
+    second = tmp_path / "neighbor.las"
+    _write_las(first, [1, 1])
+    _write_las(second, [2, 2])
+    session_id = "pathless-buffer"
+    app = SimpleNamespace(
+        loaded_file=None,
+        last_save_path=None,
+        data={
+            "xyz": np.zeros((2, 3), dtype=float),
+            "classification": np.asarray([7, 8], dtype=np.uint8),
+            "_fence_session_id": session_id,
+            "_fence_source_file_ids": np.asarray([0, 1], dtype=np.int32),
+            "_fence_source_point_indices": np.asarray([1, 0], dtype=np.int64),
+        },
+        _fence_parent_session={
+            "session_id": session_id,
+            "source_files": [str(first), str(second)],
+            "operation": "buffered_grid",
+            "primary_grid": "primary",
+            "buffer_width": 10.0,
+            "duplicate_owner_indices": np.empty(0, dtype=np.int64),
+            "duplicate_source_file_ids": np.empty(0, dtype=np.int32),
+            "duplicate_source_point_indices": np.empty(0, dtype=np.int64),
+        },
+    )
+
+    assert save_current_pointcloud_in_place(app)
+    assert np.asarray(laspy.read(first).classification).tolist() == [1, 7]
+    assert np.asarray(laspy.read(second).classification).tolist() == [8, 2]
