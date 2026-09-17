@@ -19,6 +19,28 @@ def clone_palette(palette):
     if not palette:
         return {}
     return _copy.deepcopy(palette)
+
+
+def build_class_palette(classification):
+    '''Build a visible neutral palette when no PTC palette is active.
+
+    The palette is deliberately color-neutral: a PTC may recolor it later, but
+    the base LAS/LAZ render must never depend on the user loading a PTC.
+    '''
+    classes = np.asarray(classification)
+    if classes.size == 0:
+        return {}
+
+    return {
+        int(code): {
+            'show': True,
+            'description': f'Class {int(code)}',
+            'lvl': f'Class {int(code)}',
+            'color': (160, 160, 160),
+            'weight': 1.0,
+        }
+        for code in np.unique(classes)
+    }
 # ─────────────────────────────────────────────────────────────────────────
 
 
