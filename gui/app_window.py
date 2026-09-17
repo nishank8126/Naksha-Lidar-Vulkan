@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QMessageBox, QWidget, QVBoxLayout, QInputDialog,
     QDockWidget, QTreeWidget, QTreeWidgetItem, QMenu, QColorDialog, QSplitter, QComboBox,
     QPushButton, QLabel, QSizePolicy, QHBoxLayout,
-    QDialog, QStatusBar
+    QDialog, QStatusBar, QProxyStyle, QStyle
 )
 from PySide6.QtCore import QObject, QEvent, Qt, QTimer, QSettings, Signal, QThread
 from PySide6.QtWidgets import QSlider
@@ -1072,6 +1072,15 @@ class _BackupWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+class _CompactDockSeparatorStyle(QProxyStyle):
+    """Keep dock splitters precise instead of using the platform's wide metric."""
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == QStyle.PixelMetric.PM_DockWidgetSeparatorExtent:
+            return 2
+        return super().pixelMetric(metric, option, widget)
+
+
 class NakshaApp(QMainWindow):
     # Phase 4: Global signal bus
     classification_finished = Signal(object)  # emits changed_mask (numpy array or None)
@@ -1081,6 +1090,7 @@ class NakshaApp(QMainWindow):
        
 
         super().__init__()
+        self.setObjectName("NakshaMainWindow")
         self.setContextMenuPolicy(Qt.NoContextMenu)
         try:
             from gui.app_icon import apply_window_icon, resolve_app_icon_path
@@ -1119,6 +1129,9 @@ class NakshaApp(QMainWindow):
             ThemeManager.apply_theme(self, saved_theme)
         except Exception as e:
             print(f"⚠️ Failed to apply theme: {e}")
+
+        self._compact_dock_separator_style = _CompactDockSeparatorStyle()
+        self.setStyle(self._compact_dock_separator_style)
  
         # Settings
         settings = QSettings("NakshaAI", "LidarApp")
@@ -1170,6 +1183,12 @@ class NakshaApp(QMainWindow):
         saved_style = settings.value("cross_line_style", None)
         if saved_style:
             self.cross_line_style = str(saved_style)
+
+        self.cross_section_dock_layout = settings.value(
+            "cross_section_dock_layout", "rows", type=str
+        )
+        if self.cross_section_dock_layout not in {"rows", "columns"}:
+            self.cross_section_dock_layout = "rows"
        
         # ===== SET WINDOW TITLE WITH GPU INFO =====
         if gpu_support.gpu_available:
@@ -4814,6 +4833,52 @@ class NakshaApp(QMainWindow):
             5000
         )
 
+    def _arrange_cross_section_docks(self):
+        """Arrange attached cross-section docks using the saved user preference."""
+        layout = getattr(self, "cross_section_dock_layout", "rows")
+        orientation = Qt.Horizontal if layout == "columns" else Qt.Vertical
+
+        docked = []
+        for _view_index, dock in sorted(
+            getattr(self, "section_docks", {}).items()
+        ):
+            try:
+                if (
+                    _qt_object_is_valid(dock)
+                    and dock.isVisible()
+                    and not dock.isFloating()
+                    and self.dockWidgetArea(dock) == Qt.RightDockWidgetArea
+                ):
+                    docked.append(dock)
+            except RuntimeError:
+                continue
+
+        if len(docked) < 2:
+            return
+
+        anchor = docked[0]
+        for dock in docked[1:]:
+            self.splitDockWidget(anchor, dock, orientation)
+            anchor = dock
+
+        self.resizeDocks(docked, [1] * len(docked), orientation)
+        print(
+            f"Arranged {len(docked)} attached cross sections as {layout}"
+        )
+
+    @staticmethod
+    def _update_cross_section_dock_title_style(dock, is_floating):
+        """Use a compact title strip only while a cross section is docked."""
+        dock.setProperty(
+            "compactDockTitle", "false" if is_floating else "true"
+        )
+        style = dock.style()
+        if style is not None:
+            style.unpolish(dock)
+            style.polish(dock)
+        dock.updateGeometry()
+        dock.update()
+
     def _open_specific_cross_section_view(self, view_index):
         """
         ✅ INTERNAL METHOD - Creates/activates a specific cross-section view
@@ -4861,9 +4926,12 @@ class NakshaApp(QMainWindow):
         dock = QDockWidget(f"Cross Section {view_index + 1}", self)
         dock.setObjectName(f"CrossSectionDock_{view_index}")  # CRITICAL for persistence
         dock.setContextMenuPolicy(Qt.NoContextMenu)
+        self._update_cross_section_dock_title_style(dock, is_floating=True)
 
         frame = QWidget()
         layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
         # Create VTK widget
         vtk_widget = QtInteractor(frame)
@@ -5200,12 +5268,17 @@ class NakshaApp(QMainWindow):
 
         def _on_top_level_changed(is_floating):
             """Reinstall right-click observers when dock state changes (floating <-> tabified)."""
+            self._update_cross_section_dock_title_style(dock, is_floating)
             if not is_floating:
                 print(f"📎 View {view_index + 1} docked/tabified - reinstalling right-click observers")
                 try:
                     self._reinstall_section_right_click_observer(view_index)
                 except Exception as e:
                     print(f"   ⚠️ Failed to reinstall observer: {e}")
+
+                # Wait until Qt completes the attach operation before applying
+                # the layout selected in Global Settings.
+                QTimer.singleShot(0, self._arrange_cross_section_docks)
 
         dock.topLevelChanged.connect(_on_top_level_changed)
         
@@ -7723,7 +7796,10 @@ class NakshaApp(QMainWindow):
         # the renderer falls back to TerraScan defaults until the user loads
         # a PTC manually.
         print("📋 No active PTC in memory — using TerraScan defaults")
-        return None
+        from gui.class_display import build_class_palette
+        data = getattr(self, 'data', None)
+        classification = data.get('classification') if isinstance(data, dict) else None
+        return build_class_palette(classification) if classification is not None else {}
 
         # # Try to load from last PTC
         # settings = QSettings("NakshaAI", "LidarApp")
