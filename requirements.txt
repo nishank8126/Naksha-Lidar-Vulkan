@@ -84,8 +84,9 @@ Since you intend to commit every listed change, run:
 git add -A
 git diff --cached --stat
 git diff --cached
-git commit -m "sectionController"
-git push origin GIS-workflow
+git commit -m "75 pt preserves the imported size. Values below 75 pt continue shrinking linearly.Values above 75 pt grow with stronger world-space scaling.Repeated edits use an immutable baseline, preventing accumulated scaling errors.Works for both vtkFollower and vtkTextActor3D labelsUses the current class set.Backfills missing Lvl, description, draw, and color.Checks the live Display Mode table and all per-view palettes.Preserves shortcut-specific visibility and weight settings.Falls back to description or class code when no meaningful level exists."
+git push origin software-enhancement-20260910
 
-git pull --rebase origin GIS-workflow
-git push origin GIS-workflow
+
+# git pull --rebase origin MAIN
+# git push origin MAIN

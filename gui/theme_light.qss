@@ -13,6 +13,14 @@ QMainWindow, QWidget {
     font-size: 11pt;
 }
 
+QMainWindow#NakshaMainWindow::separator {
+    background: #d0d5dd;
+    margin: 0px;
+}
+QMainWindow#NakshaMainWindow::separator:hover {
+    background: #00b4d8;
+}
+
 /* ── Menu Bar ───────────────────────────────────────────────── */
 QMenuBar {
     background-color: #f0f2f5;
@@ -74,6 +82,24 @@ QDockWidget::close-button, QDockWidget::float-button {
 }
 QDockWidget::close-button:hover, QDockWidget::float-button:hover {
     background: #00b4d8;
+}
+
+/* Cross-section docks save canvas space when attached. Floating windows keep
+   the normal, roomier title treatment above. */
+QDockWidget[compactDockTitle="true"] {
+    font-size: 11px;
+    font-weight: 600;
+}
+QDockWidget[compactDockTitle="true"]::title {
+    padding: 2px 4px;
+    border-bottom: 1px solid #00b4d8;
+}
+QDockWidget[compactDockTitle="true"]::close-button,
+QDockWidget[compactDockTitle="true"]::float-button {
+    width: 13px;
+    height: 13px;
+    margin: 2px 2px 2px 0px;
+    padding: 0px;
 }
 
 /* ── Buttons ────────────────────────────────────────────────── */
