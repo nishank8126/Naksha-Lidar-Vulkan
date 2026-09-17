@@ -3252,6 +3252,11 @@ class DisplayModeDialog(QDialog):
             }
             self.applied.emit(payload)
 
+        # Main View owns the canonical classification schema. Notify any
+        # open picker after Add/Edit/Delete + Apply so its choices refresh.
+        if self.current_slot == 0:
+            self.classes_loaded.emit()
+
         if hasattr(app, 'statusBar'):
             view_names = ["Main View", "View 1", "View 2", "View 3", "View 4"]
             v_name = (view_names[self.current_slot]

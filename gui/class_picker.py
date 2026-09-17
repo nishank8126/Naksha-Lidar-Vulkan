@@ -568,40 +568,40 @@ class ClassPicker(QWidget):
         
         class_list = []
         
-        # Get classes from Display Mode
-        display_dialog = getattr(self.app, 'display_mode_dialog', getattr(self.app, 'display_dialog', None))
-
-        if display_dialog:
-            table = display_dialog.table
-            for row in range(table.rowCount()):
-                try:
-                    code_item = table.item(row, 1)
-                    if not code_item: continue
-                    
-                    code = int(code_item.text())
-                    desc = table.item(row, 2).text()
-                    
-                    lvl_item = table.item(row, 4)
-                    lvl = lvl_item.text() if lvl_item else ""
-                    
-                    color_item = table.item(row, 5)
-                    color = color_item.background().color() if color_item else QColor(128, 128, 128)
-                    
-                    class_list.append({'code': code, 'desc': desc, 'lvl': lvl, 'color': color})
-                except Exception:
-                    continue
-                    
-        # Fallback: Use app's class_palette
-        if not class_list and hasattr(self.app, 'class_palette'):
-            for code, info in sorted(self.app.class_palette.items()):
+        # The live palette is canonical after Display Mode Apply. Reading the
+        # dialog table first left an open picker one edit behind.
+        palette = getattr(self.app, 'class_palette', {}) or {}
+        if palette:
+            for code, info in sorted(palette.items()):
                 color_tuple = info.get('color', (128, 128, 128))
                 class_list.append({
-                    'code': code,
+                    'code': int(code),
                     'desc': info.get('description', ''),
                     'lvl': info.get('lvl', ''),
                     'color': QColor(*color_tuple)
                 })
 
+        # Compatibility fallback for startup states where the table is ready
+        # before the application palette has been initialized.
+        display_dialog = getattr(self.app, 'display_mode_dialog', getattr(self.app, 'display_dialog', None))
+        if not class_list and display_dialog:
+            table = display_dialog.table
+            for row in range(table.rowCount()):
+                try:
+                    code_item = table.item(row, 1)
+                    if not code_item:
+                        continue
+
+                    code = int(code_item.text())
+                    desc_item = table.item(row, 2)
+                    desc = desc_item.text() if desc_item else ""
+                    lvl_item = table.item(row, 4)
+                    lvl = lvl_item.text() if lvl_item else ""
+                    color_item = table.item(row, 5)
+                    color = color_item.background().color() if color_item else QColor(128, 128, 128)
+                    class_list.append({'code': code, 'desc': desc, 'lvl': lvl, 'color': color})
+                except Exception:
+                    continue
         # ---------------------------------------------------------
         # Populate UI
         # ---------------------------------------------------------
