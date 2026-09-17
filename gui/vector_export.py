@@ -3766,6 +3766,143 @@ def _geotiff_texture_pixel_budget(app, hard_cap: int = 160_000_000) -> int:
     return max(1_000_000, min(hard_cap, budget_pixels))
 
 
+def _geotiff_progress_step(progress, value=None, label=None) -> bool:
+    """Refresh the import dialog and report whether the user pressed Cancel.
+
+    QProgressDialog.cancel() only hides the dialog - it stops nothing, and the
+    next setValue() even shows it again. Every stage therefore has to pump the
+    Qt event queue (that is the only thing that makes the Cancel button
+    clickable while the import runs) and then honour wasCanceled() itself.
+    """
+    from PySide6.QtCore import QCoreApplication
+
+    if progress is None:
+        return False
+    try:
+        if label is not None:
+            progress.setLabelText(label)
+        if value is not None:
+            progress.setValue(value)
+        QCoreApplication.processEvents()
+    except Exception:
+        pass
+    try:
+        return bool(progress.wasCanceled())
+    except Exception:
+        return False
+
+
+def _geotiff_import_canceled(app, progress, input_path: str = "") -> bool:
+    """Dismiss the dialog, log a user-cancelled import and report failure.
+
+    The app-level flag lets the callers' batch loops tell "the user pressed
+    Cancel" apart from "this file could not be imported", so a deliberate
+    cancel is not reported as an import error.
+    """
+    print(f"   ⛔ GeoTIFF import cancelled by user: {input_path}")
+    try:
+        app._gis_import_canceled = True
+    except Exception:
+        pass
+    try:
+        progress.close()
+    except Exception:
+        pass
+    return False
+
+
+def _detach_raster_actor(app, actor, renderer=None) -> None:
+    """Take a half-added raster overlay back out of the scene (cancel path)."""
+    try:
+        if renderer is not None:
+            renderer.RemoveActor(actor)
+    except Exception:
+        pass
+    try:
+        app.geotiff_actors = [a for a in (getattr(app, "geotiff_actors", []) or [])
+                              if a is not actor]
+    except Exception:
+        pass
+    try:
+        texture = actor.GetTexture()
+        if texture is not None:
+            texture.SetInputData(None)
+        actor.SetTexture(None)
+        mapper = actor.GetMapper()
+        if mapper is not None:
+            mapper.SetInputData(None)
+        actor.SetMapper(None)
+    except Exception:
+        pass
+    try:
+        if getattr(app, "vtk_widget", None):
+            app.vtk_widget.render()
+    except Exception:
+        pass
+
+
+def _read_geotiff_bands(src, indexes, out_width: int, out_height: int, resampling,
+                        progress, masked: bool = False, base_value: int = 10,
+                        span: int = 18, label: str = "Reading raster..."):
+    """Read *indexes* resized to out_height x out_width, one row band per step.
+
+    A single src.read(out_shape=...) call blocks the Qt event loop for as long
+    as GDAL needs it - seconds on a big ortho, minutes when the file carries no
+    overviews - which is exactly when the user reaches for Cancel. Reading a
+    horizontal band at a time keeps the dialog clickable and lets the caller
+    abort in the middle of the read.
+
+    Returns ``(bands, canceled)``. ``bands`` is parallel to *indexes*; with
+    masked=True each band is float32 with NaN wherever the source had no data.
+    """
+    import numpy as np
+    from rasterio.windows import Window
+
+    src_width = int(src.width)
+    src_height = int(src.height)
+    out_width = max(1, int(out_width))
+    out_height = max(1, int(out_height))
+    indexes = [int(i) for i in indexes]
+    band_count = len(indexes)
+
+    bands = []
+    for idx in indexes:
+        dtype = np.float32 if masked else np.dtype(src.dtypes[idx - 1])
+        bands.append(np.empty((out_height, out_width), dtype=dtype))
+
+    rows_per_block = max(24, -(-out_height // 32))
+    total_blocks = max(1, -(-out_height // rows_per_block))
+    for block_index, row0 in enumerate(range(0, out_height, rows_per_block)):
+        row1 = min(out_height, row0 + rows_per_block)
+        # Same source/output mapping a whole-image decimated read uses, so the
+        # bands tile the raster exactly like the previous one-shot read did.
+        src_row0 = max(0, min(int(round(row0 * src_height / float(out_height))),
+                              src_height - 1))
+        src_row1 = max(src_row0 + 1,
+                       min(int(round(row1 * src_height / float(out_height))), src_height))
+        data = src.read(
+            indexes,
+            window=Window(0, src_row0, src_width, src_row1 - src_row0),
+            out_shape=(band_count, row1 - row0, out_width),
+            resampling=resampling,
+            masked=masked,
+        )
+        for slot in range(band_count):
+            block = data[slot]
+            if masked:
+                block = np.ma.filled(np.ma.asarray(block).astype(np.float32, copy=False),
+                                     np.nan)
+            bands[slot][row0:row1] = block
+
+        if _geotiff_progress_step(
+            progress,
+            value=base_value + int(round(span * (block_index + 1) / total_blocks)),
+            label=f"{label} {int(round(100.0 * (block_index + 1) / total_blocks))}%",
+        ):
+            return bands, True
+    return bands, False
+
+
 def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                               gcp_corners=None) -> bool:
     """
@@ -3810,14 +3947,14 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         if not Path(input_path).exists():
             print(f"   ❌ File does not exist")
             return False
- 
+
         progress = QProgressDialog("Loading GeoTIFF texture...", "Cancel", 0, 100, app)
         progress.setWindowTitle("Import GeoTIFF")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
-        progress.setValue(10)
-        QCoreApplication.processEvents()
- 
+        if _geotiff_progress_step(progress, value=10, label="Opening GeoTIFF..."):
+            return _geotiff_import_canceled(app, progress, input_path)
+
         # ── Step 1: read raster ───────────────────────────────────────────
         from contextlib import ExitStack
         with ExitStack() as _raster_stack:
@@ -3906,7 +4043,6 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
             total_pixels = src_width * src_height
             width = src_width
             height = src_height
-            read_kwargs = {}
             if total_pixels > max_texture_pixels:
                 scale = (max_texture_pixels / float(total_pixels)) ** 0.5
                 width = max(1, int(src_width * scale))
@@ -3915,13 +4051,16 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                     f"   Large raster detected ({src_width}x{src_height}); "
                     f"downsampling to {width}x{height} for memory safety"
                 )
-                read_kwargs = {
-                    "out_shape": (height, width),
-                    "resampling": Resampling.bilinear,
-                }
 
             if src.count >= 3:
-                rgb_data = src.read([1, 2, 3], **read_kwargs)
+                rgb_bands, canceled = _read_geotiff_bands(
+                    src, [1, 2, 3], width, height, Resampling.bilinear, progress,
+                    base_value=10, span=18, label="Reading raster bands...",
+                )
+                if canceled:
+                    return _geotiff_import_canceled(app, progress, input_path)
+                rgb_data = np.stack(rgb_bands, axis=0)
+                del rgb_bands
                 # Keep the initial overview visually consistent with the
                 # native-resolution crops loaded by raster_lod.py.
                 from gui.gis.raster_properties import (
@@ -3942,7 +4081,14 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                 # the same blue→cyan→green→yellow→red elevation stretch used by
                 # the point-cloud Elevation display. Integer image rasters keep
                 # the established grayscale path.
-                gray_data = src.read(1, masked=True, **read_kwargs)
+                gray_bands, canceled = _read_geotiff_bands(
+                    src, [1], width, height, Resampling.bilinear, progress,
+                    masked=True, base_value=10, span=18, label="Reading raster...",
+                )
+                if canceled:
+                    return _geotiff_import_canceled(app, progress, input_path)
+                gray_data = gray_bands[0]
+                del gray_bands
                 raw_gray = np.asarray(
                     gray_data.filled(np.nan)
                     if np.ma.isMaskedArray(gray_data)
@@ -3994,8 +4140,8 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                     rgb_data = rgb_data * 255.0
                 rgb_data = np.clip(rgb_data, 0.0, 255.0).astype(np.uint8)
  
-        progress.setValue(30)
-        QCoreApplication.processEvents()
+        if _geotiff_progress_step(progress, value=30, label="Preparing texture..."):
+            return _geotiff_import_canceled(app, progress, input_path)
  
         # ── Step 2: build VTK image using numpy (FAST) ───────────────────
         print(f"   🎨 Creating VTK texture (numpy path)...")
@@ -4023,8 +4169,8 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         del rgb_array
         del rgb_data
  
-        progress.setValue(55)
-        QCoreApplication.processEvents()
+        if _geotiff_progress_step(progress, value=55, label="Building VTK texture..."):
+            return _geotiff_import_canceled(app, progress, input_path)
  
         # ── Step 3: infer scene Z so the plane sits on the point cloud ───
         # In this 3D scene there is no 2D "layer order" — what you see on top is
@@ -4144,8 +4290,8 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         texture.InterpolateOff()
         texture.Update()
  
-        progress.setValue(70)
-        QCoreApplication.processEvents()
+        if _geotiff_progress_step(progress, value=70, label="Adding to scene..."):
+            return _geotiff_import_canceled(app, progress, input_path)
  
         # ── Step 4: add actor ─────────────────────────────────────────────
         print(f"   🎭 Adding to scene...")
@@ -4220,8 +4366,9 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
         live_geotiff_actors.append(actor)
         app.geotiff_actors = live_geotiff_actors
  
-        progress.setValue(85)
-        QCoreApplication.processEvents()
+        if _geotiff_progress_step(progress, value=85, label="Finalizing..."):
+            _detach_raster_actor(app, actor, renderer)
+            return _geotiff_import_canceled(app, progress, input_path)
  
         # ── Step 5: reset camera so the imported image is actually visible ─
         print(f"   📷 Resetting camera to show imported texture...")

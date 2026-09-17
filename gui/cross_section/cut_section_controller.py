@@ -2144,6 +2144,11 @@ class CutSectionController:
         
         self._set_camera_along_tangent(self.cut_vtk, self.cut_points, self.section_tangent)
 
+        # ✅ FIX: this fit runs right after the dock was shown/restored, which can
+        # still be one layout pass behind the real viewport size - re-fit once
+        # the layout has settled so a new cut always fits the whole section.
+        self._schedule_cut_view_fit_after_layout()
+
         # ------------------------------------------------------------
         # FAST PERSISTENT CUT-IN-CUT PATH
         # ------------------------------------------------------------
@@ -5253,10 +5258,26 @@ class CutSectionController:
             perp_extent = max(np.max(proj_perp) - np.min(proj_perp), 0.5)
         else:
             perp_extent = max(xmax - xmin, ymax - ymin, 0.5)
-        
-        scale = max(z_extent, perp_extent) * 0.6
+
+        # ✅ FIX: aspect-correct parallel scale.
+        # Screen-right is the in-plane perpendicular (= section length) while
+        # screen-up is Z (= elevation), so the two axes need different world
+        # spans.  The old `max(z_extent, perp_extent) * 0.6` ignored the
+        # viewport aspect: the visible world width is
+        # (2 * ParallelScale * aspect), so in a narrow/tall dock the along-
+        # section extent no longer fitted and a freshly created cut looked
+        # cropped/zoomed until the dock was resized (which re-ran this fit).
+        padding = 0.08
+        padded_perp = perp_extent * (1.0 + 2.0 * padding)
+        padded_z = z_extent * (1.0 + 2.0 * padding)
+        aspect = self._cut_view_aspect(vtk_widget)
+        scale = max((padded_perp / 2.0) / aspect, padded_z / 2.0)
         cam.SetParallelScale(scale)
         ren.ResetCameraClippingRange()
+        print(
+            f"   📷 Cut camera fit: len={perp_extent:.2f} z={z_extent:.2f} "
+            f"aspect={aspect:.2f} scale={scale:.3f}"
+        )
         
         if abs(self.cut_yaw_deg) > 1e-6:
             cam.Azimuth(self.cut_yaw_deg)
@@ -5303,6 +5324,95 @@ class CutSectionController:
             traceback.print_exc()
             return False
 
+    def _cut_view_aspect(self, vtk_widget=None):
+        """
+        Viewport aspect ratio (width / height) of the cut section widget.
+
+        Prefers the VTK render window size; falls back to the Qt widget size
+        (the render window can still report a stale size right after the dock
+        is created or re-laid out) and finally to a sane default.
+        """
+        target = vtk_widget if vtk_widget is not None else self.cut_vtk
+
+        win_w = win_h = 0
+        if target is not None:
+            try:
+                rw = target.GetRenderWindow()
+                if rw is not None:
+                    win_w, win_h = rw.GetSize()
+            except Exception:
+                win_w, win_h = 0, 0
+
+            if win_w < 10 or win_h < 10:
+                try:
+                    win_w, win_h = target.width(), target.height()
+                except Exception:
+                    win_w, win_h = 0, 0
+
+        if win_w < 10 or win_h < 10:
+            win_w, win_h = 900, 450
+
+        return max(float(win_w) / float(win_h), 0.05)
+
+    def _schedule_cut_view_fit_after_layout(self, delay_ms=150):
+        """
+        Re-run the cut camera fit once Qt has applied the final viewport size.
+
+        The first plot can run before the VTK render window reports its real
+        (often much narrower) size, so the aspect-correct fit is computed with
+        a stale aspect and the first view appears cropped.  This re-fits only
+        when the viewport aspect actually changed and the camera is still
+        untouched, so a user pan/zoom (or the resize-driven refit) is never
+        overridden.
+        """
+        if self.cut_vtk is None:
+            return
+
+        try:
+            cam = self.cut_vtk.renderer.GetActiveCamera()
+            state = (
+                tuple(cam.GetPosition()),
+                tuple(cam.GetFocalPoint()),
+                float(cam.GetParallelScale()),
+            )
+            aspect = self._cut_view_aspect(self.cut_vtk)
+        except Exception:
+            return
+
+        def _refit_if_layout_settled():
+            if self.cut_vtk is None or not getattr(self, "is_cut_view_active", False):
+                return
+            try:
+                cam_now = self.cut_vtk.renderer.GetActiveCamera()
+                state_now = (
+                    tuple(cam_now.GetPosition()),
+                    tuple(cam_now.GetFocalPoint()),
+                    float(cam_now.GetParallelScale()),
+                )
+                if state_now != state:
+                    return  # camera already moved (user interaction / refit)
+                if abs(self._cut_view_aspect(self.cut_vtk) - aspect) < 1e-3:
+                    return  # viewport unchanged - nothing to correct
+
+                if self.section_tangent is not None:
+                    self._set_camera_along_tangent(
+                        self.cut_vtk, self.cut_points, self.section_tangent
+                    )
+                else:
+                    ren = self.cut_vtk.renderer
+                    ren.ResetCamera()
+                    ren.GetActiveCamera().ParallelProjectionOn()
+                    ren.ResetCameraClippingRange()
+
+                _safe_vtk_render(self.cut_vtk)
+                print(
+                    "   📐 Cut view re-fitted after first layout "
+                    f"(aspect {aspect:.2f} → {self._cut_view_aspect(self.cut_vtk):.2f})"
+                )
+            except Exception:
+                pass
+
+        QTimer.singleShot(max(int(delay_ms), 0), _refit_if_layout_settled)
 
     def _get_cut_slot_palette(self, ensure_seed: bool = True):
         """
@@ -6461,7 +6571,11 @@ class CutSectionController:
             ren.GetActiveCamera().ParallelProjectionOn()
             ren.ResetCameraClippingRange()
         _safe_vtk_render(self.cut_vtk)
-        
+
+        # ✅ FIX: the first plot can run before the render window knows its real
+        # (possibly narrow) size - re-fit once the layout has settled.
+        self._schedule_cut_view_fit_after_layout()
+
         print(f"✅ Cut plotted to dedicated widget: {points.shape[0]} pts")
 
 

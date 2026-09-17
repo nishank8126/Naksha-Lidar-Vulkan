@@ -1231,6 +1231,18 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
         If > 0, stop after reading this many features (used for huge layers).
     """
     _t0 = time.perf_counter()
+
+    # Reuse the layer if this feature class is already on the map instead of
+    # reading every feature a second time and registering a duplicate layer.
+    try:
+        from gui.gis.gis_layers import find_loaded_layer, focus_loaded_layer
+        already = find_loaded_layer(app, gdb_path, layer_name)
+        if already is not None:
+            focus_loaded_layer(app, already)
+            return already
+    except Exception as exc:
+        log.warning("import_gdb_layer: duplicate check failed: %s", exc)
+
     ds = open_gdb_for_read(gdb_path)
     log.warning("import_gdb_layer[%s]: open dataset %.3fs", layer_name, time.perf_counter() - _t0)
     if ds is None:

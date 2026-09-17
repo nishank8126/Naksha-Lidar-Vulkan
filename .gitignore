@@ -40,6 +40,7 @@ NAKSHA-LIDAR.zip
 NAKSHA-LIDAR.rar
 *.log
 *.tmp
+*.zip
 
 # Credentials and machine-local configuration
 crash_config.json
@@ -57,3 +58,7 @@ Thumbs.db
 cloth_nodes.txt
 .claude/
 .cwj_uploads/
+tests/
+patch_backups/
+.commandcode/
+.workbuddy-ai/

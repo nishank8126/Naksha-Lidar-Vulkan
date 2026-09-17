@@ -2748,6 +2748,11 @@ def unified_import_overlay(app):
         try:
             if _import_one(app, p):
                 ok += 1
+            elif _import_batch_canceled(app):
+                # The user pressed Cancel: stop the batch, do not report it as
+                # a failure to import.
+                print(f"   ⛔ Import batch cancelled by user at {Path(p).name}")
+                break
             else:
                 fail += 1
         except Exception as exc:
@@ -2843,6 +2848,90 @@ def _show_ecw_dialog(app, path: str) -> None:
     dlg.exec()
 
 
+def _source_identity(path) -> str:
+    """Canonical identity for a GIS source file.
+
+    Case, relative-vs-absolute and symlink differences all have to collapse to
+    one identity, otherwise re-picking the same file through a different path
+    still registers a second copy of the same layer.
+    """
+    try:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        return os.path.normcase(os.path.realpath(os.path.abspath(text)))
+    except Exception:
+        return str(path or "")
+
+
+def find_loaded_layer(app, path, source_layer=None, registry=None):
+    """Return the layer already displaying *path* (+*source_layer*), else None.
+
+    A container (GPKG/GDB/SQLite) exposes many public layers from one file, so
+    those must match on the source layer name as well. Single-layer sources
+    (.shp/.tif/.geojson/...) are identified by their file path alone, which is
+    what stops a second copy of an already-loaded file from being stacked in
+    the Layers panel.
+    """
+    target = _source_identity(path)
+    if not target:
+        return None
+    wanted = str(source_layer).casefold() if source_layer else None
+    entries = registry if registry is not None else _registry(app)
+    for e in list(entries or []):
+        if not isinstance(e, dict):
+            continue
+        if _source_identity(e.get("path")) != target:
+            continue
+        if wanted is None:
+            return e
+        existing = e.get("source_layer")
+        if existing and str(existing).casefold() == wanted:
+            return e
+    return None
+
+
+def _import_batch_canceled(app) -> bool:
+    """True when the import that just finished was stopped by the user's Cancel.
+
+    Batch loops use this to stop cleanly instead of reporting a cancelled file
+    as "could not be imported". ``_import_one`` clears the flag on entry, so it
+    always describes the import that just returned.
+    """
+    if getattr(app, "_gis_import_canceled", False):
+        try:
+            app._gis_import_canceled = False
+        except Exception:
+            pass
+        return True
+    return False
+
+
+def focus_loaded_layer(app, entry) -> None:
+    """Point the user at a layer that is already loaded instead of duplicating it."""
+    if not isinstance(entry, dict):
+        return
+    name = entry.get("name") or Path(str(entry.get("path") or "")).name
+    print(f"   ♻️  '{name}' is already loaded — keeping the existing layer")
+    try:
+        if not entry.get("visible", True):
+            _set_layer_visible(app, entry, True)
+    except Exception:
+        pass
+    dock = getattr(app, _PANEL_ATTR, None)
+    if dock is not None:
+        try:
+            dock.refresh(select_id=entry.get("id"))
+        except Exception:
+            pass
+    try:
+        app.statusBar().showMessage(
+            f"'{name}' is already loaded — reusing the existing layer", 4000
+        )
+    except Exception:
+        pass
+
+
 def _import_one(app, path: str) -> bool:
     """Import any GIS source supported by Naksha's runtime driver set.
 
@@ -2852,6 +2941,11 @@ def _import_one(app, path: str) -> bool:
     """
     ext = Path(path).suffix.lower()
     name = Path(path).name
+
+    try:
+        app._gis_import_canceled = False
+    except Exception:
+        pass
 
     if str(path).lower().endswith(".gdb"):
         return _import_gdb(app, path)
@@ -2970,6 +3064,15 @@ def _import_raster_layer(app, path: str, name: str, world_bounds=None,
                          gcp_corners=None) -> bool:
     """Import a GeoTIFF and register the new texture actor(s) as one layer."""
     from gui.vector_export import import_geotiff_as_texture
+
+    # Adding the same file twice used to stack a second identical texture in the
+    # Layers panel (and a second full-resolution texture in VRAM). Re-import
+    # paths - georeferencing, stranded-raster re-fit - remove the old entry
+    # first, so they never match here.
+    already = find_loaded_layer(app, path)
+    if already is not None:
+        focus_loaded_layer(app, already)
+        return True
 
     before = list(getattr(app, "geotiff_actors", []) or [])
     ok = import_geotiff_as_texture(app, path, world_bounds=world_bounds,

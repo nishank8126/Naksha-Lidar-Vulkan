@@ -13213,13 +13213,17 @@ class NakshaApp(QMainWindow):
                 return
             event.acceptProposedAction()
 
-            from gui.gis.gis_layers import (_import_one, show_gis_layers_panel,
+            from gui.gis.gis_layers import (_import_batch_canceled, _import_one,
+                                            show_gis_layers_panel,
                                             sort_imports_vectors_first)
             ok = 0
             for p in sort_imports_vectors_first(paths):
                 try:
                     if _import_one(self, p):
                         ok += 1
+                    elif _import_batch_canceled(self):
+                        print(f"   ⛔ Drop import cancelled by user at {p}")
+                        break
                 except Exception as exc:
                     print(f"   ❌ Drop import error for {p}: {exc}")
                     import traceback
