@@ -62,8 +62,8 @@ class _SectionPreviewOverlay(QWidget):
         self._style   = style
         if not self.isVisible():
             self.show()
-        self.raise_()
-        self.repaint()
+            self.raise_()
+        self.update()
 
     def set_line(self, p1: tuple, p2: tuple, color=(255, 0, 255), width: int = 2, style: str = 'solid'):
         self._sync_geometry()
@@ -73,8 +73,24 @@ class _SectionPreviewOverlay(QWidget):
         self._style   = style
         if not self.isVisible():
             self.show()
-        self.raise_()
-        self.repaint()
+            self.raise_()
+        self.update()
+
+    def set_preview(self, p1: tuple, p2: tuple, corners: list,
+                    color=(255, 0, 255), width: int = 2,
+                    style: str = 'solid'):
+        """Update the complete rectangle preview in one composited frame."""
+        self._sync_geometry()
+        self._line = (p1[0], p1[1], p2[0], p2[1])
+        self._corners = list(corners)
+        self._color = QColor(*color)
+        self._width = width
+        self._style = style
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+        # Coalesce high-frequency mouse events into the next Qt paint pass.
+        self.update()
 
 
     def clear(self):
@@ -83,7 +99,7 @@ class _SectionPreviewOverlay(QWidget):
         # Don't call hide() here - it causes flickering and "clashing" with the OS window manager
         # during rapid continuous actions. The empty paintEvent + repaint() is enough to make it
         # instantly invisible.
-        self.repaint()  # Force instant synchronous clear before heavy thread blocking
+        self.repaint()  # Clear before section computation blocks the UI thread
 
     # ------------------------------------------------------------------
     def paintEvent(self, event):
@@ -1406,14 +1422,9 @@ class SectionController:
             width   = int(getattr(self.app, 'cross_line_width', 2))
             style   = getattr(self.app, 'cross_line_style', 'solid')
 
-            # Sync centerline to P1-P2 so it stays visible inside the box
-            overlay.set_line(
+            overlay.set_preview(
                 self._vtk_display_to_qt(*p1_screen),
                 self._vtk_display_to_qt(*p2_screen),
-                color=color, width=width, style=style
-            )
-
-            overlay.set_rect(
                 [self._vtk_display_to_qt(*c1),
                  self._vtk_display_to_qt(*c2),
                  self._vtk_display_to_qt(*c3),
