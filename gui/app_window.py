@@ -5053,18 +5053,6 @@ class NakshaApp(QMainWindow):
                 # stale entry doesn't block reinstall when the dialog is reopened.
                 self._remove_camera_sync_observer(view_index)
 
-                # ✅ Clean up resize refit timer and event filter
-                try:
-                    timers = getattr(self, '_section_resize_timers', {})
-                    if view_index in timers:
-                        timers[view_index].stop()
-                        del timers[view_index]
-                    filters = getattr(self, '_section_resize_filters', {})
-                    if view_index in filters:
-                        del filters[view_index]
-                except Exception:
-                    pass
-
                 # Remove from tracking (but don't delete the widget yet - let Qt handle it)
                 if hasattr(self, 'section_docks') and view_index in self.section_docks:
                     del self.section_docks[view_index]
@@ -5214,56 +5202,7 @@ class NakshaApp(QMainWindow):
             vtk_widget.interactor.installEventFilter(self._shortcut_filter)
         self._register_canvas_cursor_widget(vtk_widget.interactor)
         self._install_section_wheel_zoom(vtk_widget)
-
-        # ✅ Auto-refit camera when section dock is resized
-        if not hasattr(self, '_section_resize_timers'):
-            self._section_resize_timers = {}
-        from PySide6.QtCore import QTimer, QEvent
-        _refit_timer_key = view_index
-        _refit_timer = QTimer(self)
-        _refit_timer.setSingleShot(True)
-        _refit_timer.setInterval(200)  # debounce 200ms
-        def _do_refit():
-            try:
-                sc = getattr(self, 'section_controller', None)
-                if sc is not None:
-                    sc.refit_camera_to_visible_points(_refit_timer_key)
-            except Exception:
-                pass
-        _refit_timer.timeout.connect(_do_refit)
-        self._section_resize_timers[_refit_timer_key] = _refit_timer
-
-        # Override dock's resizeEvent to trigger camera refit
-        _original_dock_resize = dock.resizeEvent
-        _app_ref = self
-        _vid_ref = view_index
-        def _patched_dock_resize(event, _orig=_original_dock_resize, _app=_app_ref, _vid=_vid_ref):
-            _orig(event)
-            try:
-                t = getattr(_app, '_section_resize_timers', {}).get(_vid)
-                if t is not None:
-                    t.start()
-            except Exception:
-                pass
-        dock.resizeEvent = _patched_dock_resize
-
-        # Also watch the VTK interactor's resize (covers layout-driven resizes)
-        from PySide6.QtCore import QObject as _QObject
-        class _VtkResizeFilter(_QObject):
-            def __init__(self, timer, parent=None):
-                super().__init__(parent)
-                self.timer = timer
-            def eventFilter(self, obj, event):
-                if event.type() == QEvent.Resize:
-                    self.timer.start()
-                return False
-        _vtk_filter = _VtkResizeFilter(_refit_timer, vtk_widget.interactor)
-        vtk_widget.interactor.installEventFilter(_vtk_filter)
-        # prevent GC
-        if not hasattr(self, '_section_resize_filters'):
-            self._section_resize_filters = {}
-        self._section_resize_filters[view_index] = _vtk_filter
-
+        
         if hasattr(self, 'identification_tool') and self.identification_tool.active:
             self.identification_tool.activate_for_section(vtk_widget, view_index)
             print(f"🔍 Auto-activated identification for view {view_index + 1}")
