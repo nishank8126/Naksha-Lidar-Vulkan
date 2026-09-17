@@ -9164,6 +9164,25 @@ def classify_brush(app, center=None, radius=None, from_classes=None, to_class=No
     _fast_update_colors(app, global_indices, to_class, is_cut_section)
 
 
+def _section_brush_uses_class_rgb(app, view_idx: int, actor=None) -> bool:
+    """Return True only when the section point actor is visibly in Class mode."""
+    live_mode = str(getattr(actor, "_naksha_color_mode", "") or "").lower()
+    if not live_mode:
+        vtk_widget = (getattr(app, "section_vtks", {}) or {}).get(view_idx)
+        live_mode = str(
+            getattr(vtk_widget, "_naksha_color_mode", "") or ""
+        ).lower()
+    if live_mode:
+        return live_mode == "class"
+
+    dialog = (getattr(app, "display_mode_dialog", None)
+              or getattr(app, "display_dialog", None))
+    view_modes = getattr(dialog, "view_color_modes", {}) if dialog else {}
+    try:
+        return int((view_modes or {}).get(view_idx + 1, 0) or 0) == 0
+    except (TypeError, ValueError):
+        return True
+
 def _fast_update_colors(app, indices: np.ndarray, new_class: int, is_cut_section: bool) -> None:
     """
     Vectorized GPU color poke for brush/drag strokes.
@@ -9192,7 +9211,12 @@ def _fast_update_colors(app, indices: np.ndarray, new_class: int, is_cut_section
             actor_name  = f"_section_{active_view}_unified"
             actor       = vtk_widget.actors.get(actor_name)   # O(1) dict, was O(n_actors)
 
-            if actor is not None:
+            # Brush preview is the one classification path that writes VTK
+            # scalars directly. Never inject class colors into a point actor
+            # whose live RGB buffer represents another display mode.
+            if actor is not None and _section_brush_uses_class_rgb(
+                app, active_view, actor
+            ):
                 mapper   = actor.GetMapper()
                 polydata = mapper.GetInput() if mapper else None
                 if polydata is not None:

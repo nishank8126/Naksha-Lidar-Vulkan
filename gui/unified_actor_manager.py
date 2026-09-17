@@ -4965,6 +4965,41 @@ def _refresh_actor_boundary_flags(actor, reason="structured-border"):
 # ─────────────────────────────────────────────────────────────────────────────
 # sync_palette_to_gpu — called by Display Mode dialog Apply
 # ─────────────────────────────────────────────────────────────────────────────
+def _slot_uses_class_rgb(app, slot_idx: int, actor=None) -> bool:
+    """Return whether a slot's live point RGB buffer represents classification."""
+    if slot_idx == 0:
+        mode = str(getattr(app, "display_mode", "class") or "class").lower()
+        return mode in ("class", "shaded_class")
+
+    if 1 <= slot_idx <= 4:
+        # The actor is the rendered state. Dialog state can briefly say Class
+        # while shortcut/preset code is rebuilding UI around a section that is
+        # still displaying Depth/Line/RGB/Intensity/Elevation.
+        live_mode = str(getattr(actor, "_naksha_color_mode", "") or "").lower()
+        if live_mode:
+            return live_mode in ("class", "shaded_class")
+
+        vtk_widget = (getattr(app, "section_vtks", {}) or {}).get(slot_idx - 1)
+        live_mode = str(
+            getattr(vtk_widget, "_naksha_color_mode", "") or ""
+        ).lower()
+        if live_mode:
+            return live_mode in ("class", "shaded_class")
+
+        dialog = (getattr(app, "display_mode_dialog", None)
+                  or getattr(app, "display_dialog", None))
+        view_modes = getattr(dialog, "view_color_modes", None) if dialog else None
+        if not isinstance(view_modes, dict):
+            view_modes = getattr(app, "view_color_modes", {})
+        try:
+            mode_idx = int((view_modes or {}).get(slot_idx, 0) or 0)
+        except (TypeError, ValueError):
+            mode_idx = 0
+        return mode_idx in (0, 1)
+
+    # Cut Section remains classification-only.
+    return slot_idx == 5
+
 def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
                         border: Optional[float] = None, render: bool = True,
                         rewrite_rgb: Optional[bool] = None, **kwargs):
@@ -5076,14 +5111,10 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         app.view_borders[slot_idx] = float(border)
 
     if rewrite_rgb is None:
-        if slot_idx == 0:
-            # Keep main-view mode colors stable in non-class modes.
-            # Slot-0 palette sync should still update shader LUT uniforms (visibility/weights/border),
-            # but must not overwrite the current RGB buffer used by intensity/depth/rgb/elevation.
-            current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-            rewrite_rgb = current_mode in ("class", "shaded_class")
-        else:
-            rewrite_rgb = True
+        # Palette sync also runs during classification to refresh visibility
+        # uniforms. Preserve any non-class RGB buffer currently displayed by
+        # Main View or an independent cross-section slot.
+        rewrite_rgb = _slot_uses_class_rgb(app, slot_idx, actor)
 
     rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
     if bool(rewrite_rgb) and rgb_ptr is not None and _is_writable(rgb_ptr):
@@ -5296,6 +5327,11 @@ def refresh_section_after_weight_change(
             if vtk_ca:
                 vtk_ca.Modified()
             _mark_actor_dirty(actor)
+
+    # Persist the mode that is actually represented by this actor's RGB
+    # buffer. Classification refreshes must not rely on transient dialog state.
+    actor._naksha_color_mode = str(mode or "class").lower()
+    vtk_widget._naksha_color_mode = actor._naksha_color_mode
 
     _push_uniforms_direct(actor, ctx)
 
@@ -6684,6 +6720,15 @@ def build_section_unified_actor(
         if actor is None:
             return None
         _wire_actor_metadata(actor, mesh, vtk_ca, _vtk_rgb, _vtk_cls, class_vtk, bf_vtk, combined_global_mask, actual_pt_size)
+
+        # A freshly built section unified actor is CLASS-colored by definition.
+        # Stamp the live mode immediately so classification refresh does not
+        # inherit a stale Depth/RGB/Intensity/Elevation/Line mode from the
+        # previous actor/widget state.  _slot_uses_class_rgb() intentionally
+        # trusts this live metadata before dialog state.
+        actor._naksha_color_mode = "class"
+        vtk_widget._naksha_color_mode = "class"
+
         actor._naksha_global_indices = all_global_indices
         vtk_widget._naksha_full_detail_actor = actor
         try:
@@ -6714,6 +6759,12 @@ def build_section_unified_actor(
     if lod_actor is None:
         return None
     _wire_actor_metadata(lod_actor, lod_mesh, lod_vtk_ca, lod_vtk_rgb, lod_vtk_cls, lod_class_vtk, lod_bf_vtk, combined_global_mask, actual_pt_size)
+
+    # The first-frame LOD actor also starts as CLASS-colored.  Do not let the
+    # section widget keep the mode of the actor that this rebuild replaced.
+    lod_actor._naksha_color_mode = "class"
+    vtk_widget._naksha_color_mode = "class"
+
     lod_actor._naksha_global_indices = all_global_indices[lod_sel]
     lod_actor._naksha_lod_source_indices = lod_sel
     vtk_widget._naksha_section_render_mode = "unified_lod"
@@ -6767,6 +6818,12 @@ def build_section_unified_actor(
                             pass
                         return
                     _wire_actor_metadata(full_actor, full_mesh, full_vtk_ca, full_vtk_rgb, full_vtk_cls, full_class_vtk, full_bf_vtk, combined_global_mask, actual_pt_size)
+
+                    # Preserve the same CLASS live-mode invariant when the
+                    # background full-resolution actor replaces the LOD actor.
+                    full_actor._naksha_color_mode = "class"
+                    vtk_widget._naksha_color_mode = "class"
+
                     full_actor._naksha_global_indices = all_global_indices
                     if interaction_actor_name in vtk_widget.actors:
                         vtk_widget._naksha_full_detail_actor = full_actor
@@ -7161,10 +7218,7 @@ def fast_cross_section_update(
     # reverting Line/Depth/RGB/Intensity/Elevation back to Class colors
     # after any classify action -- Main View never had this problem
     # because it already had this exact check.
-    dlg_for_mode = getattr(app, 'display_mode_dialog', None)
-    _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
-    section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
-    section_is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    section_is_class_like = _slot_uses_class_rgb(app, slot_idx, actor)
 
     if n_changed > 0 and section_is_class_like:
         if changed_idx.max(initial=-1) >= len(rgb_ptr):
@@ -7375,17 +7429,9 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
     # unconditionally) -- so undo and partial-classify updates always
     # repainted a section's RGB buffer with classification colors even
     # while that section was showing Line/Depth/RGB/Intensity/Elevation,
-    # silently reverting those modes back to Class colors. Now checks each
-    # section's own remembered mode (dlg.view_color_modes[slot_idx]), same
-    # source of truth used everywhere else this session.
-    if slot_idx == 0:
-        display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-        is_class_like = display_mode in ("class", "shaded_class")
-    else:
-        dlg_for_mode = getattr(app, 'display_mode_dialog', None)
-        _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
-        section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
-        is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    # silently reverting those modes back to Class colors. The actor's live
+    # render-mode tag is authoritative; dialog state is only a legacy fallback.
+    is_class_like = _slot_uses_class_rgb(app, slot_idx, actor)
     if is_class_like:
         if hasattr(actor, "_naksha_section_class"):
             actor._naksha_section_class[local_indices] = reverted_cls
