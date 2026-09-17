@@ -5124,6 +5124,9 @@ class ByClassRibbon(QWidget):
         self._dialog_guard_host = None
         self._dialog_guard_app = None
         self._dialog_raise_scheduled = False
+        # The dialog the user most recently opened/clicked via
+        # _show_or_raise_dialog() - see _refresh_dialog_zorder()'s use of it.
+        self._last_raised_byclass_dialog = None
         
         # ✅ Store dialog references
         self.by_class_dialog = None
@@ -5209,6 +5212,23 @@ class ByClassRibbon(QWidget):
                 dialog.raise_()
             except Exception:
                 continue
+
+        # The loop above always raises every visible By Class dialog in the
+        # same fixed order, so whichever one comes last in
+        # _iter_byclass_dialogs() would otherwise always win the z-order -
+        # e.g. Fence sitting on top of Height just because it's later in
+        # that tuple, even though Height is the one the user just clicked
+        # open. Re-raise the most recently user-opened dialog one more time
+        # so it keeps the final say, without changing anything about the
+        # "every By Class dialog stays above the main window" guarantee the
+        # loop above already provides.
+        last = self._last_raised_byclass_dialog
+        if last is not None:
+            try:
+                if last.isVisible() and not last.isHidden() and not last.isMinimized():
+                    last.raise_()
+            except Exception:
+                self._last_raised_byclass_dialog = None
 
     def eventFilter(self, obj, event):
         try:
@@ -5403,14 +5423,32 @@ class ByClassRibbon(QWidget):
     def _show_or_raise_dialog(self, dialog, dialog_name):
         """
         ✅ Helper: Show/raise dialog if hidden or minimized
-        
+
         Args:
             dialog: Dialog instance
             dialog_name: Name for logging
         """
         if dialog is None:
             return
-        
+
+        # Mutual exclusivity: only one By Class family dialog (By Class,
+        # Height, Fence, Low Points, Isolated, Ground, Below Surface) stays
+        # on screen at a time, so opening one doesn't leave others peeking
+        # out from behind it. hide() rather than close(): each dialog's own
+        # settings (selected classes, height range, fence, etc.) are
+        # preserved exactly as left, ready to resume next time it's opened -
+        # this never touches a dialog that's minimized, since a minimized
+        # one is already tucked into the taskbar and isn't part of the
+        # on-screen clutter this is fixing.
+        for other in self._iter_byclass_dialogs():
+            if other is dialog:
+                continue
+            try:
+                if not other.isHidden() and other.isVisible() and not other.isMinimized():
+                    other.hide()
+            except Exception:
+                continue
+
         # Show if hidden
         if dialog.isHidden():
             print(f"👁️ {dialog_name} was hidden - showing...")
@@ -5429,6 +5467,16 @@ class ByClassRibbon(QWidget):
         # Raise to front and activate
         dialog.raise_()
         dialog.activateWindow()
+        # _schedule_dialog_zorder_refresh() below re-raises every visible
+        # By Class dialog in _iter_byclass_dialogs()'s fixed order, which
+        # would otherwise immediately undo the raise_() above the instant
+        # any OTHER By Class dialog (e.g. Fence) was already open - it
+        # always ends up on top since it comes later in that fixed tuple,
+        # regardless of which dialog the user actually just clicked open.
+        # Track the dialog that was just explicitly opened here so the
+        # refresh can give it the final say once it's done restacking
+        # everyone above the main window.
+        self._last_raised_byclass_dialog = dialog
         self._schedule_dialog_zorder_refresh()
         print(f"✅ {dialog_name} raised to front")
 
