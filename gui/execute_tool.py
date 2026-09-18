@@ -491,20 +491,13 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             print(f"🎨 APPLYING DISPLAYMODE PRESET")
             print(f"{'='*60}")
             
-            # ✅ CRITICAL: Initialize app_window.view_palettes with CORRECT WEIGHTS
-            if not hasattr(app_window, 'view_palettes'):
+            # Keep unrelated view slots intact.  A shortcut may target one view;
+            # clearing all six here used to erase Cross/Cut PTC schemas.
+            if not hasattr(app_window, 'view_palettes') or not isinstance(app_window.view_palettes, dict):
                 app_window.view_palettes = {}
             
-            # Set default weights based on view type
-            for view_idx in range(6):  # 0=Main, 1-4=Cross-sections, 5=Cut
-                if view_idx == 0:
-                    default_weight = 1.0  # Main View
-                else:
-                    default_weight = 0.5  # All others
-                
-                app_window.view_palettes[view_idx] = {}
-            
-            # ✅ Now apply preset values, overriding defaults only where preset has data
+            # Apply only the view(s) carried by the rebased preset.  Rebase already
+            # contains the complete current PTC schema for each target view.
             for view_idx_str, classes in views.items():
                 view_idx = int(view_idx_str)
                 
@@ -512,6 +505,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 
                 # Get default weight for this view type
                 default_weight = 1.0 if view_idx == 0 else 0.5
+                app_window.view_palettes[view_idx] = {}
                 
                 # Copy all class info from preset
                 for code_str, info in classes.items():
@@ -537,19 +531,11 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 print(f"      📊 Visible: {visible}")
                 print(f"      ⚖️ Weights: {weights}")
             
-            # ✅ Also update class_palette from view 0
+            # Main runtime palette mirrors the fully-rebased Main slot.  Because
+            # the rebase is schema-complete, this cannot delete newly-added PTC classes.
             if 0 in views:
-                app_window.class_palette = {}
-                for code_str, info in views[0].items():
-                    code_int = int(code_str)
-                    app_window.class_palette[code_int] = {
-                        "show": info.get("show", False),
-                        "description": info.get("description", ""),
-                        "color": info.get("color", (128, 128, 128)),
-                        "weight": info.get("weight", 1.0),
-                        "draw": info.get("draw", ""),
-                        "lvl": info.get("lvl", "")
-                    }
+                from gui.display_mode import clone_palette
+                app_window.class_palette = clone_palette(app_window.view_palettes.get(0, {}))
             
             # Trigger refresh
             from gui.class_display import update_class_mode

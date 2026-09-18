@@ -11,7 +11,7 @@ from PySide6.QtCore import Signal, Qt, QSettings, QEvent
 from PySide6.QtGui import QColor, QAction, QActionGroup
 from torch import layout
 
-from .class_picker import ClassPicker
+from .class_picker import ClassPicker, resolve_class_catalog
 from .theme_manager import get_dialog_stylesheet
 from .shading_preset_quality import (
     SHADING_QUALITY_CHOICES,
@@ -333,49 +333,66 @@ def decode_display_preset(text):
         print(f"❌ decode_display_preset error: {e}")
         return None
 def rebase_display_preset_to_current_ptc(preset: dict, app_window) -> dict:
-    """
-    Rebuild a DisplayMode preset's per-class data using the CURRENTLY
-    LOADED PTC's app.class_palette.
+    """Rebase DisplayMode state onto the *current* PTC schema.
 
-    - Preserves: shortcut's show/weight values, border_percent,
-      border_type, force_refresh.
-    - Replaces:  description/color/draw/lvl with the live values from
-      app.class_palette (so a stale preset from a different PTC can
-      never reapply old class metadata).
-    - Classes present in the preset but missing from the current PTC's
-      class_palette are dropped.
+    A shortcut owns presentation choices (show/weight/border/mode).  It does
+    **not** own PTC identity metadata.  In particular, a shortcut created before
+    a new class was added must not delete that class when pressed.
     """
-    current_palette = getattr(app_window, "class_palette", {}) or {}
+    if not isinstance(preset, dict):
+        return preset
+
+    app_views = getattr(app_window, "view_palettes", {}) or {}
+    current_palette = resolve_class_catalog(app_window)
+
+    if not current_palette:
+        # Fail safe: never replace a valid shortcut with an empty schema merely
+        # because a load is between phases.
+        return dict(preset)
 
     rebased_views = {}
-    for view_idx, classes in (preset.get("views", {}) or {}).items():
-        view_idx = int(view_idx)
-        rebased = {}
+    for raw_view_idx, raw_classes in (preset.get("views", {}) or {}).items():
+        view_idx = int(raw_view_idx)
+        saved_classes = raw_classes if isinstance(raw_classes, dict) else {}
+        view_live = app_views.get(view_idx, {}) if isinstance(app_views, dict) else {}
+        if not isinstance(view_live, dict):
+            view_live = {}
 
-        for code, info in classes.items():
-            code = int(code)
-            live = current_palette.get(code)
-            if live is None:
-                # Class no longer exists in the newly loaded PTC — skip it.
-                continue
+        rebased = {}
+        # Iterate the CURRENT PTC, not the old shortcut.  This is what keeps
+        # newly-added classes alive and drops only classes truly removed from PTC.
+        for code, live in sorted(current_palette.items()):
+            saved = saved_classes.get(code)
+            if saved is None:
+                saved = saved_classes.get(str(code))
+            saved = saved if isinstance(saved, dict) else None
+
+            slot_entry = view_live.get(code)
+            if slot_entry is None:
+                slot_entry = view_live.get(str(code))
+            slot_entry = slot_entry if isinstance(slot_entry, dict) else {}
+
+            show_fallback = slot_entry.get("show", live.get("show", True))
+            weight_fallback = slot_entry.get("weight", live.get("weight", 1.0))
             rebased[code] = {
-                "show":        bool(info.get("show", False)),
-                "weight":      float(info.get("weight", 1.0)),
-                "description": live.get("description", ""),
-                "color":       tuple(live.get("color", (128, 128, 128))),
-                "draw":        live.get("draw", ""),
-                "lvl":         live.get("lvl", ""),
+                "show": bool(saved.get("show", show_fallback)) if saved else bool(show_fallback),
+                "weight": float(saved.get("weight", weight_fallback)) if saved else float(weight_fallback),
+                "description": str(live.get("description", "")),
+                "color": tuple(live.get("color", (128, 128, 128))),
+                "draw": str(live.get("draw", "")),
+                "lvl": str(live.get("lvl", "")),
             }
 
         rebased_views[view_idx] = rebased
 
-    return {
-        "display_mode":   str(preset.get("display_mode", "class") or "class"),
-        "border_percent": float(preset.get("border_percent", 0.0)),
-        "border_type":    int(preset.get("border_type", 0)),
-        "force_refresh":  bool(preset.get("force_refresh", True)),
-        "views":          rebased_views,
-    }
+    # Preserve quality_mode, flight_lines, and any future top-level fields.
+    result = dict(preset)
+    result["display_mode"] = str(preset.get("display_mode", "class") or "class")
+    result["border_percent"] = float(preset.get("border_percent", 0.0))
+    result["border_type"] = int(preset.get("border_type", 0))
+    result["force_refresh"] = bool(preset.get("force_refresh", True))
+    result["views"] = rebased_views
+    return result
 
 
 def summarize_display_like_preset(preset: dict, prefix: str = "Preset") -> str:
@@ -4913,6 +4930,13 @@ class ShortcutManager(QWidget):
             return cleanly instead of crashing with
             "Signal source has been deleted".
         """
+        if not self.isVisible():
+            # Defensive guard for old/stale signal connections from a hidden
+            # manager window.  Runtime ClassPicker changes must never edit .mnu.
+            self.is_editing_shortcuts = False
+            self._active_row = None
+            return
+
         if not self.is_editing_shortcuts:
             print("⏭️ update_classes_from_picker: Not in editing mode")
             return
@@ -5549,9 +5573,32 @@ class ShortcutManager(QWidget):
         finally:
             self._applying_shortcuts = False
 
-    def on_cancel(self):
+    def _end_class_picker_edit_session(self):
+        """Detach ShortcutManager from the runtime ClassPicker.
+
+        ClassPicker is shared with normal classification tools.  Leaving these
+        signal connections armed after the Shortcut Manager is hidden lets later
+        runtime shortcut/tool changes silently rewrite the shortcut row.
+        """
         self.is_editing_shortcuts = False
-        
+        self._active_row = None
+        picker = getattr(self.app_window, "class_picker", None)
+        if (
+            self._qobject_alive(picker)
+            and self._qobject_alive(getattr(picker, "from_list", None))
+            and self._qobject_alive(getattr(picker, "to_combo", None))
+        ):
+            self._safe_disconnect(
+                picker.from_list.itemSelectionChanged,
+                self.update_classes_from_picker,
+            )
+            self._safe_disconnect(
+                picker.to_combo.currentIndexChanged,
+                self.update_classes_from_picker,
+            )
+
+    def on_cancel(self):
+        self._end_class_picker_edit_session()
         self.hide()
 
     def showEvent(self, event):
@@ -5568,8 +5615,9 @@ class ShortcutManager(QWidget):
         super().changeEvent(event)
 
     def closeEvent(self, event):
-        # Always hide on close (X button) — never destroy the widget.
-        # Real cleanup happens in _do_real_close() called only at app shutdown.
+        # Always hide on close (X button) — never destroy the widget.  Crucially,
+        # stop editing the shared runtime ClassPicker before hiding.
+        self._end_class_picker_edit_session()
         event.ignore()
         self.hide()
 

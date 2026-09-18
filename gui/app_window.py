@@ -4570,15 +4570,8 @@ class NakshaApp(QMainWindow):
             if hasattr(dialog, 'view_palettes') and 0 in dialog.view_palettes:
                 # Keep app.class_palette canonical to MAIN VIEW (slot 0).
                 # Cross-section slots (1..4) must remain isolated in view_palettes.
-                self.class_palette = {}
-                for code, info in dialog.view_palettes[0].items():
-                    self.class_palette[code] = {
-                        "show": bool(info.get("show", False)),
-                        "description": str(info.get("description", "")),
-                        "lvl": str(info.get("lvl", "")),
-                        "color": tuple(info.get("color", (128, 128, 128))),
-                        "weight": float(info.get("weight", 1.0))
-                    }
+                from gui.display_mode import clone_palette
+                self.class_palette = clone_palette(dialog.view_palettes[0])
                 print(f"  ✅ Synced {len(self.class_palette)} MAIN-view classes from Display Mode")
                 if current_slot != 0:
                     print(f"  ℹ️ Active slot is {current_slot}; preserved class_palette from slot 0")
@@ -9338,14 +9331,27 @@ class NakshaApp(QMainWindow):
             if not hasattr(self, 'view_palettes'):
                 self.view_palettes = {}
 
-            self.view_palettes[target_view] = {
-                code: {
+            # IMPORTANT: a DisplayMode apply is allowed to change presentation state,
+            # but it must never strip PTC schema metadata.  ClassPicker displays the
+            # PTC name from ``lvl``; losing it makes the picker fall back to the hard-
+            # coded LAS names and makes a valid custom class look like the wrong code.
+            normalized_palette = {}
+            for raw_code, raw_info in (incoming_palette or {}).items():
+                try:
+                    code = int(raw_code)
+                except (TypeError, ValueError):
+                    continue
+                info = raw_info if isinstance(raw_info, dict) else {}
+                normalized_palette[code] = {
                     "show": bool(info.get("show", True)),
                     "color": tuple(info.get("color", (128, 128, 128))),
                     "weight": float(info.get("weight", 1.0)),
-                    "description": str(info.get("description", ""))
-                } for code, info in incoming_palette.items()
-            }
+                    "description": str(info.get("description", "")),
+                    "draw": str(info.get("draw", "")),
+                    "lvl": str(info.get("lvl", "")),
+                }
+
+            self.view_palettes[target_view] = normalized_palette
 
             # ============================================================
             # CASE A: MAIN VIEW (View 0) - ULTRA OPTIMIZED
@@ -16730,7 +16736,9 @@ class NakshaApp(QMainWindow):
             self.data = None
             self.loaded_file = None
             self.last_save_path = None
-            self.class_palette = {}
+            # GLOBAL PTC state intentionally survives a grid/file switch.  Clearing
+            # class_palette here made the restore pipeline rebuild it indirectly from
+            # a view snapshot, which could lose names/colors before the next shortcut.
 
             # Clear layers so previous file arrays are not retained across grid switches.
             if hasattr(self, "layers") and isinstance(self.layers, list):
@@ -16757,8 +16765,8 @@ class NakshaApp(QMainWindow):
             except Exception:
                 pass
              
-            if hasattr(self, "view_palettes"):
-                self.view_palettes.clear()
+            # view_palettes are also GLOBAL DisplayMode/PTC state.  Keep the six
+            # per-view schemas/visibility snapshots; only point-data caches are stale.
             if hasattr(self, 'undo_stack'):
                 self.undo_stack.clear()
             if hasattr(self, 'redo_stack'):

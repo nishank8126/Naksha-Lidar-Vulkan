@@ -8547,7 +8547,8 @@ class GridLabelManager:
         self.app._loaded_with_class_filter = False
         self.app.loaded_file = None
         self.app.last_save_path = None
-        self.app.class_palette = {}
+        # GLOBAL PTC/class palette must survive grid navigation.  The incoming
+        # point cloud changes, the user's active PTC does not.
         # ✅ FIX: Clear stale Z-bounds cache so SNT actors land at the correct Z
         # for the incoming LAZ file. Without this, _get_snt_z_offset reads the old
         # file's z_max and the SNT grid appears above the new point cloud.
@@ -8578,8 +8579,8 @@ class GridLabelManager:
         except Exception:
             pass
         
-        if hasattr(self.app, "view_palettes"):
-            self.app.view_palettes.clear()
+        # Keep GLOBAL per-view PTC/display palettes across grid switches.
+        # Their visibility is intentionally per slot and is reconciled on load.
         
         if hasattr(self.app, 'undo_stack'):
             self.app.undo_stack.clear()

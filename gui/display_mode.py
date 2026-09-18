@@ -2027,6 +2027,8 @@ class DisplayModeDialog(QDialog):
             for row in range(self.table.rowCount()):
                 code        = int(self.table.item(row, 1).text())
                 desc        = self.table.item(row, 2).text()
+                draw_item   = self.table.item(row, 3)
+                draw        = draw_item.text() if draw_item else ""
                 lvl_item    = self.table.item(row, 4)
                 lvl         = lvl_item.text() if lvl_item else ""
                 color       = self.table.item(row, 5).background().color().getRgb()[:3]
@@ -2037,6 +2039,7 @@ class DisplayModeDialog(QDialog):
                 master_palette[code] = {
                     "show":        show,
                     "description": desc,
+                    "draw":        draw,
                     "lvl":         lvl,
                     "color":       color,
                     "weight":      weight
@@ -2090,6 +2093,7 @@ class DisplayModeDialog(QDialog):
                     self.view_palettes[view_idx][code] = {
                         "show":        show_to_use,
                         "description": str(info["description"]),
+                        "draw":        str(info.get("draw", "")),
                         "lvl":         str(info.get("lvl", "")),
                         "color":       color_to_use,
                         "weight":      weight_to_use
@@ -2932,25 +2936,41 @@ class DisplayModeDialog(QDialog):
         if self.current_slot == 0:
             app.class_palette = clone_palette(class_map)
 
-            # Keep every other already-seeded view slot's colors/weights/etc.
-            # in sync with this Main View edit. Only 'show' (visibility) is
-            # meant to differ per view — everything else is meant to be
-            # shared. Without this, a cross-section view whose slot palette
-            # was already seeded before this edit keeps showing the old
-            # color even after re-taking its section, because nothing ever
-            # pushed the new value into its (already-persisted) snapshot.
+            # Reconcile the PTC schema into every already-seeded view slot.
+            # Only ``show`` is per-view.  Class identity (code/name/draw/color/
+            # weight) is global.  The previous code only updated classes that
+            # already existed in a slot, so a class added to the PTC vanished
+            # from Cross/Cut palettes and later from shortcut rebases.
+            master_codes = set(class_map)
             for other_slot in range(1, 6):
                 for target_palettes in (self.view_palettes, app.view_palettes):
                     existing = target_palettes.get(other_slot)
                     if not existing:
-                        continue  # not seeded yet — will pick up fresh values when it is
+                        continue  # not seeded yet — fresh seeding will use Main schema
+
+                    # A deleted Main/PTC class must not survive in an old slot.
+                    for stale_code in set(existing) - master_codes:
+                        existing.pop(stale_code, None)
+
                     for code, entry in class_map.items():
-                        target_entry = existing.get(code)
-                        if target_entry is None:
-                            continue
-                        keep_show = target_entry.get('show', entry.get('show', True))
-                        target_entry.update(_copy.deepcopy(entry))
-                        target_entry['show'] = keep_show
+                        previous = existing.get(code)
+                        keep_show = (
+                            previous.get('show', entry.get('show', True))
+                            if isinstance(previous, dict)
+                            else entry.get('show', True)
+                        )
+                        existing[code] = _copy.deepcopy(entry)
+                        existing[code]['show'] = bool(keep_show)
+
+                # Keep the dialog's checkbox snapshot structurally aligned too.
+                if not hasattr(self, 'slot_shows') or self.slot_shows is None:
+                    self.slot_shows = {}
+                slot_show = self.slot_shows.setdefault(other_slot, {})
+                for stale_code in set(slot_show) - master_codes:
+                    slot_show.pop(stale_code, None)
+                live_slot = self.view_palettes.get(other_slot, {})
+                for code, entry in live_slot.items():
+                    slot_show[code] = bool(entry.get('show', True))
 
             # ============================================================
             # ACTIVE PTC FOR AI
