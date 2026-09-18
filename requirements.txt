@@ -78,13 +78,11 @@ pyinstaller>=6.0
 # git commit -m "SURFACE CLASSIFICATION: Added new feature to classify point cloud surfaces based on user-defined criteria., CLASSIFICATION TOOLS DEACTIVATION , FREEHAND , FEILD OPTIOND FOR IDENTIFIACATION , CONFLCIT BETWEEN TOOLS AND IDENTIFY TOOL  "
 # git push origin MAIN
 
-
-
 Since you intend to commit every listed change, run:
 git add -A
 git diff --cached --stat
 git diff --cached
-git commit -m "GIS-workflow"
+git commit -m "shortcuts compatibility"
 git push origin GIS-workflow
 
 # git pull --rebase origin MAIN

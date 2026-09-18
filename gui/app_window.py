@@ -6517,6 +6517,11 @@ class NakshaApp(QMainWindow):
     def update_shortcuts(self, shortcuts):
         if shortcuts:
             self.shortcuts = shortcuts
+            shortcut_filter = getattr(self, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
             print("✅ Shortcuts updated:", self.shortcuts)
 
     # def keyPressEvent(self, event):

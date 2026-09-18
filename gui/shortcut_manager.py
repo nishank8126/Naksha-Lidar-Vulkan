@@ -3696,6 +3696,11 @@ class ShortcutManager(QWidget):
 
             # ✅ ONLY update the shortcuts lookup table — nothing else
             app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
 
             if hasattr(app_window, 'statusBar'):
                 app_window.statusBar().showMessage(
@@ -5512,6 +5517,11 @@ class ShortcutManager(QWidget):
                     print(f"   Row {row}: {mod}+{key} → {tool}, from={from_cls}, to={to_cls}")
 
             self.app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(self.app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
 
             if not hasattr(self.app_window, 'view_palettes'):
                 self.app_window.view_palettes = {}
@@ -5757,6 +5767,11 @@ class ShortcutManager(QWidget):
                 self._is_loading_shortcuts = False
 
             self.app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(self.app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
             print(f"✅ {len(shortcuts)} shortcuts loaded into app_window.shortcuts")
             print("   ⚠️  view_palettes / class_palette NOT touched — will apply on keypress only")
 
