@@ -1328,6 +1328,61 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 5000
             )
 
+    # ── Validate explicit shortcut class codes against the current PTC ───────
+    # Toolbar/manual activations may intentionally pass None and keep the live
+    # ClassPicker choice, so only explicit codes are validated.  A removed
+    # target class is never silently remapped.  A source list is filtered, but
+    # if every configured source was removed we reject rather than broaden the
+    # shortcut to "Any class".
+    try:
+        from gui.class_picker import resolve_class_catalog
+        _catalog = resolve_class_catalog(app_window)
+        _valid_codes = {int(code) for code in (_catalog or {})}
+    except Exception as _catalog_err:
+        print(f"⚠️ Classification shortcut catalog validation skipped: {_catalog_err}")
+        _valid_codes = set()
+
+    if _valid_codes:
+        if to_cls is not None:
+            try:
+                _target_code = int(to_cls)
+            except (TypeError, ValueError):
+                _target_code = None
+            if _target_code is None or _target_code not in _valid_codes:
+                msg = f"Classification shortcut target class {to_cls!r} is not present in the current PTC."
+                print(f"⚠️ {msg}")
+                try:
+                    app_window.statusBar().showMessage(msg, 6000)
+                except Exception:
+                    pass
+                return
+            to_cls = _target_code
+
+        if isinstance(from_cls, (list, tuple, set)) and len(from_cls) > 0:
+            _original_sources = list(from_cls)
+            _filtered_sources = []
+            for _code in _original_sources:
+                try:
+                    _code_int = int(_code)
+                except (TypeError, ValueError):
+                    continue
+                if _code_int in _valid_codes and _code_int not in _filtered_sources:
+                    _filtered_sources.append(_code_int)
+            if not _filtered_sources:
+                msg = "Classification shortcut source classes are no longer present in the current PTC."
+                print(f"⚠️ {msg} configured={_original_sources}")
+                try:
+                    app_window.statusBar().showMessage(msg, 6000)
+                except Exception:
+                    pass
+                return
+            if len(_filtered_sources) != len(_original_sources):
+                print(
+                    f"ℹ️ Classification shortcut source classes reconciled "
+                    f"{_original_sources} -> {_filtered_sources}"
+                )
+            from_cls = _filtered_sources
+
     # ── All clear — proceed with classification tool activation ──────────────
     print(f"🎯 Activating classification tool: {tool_name}")
     

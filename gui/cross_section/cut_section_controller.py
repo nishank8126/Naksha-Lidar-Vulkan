@@ -2298,35 +2298,11 @@ class CutSectionController:
         setattr(wrapper, "on_classify_done", on_classify_done_cut)
         self._restore_classification_tools()    
         
-        if not hasattr(self.app, 'original_undo_classification'):
-            self.app.original_undo_classification = self.app.undo_classification
-            self.app.original_redo_classification = self.app.redo_classification
-            
-            def undo_with_cut_refresh():
-                self.app.original_undo_classification()
-                if hasattr(self.app, 'cut_section_controller'):
-                    ctrl = self.app.cut_section_controller
-                    if ctrl.is_cut_view_active and ctrl.cut_points is not None:
-                        try:
-                            print("🔄 [UNDO] Refreshing cut section...")
-                            ctrl._refresh_cut_colors_fast()
-                        except Exception as e:
-                            print(f"⚠️ Cut undo refresh failed: {e}")
-            
-            def redo_with_cut_refresh():
-                self.app.original_redo_classification()
-                if hasattr(self.app, 'cut_section_controller'):
-                    ctrl = self.app.cut_section_controller
-                    if ctrl.is_cut_view_active and ctrl.cut_points is not None:
-                        try:
-                            print("🔄 [REDO] Refreshing cut section...")
-                            ctrl._refresh_cut_colors_fast()
-                        except Exception as e:
-                            print(f"⚠️ Cut redo refresh failed: {e}")
-            
-            self.app.undo_classification = undo_with_cut_refresh
-            self.app.redo_classification = redo_with_cut_refresh
-            print("✅ Cut section undo/redo hooks installed")
+        # Undo/redo is centralized in NakshaApp.  It already refreshes the Cut
+        # Section after classification history changes, so do not monkey-patch
+        # app.undo_classification/app.redo_classification here.  Keeping one
+        # owner also preserves their Boolean return contract for shortcut
+        # dispatch and avoids duplicate Cut refreshes.
         
         print("✅ ClassificationInteractor attached to dedicated cut widget!")
 

@@ -399,19 +399,13 @@ class PointCountWidget(QWidget):
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(2)
         
-        STANDARD_LEVELS = {
-            0: "Created", 1: "Ground", 2: "Low vegetation", 3: "Medium vegetation",
-            4: "High vegetation", 5: "Buildings", 6: "Water", 7: "Railways",
-            8: "Railways (structure)", 9: "Type 1 Street", 10: "Type 2 Street",
-            11: "Type 3 Street", 12: "Type 4 Street", 13: "Bridge",
-            14: "Bare Conductors", 15: "Elicord Overhead Cables", 16: "Pylons or Poles",
-            17: "HV Overhead Lines", 18: "MV Overhead Lines", 19: "LV Overhead Lines",
-        }
-        
-        # Determine the level name (fallback to standard levels)
+        # Class identity is owned by the loaded PTC/runtime catalog.  Never
+        # substitute semantic LAS/ENEL names here: doing so can make the
+        # statistics panel disagree with Display Mode/ClassPicker.  If metadata
+        # is genuinely unavailable, use a neutral code-only label.
         lvl_str = str(lvl).strip() if lvl else ""
         if not lvl_str or lvl_str == "-":
-            lvl_str = STANDARD_LEVELS.get(code, str(code))
+            lvl_str = f"Class {code}"
             
         desc_str = description.strip() if description else ""
         

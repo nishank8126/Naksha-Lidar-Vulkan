@@ -372,6 +372,60 @@ from PySide6.QtWidgets import QDialog
 from .dialogs.load_pointcloud_dialog import DEFAULT_IMPORT_OPTIONS, LoadPointCloudDialog
 
 
+def _parse_terrascan_prj(prj_path):
+    """Return existing LAS/LAZ files referenced by a TerraScan block PRJ.
+
+    TerraScan block files contain lines such as ``Block tile_name`` followed
+    by polygon coordinates. This parser intentionally ignores geometry here;
+    ``NakshaApp._load_terrascan_prj`` only needs the referenced point-cloud
+    files. Relative paths are resolved against the PRJ directory, duplicates
+    are removed while preserving order, and both names with and without an
+    explicit .las/.laz suffix are supported.
+    """
+    from pathlib import Path
+    import re
+
+    prj = Path(str(prj_path))
+    try:
+        lines = prj.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:
+        print(f"⚠️ Failed to read TerraScan PRJ {prj}: {exc}")
+        return []
+
+    out = []
+    seen = set()
+    for line in lines:
+        match = re.match(r"\s*Block\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        raw_name = match.group(1).strip().strip('"')
+        if not raw_name:
+            continue
+
+        ref = Path(raw_name)
+        candidates = []
+        if ref.suffix.lower() in {".las", ".laz"}:
+            candidates.append(ref if ref.is_absolute() else prj.parent / ref)
+        else:
+            base = ref if ref.is_absolute() else prj.parent / ref
+            candidates.extend([base.with_suffix(".laz"), base.with_suffix(".las")])
+
+        for candidate in candidates:
+            try:
+                if not candidate.exists():
+                    continue
+                key = os.path.normcase(os.path.abspath(str(candidate)))
+            except OSError:
+                continue
+            if key in seen:
+                break
+            seen.add(key)
+            out.append(str(candidate))
+            break
+
+    return out
+
+
 def restore_class_from_user_data_if_marked(las_obj) -> np.ndarray | None:
     """
     If this LAZ/LAS was saved by Naksha as LAS 1.2 with original classes stored

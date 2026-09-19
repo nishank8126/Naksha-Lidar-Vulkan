@@ -1927,9 +1927,8 @@ class DisplayModeDialog(QDialog):
             When *True* (explicit user "Load PTC" action), the PTC colours
             overwrite every view slot unconditionally.
             When *False* (auto-reload during dialog open / grid switch),
-            existing per-view colour, show and weight customisations set
-            by DisplayMode presets are preserved for classes that already
-            exist in the view palette.
+            per-view visibility and weight are preserved for classes that
+            still exist, but class identity/color always comes from the PTC.
         """
         if getattr(self, "_ptc_load_in_progress", False):
             print("â­ï¸ PTC load already in progress - skipping re-entrant call")
@@ -2049,7 +2048,7 @@ class DisplayModeDialog(QDialog):
                 self.view_palettes = {}
 
             # Keep a snapshot of the pre-load per-slot palettes so auto-reload
-            # can preserve existing user customizations (show/color/weight).
+            # can preserve per-view presentation state (show/weight only).
             # Prefer app.view_palettes as baseline when available because it is
             # the canonical runtime source across grid-switch restores.
             previous_view_palettes = {}
@@ -2083,10 +2082,10 @@ class DisplayModeDialog(QDialog):
                     else:
                         # â”€â”€ Auto-reload (dialog open / grid switch) AND
                         #    this class already exists in the per-view palette â”€â”€
-                        # Preserve per-view customisations (colour, visibility,
-                        # weight) so DisplayMode preset colours are never
-                        # silently overwritten by PTC auto-reload.
-                        color_to_use  = tuple(existing.get('color', info["color"]))
+                        # Preserve per-view presentation state only.  PTC owns
+                        # semantic class identity *and color*, so stale palette
+                        # colors must not survive a PTC auto-reload/grid switch.
+                        color_to_use  = tuple(info["color"])
                         show_to_use   = bool(existing.get('show', info["show"]))
                         weight_to_use = float(existing.get('weight', info.get("weight", 1.0)))
 
@@ -2166,12 +2165,45 @@ class DisplayModeDialog(QDialog):
             self._bulk_ptc_loading = False
             self._ptc_load_in_progress = False
 
+    def _broadcast_ptc_schema_change(self, reason):
+        """Notify metadata consumers after Add/Edit/Delete without repainting.
+
+        This intentionally does not call Apply, touch GPU actors, or activate
+        the PTC for AI.  It only announces that the live Display Mode table
+        changed so ClassPicker/conversion/shortcut UIs can re-resolve metadata.
+        """
+        try:
+            self.classes_loaded.emit()
+        except Exception as exc:
+            print(f"⚠️ PTC schema broadcast failed ({reason}): {exc}")
+
+        app = self._get_app_window()
+        if app is not None:
+            # Rebase only DisplayMode preset schema snapshots. Classification
+            # shortcut validity is checked at activation time in execute_tool.
+            try:
+                from .shortcut_manager import rebase_display_preset_to_current_ptc
+                for _combo, _entry in getattr(app, "shortcuts", {}).items():
+                    if _entry.get("tool") == "DisplayMode" and _entry.get("preset"):
+                        _entry["preset"] = rebase_display_preset_to_current_ptc(
+                            _entry["preset"], app
+                        )
+            except Exception as exc:
+                print(f"⚠️ PTC shortcut schema rebase failed ({reason}): {exc}")
+
+        print(
+            f"[PTC-SCHEMA] change={reason} classes={self.table.rowCount()} "
+            f"broadcast=1",
+            flush=True,
+        )
+
     def on_add(self):
         dlg = EditClassDialog(parent=self)
         if dlg.exec() == QDialog.Accepted:
             # EditClassDialog stores the selected QColor as an attribute.
             # Calling it raises: TypeError: 'QColor' object is not callable.
             self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color)
+            self._broadcast_ptc_schema_change("add")
 
     def on_edit(self):
         row = self.table.currentRow()
@@ -2184,7 +2216,10 @@ class DisplayModeDialog(QDialog):
         color  = self.table.item(row, 5).background().color()
         weight = self.table.item(row, 6).text() if self.table.columnCount() > 6 else "2.0"
 
-        dlg = EditClassDialog(code, desc, color, self, draw, lvl, weight)
+        dlg = EditClassDialog(
+            code, desc, color, self, draw, lvl, weight,
+            target_slot=self.current_slot,
+        )
         if dlg.exec() == QDialog.Accepted:
             self.table.setItem(row, 1, QTableWidgetItem(str(dlg.code())))
             self.table.setItem(row, 2, QTableWidgetItem(dlg.desc()))
@@ -2193,11 +2228,13 @@ class DisplayModeDialog(QDialog):
             self._set_color_cell(row, dlg.color)
             self.table.setItem(row, 6, QTableWidgetItem(f"{float(dlg.weight()):.2f}"))
             self._format_table_row(row)
+            self._broadcast_ptc_schema_change("edit")
 
     def on_delete(self):
         row = self.table.currentRow()
         if row >= 0:
             self.table.removeRow(row)
+            self._broadcast_ptc_schema_change("delete")
 
     def _on_color_mode_changed(self, idx):
         """
@@ -2959,8 +2996,18 @@ class DisplayModeDialog(QDialog):
                             if isinstance(previous, dict)
                             else entry.get('show', True)
                         )
+                        # Per-view weights are presentation state, exactly like
+                        # per-view visibility.  Main/PTC Apply owns class identity
+                        # (name/draw/lvl/color) but must never overwrite a user
+                        # weight already configured for Cross/Cut slots.
+                        keep_weight = (
+                            previous.get('weight', entry.get('weight', 1.0))
+                            if isinstance(previous, dict)
+                            else entry.get('weight', 1.0)
+                        )
                         existing[code] = _copy.deepcopy(entry)
                         existing[code]['show'] = bool(keep_show)
+                        existing[code]['weight'] = float(keep_weight)
 
                 # Keep the dialog's checkbox snapshot structurally aligned too.
                 if not hasattr(self, 'slot_shows') or self.slot_shows is None:
@@ -3912,7 +3959,7 @@ class EditClassDialog(InputPopupMixin, QDialog):
     weight_applied = Signal(float)
 
     def __init__(self, code=0, desc="", color=QColor("white"), parent=None,
-                 draw="Not set", lvl="", weight=2.0):
+                 draw="Not set", lvl="", weight=2.0, target_slot=None):
         super().__init__(parent)
         self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Edit Class")
@@ -3921,6 +3968,16 @@ class EditClassDialog(InputPopupMixin, QDialog):
         self.default_weight  = float(weight)
         self.current_weight  = float(weight)
         self.parent_dialog   = parent
+        # Freeze the slot this editor belongs to.  The Display Mode target-view
+        # combo can change while this floating dialog is open; using the live
+        # parent.current_slot at Apply time can otherwise send a View-1 weight
+        # to View-2 (or vice versa).
+        if target_slot is None and parent is not None:
+            target_slot = getattr(parent, 'current_slot', 0)
+        try:
+            self.target_slot = int(target_slot)
+        except Exception:
+            self.target_slot = 0
 
         layout = QVBoxLayout(self)
 
@@ -3994,8 +4051,8 @@ class EditClassDialog(InputPopupMixin, QDialog):
             # 3. Setup Context
             parent_table = self.parent_dialog.table
             code = int(self.code_edit.text())
-            current_slot = self.parent_dialog.current_slot
-            app = self.parent_dialog.parent()
+            current_slot = int(getattr(self, 'target_slot', self.parent_dialog.current_slot))
+            app = self.parent_dialog._get_app_window() if hasattr(self.parent_dialog, '_get_app_window') else self.parent_dialog.parent()
 
             # 4. Update UI Table
             for row in range(parent_table.rowCount()):

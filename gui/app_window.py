@@ -12425,11 +12425,11 @@ class NakshaApp(QMainWindow):
         """Update point count statistics widget"""
         if hasattr(self, 'pointcountwidget') and self.pointcountwidget:
             try:
-                from gui.point_count_widget import refreshpointstatistics
-                refreshpointstatistics(self)
+                from gui.point_count_widget import refresh_point_statistics
+                refresh_point_statistics(self)
                 print("✅ Statistics updated")
             except Exception as e:
-                pass
+                print(f"⚠️ Statistics refresh failed: {e}")
 
     def _refresh_changed_points_after_undo_redo(self, changed_mask):
         """
