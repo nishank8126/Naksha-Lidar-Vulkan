@@ -3064,8 +3064,9 @@ def get_dialog_stylesheet() -> str:
         border: 1px solid {primary_border};
     }}
     QPushButton#apply_btn:hover {{
-        background-color: {primary_hover};
-        border: 1px solid {primary_border};
+        background-color: #1a2a3d;
+        border: 1px solid #4a9eff;
+        color: #4a9eff;
     }}
     QPushButton#secondaryBtn {{
         background-color: {c.get('bg_secondary')};

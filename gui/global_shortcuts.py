@@ -682,11 +682,31 @@ class GlobalShortcutFilter(QObject):
                     except Exception:
                         focus_in_class_picker = False
 
-                allow_classification_history_from_picker = (
-                    focus_in_class_picker
-                    and self._is_classification_active()
-                    and bool(event.modifiers() & Qt.ControlModifier)
+                # Display Mode's view / colour-mode combo boxes keep keyboard
+                # focus after the user touches the dialog. A combo box has no
+                # text undo of its own, so Ctrl+Z/Y must still reach the
+                # classification history instead of being swallowed here.
+                focus_in_display_mode_combo = False
+                dm_dlg = self._get_live_qt_attr("display_mode_dialog")
+                if (
+                    dm_dlg is not None
+                    and isinstance(focus_widget, QComboBox)
+                ):
+                    try:
+                        focus_in_display_mode_combo = (
+                            dm_dlg.isVisible()
+                            and dm_dlg.isAncestorOf(focus_widget)
+                        )
+                    except Exception:
+                        focus_in_display_mode_combo = False
+
+                is_history_key = (
+                    bool(event.modifiers() & Qt.ControlModifier)
                     and event.key() in (Qt.Key_Z, Qt.Key_Y)
+                )
+                allow_classification_history_from_picker = is_history_key and (
+                    (focus_in_class_picker and self._is_classification_active())
+                    or focus_in_display_mode_combo
                 )
 
                 if (

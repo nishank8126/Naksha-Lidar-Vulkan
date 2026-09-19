@@ -466,7 +466,7 @@ QWidget {
 /* Table styling */
 QTableWidget {
     background-color: #252526;
-    gridline-color: #3e3e42;
+    gridline-color: #FFFFFF;
     border: 1px solid #3e3e42;
     selection-background-color: #0e639c;
     alternate-background-color: #2d2d30;
@@ -497,8 +497,8 @@ QHeaderView::section {
     background-color: #2d2d30;
     border: none;
     padding: 8px;
-    border-bottom: 1px solid #3e3e42;
-    border-right: 1px solid #3e3e42;
+    border-bottom: 1px solid #FFFFFF;
+    border-right: 1px solid #FFFFFF;
     font-weight: bold;
     color: #cccccc;
 }
@@ -511,6 +511,7 @@ QHeaderView::section:hover {
 QComboBox {
     background-color: #3c3c3c;
     border: 1px solid #404040;
+    border-right: 2px solid #FFFFFF;
     border-radius: 4px;
     padding: 4px 8px;
     color: #e0e0e0;
@@ -2900,7 +2901,7 @@ class ShortcutManager(QWidget):
         search_layout.setSpacing(8)
         search_layout.setContentsMargins(0, 4, 0, 8)
 
-        search_label = QLabel("🔍 Search:")
+        search_label = QLabel("Search:")
         search_label.setObjectName("dialogInlineNote")
         search_layout.addWidget(search_label)
 
@@ -3430,6 +3431,8 @@ class ShortcutManager(QWidget):
         self.table.setCellWidget(row, self.COL_TOOL, tool_combo)
 
         self._update_row_header(row)
+        # ✅ Grey out already-used keys for this row's modifier
+        QTimer.singleShot(0, lambda r=row: self._update_key_combo_availability(r))
 
     # ─────────────────────────────────────────────────────────────────
     # TABLE BODY right-click context menu
@@ -3526,6 +3529,9 @@ class ShortcutManager(QWidget):
         if new_row >= 0:
             self._set_current_row(new_row)
 
+        # ✅ Keys freed by deletion may now be available in other rows
+        self._refresh_all_key_availability()
+
     def on_item_clicked(self, item):
         """Prevent Classes column from being edited with single click"""
         if item.column() == self.COL_CLASSES:
@@ -3545,6 +3551,22 @@ class ShortcutManager(QWidget):
                     return True, row
         return False, -1
 
+    # ── Predefined shortcuts that cannot be reassigned ────────────────
+    _PREDEFINED_SHORTCUTS = {
+        # (modifier_lower, key_upper): description shown in warning
+        ("ctrl", "Z"): "UNDO operations",
+        ("ctrl", "Y"): "REDO operations",
+        ("shift", "P"): "3D View mode",
+        ("shift", "F"): "Fit View mode",
+        ("ctrl+shift", "F"): "Lock to Fit View mode",
+    }
+
+    def _is_predefined_shortcut(self, mod, key):
+        """Check if this modifier+key combo is reserved for a predefined action."""
+        mod_lower = mod.lower().strip()
+        key_upper = key.upper().strip()
+        return self._PREDEFINED_SHORTCUTS.get((mod_lower, key_upper))
+
     def _on_key_changed(self, row):
         """Called when modifier or key changes — check for duplicates."""
         if self._is_loading_shortcuts:
@@ -3555,17 +3577,65 @@ class ShortcutManager(QWidget):
             return
         mod = mod_combo.currentText()
         key = key_combo.currentText()
-        is_dup, dup_row = self._is_key_duplicate(mod, key, row)
-        if is_dup:
+
+        # ✅ Check predefined / reserved shortcuts first
+        predefined_desc = self._is_predefined_shortcut(mod, key)
+        if predefined_desc:
             QMessageBox.warning(
                 self,
-                "Duplicate Shortcut",
-                f"⚠️ {mod}+{key} is already assigned to row {dup_row + 1}!\n\n"
-                "Each shortcut key can only be used once.\n"
-                "Please choose a different key or modifier."
+                "Reserved Shortcut",
+                f"This Shortcut Keys combination is already predefined for {predefined_desc}, use other keys"
             )
-            # ✅ Reset to F1 to avoid conflict (restored from old code)
+            key_combo.blockSignals(True)
             key_combo.setCurrentText("F1")
+            key_combo.blockSignals(False)
+            return
+
+        # ✅ Refresh key availability highlighting for all rows
+        self._refresh_all_key_availability()
+
+    def _get_used_keys_for_modifier(self, mod):
+        """Return the set of keys already used for a given modifier across all rows."""
+        used = set()
+        mod_lower = mod.lower().strip()
+        for r in range(self.table.rowCount()):
+            mc = self.table.cellWidget(r, self.COL_MODIFIER)
+            kc = self.table.cellWidget(r, self.COL_KEY)
+            if mc and kc:
+                if mc.currentText().lower().strip() == mod_lower:
+                    used.add(kc.currentText().upper().strip())
+        # Also include predefined shortcuts for this modifier
+        for (pre_mod, pre_key) in self._PREDEFINED_SHORTCUTS:
+            if pre_mod == mod_lower:
+                used.add(pre_key)
+        return used
+
+    def _update_key_combo_availability(self, row):
+        """Grey out keys that are already used for the current modifier in other rows."""
+        mod_combo = self.table.cellWidget(row, self.COL_MODIFIER)
+        key_combo = self.table.cellWidget(row, self.COL_KEY)
+        if not mod_combo or not key_combo:
+            return
+        current_mod = mod_combo.currentText().lower().strip()
+        current_key = key_combo.currentText().upper().strip()
+        used_keys = self._get_used_keys_for_modifier(current_mod)
+        model = key_combo.model()
+        for i in range(key_combo.count()):
+            item = model.item(i)
+            key_text = key_combo.itemText(i).upper().strip()
+            if key_text in used_keys:
+                item.setEnabled(False)
+                item.setForeground(QColor("#000000"))
+            else:
+                item.setEnabled(True)
+                item.setForeground(QColor("#FFFFFF"))
+
+    def _refresh_all_key_availability(self):
+        """Update key combo grey-out state for every row."""
+        if self._is_loading_shortcuts:
+            return
+        for r in range(self.table.rowCount()):
+            self._update_key_combo_availability(r)
 
     def on_add(self):
         # A filtered table can hide the appended row. Adding starts a new edit,
@@ -5685,8 +5755,34 @@ class ShortcutManager(QWidget):
                 needs_new = True
 
         if needs_new:
+            # Show a lightweight loading splash while the heavy constructor runs
+            from PySide6.QtWidgets import QLabel, QWidget, QApplication
+            from PySide6.QtGui import QFont
+            _splash = QWidget(None, Qt.SplashScreen | Qt.FramelessWindowHint)
+            _splash.setAttribute(Qt.WA_ShowWithoutActivating)
+            _splash.setFixedSize(260, 60)
+            _splash.setStyleSheet(
+                "background-color: #1e1e2e; border: 1px solid #444; border-radius: 8px;"
+            )
+            _lbl = QLabel("Loading shortcuts...", _splash)
+            _lbl.setAlignment(Qt.AlignCenter)
+            _lbl.setStyleSheet(
+                "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+            )
+            _lbl.setGeometry(_splash.rect())
+            # Position near the Config button or center of screen
+            screen = QApplication.primaryScreen().geometry()
+            _splash.move(
+                screen.width() // 2 - 130,
+                screen.height() // 2 - 30
+            )
+            _splash.show()
+            QApplication.processEvents()  # force the splash to paint
+
             inst = ShortcutManager(app_window)
             ShortcutManager.instance = inst
+
+            _splash.close()
 
         # Restore from minimized/taskbar state if needed
         inst.setWindowFlag(Qt.WindowStaysOnTopHint, True)
