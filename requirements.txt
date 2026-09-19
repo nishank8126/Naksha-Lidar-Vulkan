@@ -82,7 +82,7 @@ Since you intend to commit every listed change, run:
 git add -A
 git diff --cached --stat
 git diff --cached
-git commit -m "shortcuts compatibility"
+git commit -m "class picker issues fixed"
 git push origin ortho-pyramid-tif-loading
 
 # git pull --rebase origin MAIN

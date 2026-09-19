@@ -523,16 +523,7 @@ class ClassPicker(QWidget):
     def ensure_visible(self):
         """Force the ClassPicker visible, first reconciling it with live PTC state."""
         print(f"🔄 Ensuring ClassPicker is visible...")
-        signature = self._current_class_signature()
-        if signature and signature != self._last_class_signature:
-            # A shortcut may be activating right now; app.from_classes/to_class
-            # are the authoritative selections for that activation.  Rebuild from
-            # live PTC metadata without restoring a stale picker selection over it.
-            self._saved_to_class = getattr(self.app, 'to_class', self._saved_to_class)
-            self._saved_from_classes = getattr(self.app, 'from_classes', self._saved_from_classes)
-            self.populate_dropdowns()
-        else:
-            self.sync_with_app()
+        self.sync_with_app()
 
         if self.isMinimized():
             self.showNormal()
@@ -643,6 +634,20 @@ class ClassPicker(QWidget):
     
     def sync_with_app(self):
         """Call this whenever tool/classes change externally."""
+        signature = self._current_class_signature()
+        if (
+            self._last_class_signature is not None
+            and signature != self._last_class_signature
+        ):
+            # Classification shortcuts enter through sync_with_app(). Rebuild
+            # here before displaying the shortcut's From/To selections.
+            self.populate_dropdowns(
+                to_class_override=getattr(self.app, "to_class", None),
+                from_classes_override=getattr(self.app, "from_classes", None),
+            )
+            self._update_title()
+            return
+
         self.from_list.blockSignals(True)
         self.to_combo.blockSignals(True)
 
@@ -728,7 +733,12 @@ class ClassPicker(QWidget):
         print(f"   ⚠️ Could not find class {old_value}")
         return False
 
-    def populate_dropdowns(self):
+    def populate_dropdowns(
+        self,
+        *,
+        to_class_override=_USE_EXISTING_SELECTION,
+        from_classes_override=_USE_EXISTING_SELECTION,
+    ):
         """
         Build class dropdowns with FORCEFUL defaults.
         ✅ FIXED: Preserves "To class" and "From class" selections across rebuilds
@@ -741,21 +751,34 @@ class ClassPicker(QWidget):
         # Priority order: saved instance var > current UI > app state
         
         # Get "To class" to preserve
-        to_class_to_restore = self._saved_to_class
-        if to_class_to_restore is None:
-            to_class_to_restore = self.to_combo.currentData() if self.to_combo.count() > 0 else None
-        if to_class_to_restore is None:
-            to_class_to_restore = getattr(self.app, 'to_class', None)
+        if to_class_override is not _USE_EXISTING_SELECTION:
+            to_class_to_restore = to_class_override
+        else:
+            to_class_to_restore = self._saved_to_class
+            if to_class_to_restore is None:
+                to_class_to_restore = (
+                    self.to_combo.currentData()
+                    if self.to_combo.count() > 0
+                    else None
+                )
+            if to_class_to_restore is None:
+                to_class_to_restore = getattr(self.app, 'to_class', None)
         
         # Get "From classes" to preserve
-        from_classes_to_restore = self._saved_from_classes
-        if from_classes_to_restore is None:
-            selected_items = self.from_list.selectedItems()
-            if selected_items:
-                from_classes_to_restore = [item.data(Qt.UserRole) for item in selected_items 
-                                           if item.data(Qt.UserRole) is not None]
-        if from_classes_to_restore is None:
-            from_classes_to_restore = getattr(self.app, 'from_classes', None)
+        if from_classes_override is not _USE_EXISTING_SELECTION:
+            from_classes_to_restore = from_classes_override
+        else:
+            from_classes_to_restore = self._saved_from_classes
+            if from_classes_to_restore is None:
+                selected_items = self.from_list.selectedItems()
+                if selected_items:
+                    from_classes_to_restore = [
+                        item.data(Qt.UserRole)
+                        for item in selected_items
+                        if item.data(Qt.UserRole) is not None
+                    ]
+            if from_classes_to_restore is None:
+                from_classes_to_restore = getattr(self.app, 'from_classes', None)
         
         print(f"   📌 Will restore - To: {to_class_to_restore}, From: {from_classes_to_restore}")
         
@@ -912,4 +935,3 @@ class ClassPicker(QWidget):
         """Configure picker when 'To class' is background (0)."""
         self.setEnabled(True)
         print("🎨 ClassPicker: background mode configured")
-        
