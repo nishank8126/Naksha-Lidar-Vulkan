@@ -4111,9 +4111,35 @@ def make_color_icon(rgb):
     return QIcon(pix)
 
 
-# Conversion/classification dialogs intentionally do not define their own
-# semantic class-name table.  The active Display Mode/PTC catalog is the
-# single authority for code/name/color identity.
+CONVERSION_STANDARD_LEVELS = {
+    0: "Created",
+    1: "Ground",
+    2: "Low vegetation",
+    3: "Medium vegetation",
+    4: "High vegetation",
+    5: "Buildings",
+    6: "Water",
+    7: "Railways",
+    8: "Railways (structure)",
+    9: "Type 1 Street",
+    10: "Type 2 Street",
+    11: "Type 3 Street",
+    12: "Type 4 Street",
+    13: "Bridge",
+    14: "Bare Conductors",
+    15: "Elicord Overhead Cables",
+    16: "Pylons or Poles",
+    17: "HV Overhead Lines",
+    18: "MV Overhead Lines",
+    19: "LV Overhead Lines",
+    20: "Other Lines",
+    21: "Class 21",
+    22: "Class 22",
+    31: "Practicable Positions",
+    32: "Class 32",
+    51: "Low point",
+    52: "Isolated point",
+}
 
 
 def _coerce_rgb_tuple(value, default=(128, 128, 128)):
@@ -4134,48 +4160,953 @@ def _coerce_rgb_tuple(value, default=(128, 128, 128)):
 
 
 def _collect_conversion_classes(app, standard_levels=None):
-    """Return conversion-dialog rows from the same catalog as ClassPicker.
-
-    ``standard_levels`` is retained only for call-site compatibility; it is
-    deliberately ignored so an old hard-coded semantic label cannot override
-    the currently loaded PTC.  ``resolve_class_catalog`` already enforces the
-    authority order: live Display Mode table -> active PTC schema -> runtime
-    fallback.  Therefore stale view-palette codes cannot be resurrected while
-    a current PTC/table exists.
     """
-    del standard_levels
+    Build class rows used by conversion dialogs from the best available sources.
+    Priority: Display Mode table -> slot 0 palettes -> app.class_palette.
+    """
+    resolved_levels = dict(CONVERSION_STANDARD_LEVELS)
+    if isinstance(standard_levels, dict):
+        resolved_levels.update(standard_levels)
 
-    try:
-        from gui.class_picker import resolve_class_catalog
-        catalog = resolve_class_catalog(app)
-    except Exception as exc:
-        print(f"⚠️ Conversion class catalog resolve failed: {exc}")
-        catalog = {}
+    class_map = {}
+
+    def _norm_text(value):
+        if value is None:
+            return ""
+        return " ".join(str(value).strip().split())
+
+    def _is_placeholder_label(value, code):
+        """
+        True when text is effectively a placeholder for the numeric class code
+        (e.g. "", "20", "Class 20", "cls20"), not a real human label.
+        """
+        text = _norm_text(value)
+        if not text:
+            return True
+
+        code_text = str(code)
+        low = text.lower()
+        placeholder_tokens = {
+            code_text.lower(),
+            f"class {code_text}",
+            f"class{code_text}",
+            f"cls {code_text}",
+            f"cls{code_text}",
+            f"code {code_text}",
+            f"code{code_text}",
+            "unknown",
+            "n/a",
+            "na",
+            "-",
+        }
+        if low in placeholder_tokens:
+            return True
+
+        try:
+            if text.replace(".", "", 1).isdigit():
+                return int(float(text)) == int(code)
+        except Exception:
+            pass
+        return False
+
+    def _is_informative_label(value, code):
+        return not _is_placeholder_label(value, code)
+
+    def _upsert(code, desc="", lvl="", color=None):
+        try:
+            code = int(code)
+        except Exception:
+            return
+
+        entry = class_map.get(code)
+        if entry is None:
+            entry = {"code": code, "desc": "", "lvl": "", "color": (128, 128, 128)}
+            class_map[code] = entry
+
+        desc_text = _norm_text(desc)
+        lvl_text = _norm_text(lvl)
+
+        # Prefer informative labels over placeholders, regardless of source order.
+        if desc_text:
+            if _is_informative_label(desc_text, code):
+                if not _is_informative_label(entry["desc"], code):
+                    entry["desc"] = desc_text
+            elif not entry["desc"]:
+                entry["desc"] = desc_text
+
+        if lvl_text:
+            if _is_informative_label(lvl_text, code):
+                if not _is_informative_label(entry["lvl"], code):
+                    entry["lvl"] = lvl_text
+            elif not entry["lvl"]:
+                entry["lvl"] = lvl_text
+
+        if color is not None:
+            entry["color"] = _coerce_rgb_tuple(color, entry["color"])
+
+    # Source 1: Active Display Mode table (authoritative when available).
+    display_dialog = getattr(app, "display_mode_dialog", getattr(app, "display_dialog", None))
+    table = getattr(display_dialog, "table", None) if display_dialog is not None else None
+    if table is not None:
+        for row in range(table.rowCount()):
+            code = None
+            for code_col in (1, 0, 2):
+                item = table.item(row, code_col)
+                if item is None:
+                    continue
+                try:
+                    code = int(str(item.text()).strip())
+                    break
+                except Exception:
+                    continue
+            if code is None:
+                continue
+
+            desc_item = table.item(row, 2)
+            desc = desc_item.text() if desc_item is not None else ""
+
+            lvl_item = table.item(row, 4)
+            lvl = lvl_item.text() if lvl_item is not None else ""
+
+            color_item = table.item(row, 5)
+            qcolor = color_item.background().color() if color_item is not None else None
+
+            _upsert(code, desc=desc, lvl=lvl, color=qcolor)
+
+    # Source 2+: Palette dicts, including slot 0 mirrors.
+    palette_candidates = []
+    if callable(getattr(app, "_get_main_view_palette", None)):
+        try:
+            palette_candidates.append(app._get_main_view_palette())
+        except Exception:
+            pass
+    if display_dialog is not None and hasattr(display_dialog, "view_palettes"):
+        palette_candidates.append((display_dialog.view_palettes or {}).get(0))
+    if hasattr(app, "view_palettes"):
+        palette_candidates.append((app.view_palettes or {}).get(0))
+    palette_candidates.append(getattr(app, "class_palette", None))
+
+    for palette in palette_candidates:
+        if not isinstance(palette, dict):
+            continue
+        for code, info in palette.items():
+            if not isinstance(info, dict):
+                continue
+            desc = info.get("description", "")
+            lvl = info.get("lvl", "")
+            if not lvl and desc and str(desc).strip() and str(desc).strip() != str(code):
+                lvl = desc
+            _upsert(code, desc=desc, lvl=lvl, color=info.get("color", (128, 128, 128)))
+
+    # Last resort: infer codes from loaded classification array.
+    if not class_map:
+        data = getattr(app, "data", None)
+        cls_arr = data.get("classification") if isinstance(data, dict) else None
+        if cls_arr is not None:
+            try:
+                for code in np.unique(cls_arr):
+                    _upsert(code)
+            except Exception:
+                pass
 
     class_list = []
-    for raw_code, raw_info in sorted((catalog or {}).items(), key=lambda kv: int(kv[0])):
-        try:
-            code = int(raw_code)
-        except (TypeError, ValueError):
-            continue
-        info = raw_info if isinstance(raw_info, dict) else {}
-        lvl = " ".join(str(info.get("lvl", "") or "").strip().split())
-        desc = " ".join(str(info.get("description", "") or "").strip().split())
-        if not lvl:
-            # Neutral fallback only.  Never invent a semantic class name.
-            lvl = desc or f"Class {code}"
-            if desc == lvl:
+    for code in sorted(class_map.keys()):
+        entry = class_map[code]
+        lvl = _norm_text(entry.get("lvl", ""))
+        desc = _norm_text(entry.get("desc", ""))
+
+        if _is_placeholder_label(lvl, code):
+            # If description has the real class text, promote it to level.
+            if _is_informative_label(desc, code):
+                lvl = desc
                 desc = ""
-        if desc and desc.lower() == lvl.lower():
+            else:
+                lvl = resolved_levels.get(code, str(code))
+
+        # Hide placeholder descriptions.
+        if _is_placeholder_label(desc, code):
             desc = ""
-        class_list.append({
-            "code": code,
-            "desc": desc,
-            "lvl": lvl,
-            "color": _coerce_rgb_tuple(info.get("color", (128, 128, 128))),
-        })
+
+        # Avoid labels like "Ground (Ground)" or "20 (20)".
+        if desc:
+            same_as_lvl = desc.lower() == lvl.lower()
+            same_as_code = desc == str(code)
+            if same_as_lvl or same_as_code:
+                desc = ""
+
+        class_list.append(
+            {
+                "code": code,
+                "desc": desc,
+                "lvl": lvl,
+                "color": _coerce_rgb_tuple(entry.get("color", (128, 128, 128))),
+            }
+        )
 
     return class_list
+
+
+def _apply_dialog_theme(dialog):
+    """Apply the shared themed dialog stylesheet when available."""
+    try:
+        from gui.theme_manager import get_dialog_stylesheet
+        dialog.setStyleSheet(get_dialog_stylesheet())
+    except Exception:
+        pass
+
+
+def _create_dialog_info_strip(text):
+    """Create a compact top info strip like the newer management dialogs."""
+    frame = QFrame()
+    frame.setObjectName("dialogInfoStrip")
+
+    layout = QHBoxLayout(frame)
+    layout.setContentsMargins(10, 6, 10, 6)
+    layout.setSpacing(6)
+
+    label = QLabel(text)
+    label.setObjectName("dialogInlineNote")
+    label.setWordWrap(True)
+    layout.addWidget(label)
+
+    return frame, label
+
+
+def _create_dialog_card(title=None, badge_text=None):
+    """Create a compact bordered card for dialog sections."""
+    frame = QFrame()
+    frame.setObjectName("dialogCard")
+
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(10, 8, 10, 8)
+    layout.setSpacing(6)
+
+    badge = None
+    if title:
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+
+        label = QLabel(title)
+        label.setObjectName("dialogSectionLabel")
+        header.addWidget(label)
+        header.addStretch()
+
+        if badge_text is not None:
+            badge = QLabel(str(badge_text))
+            badge.setObjectName("valuePill")
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setMinimumWidth(28)
+            header.addWidget(badge)
+
+        layout.addLayout(header)
+
+    return frame, layout, badge
+
+
+def _set_compact_button_role(button, role="secondary"):
+    """Use compact themed button variants instead of ad-hoc inline styles."""
+    if role == "primary":
+        button.setObjectName("displayApplyBtn")
+        button.setStyleSheet("QPushButton#displayApplyBtn { min-height: 26px; }")
+    elif role == "danger":
+        button.setObjectName("dangerBtn")
+        button.setStyleSheet("QPushButton#dangerBtn { min-height: 26px; }")
+    else:
+        button.setObjectName("displayActionButton")
+        button.setStyleSheet("QPushButton#displayActionButton { min-height: 26px; }")
+    return button
+
+
+def _set_dialog_status(label, text, tone="neutral"):
+    """Apply a compact bordered status style to a label."""
+    from gui.theme_manager import ThemeColors
+
+    styles = {
+        "neutral": (
+            ThemeColors.get("bg_input"),
+            ThemeColors.get("border_light"),
+            ThemeColors.get("text_secondary"),
+        ),
+        "success": (
+            ThemeColors.get("bg_input"),
+            ThemeColors.get("success"),
+            ThemeColors.get("text_primary"),
+        ),
+        "danger": (
+            ThemeColors.get("bg_input"),
+            ThemeColors.get("danger"),
+            ThemeColors.get("danger"),
+        ),
+    }
+    background, border, color = styles.get(tone, styles["neutral"])
+
+    label.setText(text)
+    label.setWordWrap(True)
+    label.setStyleSheet(
+        "QLabel {{"
+        f"background-color:{background};"
+        f"border:1px solid {border};"
+        "border-radius:6px;"
+        "padding:5px 8px;"
+        f"color:{color};"
+        "font-size:8.5pt;"
+        "}}"
+    )
+
+
+def _create_dialog_scroll_container(parent_layout):
+    """Create a scrollable body while keeping footer actions always visible."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(4, 4, 4, 4)
+    layout.setSpacing(4)
+
+    scroll.setWidget(container)
+    parent_layout.addWidget(scroll, 1)
+    return layout
+
+
+def _set_fence_picker_button_state(owner, is_open):
+    """Reflect whether the child fence picker is open on the launcher button."""
+    button = getattr(owner, "select_fence_btn", None)
+    if button is None:
+        return
+    if is_open:
+        button.setText("Close Fence Picker")
+    else:
+        count = len(getattr(owner, "selected_fences", []))
+        if count > 0:
+            button.setText(f"Select Fence ({count})")
+        else:
+            button.setText("Select Fence")
+    _set_compact_button_role(button, "secondary" if is_open else "primary")
+
+
+def _get_fence_identity(shape):
+    """Return a stable identity for digitizer and curve-tool fences."""
+    if not isinstance(shape, dict):
+        return id(shape)
+    if shape.get("source") == "curve_tool":
+        return id(shape.get("curve_data", shape))
+    return id(shape)
+
+
+def _prepare_fence_shape(shape):
+    """Close open line-like shapes on a copy so fence masking can use polygons."""
+    if not isinstance(shape, dict):
+        return shape
+    if shape.get("type") not in ["line", "smart_line", "polyline", "smartline", "curve"]:
+        return shape
+
+    coords = shape.get("coords", [])
+    if isinstance(coords, list):
+        coords = np.array(coords)
+
+    try:
+        if len(coords) > 0 and not np.array_equal(coords[0], coords[-1]):
+            prepared = dict(shape)
+            prepared["coords"] = (
+                np.vstack([coords, coords[0]])
+                if isinstance(coords, np.ndarray)
+                else list(coords) + [list(coords[0])]
+            )
+            return prepared
+    except Exception:
+        pass
+
+    return shape
+
+
+def _show_fence_selection_dialog(owner, window_title, info_text):
+    """Open a compact non-modal fence picker shared by the By Class dialogs."""
+    from PySide6.QtCore import QTimer
+
+    existing_dialog = getattr(owner, "_fence_selection_dialog", None)
+    if existing_dialog is not None:
+        try:
+            if existing_dialog.isVisible():
+                existing_dialog.close()
+                return
+        except (RuntimeError, ReferenceError):
+            pass
+        owner._fence_selection_dialog = None
+
+    digitize = getattr(owner.app, "digitizer", None)
+    curve_tool = getattr(owner.app, "curve_tool", None)
+
+    valid_shapes = []
+    if digitize:
+        drawings = getattr(digitize, "drawings", [])
+        if drawings:
+            valid_shapes = [
+                drawing
+                for drawing in drawings
+                if drawing.get("type") in [
+                    "rectangle",
+                    "circle",
+                    "polygon",
+                    "freehand",
+                    "line",
+                    "smart_line",
+                    "polyline",
+                    "smartline",
+                ]
+            ]
+
+    curve_fences = []
+    if curve_tool and hasattr(curve_tool, "get_curves_as_fences"):
+        curve_fences = curve_tool.get_curves_as_fences()
+
+    all_fences = valid_shapes + curve_fences
+    if not all_fences:
+        QMessageBox.warning(
+            owner,
+            "No Shapes Found",
+            "No shapes or curves found.\n\n"
+            "• Draw shapes using Digitize tools, OR\n"
+            "• Draw curves using the Curve tool",
+        )
+        return
+
+    if not digitize and not curve_tool:
+        QMessageBox.warning(
+            owner,
+            "No Tools Available",
+            "Digitize manager and Curve tool not found.",
+        )
+        return
+
+    from gui.theme_manager import ThemeColors
+    from PySide6.QtWidgets import QLabel as QLabel2
+
+    renderer = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
+
+    def _add_actor_to_renderer(actor):
+        if actor is None:
+            return
+        r = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
+        if r is None:
+            return
+        try:
+            if hasattr(actor, "IsA") and actor.IsA("vtkActor2D"):
+                r.AddViewProp(actor)
+            else:
+                r.AddActor(actor)
+        except Exception:
+            pass
+
+    def _remove_actor_from_renderer(actor):
+        if actor is None:
+            return
+        r = getattr(getattr(owner.app, "vtk_widget", None), "renderer", None)
+        if r is None:
+            return
+        try:
+            r.RemoveActor(actor)
+        except Exception:
+            pass
+        try:
+            r.RemoveActor2D(actor)
+        except Exception:
+            pass
+        try:
+            r.RemoveViewProp(actor)
+        except Exception:
+            pass
+
+    def _render_view():
+        try:
+            owner.app.vtk_widget.render()
+        except Exception:
+            pass
+
+    def _make_highlight_actor(coords, color, width):
+        try:
+            import vtk
+
+            points = vtk.vtkPoints()
+            points.SetDataTypeToDouble()
+            for coord in coords:
+                z_value = float(coord[2]) if len(coord) > 2 else 0.0
+                points.InsertNextPoint(float(coord[0]), float(coord[1]), z_value)
+
+            polyline = vtk.vtkPolyLine()
+            polyline.GetPointIds().SetNumberOfIds(len(coords))
+            for index in range(len(coords)):
+                polyline.GetPointIds().SetId(index, index)
+
+            cell_array = vtk.vtkCellArray()
+            cell_array.InsertNextCell(polyline)
+
+            poly_data = vtk.vtkPolyData()
+            poly_data.SetPoints(points)
+            poly_data.SetLines(cell_array)
+
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(poly_data)
+
+            transform = vtk.vtkCoordinate()
+            transform.SetCoordinateSystemToWorld()
+            mapper.SetTransformCoordinate(transform)
+
+            actor = vtk.vtkActor2D()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(*color)
+            actor.GetProperty().SetLineWidth(width)
+            actor.GetProperty().SetDisplayLocationToForeground()
+            return actor
+        except Exception:
+            try:
+                if hasattr(owner.app, "digitizer"):
+                    return owner.app.digitizer._make_polyline_actor(
+                        coords,
+                        color=color,
+                        width=width,
+                    )
+            except Exception:
+                pass
+            return None
+
+    if hasattr(owner, "_selection_highlight_actors"):
+        for actor in list(getattr(owner, "_selection_highlight_actors", []) or []):
+            _remove_actor_from_renderer(actor)
+        owner._selection_highlight_actors = []
+
+    current_hover_actor = [None]
+    selection_highlight_actors = {}
+
+    def highlight_fence_in_3d(shape):
+        if current_hover_actor[0] is not None:
+            _remove_actor_from_renderer(current_hover_actor[0])
+            current_hover_actor[0] = None
+        if not shape:
+            _render_view()
+            return
+        coords = shape.get("coords", [])
+        if not coords:
+            return
+        highlight_actor = _make_highlight_actor(coords, (1, 1, 0), 6)
+        if highlight_actor is not None:
+            _add_actor_to_renderer(highlight_actor)
+            current_hover_actor[0] = highlight_actor
+            _render_view()
+
+    def add_selection_highlight(shape):
+        coords = shape.get("coords", [])
+        if not coords:
+            return
+        actor = _make_highlight_actor(coords, (0, 0.5, 1), 5)
+        if actor is not None:
+            selection_highlight_actors[_get_fence_identity(shape)] = actor
+            _add_actor_to_renderer(actor)
+            _render_view()
+
+    def remove_selection_highlight(shape):
+        actor = selection_highlight_actors.pop(_get_fence_identity(shape), None)
+        if actor is not None:
+            _remove_actor_from_renderer(actor)
+            _render_view()
+
+    def row_stylesheet(is_curve=False, selected=False):
+        background = ThemeColors.get("dialog_selection", ThemeColors.get("bg_tertiary"))
+        if not selected:
+            background = ThemeColors.get("bg_secondary") if is_curve else ThemeColors.get("bg_input")
+        border = ThemeColors.get("border_active") if selected else ThemeColors.get("border_light")
+        hover_background = ThemeColors.get("bg_button_hover")
+        return (
+            "QWidget#fencePickerRow {"
+            f"background-color:{background};"
+            f"border:1px solid {border};"
+            "border-radius:8px;"
+            "}"
+            "QWidget#fencePickerRow:hover {"
+            f"background-color:{hover_background};"
+            f"border:1px solid {ThemeColors.get('border_active')};"
+            "}"
+        )
+
+    dialog = QDialog(owner, Qt.Dialog)
+    owner._fence_selection_dialog = dialog
+    _apply_dialog_theme(dialog)
+    dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+    dialog.setWindowTitle(window_title)
+    dialog.setWindowModality(Qt.NonModal)
+    dialog.resize(430, 460)
+
+    _set_fence_picker_button_state(owner, True)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(8, 8, 8, 8)
+    layout.setSpacing(6)
+
+    info_strip, _ = _create_dialog_info_strip(info_text)
+    layout.addWidget(info_strip)
+
+    summary_card, summary_layout, summary_badge = _create_dialog_card("Available Fences", len(all_fences))
+    count_label = QLabel(
+        f"Digitizer: {len(valid_shapes)} | Curves: {len(curve_fences)}"
+    )
+    count_label.setObjectName("dialogCaption")
+    summary_layout.addWidget(count_label)
+
+    permanent_check = QCheckBox("Keep selected fences for next conversion")
+    permanent_check.setChecked(bool(getattr(owner, "permanent_fence_mode", True) or not owner.selected_fences))
+    summary_layout.addWidget(permanent_check)
+    layout.addWidget(summary_card)
+
+    list_card, list_layout, _ = _create_dialog_card("Fence List")
+    fence_list = QListWidget()
+    fence_list.setSelectionMode(QAbstractItemView.NoSelection)
+    fence_list.setStyleSheet(
+        "QListWidget {"
+        f"background-color:{ThemeColors.get('bg_input')};"
+        f"border:1px solid {ThemeColors.get('border_light')};"
+        "border-radius:8px;"
+        "padding:4px;"
+        "}"
+        "QListWidget::item {"
+        "border:none;"
+        "padding:0px;"
+        "}"
+    )
+    list_layout.addWidget(fence_list, 1)
+
+    stats_label = QLabel()
+    list_layout.addWidget(stats_label)
+    layout.addWidget(list_card, 1)
+
+    custom_widgets = []
+    current_ids = {_get_fence_identity(fence) for fence in owner.selected_fences}
+    live_source_ids = {_get_fence_identity(fence) for fence in all_fences}
+
+    for index, fence in enumerate(all_fences):
+        shape_type = fence.get("type", "unknown")
+        coords = fence.get("coords", [])
+        is_curve = fence.get("source") == "curve_tool"
+        title_text = (
+            f"Curve #{fence.get('curve_index', index) + 1}"
+            if is_curve
+            else f"#{index + 1}: {shape_type.replace('_', ' ').title()}"
+        )
+        source_tag = "Curve Tool" if is_curve else "Digitizer"
+
+        size_text = ""
+        try:
+            coord_array = np.array(coords)
+            width = coord_array[:, 0].max() - coord_array[:, 0].min()
+            height = coord_array[:, 1].max() - coord_array[:, 1].min()
+            size_text = f"{width:.1f} x {height:.1f} m"
+        except Exception:
+            pass
+
+        is_current = _get_fence_identity(fence) in current_ids
+
+        item_widget = QWidget()
+        item_widget.setObjectName("fencePickerRow")
+        item_widget.setStyleSheet(row_stylesheet(is_curve, is_current))
+        item_widget.setCursor(Qt.PointingHandCursor)
+
+        item_layout = QHBoxLayout(item_widget)
+        item_layout.setContentsMargins(8, 4, 8, 4)
+        item_layout.setSpacing(6)
+
+        checkbox = QCheckBox()
+        checkbox.setCursor(Qt.PointingHandCursor)
+        item_layout.addWidget(checkbox, 0, Qt.AlignVCenter)
+
+        title_label = QLabel2(title_text)
+        title_label.setStyleSheet(
+            f"color:{ThemeColors.get('text_primary')};"
+            "font-weight:600;"
+            "background:transparent;"
+            "border:none;"
+        )
+        item_layout.addWidget(title_label, 1, Qt.AlignVCenter)
+
+        delete_button = None
+        if not is_curve:
+            delete_button = QPushButton("X")
+            delete_button.setAutoDefault(False)
+            _set_compact_button_role(delete_button, "danger")
+            delete_button.setStyleSheet(
+                "QPushButton#dangerBtn {"
+                "  padding: 0px;"
+                "  min-height: 24px;"
+                "  min-width: 24px;"
+                "  max-width: 24px;"
+                "  max-height: 24px;"
+                "  border-radius: 4px;"
+                "}"
+            )
+            item_layout.addWidget(delete_button, 0, Qt.AlignVCenter)
+        else:
+            spacer = QWidget()
+            spacer.setFixedWidth(24)
+            item_layout.addWidget(spacer)
+
+        list_item = QListWidgetItem()
+        list_item.setSizeHint(item_widget.sizeHint())
+        fence_list.addItem(list_item)
+        fence_list.setItemWidget(list_item, item_widget)
+
+        def make_toggle(row_widget, shape_data, curve_shape):
+            def toggle(checked):
+                row_widget.setStyleSheet(row_stylesheet(curve_shape, checked))
+                if checked:
+                    add_selection_highlight(shape_data)
+                else:
+                    remove_selection_highlight(shape_data)
+            return toggle
+
+        checkbox.toggled.connect(make_toggle(item_widget, fence, is_curve))
+
+        if is_current:
+            checkbox.setChecked(True)
+
+        if delete_button is not None:
+            def make_row_click(row_checkbox, danger_button, row_item):
+                def on_mouse_press(event):
+                    fence_list.setCurrentItem(row_item)
+                    if not danger_button.underMouse():
+                        row_checkbox.setChecked(not row_checkbox.isChecked())
+                return on_mouse_press
+
+            item_widget.mousePressEvent = make_row_click(checkbox, delete_button, list_item)
+
+            def make_delete(row_checkbox):
+                def delete_action():
+                    row_checkbox.setChecked(False)
+                return delete_action
+
+            delete_button.clicked.connect(make_delete(checkbox))
+        else:
+            def make_curve_click(row_checkbox, row_item):
+                def on_mouse_press(event):
+                    fence_list.setCurrentItem(row_item)
+                    row_checkbox.setChecked(not row_checkbox.isChecked())
+                return on_mouse_press
+
+            item_widget.mousePressEvent = make_curve_click(checkbox, list_item)
+
+        class HoverEventFilter(QWidget):
+            def __init__(self, parent, shape_data):
+                super().__init__(parent)
+                self.shape_data = shape_data
+
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Enter:
+                    highlight_fence_in_3d(self.shape_data)
+                elif event.type() == QEvent.Leave:
+                    highlight_fence_in_3d(None)
+                return super().eventFilter(obj, event)
+
+        item_widget.installEventFilter(HoverEventFilter(item_widget, fence))
+        custom_widgets.append((checkbox, fence))
+
+    def _reopen_with_live_data():
+        dialog = getattr(owner, "_fence_selection_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return
+        digitize_live = getattr(owner.app, "digitizer", None)
+        curve_tool_live = getattr(owner.app, "curve_tool", None)
+        live_valid = []
+        if digitize_live:
+            drawings = getattr(digitize_live, "drawings", []) or []
+            if drawings:
+                live_valid = [
+                    drawing
+                    for drawing in drawings
+                    if drawing.get("type") in [
+                        "rectangle",
+                        "circle",
+                        "polygon",
+                        "freehand",
+                        "line",
+                        "smart_line",
+                        "polyline",
+                        "smartline",
+                    ]
+                ]
+        live_curve_fences = []
+        if curve_tool_live and hasattr(curve_tool_live, "get_curves_as_fences"):
+            live_curve_fences = curve_tool_live.get_curves_as_fences()
+        live_ids = {_get_fence_identity(fence) for fence in (live_valid + live_curve_fences)}
+        if live_ids == live_source_ids:
+            return
+        try:
+            dialog.close()
+        except Exception:
+            pass
+        QTimer.singleShot(
+            0,
+            lambda: _show_fence_selection_dialog(owner, window_title, info_text),
+        )
+
+    refresh_timer = QTimer(dialog)
+    refresh_timer.setInterval(350)
+    refresh_timer.timeout.connect(_reopen_with_live_data)
+    refresh_timer.start()
+    dialog._fence_selection_refresh_timer = refresh_timer
+
+    def update_stats():
+        checked_count = sum(1 for checkbox, _ in custom_widgets if checkbox.isChecked())
+        if checked_count == 0:
+            _set_dialog_status(stats_label, "No fences selected", "neutral")
+        elif checked_count == 1:
+            _set_dialog_status(stats_label, "1 fence selected", "success")
+        else:
+            _set_dialog_status(stats_label, f"{checked_count} fences selected", "success")
+        if summary_badge is not None:
+            summary_badge.setText(str(len(all_fences)))
+
+    for checkbox, _ in custom_widgets:
+        checkbox.toggled.connect(update_stats)
+
+    update_stats()
+
+    footer = QHBoxLayout()
+    footer.setContentsMargins(0, 0, 0, 0)
+    footer.setSpacing(6)
+
+    select_all_button = QPushButton("Select All")
+    select_all_button.setAutoDefault(False)
+    _set_compact_button_role(select_all_button)
+    select_all_button.clicked.connect(
+        lambda: [checkbox.setChecked(True) for checkbox, _ in custom_widgets]
+    )
+    footer.addWidget(select_all_button)
+
+    clear_all_button = QPushButton("Clear All")
+    clear_all_button.setAutoDefault(False)
+    _set_compact_button_role(clear_all_button)
+
+    def clear_all():
+        for checkbox, _ in custom_widgets:
+            checkbox.setChecked(False)
+
+    clear_all_button.clicked.connect(clear_all)
+    footer.addWidget(clear_all_button)
+    footer.addStretch()
+
+    apply_button = QPushButton("Apply Selection")
+    apply_button.setAutoDefault(False)
+    apply_button.setMinimumWidth(140)
+    _set_compact_button_role(apply_button, "primary")
+
+    applied = [False]
+
+    def apply_selection():
+        applied[0] = True
+        highlight_fence_in_3d(None)
+        selected_shapes = [shape for checkbox, shape in custom_widgets if checkbox.isChecked()]
+
+        owner.permanent_fence_mode = permanent_check.isChecked()
+        prepared_shapes = []
+        seen_ids = set()
+        for shape in selected_shapes:
+            fence_id = _get_fence_identity(shape)
+            if fence_id in seen_ids:
+                continue
+            prepared_shapes.append(_prepare_fence_shape(shape))
+            seen_ids.add(fence_id)
+
+        owner.selected_fences = prepared_shapes
+
+        owner._selection_highlight_actors = list(selection_highlight_actors.values())
+        owner.update_fence_display()
+
+        shape_count = sum(1 for fence in owner.selected_fences if fence.get("source") != "curve_tool")
+        curve_count = sum(1 for fence in owner.selected_fences if fence.get("source") == "curve_tool")
+        total_points = sum(len(fence.get("coords", [])) for fence in owner.selected_fences)
+
+        parts = []
+        if shape_count:
+            parts.append(f"{shape_count} shape(s)")
+        if curve_count:
+            parts.append(f"{curve_count} curve(s)")
+
+        if hasattr(owner, "fence_status"):
+            if not parts:
+                _set_dialog_status(
+                    owner.fence_status,
+                    "No fence selected",
+                    "neutral",
+                )
+            else:
+                _set_dialog_status(
+                    owner.fence_status,
+                    f"{' + '.join(parts)} selected ({total_points} pts)",
+                    "success",
+                )
+
+        _render_view()
+        dialog.close()
+
+    apply_button.clicked.connect(apply_selection)
+    footer.addWidget(apply_button)
+
+    close_button = QPushButton("Close")
+    close_button.setAutoDefault(False)
+    _set_compact_button_role(close_button)
+    close_button.clicked.connect(dialog.close)
+    footer.addWidget(close_button)
+    layout.addLayout(footer)
+
+    def on_dialog_finished(result):
+        highlight_fence_in_3d(None)
+        if not applied[0]:
+            for actor in list(selection_highlight_actors.values()):
+                _remove_actor_from_renderer(actor)
+            selection_highlight_actors.clear()
+            if owner.selected_fences and hasattr(owner, "_restore_highlights_from_data"):
+                try:
+                    owner._restore_highlights_from_data()
+                except Exception:
+                    pass
+        owner._fence_selection_dialog = None
+        _set_fence_picker_button_state(owner, False)
+
+    dialog.finished.connect(on_dialog_finished)
+
+    def select_focused_or_first_fence():
+        row = fence_list.currentRow()
+        if row < 0:
+            row = 0
+        if 0 <= row < len(custom_widgets):
+            custom_widgets[row][0].setChecked(True)
+
+    def dialog_key_press(event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            select_focused_or_first_fence()
+            event.accept()
+            return
+        QDialog.keyPressEvent(dialog, event)
+
+    dialog.keyPressEvent = dialog_key_press
+    dialog.show()
+    try:
+        dialog.raise_()
+    except Exception:
+        try:
+            getattr(dialog, "raise")()
+        except Exception:
+            pass
+    try:
+        dialog.activateWindow()
+    except Exception:
+        pass
+
+    parent_rect = owner.frameGeometry()
+    dialog.move(
+        parent_rect.x() + max(0, (parent_rect.width() - dialog.width()) // 2),
+        parent_rect.y() + max(0, (parent_rect.height() - dialog.height()) // 2),
+    )
 
 
 class ByClassRibbon(QWidget):

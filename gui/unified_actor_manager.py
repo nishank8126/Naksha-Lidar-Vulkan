@@ -5340,21 +5340,8 @@ def refresh_section_after_weight_change(
     except Exception:
         pass
 
-    try:
-        _custom_weights = [
-            float(info.get('weight', 1.0))
-            for info in (palette or {}).values()
-            if isinstance(info, dict) and abs(float(info.get('weight', 1.0)) - 1.0) > 1e-6
-        ]
-        _weight_summary = (
-            f", custom_weights={len(_custom_weights)}, "
-            f"range={min(_custom_weights):.2f}-{max(_custom_weights):.2f}"
-            if _custom_weights else ", custom_weights=0"
-        )
-    except Exception:
-        _weight_summary = ""
     print(f"   ✅ refresh_section_after_weight_change: view={view_idx+1} "
-          f"(slot={slot_idx}, border={border_percent}%, base_size={base_point_size}{_weight_summary})")
+          f"(slot={slot_idx}, border={border_percent}%, base_size={base_point_size})")
     return True
 
 
@@ -7151,29 +7138,6 @@ def fast_cross_section_update(
     actor = vtk_widget.actors.get(actor_name)
     if actor is None:
         return False
-
-    # A classification commit changes the per-point class ID.  Point size is
-    # shader-driven from the slot-local weight LUT, so before patching the new
-    # class IDs make sure this actor still carries the CURRENT section palette.
-    # This is intentionally slot-local: Main, View 1, View 2, etc. may all have
-    # different user-defined weights.
-    try:
-        _weights_applied = getattr(app, '_slot_weights_applied', set()) or set()
-        _has_custom_weight = any(
-            abs(float(info.get('weight', 1.0)) - 1.0) > 1e-6
-            for info in (palette or {}).values()
-            if isinstance(info, dict)
-        )
-        if slot_idx in _weights_applied or _has_custom_weight:
-            _ctx = getattr(actor, '_naksha_shader_ctx', None)
-            if _ctx is not None:
-                _base_sz = float(getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE))
-                _ctx.force_reload()
-                _ctx.load_from_palette(palette, border_percent, _base_sz)
-                _push_uniforms_direct(actor, _ctx)
-                actor._last_uniform_generation = _ctx._generation
-    except Exception as _weight_sync_err:
-        print(f"   ⚠️ Section {view_idx+1} weight LUT refresh skipped: {_weight_sync_err}")
 
     actor_global_indices = getattr(actor, "_naksha_global_indices", None)
     if (
