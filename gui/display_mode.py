@@ -2184,7 +2184,10 @@ class DisplayModeDialog(QDialog):
         color  = self.table.item(row, 5).background().color()
         weight = self.table.item(row, 6).text() if self.table.columnCount() > 6 else "2.0"
 
-        dlg = EditClassDialog(code, desc, color, self, draw, lvl, weight)
+        dlg = EditClassDialog(
+            code, desc, color, self, draw, lvl, weight,
+            target_slot=self.current_slot,
+        )
         if dlg.exec() == QDialog.Accepted:
             self.table.setItem(row, 1, QTableWidgetItem(str(dlg.code())))
             self.table.setItem(row, 2, QTableWidgetItem(dlg.desc()))
@@ -2959,8 +2962,17 @@ class DisplayModeDialog(QDialog):
                             if isinstance(previous, dict)
                             else entry.get('show', True)
                         )
+                        # Per-view weight is presentation state, like visibility.
+                        # Main/PTC Apply owns class identity, but it must not
+                        # overwrite a weight already configured for Cross/Cut.
+                        keep_weight = (
+                            previous.get('weight', entry.get('weight', 1.0))
+                            if isinstance(previous, dict)
+                            else entry.get('weight', 1.0)
+                        )
                         existing[code] = _copy.deepcopy(entry)
                         existing[code]['show'] = bool(keep_show)
+                        existing[code]['weight'] = float(keep_weight)
 
                 # Keep the dialog's checkbox snapshot structurally aligned too.
                 if not hasattr(self, 'slot_shows') or self.slot_shows is None:
@@ -3912,7 +3924,7 @@ class EditClassDialog(InputPopupMixin, QDialog):
     weight_applied = Signal(float)
 
     def __init__(self, code=0, desc="", color=QColor("white"), parent=None,
-                 draw="Not set", lvl="", weight=2.0):
+                 draw="Not set", lvl="", weight=2.0, target_slot=None):
         super().__init__(parent)
         self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Edit Class")
@@ -3921,6 +3933,15 @@ class EditClassDialog(InputPopupMixin, QDialog):
         self.default_weight  = float(weight)
         self.current_weight  = float(weight)
         self.parent_dialog   = parent
+        # Freeze the view slot this editor belongs to. The Display Mode target
+        # can change while this floating editor is open; a View-1 weight must
+        # never be applied to View 2 because current_slot changed meanwhile.
+        if target_slot is None and parent is not None:
+            target_slot = getattr(parent, 'current_slot', 0)
+        try:
+            self.target_slot = int(target_slot)
+        except Exception:
+            self.target_slot = 0
 
         layout = QVBoxLayout(self)
 
@@ -3994,8 +4015,12 @@ class EditClassDialog(InputPopupMixin, QDialog):
             # 3. Setup Context
             parent_table = self.parent_dialog.table
             code = int(self.code_edit.text())
-            current_slot = self.parent_dialog.current_slot
-            app = self.parent_dialog.parent()
+            current_slot = int(getattr(self, 'target_slot', self.parent_dialog.current_slot))
+            app = (
+                self.parent_dialog._get_app_window()
+                if hasattr(self.parent_dialog, '_get_app_window')
+                else self.parent_dialog.parent()
+            )
 
             # 4. Update UI Table
             for row in range(parent_table.rowCount()):
