@@ -10975,9 +10975,56 @@ class NakshaApp(QMainWindow):
 
 
 
+    def _finalize_pending_classification_stroke_for_history(self):
+        """Commit a live brush stroke before reading classification history."""
+        interactors = [getattr(self, "classify_interactor", None)]
+        interactors.extend(
+            list((getattr(self, "classify_interactors", None) or {}).values())
+        )
+        interactors.append(getattr(self, "cut_classify_interactor", None))
+
+        finalized = 0
+        seen = set()
+        for interactor in interactors:
+            if interactor is None or id(interactor) in seen:
+                continue
+            seen.add(id(interactor))
+            finalize = getattr(
+                interactor, "finalize_pending_brush_for_history", None
+            )
+            if not callable(finalize):
+                continue
+            try:
+                if finalize():
+                    finalized += 1
+            except Exception as exc:
+                print(
+                    "CLASSIFICATION_HISTORY pending_finalize=failed "
+                    f"error={exc}"
+                )
+
+        if finalized:
+            print(
+                "CLASSIFICATION_HISTORY "
+                f"pending_finalize=committed strokes={finalized}"
+            )
+        return finalized
+
+
     def undo_classification(self):
-        if not self.undo_stack: return
-        step = self.undo_stack.pop()
+        self._finalize_pending_classification_stroke_for_history()
+        if not self.undo_stack:
+            print("CLASSIFICATION_UNDO status=no_history")
+            try:
+                self.statusBar().showMessage("Nothing to undo", 2000)
+            except Exception:
+                pass
+            return False
+
+        # Validate before removing the entry. Previously a missing/empty mask
+        # silently consumed the step, making subsequent Ctrl+Z presses appear
+        # broken until the classify tool was deactivated.
+        step = self.undo_stack[-1]
         mask = step.get('mask')
         if mask is None:
             indices = step.get('indices')
@@ -10989,10 +11036,26 @@ class NakshaApp(QMainWindow):
                     idx = idx[(idx >= 0) & (idx < mask.shape[0])]
                     if idx.size > 0:
                         mask[idx] = True
-        if mask is None or not mask.any(): return
+        if mask is None or not mask.any():
+            print("CLASSIFICATION_UNDO status=invalid_history reason=empty_mask")
+            return False
 
         old_cls = step.get('old_classes')
-        if old_cls is None: return
+        if old_cls is None:
+            print("CLASSIFICATION_UNDO status=invalid_history reason=missing_old_classes")
+            return False
+        import numpy as np
+        old_cls = np.asarray(old_cls)
+        changed_count = int(np.count_nonzero(mask))
+        if old_cls.size not in (1, changed_count):
+            print(
+                "CLASSIFICATION_UNDO status=invalid_history "
+                f"reason=class_count_mismatch changed={changed_count} "
+                f"old_classes={old_cls.size}"
+            )
+            return False
+
+        self.undo_stack.pop()
 
         # 1. Revert CPU RAM
         classes_before_undo = self.data["classification"][mask].copy()

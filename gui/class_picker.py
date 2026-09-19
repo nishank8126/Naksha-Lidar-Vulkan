@@ -118,11 +118,17 @@ def _is_meaningful_name(value, code):
 
 
 def resolve_class_catalog(app):
-    """Resolve stable PTC class metadata without changing runtime palettes.
+    """Resolve the current class catalog from the loaded PTC schema.
 
-    The live app palette owns the active class set and presentation state. The
-    Display Mode table owns code/name identity and is not rewritten by shortcut
-    application, so it prevents stale preset snapshots from renaming classes.
+    Class identity (code/name/description/draw/color) must have exactly one
+    authority.  When the Display Mode table contains classes, it represents the
+    currently loaded/edited PTC and therefore owns the class set and identity
+    metadata.  ``active_ptc_schema`` is the next fallback when the dialog/table
+    is unavailable.  Runtime/view palettes may contribute only presentation
+    state (show/weight); they must never rename, recolor, add, or resurrect a
+    class that is not present in the current PTC schema.
+
+    This function is read-only: it never mutates app/view palettes.
     """
     live = _normalize_palette(getattr(app, "class_palette", {}) or {})
     table = _display_table_palette(app)
@@ -132,77 +138,79 @@ def resolve_class_catalog(app):
     app_slot_zero = _normalize_palette(
         app_views.get(0, {}) if isinstance(app_views, dict) else {}
     )
+
     dialog = getattr(app, "display_mode_dialog", None)
+    if dialog is None:
+        dialog = getattr(app, "display_dialog", None)
     if dialog is not None and not _qt_object_is_valid(dialog):
         dialog = None
-    active_path = getattr(app, "active_ptc_path", None)
-    current_path = getattr(dialog, "current_ptc_path", None) if dialog else None
-    if active_path and current_path:
-        try:
-            if os.path.normcase(os.path.abspath(str(active_path))) != os.path.normcase(
-                os.path.abspath(str(current_path))
-            ):
-                active = {}
-        except (OSError, TypeError, ValueError):
-            active = {}
+
     dialog_views = getattr(dialog, "view_palettes", {}) if dialog is not None else {}
     dialog_slot_zero = _normalize_palette(
         dialog_views.get(0, {}) if isinstance(dialog_views, dict) else {}
     )
 
-    # Preserve existing behavior: class_palette defines which classes tools can
-    # target. The Display table is only a startup fallback for the class set.
-    class_codes = set(live or table or active or app_slot_zero or dialog_slot_zero)
+    # PTC authority order:
+    #   1) current Display Mode table (also reflects unsaved Add/Edit/Delete)
+    #   2) last explicitly activated PTC schema
+    #   3) runtime palette only when no PTC schema is available
+    if table:
+        schema = table
+        schema_source = "display_table"
+    elif active:
+        schema = active
+        schema_source = "active_ptc_schema"
+    elif live:
+        schema = live
+        schema_source = "class_palette_fallback"
+    elif app_slot_zero:
+        schema = app_slot_zero
+        schema_source = "app_view0_fallback"
+    else:
+        schema = dialog_slot_zero
+        schema_source = "dialog_view0_fallback"
+
+    class_codes = set(schema)
     catalog = {}
-    metadata_sources = (table, active, live, app_slot_zero, dialog_slot_zero)
+
+    # Runtime palettes are allowed to retain presentation state only.
+    presentation_sources = (live, app_slot_zero, dialog_slot_zero)
 
     for code in sorted(class_codes):
-        entry = dict(live.get(code, {}))
-        if not entry:
-            for source in metadata_sources:
-                if code in source:
-                    entry = dict(source[code])
-                    break
+        identity = dict(schema.get(code, {}))
 
-        for field in ("lvl", "description"):
-            value = next(
-                (
-                    source[code].get(field)
-                    for source in metadata_sources
-                    if code in source
-                    and _is_meaningful_name(source[code].get(field), code)
-                ),
-                None,
-            )
-            if value is not None:
-                entry[field] = str(value).strip()
-            elif field == "lvl" and not _is_meaningful_name(
-                entry.get(field), code
-            ):
-                entry[field] = ""
+        # Do not backfill identity from an older runtime/activated schema when
+        # the Display Mode table is available. A blank field in the currently
+        # loaded PTC stays blank (and receives only a neutral UI label later)
+        # rather than inheriting a stale semantic name or color.
 
-        draw = next(
-            (
-                source[code].get("draw")
-                for source in metadata_sources
-                if code in source and str(source[code].get("draw") or "").strip()
-            ),
-            None,
+        entry = dict(identity)
+
+        # show/weight are presentation state. Prefer the live Main View state,
+        # then the per-view snapshots, and finally the PTC/default value.
+        presentation = next(
+            (source[code] for source in presentation_sources if code in source),
+            {},
         )
-        if draw is not None:
-            entry["draw"] = str(draw)
-
+        entry["show"] = bool(
+            presentation.get("show", identity.get("show", True))
+        )
         try:
-            entry["color"] = _normalize_rgb(
-                entry.get("color", (128, 128, 128))
+            entry["weight"] = float(
+                presentation.get("weight", identity.get("weight", 1.0))
             )
+        except (TypeError, ValueError):
+            entry["weight"] = 1.0
+
+        # Normalize identity without inventing a semantic class name.
+        entry["lvl"] = str(identity.get("lvl", "") or "").strip()
+        entry["description"] = str(identity.get("description", "") or "").strip()
+        entry["draw"] = str(identity.get("draw", "") or "").strip()
+        try:
+            entry["color"] = _normalize_rgb(identity.get("color", (128, 128, 128)))
         except Exception:
             entry["color"] = (128, 128, 128)
-        entry.setdefault("show", True)
-        entry.setdefault("weight", 1.0)
-        entry.setdefault("description", "")
-        entry.setdefault("lvl", "")
-        entry.setdefault("draw", "")
+
         catalog[code] = entry
 
     return catalog
@@ -782,32 +790,6 @@ class ClassPicker(QWidget):
         
         print(f"   📌 Will restore - To: {to_class_to_restore}, From: {from_classes_to_restore}")
         
-        # ---------------------------------------------------------
-        # Define Forceful Defaults (Safety Net)
-        # ---------------------------------------------------------
-        STANDARD_LEVELS = {
-            0: "Created",
-            1: "Ground",
-            2: "Low vegetation",
-            3: "Medium vegetation",
-            4: "High vegetation",
-            5: "Buildings",
-            6: "Water",
-            7: "Railways",
-            8: "Railways (structure)",
-            9: "Type 1 Street",
-            10: "Type 2 Street",
-            11: "Type 3 Street",
-            12: "Type 4 Street",
-            13: "Bridge",
-            14: "Bare Conductors",
-            15: "Elicord Overhead Cables",
-            16: "Pylons or Poles",
-            17: "HV Overhead Lines",
-            18: "MV Overhead Lines",
-            19: "LV Overhead Lines",
-        }
-
         # Block signals during rebuild
         self.setUpdatesEnabled(False)
         self.from_list.blockSignals(True)
@@ -857,10 +839,10 @@ class ClassPicker(QWidget):
             raw_lvl = str(cls['lvl'] or '').strip()
             desc = str(cls['desc'] or '').strip()
 
-            # Custom PTC metadata always wins.  If an older runtime snapshot has
-            # no lvl but still has description, use that description rather than
-            # displaying an unrelated hard-coded LAS class name.
-            lvl = raw_lvl or desc or STANDARD_LEVELS.get(code, str(code))
+            # Loaded PTC metadata is authoritative.  Never substitute a hard-coded
+            # semantic class name: if the PTC provides neither lvl nor description,
+            # use a neutral label so a stale standard cannot misidentify the code.
+            lvl = raw_lvl or desc or f"Class {code}"
             
             icon = make_color_icon(cls['color'])
             label = f"{code} - {lvl}"

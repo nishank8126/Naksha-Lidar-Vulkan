@@ -67,6 +67,82 @@ def test_mixed_transition_uses_safe_fallback():
     assert _plan([5, 2], [2, 7]) is shading.ShadingEditKind.FULL_REBUILD
 
 
+def _same_preset_shading_app():
+    class App:
+        pass
+
+    actor = object()
+    app = App()
+    app.data = {
+        "xyz": np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0],
+        ]),
+        "classification": np.full(3, 2, dtype=np.uint8),
+    }
+    app.vtk_widget = SimpleNamespace(
+        actors={"shaded_mesh": actor},
+        render=mock.Mock(),
+    )
+    app._shaded_mesh_actor = actor
+    app.class_palette = {2: {"show": True}}
+    app.shading_quality = "normal"
+    return app
+
+
+def test_force_rebuild_bypasses_same_preset_current_shortcut():
+    app = _same_preset_shading_app()
+    cache = SimpleNamespace(
+        is_fully_current=mock.Mock(return_value=True),
+        is_valid=mock.Mock(return_value=True),
+    )
+
+    with (
+        mock.patch.object(shading, "_prepare_scene_for_shading"),
+        mock.patch(
+            "gui.flight_line_filter.flight_line_visibility_mask",
+            return_value=np.ones(3, dtype=bool),
+        ),
+        mock.patch.object(shading, "_get_shading_visibility", return_value={2}),
+        mock.patch.object(shading, "_build_cache_key", return_value=("same",)),
+        mock.patch.object(shading, "get_cache", return_value=cache),
+        mock.patch.object(
+            shading, "_get_rendered_cache_key", return_value=("same",)
+        ),
+        mock.patch.object(shading, "_build_visible_geometry") as rebuild,
+    ):
+        shading.update_shaded_class(app, force_rebuild=True)
+
+    cache.is_fully_current.assert_not_called()
+    rebuild.assert_called_once()
+
+
+def test_same_preset_current_shortcut_remains_for_normal_refresh():
+    app = _same_preset_shading_app()
+    cache = SimpleNamespace(is_fully_current=mock.Mock(return_value=True))
+
+    with (
+        mock.patch.object(shading, "_prepare_scene_for_shading"),
+        mock.patch(
+            "gui.flight_line_filter.flight_line_visibility_mask",
+            return_value=np.ones(3, dtype=bool),
+        ),
+        mock.patch.object(shading, "_get_shading_visibility", return_value={2}),
+        mock.patch.object(shading, "_build_cache_key", return_value=("same",)),
+        mock.patch.object(shading, "get_cache", return_value=cache),
+        mock.patch.object(
+            shading, "_get_rendered_cache_key", return_value=("same",)
+        ),
+        mock.patch.object(shading, "_hide_point_cloud_actors_for_shading"),
+        mock.patch.object(shading, "_build_visible_geometry") as rebuild,
+    ):
+        shading.update_shaded_class(app)
+
+    cache.is_fully_current.assert_called_once()
+    rebuild.assert_not_called()
+
+
 def test_recovers_exact_delta_from_matching_undo_entry():
     app = SimpleNamespace(undo_stack=[{
         "indices": np.array([3, 9]),

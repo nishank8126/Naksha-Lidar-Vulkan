@@ -10672,6 +10672,8 @@ class ClassificationInteractor:
         # Brush stroke state (initialized here so cleanup() is always safe)
         self._brush_accumulated_mask = None
         self._brush_old_classes = {}
+        self._brush_old_classes_arrays = []
+        self._brush_indices_arrays = []
         self._brush_frame_chunks = []
         self._brush_stroke_positions = []
         self._last_brush_center = None
@@ -11438,16 +11440,29 @@ class ClassificationInteractor:
 
         mask = getattr(self, "_brush_accumulated_mask", None)
         old_classes_dict = getattr(self, "_brush_old_classes", None) or {}
+        index_chunks = getattr(self, "_brush_indices_arrays", None) or []
+        old_class_chunks = getattr(self, "_brush_old_classes_arrays", None) or []
         to_class = getattr(self.app, "to_class", None)
         undo_mask = None
 
         if mask is not None and np.any(mask):
-            if old_classes_dict and to_class is not None:
+            indices = None
+            old_cls = None
+            if index_chunks and len(index_chunks) == len(old_class_chunks):
+                indices = np.concatenate(index_chunks).astype(np.int64, copy=False)
+                old_cls = np.concatenate(old_class_chunks)
+                if indices.size:
+                    _, first_idx = np.unique(indices, return_index=True)
+                    indices = indices[first_idx]
+                    old_cls = old_cls[first_idx]
+            elif old_classes_dict:
                 indices = np.array(sorted(old_classes_dict.keys()), dtype=np.int64)
                 old_cls = np.array(
                     [old_classes_dict[int(i)] for i in indices],
                     dtype=self.app.data["classification"].dtype,
                 )
+
+            if indices is not None and indices.size and to_class is not None:
                 new_cls = np.full(len(indices), to_class, dtype=old_cls.dtype)
 
                 undo_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
@@ -11597,6 +11612,33 @@ class ClassificationInteractor:
         self.is_dragging = False
 
         return undo_mask
+
+    def finalize_pending_brush_for_history(self):
+        """Commit an applied brush stroke before an immediate undo/redo request."""
+        if getattr(self.app, "active_classify_tool", None) != "brush":
+            return False
+
+        stack = getattr(self.app, "undo_stack", None)
+        before = len(stack) if stack is not None else 0
+
+        if self._is_main_view():
+            self._finalize_pending_main_brush_stroke()
+        else:
+            has_chunks = bool(getattr(self, "_brush_indices_arrays", None))
+            has_selection = bool(np.any(
+                getattr(self, "_brush_section_local_mask", None)
+            )) if getattr(self, "_brush_section_local_mask", None) is not None else False
+            if not getattr(self, "is_dragging", False) or not (
+                    has_chunks or has_selection):
+                return False
+            # A Qt focus/shortcut transition can occasionally prevent VTK from
+            # delivering the physical release. Run the established section
+            # release path once so its already-applied points become undoable.
+            self._last_release_time = 0.0
+            self.on_left_release(self.style, "HistoryFinalizePendingBrush")
+
+        after = len(stack) if stack is not None else 0
+        return after > before
 
     # ═══════════════════════════════════════════════════════════════════════
     # ✅ SAFE RENDER GUARDS - Prevents crash on stale VTK render windows
