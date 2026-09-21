@@ -1,4 +1,4 @@
-﻿TOOL_MAP = {
+TOOL_MAP = {
     "AboveLine": "above_line",
     "BelowLine": "below_line",
     "ParallelLine": "parallel_line",

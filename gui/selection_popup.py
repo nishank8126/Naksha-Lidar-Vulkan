@@ -1,4 +1,4 @@
-﻿"""
+"""
 SelectionModeDialog — MicroStation-style PowerSelector panel.
 
 UI rewrite: no fixed size, full-text buttons, and auto-positioned to

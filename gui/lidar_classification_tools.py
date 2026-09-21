@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 from scipy.spatial import cKDTree, Delaunay
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,

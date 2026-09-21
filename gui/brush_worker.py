@@ -1,4 +1,4 @@
-﻿"""
+"""
 BrushQueryWorker — background QThread for brush spatial queries.
 
 The scipy cKDTree.query_ball_point() releases the GIL in its C layer.

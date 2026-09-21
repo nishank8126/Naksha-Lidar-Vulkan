@@ -1,4 +1,4 @@
-﻿
+
 """
 DXF Attachment System with Multiple File Support and Management
 

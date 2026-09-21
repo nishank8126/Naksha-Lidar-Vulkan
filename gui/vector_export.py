@@ -1,4 +1,4 @@
-﻿# ============================================================================
+# ============================================================================
 # FILE: vector_export.py
 # Complete vector drawing export/import system for NakshaAI-Lidar
 # Supports DXF, GeoJSON, and Shapefile formats with full metadata

@@ -1,4 +1,4 @@
-﻿from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QEvent, Qt, QTimer, QElapsedTimer
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QEvent, Qt, QTimer, QElapsedTimer
 from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
 import sys
 from flask import views

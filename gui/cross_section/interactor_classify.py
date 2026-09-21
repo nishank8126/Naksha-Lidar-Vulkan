@@ -1,4 +1,4 @@
-﻿# from json import tool
+# from json import tool
 # from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 # from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
 # from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
