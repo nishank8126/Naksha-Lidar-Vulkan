@@ -876,7 +876,9 @@ class GlobalShortcutFilter(QObject):
                 
                 if self._is_classification_active():
                     print("🛑 ESC - deactivating classification")
-                    self.app_window.deactivate_classification_tool()
+                    self.app_window.deactivate_classification_tool(
+                        cancel_pending_brush=True
+                    )
                     return True
                 
                 return False

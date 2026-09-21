@@ -11613,6 +11613,85 @@ class ClassificationInteractor:
 
         return undo_mask
 
+    def cancel_pending_brush_stroke(self):
+        """Roll back the live brush stroke without adding an undo entry."""
+        if getattr(self.app, "active_classify_tool", None) != "brush":
+            return None
+
+        index_chunks = getattr(self, "_brush_indices_arrays", None) or []
+        old_class_chunks = getattr(self, "_brush_old_classes_arrays", None) or []
+        old_classes_dict = getattr(self, "_brush_old_classes", None) or {}
+        indices = old_cls = None
+
+        if index_chunks and len(index_chunks) == len(old_class_chunks):
+            indices = np.concatenate(index_chunks).astype(np.int64, copy=False)
+            old_cls = np.concatenate(old_class_chunks)
+            if indices.size:
+                # A point may be touched more than once during a stroke. The
+                # first saved value is its class before this gesture began.
+                _, first_idx = np.unique(indices, return_index=True)
+                indices = indices[first_idx]
+                old_cls = old_cls[first_idx]
+        elif old_classes_dict:
+            indices = np.array(sorted(old_classes_dict), dtype=np.int64)
+            old_cls = np.array(
+                [old_classes_dict[int(i)] for i in indices],
+                dtype=self.app.data["classification"].dtype,
+            )
+
+        changed_mask = None
+        if indices is not None and indices.size:
+            classes = self.app.data["classification"]
+            classes[indices] = old_cls
+            changed_mask = np.zeros(len(classes), dtype=bool)
+            changed_mask[indices] = True
+
+        # Invalidate queued worker results before clearing the transaction.
+        self._brush_current_to_class = None
+        self._brush_accumulated_mask = None
+        self._brush_old_classes = {}
+        self._brush_old_classes_arrays = []
+        self._brush_indices_arrays = []
+        self._brush_frame_chunks = []
+        self._brush_stroke_positions = []
+        self._last_brush_center = None
+        self._last_brush_center_uv = None
+        self._brush_needs_render = False
+        self._brush_visible_classes = None
+        self._brush_section_local_mask = None
+        self.app._suppress_section_refresh = False
+        self.is_dragging = False
+
+        try:
+            self._destroy_brush_paint_overlay()
+        except Exception:
+            pass
+        try:
+            self._clear_all_previews()
+        except Exception:
+            pass
+
+        if changed_mask is not None:
+            try:
+                from gui.unified_actor_manager import fast_undo_update
+                fast_undo_update(self.app, changed_mask=changed_mask)
+            except Exception as exc:
+                print(f"⚠️ Brush cancel refresh failed: {exc}")
+            try:
+                ctrl = getattr(self.app, "cut_section_controller", None)
+                if ctrl is not None and getattr(ctrl, "is_cut_view_active", False):
+                    ctrl._refresh_cut_colors_fast()
+            except Exception:
+                pass
+            try:
+                from gui.point_count_widget import refresh_point_statistics
+                refresh_point_statistics(self.app)
+            except Exception:
+                pass
+            print(f"🧹 Cancelled live brush stroke: restored {len(indices):,} points")
+
+        return changed_mask
+
     def finalize_pending_brush_for_history(self):
         """Commit an applied brush stroke before an immediate undo/redo request."""
         if getattr(self.app, "active_classify_tool", None) != "brush":

@@ -10178,7 +10178,8 @@ class NakshaApp(QMainWindow):
             print("✅ SNT/DXF Shielded and Prioritized.")
         except Exception as e: print(f"⚠️ Sync failed: {e}")
  
-    def deactivate_classification_tool(self, preserve_cross_section=False):
+    def deactivate_classification_tool(self, preserve_cross_section=False,
+                                       cancel_pending_brush=False):
  
         """
         Properly deactivate classification and unlock all views.
@@ -10187,7 +10188,28 @@ class NakshaApp(QMainWindow):
         print(f"\n{'='*60}")
         print(f"🛑 DEACTIVATING CLASSIFICATION TOOL")
         print(f"{'='*60}")
- 
+
+        # Escape means cancel, not commit. Brush painting updates the canonical
+        # class array continuously, so restore the active stroke before cleanup()
+        # gets a chance to finalize it into classification history.
+        if cancel_pending_brush and self.active_classify_tool == "brush":
+            interactors = [getattr(self, "classify_interactor", None)]
+            interactors.extend(
+                list((getattr(self, "classify_interactors", None) or {}).values())
+            )
+            interactors.append(getattr(self, "cut_classify_interactor", None))
+            seen = set()
+            for interactor in interactors:
+                if interactor is None or id(interactor) in seen:
+                    continue
+                seen.add(id(interactor))
+                cancel = getattr(interactor, "cancel_pending_brush_stroke", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception as exc:
+                        print(f"⚠️ Pending brush rollback failed: {exc}")
+
         try:
             from . import session_manager
             if hasattr(session_manager, "APP_BUSY"):
