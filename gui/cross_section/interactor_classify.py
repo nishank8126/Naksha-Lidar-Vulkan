@@ -13493,6 +13493,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.poly_actor_cut):
             renderer.AddActor2D(self.poly_actor_cut)
         self.poly_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.poly_actor_cut, 'polygon')
 
         pts = self._poly_cut_pts
         lines = self._poly_cut_lines
@@ -18003,6 +18005,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor_cut):
             renderer.AddActor2D(self.circle_actor_cut)
         self.circle_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor_cut, 'circle')
 
         # ── FAST GEOMETRY UPDATE (world → display coords) ────────────────────
         if not hasattr(self, "_circle_cut_coord"):
@@ -18083,6 +18087,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.line_actor_cut):
             renderer.AddActor2D(self.line_actor_cut)
         self.line_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.line_actor_cut, getattr(self.app, "active_classify_tool", None))
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_line_cut_coord"):
@@ -18197,6 +18203,8 @@ class ClassificationInteractor:
             pts.Modified()
             self._dotted_cut_poly.Modified()
             self.dotted_actor_cut.VisibilityOn()
+            from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+            _acs(self.dotted_actor_cut, getattr(self.app, "active_classify_tool", None))
         else:
             self.dotted_actor_cut.VisibilityOff()
         # Render batched by caller
@@ -18266,6 +18274,8 @@ class ClassificationInteractor:
         pts.Modified()
         self._dotted_cut_poly.Modified()
         self.dotted_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.dotted_actor_cut, getattr(self.app, "active_classify_tool", None))
 
     def _draw_rectangle_preview_cut(self, P1, P2):
         """✅ PERFORMANCE FIX: Rectangle preview for CUT SECTION. One-time VTK pipeline init."""
@@ -18305,6 +18315,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.rect_actor_cut):
             renderer.AddActor2D(self.rect_actor_cut)
         self.rect_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.rect_actor_cut, 'rectangle')
 
         # ── FAST COORDINATE UPDATE (world → display) ─────────────────────────
         if not hasattr(self, "_rect_cut_coord"):
@@ -18381,6 +18393,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor_cut):
             renderer.AddActor2D(self.freehand_actor_cut)
         self.freehand_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor_cut, 'freehand')
 
         # ── FAST GEOMETRY UPDATE (display coords — no world conversion) ──────
         pts   = self._freehand_cut_pts
@@ -18613,6 +18627,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor_cut):
             renderer.AddActor2D(self.brush_actor_cut)
         self.brush_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor_cut, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._brush_cut_pts
@@ -18701,6 +18717,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor_cut):
             renderer.AddActor2D(self.brush_actor_cut)
         self.brush_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor_cut, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._rect_cut_pts
