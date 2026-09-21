@@ -2942,14 +2942,11 @@ def _import_one(app, path: str) -> bool:
     ext = Path(path).suffix.lower()
     name = Path(path).name
 
-<<<<<<< HEAD
     try:
         app._gis_import_canceled = False
     except Exception:
         pass
 
-=======
->>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
     if str(path).lower().endswith(".gdb"):
         return _import_gdb(app, path)
 

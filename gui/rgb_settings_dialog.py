@@ -1,4 +1,4 @@
-﻿"""
+"""
 RGB Display Customization Dialog
 Opens when user Shift+Clicks the RGB button in View Ribbon
 """

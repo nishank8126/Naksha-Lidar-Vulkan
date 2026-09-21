@@ -1,4 +1,4 @@
-﻿"""
+"""
 Elevation Color Ramp Customization Dialog
 Opens when user Shift+Clicks the Elevation button
 """

@@ -213,13 +213,9 @@ def import_native_vector_layer(app, path: str, *, layer_name=None,
         _build_line_polydata, _build_polygon_polydata, _infer_scene_z,
         _get_overlay_renderer, _make_vtk_actor, _pick_color, _render,
     )
-<<<<<<< HEAD
     from gui.gis.gis_layers import (
         register_gis_layer, _registry, find_loaded_layer, focus_loaded_layer,
     )
-=======
-    from gui.gis.gis_layers import register_gis_layer, _registry
->>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
 
     ds = _open_vector(path)
     if ds is None:
@@ -232,7 +228,6 @@ def import_native_vector_layer(app, path: str, *, layer_name=None,
             return None
 
         actual_layer_name = str(lyr.GetName() or layer_name or Path(path).stem)
-<<<<<<< HEAD
 
         # Importing a source that is already on the map must reuse the layer
         # that is already there - never build a second actor set for it.
@@ -241,8 +236,6 @@ def import_native_vector_layer(app, path: str, *, layer_name=None,
             focus_loaded_layer(app, already)
             return already
 
-=======
->>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
         label = display_name or (
             f"{Path(path).name} · {actual_layer_name}"
             if layer_name or ds.GetLayerCount() > 1

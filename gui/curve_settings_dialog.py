@@ -1,4 +1,4 @@
-﻿# gui/curve_settings_dialog.py
+# gui/curve_settings_dialog.py
 # Curve Tool Settings — style persistence for curves
  
 from PySide6.QtCore import QSettings

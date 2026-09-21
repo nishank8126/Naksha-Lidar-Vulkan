@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-﻿# from json import tool
+# from json import tool
 # from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 # from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
 # from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
@@ -10071,9 +10070,6 @@
 #         self.app.classification_finished.emit(mask)
 
 from json import tool
-=======
-﻿from json import tool
->>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleImage, vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkCoordinate
 from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray

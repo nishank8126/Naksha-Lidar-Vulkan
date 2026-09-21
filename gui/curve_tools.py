@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import vtk
 import time
 from PySide6.QtCore import Qt, QEvent, QObject # ✅ ADD QObject

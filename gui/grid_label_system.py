@@ -1,4 +1,4 @@
-﻿# import os
+# import os
 # import re
 # import time
 # import traceback
@@ -5073,6 +5073,7 @@ class SNTFenceLoadWorker(QThread):
             intensity_parts: List[np.ndarray] = []
             ret_no_parts: List[np.ndarray] = []
             ret_cnt_parts: List[np.ndarray] = []
+            line_parts: List[np.ndarray] = []
             source_file_id_parts: List[np.ndarray] = []
             source_point_idx_parts: List[np.ndarray] = []
 
@@ -5080,6 +5081,7 @@ class SNTFenceLoadWorker(QThread):
             has_intensity_any = False
             has_return_no_any = False
             has_return_cnt_any = False
+            has_line_any = False
 
             block_logs: List[Dict[str, object]] = []
             total_loaded_points = 0
@@ -5115,6 +5117,7 @@ class SNTFenceLoadWorker(QThread):
                         has_ret_no = "return_number" in dims
                         has_ret_cnt = "number_of_returns" in dims
                         has_rgb = {"red", "green", "blue"}.issubset(dims)
+                        has_line = "point_source_id" in dims
                         version = reader.header.version
                         las_version = (
                             tuple(map(int, str(version).split(".")))
@@ -5212,6 +5215,13 @@ class SNTFenceLoadWorker(QThread):
                                 ret_cnt_arr = np.zeros(n_sel, dtype=np.uint8)
                             ret_cnt_parts.append(ret_cnt_arr)
 
+                            if has_line:
+                                line_arr = np.asarray(chunk.point_source_id, dtype=np.uint16)[selected_idx]
+                                has_line_any = True
+                            else:
+                                line_arr = np.zeros(n_sel, dtype=np.uint16)
+                            line_parts.append(line_arr)
+
                             if has_rgb:
                                 rr = np.asarray(chunk.red, dtype=np.uint32)[selected_idx]
                                 gg = np.asarray(chunk.green, dtype=np.uint32)[selected_idx]
@@ -5276,6 +5286,7 @@ class SNTFenceLoadWorker(QThread):
             rgb = np.concatenate(rgb_parts, axis=0).astype(np.uint8, copy=False) if rgb_parts else None
             return_number = np.concatenate(ret_no_parts, axis=0).astype(np.uint8, copy=False) if ret_no_parts else None
             number_of_returns = np.concatenate(ret_cnt_parts, axis=0).astype(np.uint8, copy=False) if ret_cnt_parts else None
+            point_source_id = np.concatenate(line_parts, axis=0).astype(np.uint16, copy=False) if line_parts else None
             source_file_ids = (
                 np.concatenate(source_file_id_parts, axis=0).astype(np.int32, copy=False)
                 if source_file_id_parts else np.zeros(xyz.shape[0], dtype=np.int32)
@@ -5311,6 +5322,8 @@ class SNTFenceLoadWorker(QThread):
                         classification = classification[uniq_idx]
                         source_file_ids = source_file_ids[uniq_idx]
                         source_point_indices = source_point_indices[uniq_idx]
+                        if point_source_id is not None:
+                            point_source_id = point_source_id[uniq_idx]
                         if intensity is not None:
                             intensity = intensity[uniq_idx]
                         if rgb is not None:
@@ -5334,6 +5347,8 @@ class SNTFenceLoadWorker(QThread):
                 self.result_data["return_number"] = return_number
             if has_return_cnt_any and number_of_returns is not None:
                 self.result_data["number_of_returns"] = number_of_returns
+            if has_line_any and point_source_id is not None:
+                self.result_data["point_source_id"] = point_source_id
             self.result_data["_fence_source_files"] = source_files
             self.result_data["_fence_source_file_ids"] = source_file_ids
             self.result_data["_fence_source_point_indices"] = source_point_indices
@@ -6680,6 +6695,58 @@ class GridLabelManager:
             self.app.data["return_number"] = np.asarray(fenced_data.get("return_number"), dtype=np.uint8)
         if fenced_data.get("number_of_returns") is not None:
             self.app.data["number_of_returns"] = np.asarray(fenced_data.get("number_of_returns"), dtype=np.uint8)
+        if fenced_data.get("point_source_id") is not None:
+            line_ids = np.asarray(fenced_data.get("point_source_id"), dtype=np.uint16)
+            if line_ids.shape[0] == point_count:
+                self.app.data["point_source_id"] = line_ids
+            else:
+                print(
+                    "⚠️ Fence flight-line IDs dropped: "
+                    f"length mismatch ({line_ids.shape[0]:,} != {point_count:,})"
+                )
+
+        # New geometry => stale flight-line selection/caches from the previous
+        # dataset must not leak into (or hide) this fenced subset.
+        try:
+            fresh_ids = self.app.data.get("point_source_id")
+            if fresh_ids is not None and len(fresh_ids) == point_count:
+                import numpy as _np
+                unique_lines = sorted(int(v) for v in _np.unique(fresh_ids))
+                self.app.flight_line_visibility = {lid: True for lid in unique_lines}
+                self.app.flight_line_visibility_by_slot = {0: dict(self.app.flight_line_visibility)}
+                colors = dict(getattr(self.app, "flight_line_colors", {}) or {})
+                try:
+                    from gui.display_mode import DisplayModeDialog
+                    for lid in unique_lines:
+                        colors.setdefault(lid, DisplayModeDialog._flight_line_color(lid))
+                except Exception:
+                    for lid in unique_lines:
+                        colors.setdefault(
+                            lid,
+                            ((lid * 67 + 53) % 256, (lid * 131 + 97) % 256, (lid * 193 + 181) % 256),
+                        )
+                self.app.flight_line_colors = colors
+                print(f"✅ Fenced load flight lines: {len(unique_lines)} line(s) {unique_lines[:12]}")
+            else:
+                self.app.flight_line_visibility = {}
+                self.app.flight_line_visibility_by_slot = {0: {}}
+        except Exception as _line_exc:
+            print(f"⚠️ Fence flight-line menu refresh skipped: {_line_exc}")
+        try:
+            cache = getattr(self.app, "_flight_line_mask_cache_by_slot", None)
+            if isinstance(cache, dict):
+                cache.pop(0, None)
+            self.app._flight_line_mask_cache_key = None
+            self.app._flight_line_mask_cache = None
+            self.app._flight_line_visible_count_cache = None
+        except Exception:
+            pass
+        try:
+            dlg = getattr(self.app, "display_mode_dialog", None)
+            if dlg is not None and hasattr(dlg, "_rebuild_lines_menu"):
+                dlg._rebuild_lines_menu()
+        except Exception:
+            pass
 
         self.app.loaded_file = None
         self.app.last_save_path = None

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Intensity Display Customization Dialog
 Opens when user Shift+Clicks the Intensity button in View Ribbon
 Allows adjusting brightness/darkness of intensity display

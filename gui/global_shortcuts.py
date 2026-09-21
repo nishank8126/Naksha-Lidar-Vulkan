@@ -1,4 +1,4 @@
-﻿from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QEvent, Qt, QTimer, QElapsedTimer
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QEvent, Qt, QTimer, QElapsedTimer
 from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
 import sys
 from flask import views
@@ -682,7 +682,6 @@ class GlobalShortcutFilter(QObject):
                     except Exception:
                         focus_in_class_picker = False
 
-<<<<<<< HEAD
                 # Display Mode's view / colour-mode combo boxes keep keyboard
                 # focus after the user touches the dialog. A combo box has no
                 # text undo of its own, so Ctrl+Z/Y must still reach the
@@ -709,14 +708,6 @@ class GlobalShortcutFilter(QObject):
                     (focus_in_class_picker and self._is_classification_active())
                     or focus_in_display_mode_combo
                 )
-=======
-                allow_classification_history_from_picker = (
-                    focus_in_class_picker
-                    and self._is_classification_active()
-                    and bool(event.modifiers() & Qt.ControlModifier)
-                    and event.key() in (Qt.Key_Z, Qt.Key_Y)
-                )
->>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
 
                 if (
                     not focus_in_cross_selector

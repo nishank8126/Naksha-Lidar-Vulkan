@@ -1,4 +1,4 @@
-﻿
+
 """
 Grid Tool for Point Cloud Viewer
 Similar to MicroStation's grid functionality

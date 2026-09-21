@@ -1,4 +1,4 @@
-﻿"""
+"""
 GPU Render Manager - Non-invasive performance optimization
 Handles render throttling, LOD, and GPU memory management
 """

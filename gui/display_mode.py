@@ -1,4 +1,4 @@
-﻿import importlib as _importlib
+import importlib as _importlib
 import sys as _sys
 import os as _os
 import copy as _copy

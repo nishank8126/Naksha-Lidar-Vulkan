@@ -1,4 +1,4 @@
-﻿# """
+# """
 # PRJ Block Identifier Dialog
 # Loads PRJ file and allows identification/highlighting of DXF blocks
 # """

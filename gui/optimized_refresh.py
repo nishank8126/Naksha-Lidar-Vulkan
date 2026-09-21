@@ -1,4 +1,4 @@
-﻿"""
+"""
 Optimized refresh pipeline for classification updates.
 
 This module keeps the existing optimizer entry points intact while ensuring
