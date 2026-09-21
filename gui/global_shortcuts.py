@@ -704,10 +704,19 @@ class GlobalShortcutFilter(QObject):
                     bool(event.modifiers() & Qt.ControlModifier)
                     and event.key() in (Qt.Key_Z, Qt.Key_Y)
                 )
-                allow_classification_history_from_picker = is_history_key and (
-                    (focus_in_class_picker and self._is_classification_active())
-                    or focus_in_display_mode_combo
+                # A Display Mode combo box has no use for modified keys, so any
+                # Ctrl/Alt/Shift/Meta shortcut (Ctrl+Z/Y, Shift+F Fit View, ...)
+                # must still reach the global handlers. Plain letters stay with
+                # the combo (type-ahead).
+                display_combo_modified_key = focus_in_display_mode_combo and bool(
+                    event.modifiers()
+                    & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)
                 )
+                allow_classification_history_from_picker = (
+                    is_history_key
+                    and focus_in_class_picker
+                    and self._is_classification_active()
+                ) or display_combo_modified_key
 
                 if (
                     not focus_in_cross_selector
