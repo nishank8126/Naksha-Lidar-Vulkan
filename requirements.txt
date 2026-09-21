@@ -78,12 +78,23 @@ pyinstaller>=6.0
 # git commit -m "SURFACE CLASSIFICATION: Added new feature to classify point cloud surfaces based on user-defined criteria., CLASSIFICATION TOOLS DEACTIVATION , FREEHAND , FEILD OPTIOND FOR IDENTIFIACATION , CONFLCIT BETWEEN TOOLS AND IDENTIFY TOOL  "
 # git push origin MAIN
 
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
 Since you intend to commit every listed change, run:
 git add -A
 git diff --cached --stat
 git diff --cached
+<<<<<<< HEAD
 git commit -m "class picker issues fixed"
 git push origin ortho-pyramid-tif-loading
+=======
+git commit -m "75 pt preserves the imported size. Values below 75 pt continue shrinking linearly.Values above 75 pt grow with stronger world-space scaling.Repeated edits use an immutable baseline, preventing accumulated scaling errors.Works for both vtkFollower and vtkTextActor3D labelsUses the current class set.Backfills missing Lvl, description, draw, and color.Checks the live Display Mode table and all per-view palettes.Preserves shortcut-specific visibility and weight settings.Falls back to description or class code when no meaningful level exists."
+git push origin software-enhancement-20260910
+
+>>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
 
 # git pull --rebase origin MAIN
 # git push origin MAIN

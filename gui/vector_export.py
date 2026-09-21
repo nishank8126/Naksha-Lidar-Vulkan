@@ -4053,6 +4053,7 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                 )
 
             if src.count >= 3:
+<<<<<<< HEAD
                 rgb_bands, canceled = _read_geotiff_bands(
                     src, [1, 2, 3], width, height, Resampling.bilinear, progress,
                     base_value=10, span=18, label="Reading raster bands...",
@@ -4061,6 +4062,9 @@ def import_geotiff_as_texture(app, input_path: str, world_bounds=None,
                     return _geotiff_import_canceled(app, progress, input_path)
                 rgb_data = np.stack(rgb_bands, axis=0)
                 del rgb_bands
+=======
+                rgb_data = src.read([1, 2, 3], **read_kwargs)
+>>>>>>> 8935327b8c62f89eddd37c6603fdf29e6f5732a3
                 # Keep the initial overview visually consistent with the
                 # native-resolution crops loaded by raster_lod.py.
                 from gui.gis.raster_properties import (
