@@ -1,5 +1,9 @@
 from types import SimpleNamespace
+from unittest import mock
 
+import numpy as np
+
+from gui.app_window import NakshaApp
 from gui.cross_section.interactor_classify import ClassificationInteractor
 
 
@@ -127,3 +131,80 @@ def test_live_brush_transaction_is_not_discarded_as_preview_state():
     )
 
     assert peer._cancel_incomplete_classification_gesture() is False
+
+
+def test_pending_main_brush_uses_current_chunk_buffers_for_undo():
+    app = SimpleNamespace(
+        active_classify_tool="brush",
+        data={
+            "xyz": np.zeros((5, 3)),
+            "classification": np.array([2, 7, 2, 8, 2], dtype=np.uint8),
+        },
+        to_class=2,
+        undo_stack=[],
+        redo_stack=[object()],
+        display_mode="depth",
+        _max_undo_steps=30,
+        _suppress_section_refresh=True,
+    )
+    interactor = _bare_interactor(app)
+    interactor.is_dragging = True
+    interactor._is_main_view = lambda: True
+    interactor._brush_accumulated_mask = np.array(
+        [False, True, False, True, False]
+    )
+    interactor._brush_old_classes = {}
+    interactor._brush_indices_arrays = [
+        np.array([1, 3], dtype=np.int64),
+        np.array([3], dtype=np.int64),
+    ]
+    interactor._brush_old_classes_arrays = [
+        np.array([5, 6], dtype=np.uint8),
+        np.array([6], dtype=np.uint8),
+    ]
+
+    with (
+        mock.patch(
+            "gui.unified_actor_manager.guarantee_main_view_visual_refresh"
+        ),
+        mock.patch(
+            "gui.point_count_widget.refresh_point_statistics"
+        ),
+    ):
+        assert interactor.finalize_pending_brush_for_history()
+
+    assert len(app.undo_stack) == 1
+    np.testing.assert_array_equal(app.undo_stack[0]["indices"], [1, 3])
+    np.testing.assert_array_equal(app.undo_stack[0]["old_classes"], [5, 6])
+    np.testing.assert_array_equal(app.undo_stack[0]["new_classes"], [2, 2])
+    assert app.redo_stack == []
+
+
+def test_history_lookup_finalizes_pending_classification_interactor():
+    pending = SimpleNamespace(
+        finalize_pending_brush_for_history=mock.Mock(return_value=True)
+    )
+    app = SimpleNamespace(
+        classify_interactor=pending,
+        classify_interactors={0: pending},
+        cut_classify_interactor=None,
+    )
+
+    finalized = NakshaApp._finalize_pending_classification_stroke_for_history(app)
+
+    assert finalized == 1
+    pending.finalize_pending_brush_for_history.assert_called_once_with()
+
+
+def test_invalid_undo_entry_is_not_silently_consumed():
+    entry = {
+        "indices": np.array([], dtype=np.int64),
+        "old_classes": np.array([], dtype=np.uint8),
+    }
+    app = SimpleNamespace(
+        undo_stack=[entry],
+        _finalize_pending_classification_stroke_for_history=lambda: 0,
+    )
+
+    assert NakshaApp.undo_classification(app) is False
+    assert app.undo_stack == [entry]

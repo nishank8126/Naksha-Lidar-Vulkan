@@ -41,6 +41,41 @@ def _configure_console_utf8():
 _configure_console_utf8()
 
 
+def _configure_gdal_proj_env():
+    """Point GDAL/PROJ at rasterio's own bundled data, process-scoped only.
+
+    Some machines have PROJ_LIB/GDAL_DATA set system-wide by an unrelated
+    PostgreSQL/PostGIS install. That copy of proj.db can be an older schema
+    version than what this app's rasterio/GDAL build expects, which makes
+    every CRS lookup fail (breaks GeoTIFF import/ortho rendering) with no
+    obvious error to the user. Only override os.environ for this process
+    when the existing value looks like that PostGIS path - never touches
+    the persistent system/user environment variables, so other apps that
+    rely on those vars (e.g. actual PostgreSQL/PostGIS tools) are unaffected.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("rasterio")
+        if spec is None or not spec.origin:
+            return
+        rasterio_dir = Path(spec.origin).parent
+        proj_data = rasterio_dir / "proj_data"
+        gdal_data = rasterio_dir / "gdal_data"
+    except Exception:
+        return
+
+    def _looks_like_postgis(value: str | None) -> bool:
+        return bool(value) and "postgis" in value.lower()
+
+    if proj_data.is_dir() and _looks_like_postgis(os.environ.get("PROJ_LIB")):
+        os.environ["PROJ_LIB"] = str(proj_data)
+    if gdal_data.is_dir() and _looks_like_postgis(os.environ.get("GDAL_DATA")):
+        os.environ["GDAL_DATA"] = str(gdal_data)
+
+
+_configure_gdal_proj_env()
+
+
 def _run_maintenance_command() -> int | None:
     """Handle installer maintenance commands before importing the GUI stack."""
     if "--unregister-snt" not in sys.argv[1:]:

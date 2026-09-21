@@ -1,4 +1,4 @@
-﻿"""
+"""
 Menu-Based Ribbon System for NakshaAI
 Displays all menu options horizontally in a ribbon layout
 """
@@ -202,13 +202,25 @@ RIBBON_TOOLTIP_META = {
         "title": "Save As",
         "description": "Save the current project to a new file or location.",
     },
-    ("FileRibbon", "Vectors", "Export"): {
-        "title": "Export Drawings",
-        "description": "Export drawings to supported vector formats such as DXF, GeoJSON, or Shapefile.",
+    ("FileRibbon", "GIS Data", "Catalog"): {
+        "title": "GIS Catalog",
+        "description": "Browse and manage GIS data on disk: FileGDB, GeoPackage, vector and raster datasets.",
     },
-    ("FileRibbon", "Vectors", "Import"): {
-        "title": "Import Drawings",
-        "description": "Import drawings from supported vector files into the current project.",
+    ("FileRibbon", "GIS Data", "Import"): {
+        "title": "Import GIS Data",
+        "description": "Load GIS layers into the current map using the native GIS layer pipeline.",
+    },
+    ("FileRibbon", "GIS Data", "Convert"): {
+        "title": "Convert GIS Data",
+        "description": "Copy/convert native GIS datasets while preserving geometry, fields and CRS where supported.",
+    },
+    ("FileRibbon", "GIS Data", "Export"): {
+        "title": "Export Naksha Drawings",
+        "description": "Export Naksha drawing/digitizer content. Use Convert for native GIS dataset-to-dataset conversion.",
+    },
+    ("FileRibbon", "GIS Data", "Layers"): {
+        "title": "GIS Layers",
+        "description": "Show the layers and standalone tables currently loaded in the active map.",
     },
     ("FileRibbon", "Attachments", "Attach DXF"): {
         "title": "Attach DXF",
@@ -634,7 +646,7 @@ class RibbonSection(QWidget):
 
     _POINT_SYNC_EXCLUSIVE_BUTTONS = {
         "ToolsRibbon": {"Cross", "Cut"},
-        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Vertex", "AccuDraw", "Select", "Parallel", "Centerline", "Curve"},
+        "DrawRibbon": {"Smart", "Line", "Polyline", "Rect", "Circle", "Free", "Text", "Vertex", "Angle", "Select", "Parallel", "Centerline", "Curve"},
         "ClassifyRibbon": {"Above", "Below", "Parallel", "Rect", "Circle", "Polygon", "Free", "Brush", "Point", "Fence"},
         "MeasurementRibbon": {"Line", "Path", "Block", "Grid"},
         "IdentificationRibbon": {"Identify", "Zoom", "Select"},
@@ -864,11 +876,16 @@ class FileRibbon(QWidget):
 
         layout.addWidget(file_ops)
         
-        # Vector Export/Import Section
-        vector_ops = RibbonSection("Vectors", self)
-        vector_ops.add_button("Export", "📤", self._export_drawings)
-        vector_ops.add_button("Import", "📥", self._import_drawings)
-        layout.addWidget(vector_ops)
+        # GIS data management. Keep native dataset conversion separate from
+        # Naksha drawing export so users never confuse visual/digitizer output
+        # with a schema-faithful GIS round trip.
+        gis_ops = RibbonSection("GIS Data", self)
+        gis_ops.add_button("Layers", "🧱", self._show_gis_layers)
+        gis_ops.add_button("Catalog", "🗂️", self._open_gis_catalog)
+        gis_ops.add_button("Import", "📥", self._import_drawings)
+        gis_ops.add_button("Export", "📤", self._export_drawings)
+        gis_ops.add_button("Convert", "🔁", self._convert_gis_data)
+        layout.addWidget(gis_ops)
 
         # Combined attachment tools
         attachments = RibbonSection("Attachments", self)
@@ -888,8 +905,35 @@ class FileRibbon(QWidget):
         
         layout.addStretch()
     
+    def _open_gis_catalog(self):
+        """Open the GIS Catalog (data-on-disk workspace)."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.catalog_browser import show_catalog_panel
+            show_catalog_panel(app)
+        except Exception as e:
+            print(f"⚠️ GIS Catalog failed: {e}")
+
+    def _convert_gis_data(self):
+        """Open the native GIS dataset conversion tool."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.conversion_dialog import show_batch_conversion_dialog
+            show_batch_conversion_dialog(app)
+        except Exception as e:
+            print(f"⚠️ GIS conversion dialog failed: {e}")
+
+    def _show_gis_layers(self):
+        """Toggle the current-map GIS Layers panel."""
+        try:
+            app = self.parent().parent().parent()
+            from gui.gis.gis_layers import toggle_gis_layers_panel
+            toggle_gis_layers_panel(app)
+        except Exception as e:
+            print(f"⚠️ GIS Layers panel failed: {e}")
+
     def _export_drawings(self):
-        """Show export dialog for drawings"""
+        """Export Naksha drawing/digitizer content (not native GIS conversion)."""
         try:
             app = self.parent().parent().parent()
             from gui.vector_export import show_export_dialog
@@ -898,7 +942,7 @@ class FileRibbon(QWidget):
             print(f"⚠️ Export failed: {e}")
 
     def _import_drawings(self):
-        """Import GIS overlays (.shp/.tif/.geojson) into the Overlay Control Center."""
+        """Import GIS datasets into the native Layers/Overlay workspace."""
         try:
             app = self.parent().parent().parent()
             # Unified, auto-detecting import that registers each file as a managed
@@ -2033,7 +2077,7 @@ class DrawRibbon(QWidget):
         self.vertex_btn = tools.add_button("Vertex", "🔵", lambda: self._handle_vertex_click())
         tools.add_button("Curve", "〰️", lambda: self._handle_curve_click())
         tools.add_button("Hatch", "▦", lambda: self._handle_hatch_click())
-        tools.add_button("AccuDraw", "XYZ", lambda: self._handle_accudraw_click())
+        tools.add_button("Angle", "XYZ", lambda: self._handle_accudraw_click())
         layout.addWidget(tools)
 
         controls_section = RibbonSection("Controls", self)
@@ -3297,17 +3341,22 @@ class DrawRibbon(QWidget):
     def _show_vertex_action_menu(self):
         """Show Create/Move/Delete Vertex actions from the Vertex ribbon button."""
         menu = QMenu(self)
+        point_action  = menu.addAction("Create GIS Point")
+        menu.addSeparator()
         create_action = menu.addAction("Add Vertex")
         move_action   = menu.addAction("Move Vertex")
         delete_action = menu.addAction("Delete Vertex")
-
         button = getattr(self, "vertex_btn", None)
         if button is not None:
             action = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
         else:
             action = menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
 
-        if action is create_action:
+        if action is point_action:
+            self._deactivate_accudraw_before_other_tool("Create GIS Point")
+            print("GIS Point tool activation")
+            self.draw_tool_selected.emit("GIS Point")
+        elif action is create_action:
             self._deactivate_accudraw_before_other_tool("Add Vertex")
             print("🔵 Add Vertex tool activation")
             self.draw_tool_selected.emit("Vertex")
@@ -5089,6 +5138,9 @@ class ByClassRibbon(QWidget):
         self._dialog_guard_host = None
         self._dialog_guard_app = None
         self._dialog_raise_scheduled = False
+        # The dialog the user most recently opened/clicked via
+        # _show_or_raise_dialog() - see _refresh_dialog_zorder()'s use of it.
+        self._last_raised_byclass_dialog = None
         
         # ✅ Store dialog references
         self.by_class_dialog = None
@@ -5174,6 +5226,23 @@ class ByClassRibbon(QWidget):
                 dialog.raise_()
             except Exception:
                 continue
+
+        # The loop above always raises every visible By Class dialog in the
+        # same fixed order, so whichever one comes last in
+        # _iter_byclass_dialogs() would otherwise always win the z-order -
+        # e.g. Fence sitting on top of Height just because it's later in
+        # that tuple, even though Height is the one the user just clicked
+        # open. Re-raise the most recently user-opened dialog one more time
+        # so it keeps the final say, without changing anything about the
+        # "every By Class dialog stays above the main window" guarantee the
+        # loop above already provides.
+        last = self._last_raised_byclass_dialog
+        if last is not None:
+            try:
+                if last.isVisible() and not last.isHidden() and not last.isMinimized():
+                    last.raise_()
+            except Exception:
+                self._last_raised_byclass_dialog = None
 
     def eventFilter(self, obj, event):
         try:
@@ -5368,14 +5437,32 @@ class ByClassRibbon(QWidget):
     def _show_or_raise_dialog(self, dialog, dialog_name):
         """
         ✅ Helper: Show/raise dialog if hidden or minimized
-        
+
         Args:
             dialog: Dialog instance
             dialog_name: Name for logging
         """
         if dialog is None:
             return
-        
+
+        # Mutual exclusivity: only one By Class family dialog (By Class,
+        # Height, Fence, Low Points, Isolated, Ground, Below Surface) stays
+        # on screen at a time, so opening one doesn't leave others peeking
+        # out from behind it. hide() rather than close(): each dialog's own
+        # settings (selected classes, height range, fence, etc.) are
+        # preserved exactly as left, ready to resume next time it's opened -
+        # this never touches a dialog that's minimized, since a minimized
+        # one is already tucked into the taskbar and isn't part of the
+        # on-screen clutter this is fixing.
+        for other in self._iter_byclass_dialogs():
+            if other is dialog:
+                continue
+            try:
+                if not other.isHidden() and other.isVisible() and not other.isMinimized():
+                    other.hide()
+            except Exception:
+                continue
+
         # Show if hidden
         if dialog.isHidden():
             print(f"👁️ {dialog_name} was hidden - showing...")
@@ -5394,6 +5481,16 @@ class ByClassRibbon(QWidget):
         # Raise to front and activate
         dialog.raise_()
         dialog.activateWindow()
+        # _schedule_dialog_zorder_refresh() below re-raises every visible
+        # By Class dialog in _iter_byclass_dialogs()'s fixed order, which
+        # would otherwise immediately undo the raise_() above the instant
+        # any OTHER By Class dialog (e.g. Fence) was already open - it
+        # always ends up on top since it comes later in that fixed tuple,
+        # regardless of which dialog the user actually just clicked open.
+        # Track the dialog that was just explicitly opened here so the
+        # refresh can give it the final say once it's done restacking
+        # everyone above the main window.
+        self._last_raised_byclass_dialog = dialog
         self._schedule_dialog_zorder_refresh()
         print(f"✅ {dialog_name} raised to front")
 

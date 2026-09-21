@@ -1,8 +1,0 @@
-{
-  "name": "Naksha Converter",
-  "version": "1.1.2",
-  "author": "NakshaTech Software Team",
-  "description": "Convert DGN files to SNT or DXF with the bundled legacy engine, and DXF files to SNT, directly in NakshaAI.",
-  "entry": "plugin.py",
-  "class": "DrawingConverterPlugin"
-}

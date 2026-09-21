@@ -236,3 +236,114 @@ def test_camera_burst_checks_coverage_once_per_frame(monkeypatch):
         assert loader.generation == generation
     finally:
         app._raster_lod_loader.close()
+
+
+def test_camera_navigation_keeps_detail_until_frame_coverage_check(monkeypatch):
+    qt = QCoreApplication.instance() or QCoreApplication([])
+    rw = vtk.vtkRenderWindow()
+    renderer = vtk.vtkRenderer()
+    rw.AddRenderer(renderer)
+    actor = make_actor()
+    actor._raster_lod_meta.update(
+        _last_window={"wx0": 20, "wx1": 40, "wy0": 20, "wy1": 40,
+                      "out_w": 100, "out_h": 100},
+        _preview_image=vtk.vtkImageData(),
+    )
+    app = SimpleNamespace(
+        vtk_widget=SimpleNamespace(renderer=renderer,
+                                   GetRenderWindow=lambda: rw),
+        geotiff_actors=[actor],
+    )
+    restored = []
+    monkeypatch.setattr(
+        lod, "_restore_overview",
+        lambda current: restored.append(current) or current._raster_lod_meta.pop(
+            "_last_window", None
+        ) is not None,
+    )
+    lod.ensure_installed(app)
+    try:
+        renderer.GetActiveCamera().SetParallelScale(25)
+        assert restored == []
+        assert "_last_window" in actor._raster_lod_meta
+        rw.InvokeEvent("StartEvent")
+        assert restored == [actor]
+        assert "_last_window" not in actor._raster_lod_meta
+    finally:
+        app._raster_lod_loader.close()
+
+
+def test_clipping_only_camera_change_preserves_sharp_detail(monkeypatch):
+    qt = QCoreApplication.instance() or QCoreApplication([])
+    rw = vtk.vtkRenderWindow()
+    renderer = vtk.vtkRenderer()
+    rw.AddRenderer(renderer)
+    actor = make_actor()
+    actor._raster_lod_meta.update(
+        _last_window={"wx0": 0, "wx1": 100, "wy0": 0, "wy1": 100,
+                      "out_w": 1000, "out_h": 1000},
+        _preview_image=vtk.vtkImageData(),
+    )
+    app = SimpleNamespace(
+        vtk_widget=SimpleNamespace(renderer=renderer,
+                                   GetRenderWindow=lambda: rw),
+        geotiff_actors=[actor],
+    )
+    restored = []
+    monkeypatch.setattr(lod, "_restore_overview",
+                        lambda current: restored.append(current) or True)
+    lod.ensure_installed(app)
+    try:
+        generation = app._raster_lod_loader.generation
+        renderer.GetActiveCamera().SetClippingRange(0.25, 5000.0)
+        assert restored == []
+        assert app._raster_lod_loader.generation == generation
+        assert "_last_window" in actor._raster_lod_meta
+    finally:
+        app._raster_lod_loader.close()
+
+
+def test_zoom_inside_loaded_crop_keeps_sharp_texture(monkeypatch):
+    qt = QCoreApplication.instance() or QCoreApplication([])
+    rw = vtk.vtkRenderWindow()
+    rw.SetSize(100, 100)
+    renderer = vtk.vtkRenderer()
+    rw.AddRenderer(renderer)
+    camera = renderer.GetActiveCamera()
+    camera.SetParallelProjection(True)
+    camera.SetPosition(30, 30, 10)
+    camera.SetFocalPoint(30, 30, 0)
+    camera.SetViewUp(0, 1, 0)
+    camera.SetParallelScale(5)
+    actor = make_actor()
+    actor._raster_lod_meta.update(
+        _last_window={"wx0": 20, "wx1": 40, "wy0": 20, "wy1": 40,
+                      "out_w": 1000, "out_h": 1000},
+        _preview_image=vtk.vtkImageData(),
+    )
+    app = SimpleNamespace(
+        vtk_widget=SimpleNamespace(renderer=renderer, GetRenderWindow=lambda: rw),
+        geotiff_actors=[actor],
+    )
+    restored = []
+    monkeypatch.setattr(lod, "_restore_overview",
+                        lambda current: restored.append(current) or True)
+    lod.ensure_installed(app)
+    try:
+        camera.SetParallelScale(4)
+        rw.InvokeEvent("StartEvent")
+        assert restored == []
+        assert "_last_window" in actor._raster_lod_meta
+    finally:
+        app._raster_lod_loader.close()
+
+
+def test_default_orthophoto_style_adds_controlled_clarity():
+    from gui.gis.raster_properties import default_raster_style
+
+    style = default_raster_style(3)
+    assert 0 < style["brightness"] <= 5
+    assert 0 < style["contrast"] <= 10
+    assert 1.0 < style["gamma"] <= 1.1
+    assert 0 < style["saturation"] <= 20
+    assert style["resampling"] == "nearest"

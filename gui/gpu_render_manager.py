@@ -51,6 +51,11 @@ class GPURenderManager(QObject):
         self._pan_last_frame_monotonic = 0.0
         # Whether any camera interaction (pan/zoom/rotate) is active.
         self._interaction_active = False
+        # Large SNT files may contain thousands of polygonal text actors. Hide
+        # only those labels in transient camera frames, then restore their exact
+        # visibility for the settled frame.
+        self._interaction_hidden_snt_text = []
+        self._snt_text_interaction_active = False
         # Whether we disabled the interactor's native auto-render.
         self._interactor_render_disabled = False
         
@@ -257,6 +262,7 @@ class GPURenderManager(QObject):
         self._pan_frame_started = False
         self._pan_last_frame_monotonic = 0.0
         self._interaction_active = True
+        GPURenderManager._set_snt_text_interaction_visibility(self, True)
         return True
 
     def finish_pan_interaction(self):
@@ -266,6 +272,7 @@ class GPURenderManager(QObject):
         self._pan_frame_started = False
         self._pan_last_frame_monotonic = 0.0
         self._interaction_active = False
+        GPURenderManager._set_snt_text_interaction_visibility(self, False)
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return False
@@ -284,12 +291,14 @@ class GPURenderManager(QObject):
         throttle can treat interaction renders specially (immediate during pan,
         debounced otherwise) and LOD can engage."""
         self._interaction_active = True
+        GPURenderManager._set_snt_text_interaction_visibility(self, True)
         self._engage_lod()
 
     def _on_interaction_end(self, obj, event):
         """Camera interaction finished — settle with one full-quality render and
         restore full-detail LOD."""
         self._interaction_active = False
+        GPURenderManager._set_snt_text_interaction_visibility(self, False)
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return
@@ -318,6 +327,7 @@ class GPURenderManager(QObject):
         if not self._interaction_active:
             self._interaction_frame_started = False
         self._interaction_active = True
+        GPURenderManager._set_snt_text_interaction_visibility(self, True)
         self._engage_lod()
         try:
             self._wheel_idle_timer.stop()
@@ -334,10 +344,21 @@ class GPURenderManager(QObject):
         """Wheel-zoom gesture settled — drop interaction flag, restore full
         detail, and repaint once at full quality."""
         self._interaction_active = False
+        GPURenderManager._set_snt_text_interaction_visibility(self, False)
         self._restore_full_detail()
         app = self.app
         if app is None or getattr(app, "_shutdown_in_progress", False):
             return
+        # The old settle path rendered without rebuilding clip planes, so
+        # planar SNT/DXF scenes could remain fully clipped until Shift+F.
+        refresh_clipping = getattr(
+            app, "_refresh_main_view_clipping_after_navigation", None
+        )
+        if callable(refresh_clipping):
+            try:
+                refresh_clipping()
+            except Exception:
+                pass
         self.force_render()
 
     def _engage_lod(self):
@@ -351,16 +372,61 @@ class GPURenderManager(QObject):
         """
         return False
 
+    def _set_snt_text_interaction_visibility(self, hide: bool) -> int:
+        """Hide costly SNT label actors only while the camera is moving.
+
+        Only labels that were visible at interaction start are recorded, so a
+        user-hidden label remains hidden. Repeated start events are idempotent.
+        """
+        if hide:
+            if getattr(self, "_snt_text_interaction_active", False):
+                return len(getattr(self, "_interaction_hidden_snt_text", ()))
+            self._snt_text_interaction_active = True
+
+            app = self.app
+            if app is None:
+                return 0
+
+            hidden = []
+            seen = set()
+            for entry in getattr(app, "snt_actors", ()) or ():
+                for actor in entry.get("actors", ()) or ():
+                    actor_id = id(actor)
+                    if actor_id in seen or not getattr(actor, "is_grid_label", False):
+                        continue
+                    seen.add(actor_id)
+                    try:
+                        if actor.GetVisibility():
+                            actor.VisibilityOff()
+                            hidden.append(actor)
+                    except (AttributeError, ReferenceError, RuntimeError):
+                        continue
+
+            self._interaction_hidden_snt_text = hidden
+            return len(hidden)
+
+        if getattr(self, "_pan_in_progress", False) or getattr(self, "_interaction_active", False):
+            return 0
+
+        hidden = getattr(self, "_interaction_hidden_snt_text", ())
+        self._interaction_hidden_snt_text = []
+        self._snt_text_interaction_active = False
+        for actor in hidden:
+            try:
+                actor.VisibilityOn()
+            except (AttributeError, ReferenceError, RuntimeError):
+                continue
+        return len(hidden)
+
     def _remove_camera_observers(self):
         """Remove all registered VTK camera observers and reset interaction state."""
         interactor = self._camera_interactor
-        if interactor is None:
-            return
-        for oid in self._camera_observer_ids:
-            try:
-                interactor.RemoveObserver(oid)
-            except Exception:
-                pass
+        if interactor is not None:
+            for oid in self._camera_observer_ids:
+                try:
+                    interactor.RemoveObserver(oid)
+                except Exception:
+                    pass
         self._camera_observer_ids.clear()
         self._camera_interactor = None
         # Reset pan flag — if the interactor is replaced while the middle button
@@ -370,6 +436,7 @@ class GPURenderManager(QObject):
         self._pan_frame_started = False
         self._pan_last_frame_monotonic = 0.0
         self._interaction_active = False
+        GPURenderManager._set_snt_text_interaction_visibility(self, False)
         print("[GPURenderManager] Camera observers removed")
     
     def _on_camera_interaction(self, obj, event):
@@ -397,6 +464,7 @@ class GPURenderManager(QObject):
             # gesture settles, restoring full-quality rendering.
             if event in ("MouseWheelForwardEvent", "MouseWheelBackwardEvent"):
                 self._interaction_active = True
+                GPURenderManager._set_snt_text_interaction_visibility(self, True)
                 self._engage_lod()
                 try:
                     self._wheel_idle_timer.stop()

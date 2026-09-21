@@ -284,6 +284,26 @@ def has_fenced_parent_writeback(app) -> bool:
     return bool(is_fence_mode and session is not None)
 
 
+def save_current_pointcloud_in_place(app) -> bool:
+    """Silently save the currently editable dataset to its real source."""
+    data = getattr(app, "data", None)
+    if not isinstance(data, dict) or data.get("xyz") is None:
+        return False
+
+    session, error, is_fence_mode = _inspect_fenced_parent_session(app)
+    if is_fence_mode:
+        if session is None:
+            if error:
+                print(f"Fence in-place save skipped: {error}")
+            return False
+        return _save_fenced_parent_files(
+            app, session, output_dir=None, in_place=True, show_messages=False,
+        )
+
+    path = getattr(app, "last_save_path", None) or getattr(app, "loaded_file", None)
+    return save_pointcloud_quick(app, path) if path else False
+
+
 def _prompt_fenced_save_mode(app, session):
     source_count = len(session.get("source_files") or [])
     first_source = os.path.basename(session["source_files"][0]) if source_count else "parent file"
@@ -999,6 +1019,67 @@ def debug_renderer_setup(app):
         print(f"  Same renderer? {same}")    
     print()    
 
+def _coordinates_for_las_output(app, data, xyz):
+    """Return (xyz_to_write, crs_wkt, crs_epsg) without CRS relabelling.
+
+    LiDAR can be transformed into the Naksha project CRS for display.  A normal
+    Save/backup should round-trip the original source CRS when all loaded tiles
+    share one source CRS; otherwise (mixed-source project) it writes project
+    coordinates with the project CRS.
+    """
+    arr = np.asarray(xyz)
+    runtime_value = None
+    source_value = None
+    if isinstance(data, dict):
+        runtime_value = data.get("_runtime_crs_wkt")
+        source_value = data.get("_source_crs_wkt")
+        source_consistent = bool(data.get("_source_crs_consistent", True))
+    else:
+        source_consistent = True
+    if runtime_value is None:
+        runtime_value = getattr(app, "canvas_crs", None) or getattr(app, "project_crs_wkt", None) or getattr(app, "project_crs_epsg", None)
+    if not source_consistent:
+        source_value = None
+
+    try:
+        from gui.projection_engine import parse_crs, transform_points
+        runtime_crs = parse_crs(runtime_value)
+        source_crs = parse_crs(source_value) if source_value else None
+    except Exception:
+        runtime_crs = None
+        source_crs = None
+
+    output_crs = source_crs or runtime_crs
+    xyz_out = arr
+    if runtime_crs is not None and source_crs is not None:
+        try:
+            if not runtime_crs.equals(source_crs):
+                xyz_out, _ = transform_points(
+                    arr, runtime_crs, source_crs,
+                    copy=True, chunk_size=1_000_000,
+                )
+                print(f"Saving LiDAR back in native source CRS: {source_crs.name}")
+        except Exception as exc:
+            # Never write transformed coordinates with the wrong CRS. If the
+            # reverse operation fails, keep runtime/project coordinates and CRS.
+            print(f"CRS round-trip warning: {exc}; saving in project CRS instead")
+            xyz_out = arr
+            output_crs = runtime_crs
+
+    wkt = None
+    epsg = None
+    if output_crs is not None:
+        try:
+            wkt = output_crs.to_wkt()
+        except Exception:
+            wkt = None
+        try:
+            epsg = output_crs.to_epsg()
+        except Exception:
+            epsg = None
+    return xyz_out, wkt, epsg
+
+
 def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dialog=True):
     """
     ✅ Enhanced Save behavior:
@@ -1199,17 +1280,19 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         print(f"   (MicroStation/TerraScan compatible)")
         print(f"{'='*60}\n")
 
+    xyz_to_write, save_crs_wkt, save_crs_epsg = _coordinates_for_las_output(app, data, xyz)
+
     preserved_las, preserve_reason = _try_build_preserved_las(
         source_path=source_path,
         target_path=path,
-        xyz=xyz,
+        xyz=xyz_to_write,
         classes_u8=classes_u8,
         rgb16=rgb16,
         intensity16=intensity16,
         import_options=import_options,
         requested_version=las_version,
-        crs_wkt=getattr(app, "project_crs_wkt", None),
-        crs_epsg=getattr(app, "project_crs_epsg", None),
+        crs_wkt=save_crs_wkt,
+        crs_epsg=save_crs_epsg,
     )
     if preserved_las is not None:
         try:
@@ -1234,13 +1317,17 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
 
         prj_path = os.path.splitext(path)[0] + ".prj"
         try:
-            if getattr(app, "project_crs_wkt", None):
-                with open(prj_path, "w") as f:
-                    f.write(app.project_crs_wkt)
-                print(f"📌 CRS WKT saved to {prj_path}")
-            elif getattr(app, "project_crs_epsg", None):
-                with open(prj_path, "w") as f:
-                    f.write(f"EPSG:{app.project_crs_epsg}")
+            if save_crs_wkt:
+                try:
+                    from gui.projection_engine import write_prj_sidecar
+                    write_prj_sidecar(path, save_crs_wkt, esri_compatible=True)
+                except Exception:
+                    with open(prj_path, "w", encoding="utf-8") as f:
+                        f.write(save_crs_wkt)
+                print(f"📌 CRS saved to {prj_path}")
+            elif save_crs_epsg:
+                with open(prj_path, "w", encoding="utf-8") as f:
+                    f.write(f"EPSG:{save_crs_epsg}")
                 print(f"📌 EPSG code saved to {prj_path}")
         except Exception as e:
             print(f"⚠️ Failed to write .prj: {e}")
@@ -1262,19 +1349,19 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     # Embed CRS
     try:
         import pyproj
-        if getattr(app, "project_crs_wkt", None):
-            crs = pyproj.CRS.from_wkt(app.project_crs_wkt)
+        if save_crs_wkt:
+            crs = pyproj.CRS.from_wkt(save_crs_wkt)
             header.parse_crs(crs)
-            print("📌 Embedded CRS from WKT into LAS header")
-        elif getattr(app, "project_crs_epsg", None):
-            crs = pyproj.CRS.from_epsg(app.project_crs_epsg)
+            print("📌 Embedded output CRS from WKT into LAS header")
+        elif save_crs_epsg:
+            crs = pyproj.CRS.from_epsg(save_crs_epsg)
             header.parse_crs(crs)
-            print(f"📌 Embedded CRS EPSG:{app.project_crs_epsg} into LAS header")
+            print(f"📌 Embedded output CRS EPSG:{save_crs_epsg} into LAS header")
     except Exception as e:
         print(f"⚠️ Failed to embed CRS into {ext.upper()} header: {e}")
 
     las = laspy.LasData(header)
-    las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    las.x, las.y, las.z = xyz_to_write[:, 0], xyz_to_write[:, 1], xyz_to_write[:, 2]
 
     # Classification handling
     if las_version == "1.4":
@@ -1331,13 +1418,17 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
     # .prj sidecar
     prj_path = os.path.splitext(path)[0] + ".prj"
     try:
-        if getattr(app, "project_crs_wkt", None):
-            with open(prj_path, "w") as f:
-                f.write(app.project_crs_wkt)
-            print(f"📌 CRS WKT saved to {prj_path}")
-        elif getattr(app, "project_crs_epsg", None):
-            with open(prj_path, "w") as f:
-                f.write(f"EPSG:{app.project_crs_epsg}")
+        if save_crs_wkt:
+            try:
+                from gui.projection_engine import write_prj_sidecar
+                write_prj_sidecar(path, save_crs_wkt, esri_compatible=True)
+            except Exception:
+                with open(prj_path, "w", encoding="utf-8") as f:
+                    f.write(save_crs_wkt)
+            print(f"📌 CRS saved to {prj_path}")
+        elif save_crs_epsg:
+            with open(prj_path, "w", encoding="utf-8") as f:
+                f.write(f"EPSG:{save_crs_epsg}")
             print(f"📌 EPSG code saved to {prj_path}")
     except Exception as e:
         print(f"⚠️ Failed to write .prj: {e}")
@@ -1423,17 +1514,19 @@ def save_pointcloud_quick(app, path):
         rgb16 = _rgb_to_las16(data.get("rgb"))
         intensity16 = _intensity_to_uint16(data.get("intensity"), n_points=n)
 
+        xyz_to_write, save_crs_wkt, save_crs_epsg = _coordinates_for_las_output(app, data, xyz)
+
         preserved_las, preserve_reason = _try_build_preserved_las(
             source_path=source_path,
             target_path=path,
-            xyz=xyz,
+            xyz=xyz_to_write,
             classes_u8=classes_u8,
             rgb16=rgb16,
             intensity16=intensity16,
             import_options=import_options,
             requested_version=las_version,
-            crs_wkt=getattr(app, "project_crs_wkt", None),
-            crs_epsg=getattr(app, "project_crs_epsg", None),
+            crs_wkt=save_crs_wkt,
+            crs_epsg=save_crs_epsg,
         )
         if preserved_las is not None:
             try:
@@ -1463,15 +1556,15 @@ def save_pointcloud_quick(app, path):
 
         try:
             import pyproj
-            if getattr(app, "project_crs_wkt", None):
-                header.parse_crs(pyproj.CRS.from_wkt(app.project_crs_wkt))
-            elif getattr(app, "project_crs_epsg", None):
-                header.parse_crs(pyproj.CRS.from_epsg(app.project_crs_epsg))
+            if save_crs_wkt:
+                header.parse_crs(pyproj.CRS.from_wkt(save_crs_wkt))
+            elif save_crs_epsg:
+                header.parse_crs(pyproj.CRS.from_epsg(save_crs_epsg))
         except Exception as e:
             print(f"⚠️ CRS embedding skipped: {e}")
 
         las = laspy.LasData(header)
-        las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        las.x, las.y, las.z = xyz_to_write[:, 0], xyz_to_write[:, 1], xyz_to_write[:, 2]
 
         if las_version == "1.4":
             las.classification = np.clip(classes_u8, 0, 255).astype(np.uint8, copy=False)

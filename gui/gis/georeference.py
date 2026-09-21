@@ -100,20 +100,17 @@ def open_gcp_georeferencer(app, entry: dict):
         QPushButton, QLabel, QDialogButtonBox, QMessageBox, QHeaderView,
     )
     from PySide6.QtCore import Qt
-    try:
-        from gui.theme_manager import get_dialog_stylesheet
-    except Exception:
-        def get_dialog_stylesheet():
-            return ""
+    from gui.gis.gis_style import apply_gis_dialog_style, compact_layout
 
     # Non-modal so the user can click the 3D scene while the dialog stays open.
     dlg = QDialog(app)
     dlg.setWindowTitle(f"GCP Georeferencer — {entry.get('name', '')}")
     dlg.setModal(False)
-    dlg.setStyleSheet(get_dialog_stylesheet())
+    apply_gis_dialog_style(dlg)
     dlg.setMinimumWidth(480)
     app._gcp_dialog = dlg  # keep a reference so it isn't garbage-collected
     v = QVBoxLayout(dlg)
+    compact_layout(v)
 
     info = QLabel(
         "Click-to-pick (recommended): press “Pick pair”, click a feature on the "

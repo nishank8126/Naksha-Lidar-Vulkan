@@ -31,6 +31,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QCheckBox, QToolButton
 from PySide6.QtGui import QPixmap, QColor
+from gui.gis.gis_style import apply_gis_dialog_style, apply_gis_dock_style, compact_layout, compact_view
 
 # Registry attribute name on the app object.
 _REGISTRY_ATTR = "gis_layers"
@@ -196,13 +197,21 @@ def _ensure_overlay_on_top(app):
 
 
 def _render(app):
+    # Imports/removals can touch dozens of actors.  Defer all GIS-originated
+    # renders until the outermost batch is complete.
+    if getattr(app, "_gis_batch_update_depth", 0) > 0:
+        app._gis_batch_render_pending = True
+        return False
+    app._gis_batch_render_pending = False
     try:
         app.vtk_widget.render()
+        return True
     except Exception:
         try:
             app.vtk_widget.GetRenderWindow().Render()
+            return True
         except Exception:
-            pass
+            return False
 
 
 def _sub_layer_actors(sub_info: dict) -> list:
@@ -264,7 +273,9 @@ def get_layer_epsg(path: str, layer_name: str = None) -> str | None:
 
 def register_gis_layer(app, name: str, path: str, kind: str, fmt: str,
                        actors: list, opacity: float = None,
-                       allow_empty: bool = False) -> dict:
+                       allow_empty: bool = False,
+                       feature_count: int | None = None,
+                       source_layer: str | None = None) -> dict:
     """
     Register an imported overlay so the panel can manage it.
 
@@ -296,8 +307,15 @@ def register_gis_layer(app, name: str, path: str, kind: str, fmt: str,
         "actors": actors,
         "visible": True,
         "opacity": float(opacity),
-        "epsg": get_layer_epsg(path),
+        "epsg": get_layer_epsg(path, source_layer),
     }
+    if feature_count is not None:
+        try:
+            entry["feature_count"] = max(0, int(feature_count))
+        except Exception:
+            pass
+    if source_layer:
+        entry["source_layer"] = str(source_layer)
     # Sensible default stacking (top of list = drawn on top): vectors go to the
     # TOP (drawn over imagery), rasters default to the BOTTOM (background) — like
     # QGIS/Global Mapper. The user can still reorder freely afterwards.
@@ -329,40 +347,70 @@ def register_gis_layer(app, name: str, path: str, kind: str, fmt: str,
 
 
 def suspend_layer_panel_refresh(app):
-    """Pause the Overlay Control Center's per-layer refresh() during a batch
-    import. Without this, importing N layers rebuilds the whole QTreeWidget
-    (with a fresh QIcon per row) N times - O(n^2) instead of O(n). Call
-    resume_layer_panel_refresh() in a finally block to refresh once at the end.
-    """
+    """Pause GIS tree refreshes and renders during a nested batch update."""
+    depth = max(0, int(getattr(app, "_gis_batch_update_depth", 0))) + 1
+    app._gis_batch_update_depth = depth
     dock = getattr(app, _PANEL_ATTR, None)
     if dock is not None:
-        dock._refresh_suspended = getattr(dock, "_refresh_suspended", 0) + 1
+        dock._refresh_suspended = depth
 
 
 def resume_layer_panel_refresh(app):
+    depth = max(0, int(getattr(app, "_gis_batch_update_depth", 0)) - 1)
+    app._gis_batch_update_depth = depth
     dock = getattr(app, _PANEL_ATTR, None)
-    if dock is None:
+    if dock is not None:
+        dock._refresh_suspended = depth
+    if depth != 0:
         return
-    dock._refresh_suspended = max(0, getattr(dock, "_refresh_suspended", 0) - 1)
-    if not dock._refresh_suspended:
-        try:
-            dock.refresh()
-        except Exception:
-            import traceback
-            traceback.print_exc()
+
+    # A bulk import/removal batch that just finished is still unwinding inside
+    # the Qt event (button click, drop event) that triggered it. dock.refresh()
+    # below calls QTreeWidget.clear() and rebuilds dozens of items/icons -
+    # doing that synchronously here re-enters Qt's widget/paint machinery
+    # while the triggering event is still on the call stack, the same
+    # reentrancy class that crashed "Hide All" (0xc0000005 in Qt6Widgets.dll).
+    # Deferring one tick lets the current event finish first.
+    from PySide6.QtCore import QTimer
+
+    def _flush():
+        if getattr(app, "_gis_batch_order_pending", False):
+            _apply_order(app)
+
+        if dock is not None:
+            try:
+                dock.refresh()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+        pending_zoom = list(getattr(app, "_gis_batch_zoom_entries", []) or [])
+        app._gis_batch_zoom_entries = []
+        if pending_zoom:
+            zoom_to_gis_entries(app, pending_zoom)
+        elif getattr(app, "_gis_batch_render_pending", False):
+            _render(app)
+
+    QTimer.singleShot(0, _flush)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAYER OPERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
-def _set_layer_visible(app, entry: dict, visible: bool):
+def _set_layer_visible(app, entry: dict, visible: bool, *, render: bool = True):
+    """Set one layer's actor visibility, optionally deferring the render.
+
+    Bulk operations must defer rendering until every actor has been updated.
+    Rendering a partially-mutated scene once per layer is both needlessly
+    expensive and can re-enter the native VTK/Qt rendering pipeline.
+    """
     entry["visible"] = bool(visible)
-    for a in entry["actors"]:
+    for a in entry.get("actors", []):
         try:
             a.SetVisibility(1 if visible else 0)
         except Exception:
             pass
-            
+
     # Toggle sub-layers actors visibility as well
     if "sub_layers" in entry:
         for sub_code, sub_info in entry["sub_layers"].items():
@@ -372,18 +420,22 @@ def _set_layer_visible(app, entry: dict, visible: bool):
                 except Exception:
                     pass
                     
-    _render(app)
+    if render:
+        _render(app)
 
 
-def _set_layer_opacity(app, entry: dict, opacity: float):
+def _set_layer_opacity(
+    app, entry: dict, opacity: float, *, render: bool = True
+):
     opacity = max(0.0, min(1.0, float(opacity)))
     entry["opacity"] = opacity
-    for a in entry["actors"]:
+    for a in entry.get("actors", []):
         try:
             a.GetProperty().SetOpacity(opacity)
         except Exception:
             pass
-    _render(app)
+    if render:
+        _render(app)
 
 
 def _layer_bounds(entry: dict):
@@ -443,10 +495,17 @@ def _merge_bounds(bounds_list):
 
 def zoom_to_gis_entries(app, entries):
     """Frame one or more GIS layer registry entries in the main camera."""
+    entries = [entry for entry in (entries or []) if entry]
+    if getattr(app, "_gis_batch_update_depth", 0) > 0:
+        pending = list(getattr(app, "_gis_batch_zoom_entries", []) or [])
+        seen = {id(entry) for entry in pending}
+        pending.extend(entry for entry in entries if id(entry) not in seen)
+        app._gis_batch_zoom_entries = pending
+        return
     ren = _main_renderer(app)
     if ren is None:
         return
-    bounds = _merge_bounds([_layer_bounds(entry) for entry in (entries or []) if entry])
+    bounds = _merge_bounds([_layer_bounds(entry) for entry in entries])
     if bounds is None:
         return
     try:
@@ -457,12 +516,16 @@ def zoom_to_gis_entries(app, entries):
     _render(app)
 
 
-def _remove_layer(app, entry: dict):
+def _remove_layer(app, entry: dict, *, update_scene: bool = True):
     """Detach actors from their renderer and drop the layer from all stores."""
     main_ren = _main_renderer(app)
     raster_ren = _raster_renderer(app)
     ovl_ren = _overlay_renderer(app)
-    for a in entry["actors"]:
+    actors = list(entry.get("actors", []))
+    for sub_info in (entry.get("sub_layers") or {}).values():
+        actors.extend(_sub_layer_actors(sub_info))
+    actors = list({id(actor): actor for actor in actors if actor is not None}.values())
+    for a in actors:
         for ren in (raster_ren, main_ren, ovl_ren):
             if ren is None:
                 continue
@@ -483,23 +546,30 @@ def _remove_layer(app, entry: dict):
         except Exception:
             pass
 
-    # Remove from the registry.
+    # Remove from the registry and clear a stale GIS edit target.
     reg = _registry(app)
     if entry in reg:
         reg.remove(entry)
+    if getattr(app, "active_gis_edit_layer", None) is entry:
+        try:
+            from gui.gis.edit_bridge import set_active_edit_layer
+            set_active_edit_layer(app, None)
+        except Exception:
+            app.active_gis_edit_layer = None
+            app.active_gis_edit_subtype = None
 
     # Keep legacy stores consistent so other code (memory cleanup, etc.) agrees.
     if entry["kind"] == "raster":
         ga = getattr(app, "geotiff_actors", None)
         if isinstance(ga, list):
-            for a in entry["actors"]:
+            for a in actors:
                 if a in ga:
                     ga.remove(a)
     else:
         dz = getattr(app, "digitizer", None)
         drawings = getattr(dz, "drawings", None) if dz is not None else None
         if isinstance(drawings, list):
-            actor_set = set(id(a) for a in entry["actors"])
+            actor_set = {id(a) for a in actors}
             kept = [d for d in drawings
                     if id(d.get("actor")) not in actor_set]
             try:
@@ -507,18 +577,24 @@ def _remove_layer(app, entry: dict):
             except Exception:
                 pass
 
-    _apply_order(app)
-    _render(app)
-    if hasattr(app, "_sync_activity_bar"):
+    if update_scene:
+        _apply_order(app)
+        _render(app)
+    if update_scene and hasattr(app, "_sync_activity_bar"):
         try:
             app._sync_activity_bar()
         except Exception:
             pass
-    if hasattr(app, "update_epsg_display"):
+    if update_scene and hasattr(app, "update_epsg_display"):
         try:
             app.update_epsg_display()
         except Exception:
             pass
+    try:
+        from gui.crs_manager import reconcile_canvas_crs_after_content_change
+        reconcile_canvas_crs_after_content_change(app, reason="GIS layer removed")
+    except Exception as exc:
+        print(f"[CRS] reconciliation after GIS removal failed: {exc}")
 
 
 def _move_layer(app, entry: dict, delta: int):
@@ -565,6 +641,10 @@ def _apply_order(app):
     QGIS / Global-Mapper ordering: the TOP row of the panel draws on top — for
     ANY layer, raster OR vector.
     """
+    if getattr(app, "_gis_batch_update_depth", 0) > 0:
+        app._gis_batch_order_pending = True
+        return
+    app._gis_batch_order_pending = False
     reg = _registry(app)
     from gui.scene_render_pipeline import (
         ROLE_DATA, ROLE_OVERLAY, ROLE_RASTER, ROLE_TEXT,
@@ -597,19 +677,6 @@ def _apply_order(app):
                     a.GetProperty().SetDepthTestingEnabled(True)
                 except Exception:
                     pass
-                meta = getattr(a, "_raster_lod_meta", None)
-                mapper = a.GetMapper()
-                connection = mapper.GetInputConnection(0, 0) if mapper else None
-                plane = connection.GetProducer() if connection else None
-                if plane is not None and hasattr(plane, "SetOrigin"):
-                    for getter, setter in ((plane.GetOrigin, plane.SetOrigin),
-                                           (plane.GetPoint1, plane.SetPoint1),
-                                           (plane.GetPoint2, plane.SetPoint2)):
-                        x, y, _z = getter()
-                        setter(x, y, 0.0)
-                    plane.Update()
-                    if meta is not None:
-                        meta["z"] = 0.0
                 p = a.GetPosition()
                 a.SetPosition(p[0], p[1], rank * _RASTER_Z_STEP)
                 a.SetVisibility(1 if e.get("visible", True) else 0)
@@ -658,55 +725,27 @@ ROW_HEIGHT = 40  # fixed list-row height (prevents label overlap)
 
 
 def _occ_colors():
-    """Pull a theme-aware color set (works in both light and dark themes)."""
-    try:
-        from gui.theme_manager import ThemeColors as C
-
-        def g(key, fallback):
-            try:
-                val = C.get(key)
-                return val or fallback
-            except Exception:
-                return fallback
-
-        light = False
-        try:
-            light = bool(C.is_light())
-        except Exception:
-            light = False
-
-        return {
-            "panel":   g("bg_secondary", "#1b1d23"),
-            "surface": g("bg_primary",   "#16181d"),
-            "card_hover": g("bg_button", "#21242c"),
-            "btn":     g("bg_button",       "#262a33"),
-            "btn_hover": g("bg_button_hover", "#313641"),
-            "text":    g("text_primary",   "#e8eaed"),
-            "muted":   g("text_muted",     "#7f8794"),
-            "secondary": g("text_secondary", "#aeb4bf"),
-            "border":  g("border_light",   "#2a2d35"),
-            "accent":  g("accent",         "#3b5bdb"),
-            "accent_hover": g("accent_hover", "#4c6ef5"),
-            "danger":  g("danger",         "#d32f2f"),
-            "danger_hover": g("danger_hover", "#f44336"),
-            "on_accent": "#ffffff",
-            "raster":  "#2f7fd6" if not light else "#1971c2",
-            "vector":  "#37b24d" if not light else "#2f9e44",
-            # Soft selection tint that keeps the default text readable in both themes.
-            "sel":     "#d6e4ff" if light else "#2b3a5e",
-            "is_light": light,
-        }
-    except Exception:
-        # Hard fallback (dark) if the theme module is unavailable.
-        return {
-            "panel": "#1b1d23", "surface": "#16181d", "card_hover": "#21242c",
-            "btn": "#262a33", "btn_hover": "#313641", "text": "#e8eaed",
-            "muted": "#7f8794", "secondary": "#aeb4bf", "border": "#2a2d35",
-            "accent": "#3b5bdb", "accent_hover": "#4c6ef5", "danger": "#d32f2f",
-            "danger_hover": "#f44336", "on_accent": "#ffffff", "raster": "#2f7fd6",
-            "vector": "#37b24d", "sel": "#2b3a5e", "is_light": False,
-        }
-
+    """Return the fixed light GIS palette, isolated from the application theme."""
+    return {
+        "panel": "#e9edf2",
+        "surface": "#ffffff",
+        "card_hover": "#e7f1f8",
+        "btn": "#edf1f4",
+        "btn_hover": "#dceaf5",
+        "text": "#1d2730",
+        "muted": "#6c7c88",
+        "secondary": "#455661",
+        "border": "#9ba9b5",
+        "accent": "#397aa8",
+        "accent_hover": "#2f6d98",
+        "danger": "#c43b3b",
+        "danger_hover": "#a92f2f",
+        "on_accent": "#ffffff",
+        "raster": "#1971c2",
+        "vector": "#2f9e44",
+        "sel": "#b8daf4",
+        "is_light": True,
+    }
 
 # Preferred UI font (professional, falls back gracefully across platforms).
 _UI_FONT = '"Segoe UI", "Inter", "Roboto", Arial, sans-serif'
@@ -975,7 +1014,7 @@ def _checkbox_image_paths(c: dict) -> dict:
             border_color = QColor(160, 160, 160)
             bg_color = QColor(c["surface"])
             check_color = QColor(255, 255, 255)
-            
+
         p.setPen(QPen(border_color, 1.0))
         p.setBrush(bg_color)
         p.drawRect(QRectF(1.0, 1.0, 14, 14))
@@ -1228,7 +1267,7 @@ class GisLayersDock:
             QTreeWidget, QTreeWidgetItem, QPushButton, QSlider, QLabel,
             QToolButton, QSizePolicy, QLineEdit, QAbstractItemView, QHeaderView,
         )
-        from PySide6.QtCore import Qt, QSize, QTimer
+        from PySide6.QtCore import Qt, QSize
         from PySide6.QtGui import QColor, QIcon
         from gui.gis import icons as gicons
 
@@ -1236,7 +1275,7 @@ class GisLayersDock:
             def mousePressEvent(self, event):
                 pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
                 item = self.itemAt(pos)
-                
+
                 # Intercept right-clicks to preserve multi-selection
                 if event.button() == Qt.RightButton:
                     if item is not None:
@@ -1287,7 +1326,7 @@ class GisLayersDock:
         panel = QWidget()
         panel.setObjectName("GisOCC")
         panel.setMinimumWidth(240)
-        panel.setStyleSheet(_build_occ_style())
+        apply_gis_dock_style(panel)
         v = QVBoxLayout(panel)
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(4)
@@ -1314,7 +1353,7 @@ class GisLayersDock:
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(2)
-        tb_import = _tool("plus", "Create new layer…", 16)
+        tb_import = _tool("plus", "Add GIS files…", 16)
         tb_eye = _tool("eye", "Show / hide all layers")
         tb_filter = _tool("filter", "Filter layers by name")
         tb_filter.setCheckable(True)
@@ -1344,6 +1383,7 @@ class GisLayersDock:
 
         layer_list = DeselectableTreeWidget()
         layer_list.setObjectName("occTree")
+        compact_view(layer_list)
         layer_list.setHeaderHidden(True)
         layer_list.setColumnCount(2)
         layer_list.header().setStretchLastSection(False)
@@ -1458,7 +1498,47 @@ class GisLayersDock:
             tb_table.setEnabled(has_tabular)
             has_gdb = len(selections) > 0 and any(e.get("gdb_path") for e in selections)
             tb_domains.setEnabled(has_gdb)
-            
+
+            # The current vector row is the explicit target for new Draw
+            # geometry. Selection is never inferred from layer name or order.
+            current_item = layer_list.currentItem()
+            edit_entry = _entry_by_item(current_item)
+            subtype_code = (
+                current_item.data(0, Qt.UserRole + 1)
+                if current_item is not None and current_item.parent() is not None
+                else None
+            )
+            if edit_entry not in selections or edit_entry.get("kind") != "vector":
+                edit_entry = None
+                subtype_code = None
+            previous = getattr(app, "active_gis_edit_layer", None)
+            previous_subtype = getattr(app, "active_gis_edit_subtype", None)
+            active_entry = None
+            try:
+                from gui.gis.edit_bridge import set_active_edit_layer
+                active_entry = set_active_edit_layer(app, edit_entry, subtype_code)
+            except Exception as exc:
+                print(f"GIS edit-target selection warning: {exc}")
+            if active_entry is not None and (previous is not active_entry or previous_subtype != subtype_code):
+                target_name = active_entry.get("source_layer") or active_entry.get("name") or "layer"
+                target_kind = active_entry.get("geom") or "vector"
+                suffix = f" / subtype {subtype_code}" if subtype_code is not None else ""
+                try:
+                    app.statusBar().showMessage(
+                        f"Active GIS edit target: {target_name}{suffix} ({target_kind}). Completed Draw geometry will be saved to this layer.",
+                        5000,
+                    )
+                except Exception:
+                    pass
+            elif edit_entry is not None and active_entry is None:
+                try:
+                    app.statusBar().showMessage(
+                        f"Selected GIS layer is not editable: {edit_entry.get('edit_error', 'update is unavailable')}",
+                        5000,
+                    )
+                except Exception:
+                    pass
+
             # Sync tb_remove styling and tooltip based on selection
             if not selections:
                 tb_remove.setToolTip("Clear all layers")
@@ -1474,7 +1554,32 @@ class GisLayersDock:
                     layer_list.setCurrentItem(item)
                     break
 
+        def update_feature_count(layer_id, subtype_code=None):
+            """Update count cells in place without deleting live Qt tree items."""
+            entry = next((e for e in _registry(app) if e.get("id") == layer_id), None)
+            if entry is None:
+                return
+            for index in range(layer_list.topLevelItemCount()):
+                item = layer_list.topLevelItem(index)
+                if item.data(0, Qt.UserRole) != layer_id:
+                    continue
+                item.setText(1, f"{int(entry.get('feature_count') or 0):,}")
+                if subtype_code is not None:
+                    sub = (entry.get("sub_layers") or {}).get(subtype_code, {})
+                    for child_index in range(item.childCount()):
+                        child = item.child(child_index)
+                        if child.data(0, Qt.UserRole + 1) == subtype_code:
+                            child.setText(1, f"{int(sub.get('feature_count') or 0):,}")
+                            break
+                return
         def _feature_count(entry_or_sub) -> int:
+            """Return GIS FEATURE count, never VTK primitive/cell count when known."""
+            explicit = entry_or_sub.get("feature_count") if isinstance(entry_or_sub, dict) else None
+            if explicit is not None:
+                try:
+                    return max(0, int(explicit))
+                except Exception:
+                    pass
             if "_cached_count" in entry_or_sub:
                 return entry_or_sub["_cached_count"]
             total = 0
@@ -1483,7 +1588,6 @@ class GisLayersDock:
                 actors = entry_or_sub["actors"]
             elif "actor" in entry_or_sub and entry_or_sub["actor"] is not None:
                 actors = [entry_or_sub["actor"]]
-                
             for a in actors:
                 try:
                     mapper = a.GetMapper()
@@ -1493,26 +1597,43 @@ class GisLayersDock:
                             total += pd.GetNumberOfCells()
                 except Exception:
                     pass
+            # Fallback only for legacy/temporary visual layers that have no
+            # datasource feature count.  Keep the cache name for compatibility.
             entry_or_sub["_cached_count"] = total
             return total
 
+
         panel._rebuilding = False
-        panel._reorder_pending = False
 
         def refresh():
+            # Reentrancy guard: a nested/overlapping rebuild (e.g. triggered
+            # from inside Qt's own processing of this same clear/rebuild) must
+            # never delete QTreeWidgetItems while an outer call is still
+            # iterating them - that is the exact native access-violation
+            # class (0xc0000005 in Qt6Widgets.dll) this panel has crashed
+            # with before. request_refresh() already defers/coalesces calls
+            # by a tick; this guard is the second, cheap line of defense.
             if panel._rebuilding:
                 return
             panel._rebuilding = True
-            was_blocked = layer_list.blockSignals(True)
+            signals_were_blocked = layer_list.blockSignals(True)
             try:
-                # Model reset signals must reach Qt's selection model and views.
+                # Snapshot the registry because callbacks triggered by the model
+                # reset may otherwise mutate it while the tree is rebuilt.
                 reg = list(_registry(app))
                 cur = _current_entry()
                 prev = cur["id"] if cur else None
+
+                # Clear the current item before clear() - Qt otherwise deletes
+                # the still-"current" native item while its own selection
+                # machinery may still reference it.  Do not block the model:
+                # its reset notifications must reach the selection model and
+                # the view before the native QTreeWidgetItems are destroyed.
                 layer_list.setCurrentItem(None)
                 layer_list.clear()
+
                 cols_theme = _occ_colors()
-            
+
                 for e in reg:
                     # Create root item for the layer
                     item = QTreeWidgetItem()
@@ -1520,8 +1641,9 @@ class GisLayersDock:
                     # Set drag and drop flags for top-level item (reordering only, no merging as child)
                     item.setFlags((item.flags() | Qt.ItemIsDragEnabled) & ~Qt.ItemIsDropEnabled)
                 
-                    # Checkbox
-                    item.setCheckState(0, Qt.Checked if e.get("visible", True) else Qt.Unchecked)
+                    # Tables are non-spatial standalone data: no visibility checkbox.
+                    if e.get("kind") != "table":
+                        item.setCheckState(0, Qt.Checked if e.get("visible", True) else Qt.Unchecked)
                 
                     # Determine geometry type
                     geom_type = e.get("geom")
@@ -1541,7 +1663,9 @@ class GisLayersDock:
                     has_multiple_subs = "sub_layers" in e and len(e["sub_layers"]) > 1
 
                     # Icon
-                    if has_multiple_subs:
+                    if e.get("kind") == "table":
+                        item.setIcon(0, gicons.icon("table", cols_theme["muted"], 14))
+                    elif has_multiple_subs:
                         multi_geom = f"multi{geom_type}" if geom_type in ("point", "line", "polygon") else geom_type
                         symbol_color = _layer_color(e).name()
                         item.setIcon(0, QIcon(_symbol_pixmap(multi_geom, symbol_color, 14)))
@@ -1552,12 +1676,16 @@ class GisLayersDock:
                         else:
                             symbol_color = _layer_color(e).name()
                         item.setIcon(0, QIcon(_symbol_pixmap(geom_type, symbol_color, 14)))
-                
+
                     # Text & count
-                    item.setText(0, e["name"])
+                    full_name = str(e.get("name") or "Layer")
+                    display_name = str(e.get("source_layer") or full_name) if e.get("gdb_path") else full_name
+                    item.setText(0, display_name)
+                    if display_name != full_name:
+                        item.setToolTip(0, f"{full_name}\n{e.get('gdb_path', '')}")
                     if e.get("kind") != "raster":
                         count = _feature_count(e)
-                        item.setText(1, str(count))
+                        item.setText(1, f"{count:,}")
                         item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
                         item.setForeground(1, QColor(cols_theme["muted"]))
                     else:
@@ -1567,7 +1695,8 @@ class GisLayersDock:
                 
                     # Font and colors
                     font = layer_list.font()
-                    font.setPointSize(9.0)
+                    font.setPixelSize(11)
+                    font.setBold(has_multiple_subs)
                     item.setFont(0, font)
                     item.setFont(1, font)
                     item.setForeground(0, QColor(cols_theme["text"]))
@@ -1600,12 +1729,12 @@ class GisLayersDock:
                             # Sub-layer text & count
                             child.setText(0, sub_info.get("label", "Subtype"))
                             sub_count = _feature_count(sub_info)
-                            child.setText(1, str(sub_count))
+                            child.setText(1, f"{sub_count:,}")
                             child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
                             child.setForeground(1, QColor(cols_theme["muted"]))
                         
                             sub_font = layer_list.font()
-                            sub_font.setPointSize(8.5)
+                            sub_font.setPixelSize(10)
                             child.setFont(0, sub_font)
                             child.setFont(1, sub_font)
                             child.setForeground(0, QColor(cols_theme["text"]))
@@ -1618,17 +1747,45 @@ class GisLayersDock:
                 stack.setCurrentIndex(0 if reg else 1)
                 if prev is not None:
                     _select_id(prev)
+                _sync_table_btn()
             finally:
-                layer_list.blockSignals(was_blocked)
+                layer_list.blockSignals(signals_were_blocked)
                 panel._rebuilding = False
-            _sync_table_btn()
 
-        panel.refresh = refresh
+        def request_refresh(select_id=None):
+            """Queue one safe tree rebuild after the current Qt event returns."""
+            if select_id is not None:
+                panel._refresh_select_id = select_id
+            if getattr(panel, "_refresh_suspended", 0):
+                return
+            if getattr(panel, "_refresh_queued", False):
+                return
+            panel._refresh_queued = True
+
+            def _run_refresh():
+                panel._refresh_queued = False
+                if getattr(panel, "_refresh_suspended", 0):
+                    return
+                try:
+                    from shiboken6 import isValid
+                    if not isValid(panel) or not isValid(layer_list):
+                        return
+                except Exception:
+                    pass
+                refresh()
+                pending_id = getattr(panel, "_refresh_select_id", None)
+                panel._refresh_select_id = None
+                if pending_id is not None:
+                    _select_id(pending_id)
+
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, _run_refresh)
+
+        panel.update_feature_count = update_feature_count
+        panel.refresh = request_refresh
+        panel.refresh_now = refresh
 
         def _reorder_from_list():
-            panel._reorder_pending = False
-            if panel._rebuilding:
-                return
             ids = []
             for i in range(layer_list.topLevelItemCount()):
                 item = layer_list.topLevelItem(i)
@@ -1637,21 +1794,9 @@ class GisLayersDock:
                     ids.append(lid)
             if ids:
                 _reorder_registry(app, ids)
-            refresh()
 
-        reorder_timer = QTimer(panel)
-        reorder_timer.setSingleShot(True)
-        reorder_timer.timeout.connect(_reorder_from_list)
-
-        def _queue_reorder(*_):
-            if panel._rebuilding or panel._reorder_pending:
-                return
-            panel._reorder_pending = True
-            # Do not delete QTreeWidgetItems inside a Qt move/layout callback.
-            reorder_timer.start(0)
-
-        layer_list.model().rowsMoved.connect(_queue_reorder)
-        layer_list.model().layoutChanged.connect(_queue_reorder)
+        # Rebuild-free: rowsMoved fires after the model has completed the drop.
+        layer_list.model().rowsMoved.connect(_reorder_from_list)
 
         # Checkbox toggling handler
         def _on_item_changed(item, column):
@@ -1700,6 +1845,8 @@ class GisLayersDock:
                         entry = e
                         break
                 if entry:
+                    if entry.get("kind") == "table":
+                        return
                     entry["visible"] = checked
                     
                     # Toggle all sub-layers
@@ -1774,15 +1921,17 @@ class GisLayersDock:
         # ── actions ──────────────────────────────────────────────────────────
         def _on_opacity(val):
             op_value.setText(f"{val}%")
-            for e in _selected_entries():
-                _set_layer_opacity(app, e, val / 100.0)
+            selections = _selected_entries()
+            for e in selections:
+                _set_layer_opacity(app, e, val / 100.0, render=False)
+            if selections:
+                _render(app)
 
         def _do_import():
             unified_import_overlay(app)
 
         def _do_zoom():
-            for e in _selected_entries():
-                _zoom_to_layer(app, e)
+            zoom_to_gis_entries(app, _selected_entries())
 
         def _do_remove():
             selections = _selected_entries()
@@ -1804,8 +1953,10 @@ class GisLayersDock:
                                         app._attribute_tables[k].close()
                                     except Exception:
                                         pass
-                        _remove_layer(app, e)
-                    refresh()
+                        _remove_layer(app, e, update_scene=False)
+                    _apply_order(app)
+                    _render(app)
+                    request_refresh()
                 return
 
             names_str = ", ".join(f'"{e["name"]}"' for e in selections)
@@ -1822,8 +1973,10 @@ class GisLayersDock:
                                     app._attribute_tables[k].close()
                                 except Exception:
                                     pass
-                    _remove_layer(app, e)
-                refresh()
+                    _remove_layer(app, e, update_scene=False)
+                _apply_order(app)
+                _render(app)
+                request_refresh()
 
         def _do_rename():
             e = _current_entry()
@@ -1833,8 +1986,9 @@ class GisLayersDock:
             new, ok = QInputDialog.getText(app, "Rename layer", "Name:", text=e["name"])
             if ok and new.strip():
                 e["name"] = new.strip()
-                refresh()
-                _select_id(e["id"])
+                current = layer_list.currentItem()
+                if current is not None:
+                    current.setText(0, e["name"])
 
         def _do_merge_layers():
             selections = _selected_entries()
@@ -1844,7 +1998,7 @@ class GisLayersDock:
             from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
             
             dlg = QDialog(app)
-            dlg.setWindowTitle("Merge Layers")
+            dlg.setWindowTitle("Combine Temporary Drawing Layers")
             dlg.setMinimumWidth(320)
             dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
             
@@ -1852,7 +2006,7 @@ class GisLayersDock:
             v.setContentsMargins(12, 12, 12, 12)
             v.setSpacing(10)
             
-            v.addWidget(QLabel("Select target layer to merge other selected layers into:"))
+            v.addWidget(QLabel("Select the temporary drawing layer that should receive the other selected render actors:"))
             
             cmb_target = QComboBox()
             for entry in selections:
@@ -1860,14 +2014,14 @@ class GisLayersDock:
             v.addWidget(cmb_target)
             
             # Show which layers will be merged
-            lbl_info = QLabel("The other selected layers will be merged into the target.")
+            lbl_info = QLabel("Temporary drawing content only. Datasource-backed GIS layers are never combined by this command.")
             lbl_info.setStyleSheet("color: #888888; font-size: 11px;")
             v.addWidget(lbl_info)
             
             # Buttons
             h = QHBoxLayout()
             h.addStretch()
-            btn_merge = QPushButton("Merge")
+            btn_merge = QPushButton("Group")
             btn_merge.setStyleSheet("font-weight: bold;")
             btn_cancel = QPushButton("Cancel")
             h.addWidget(btn_cancel)
@@ -1929,7 +2083,7 @@ class GisLayersDock:
                             reg.remove(source_entry)
                     
                     # Refresh panel & render viewport to apply changes
-                    refresh()
+                    request_refresh()
                     _render(app)
 
         def _selected_sub_layers():
@@ -1953,7 +2107,7 @@ class GisLayersDock:
             from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
             
             dlg = QDialog(app)
-            dlg.setWindowTitle("Merge Sub-layers")
+            dlg.setWindowTitle("Group Display Categories")
             dlg.setMinimumWidth(360)
             dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
             
@@ -1961,7 +2115,7 @@ class GisLayersDock:
             v.setContentsMargins(12, 12, 12, 12)
             v.setSpacing(10)
             
-            v.addWidget(QLabel("Select target sub-layer to merge other selected sub-layers into:"))
+            v.addWidget(QLabel("Select the display category that should contain the other selected categories:"))
             
             cmb_target = QComboBox()
             for idx, (parent_entry, sub_code, item) in enumerate(selected_subs):
@@ -1970,13 +2124,13 @@ class GisLayersDock:
                 cmb_target.addItem(label, idx)
             v.addWidget(cmb_target)
             
-            lbl_info = QLabel("The other selected sub-layers will be merged into the target.")
+            lbl_info = QLabel("This changes only the Naksha display grouping; it does not author native FileGDB subtypes.")
             lbl_info.setStyleSheet("color: #888888; font-size: 11px;")
             v.addWidget(lbl_info)
             
             h = QHBoxLayout()
             h.addStretch()
-            btn_merge = QPushButton("Merge")
+            btn_merge = QPushButton("Group")
             btn_merge.setStyleSheet("font-weight: bold;")
             btn_cancel = QPushButton("Cancel")
             h.addWidget(btn_cancel)
@@ -2046,7 +2200,7 @@ class GisLayersDock:
                         del source_parent["sub_layers"][source_code]
                         
                 # Refresh panel & render viewport
-                refresh()
+                request_refresh()
                 _render(app)
 
         def _do_remove_sub_layer(parent_entry, sub_code):
@@ -2065,59 +2219,26 @@ class GisLayersDock:
                         except Exception:
                             pass
                 
-                # Delete sub-layer info
+                # Detach the sub-layer actors and remove every owning reference.
+                sub_actors = _sub_layer_actors(sub_info)
+                for actor in sub_actors:
+                    for renderer in (
+                        _raster_renderer(app), _main_renderer(app), _overlay_renderer(app)
+                    ):
+                        if renderer is None:
+                            continue
+                        try:
+                            renderer.RemoveViewProp(actor)
+                        except Exception:
+                            pass
+                parent_entry["actors"] = [
+                    actor for actor in parent_entry.get("actors", [])
+                    if all(actor is not removed for removed in sub_actors)
+                ]
                 if sub_code in parent_entry.get("sub_layers", {}):
                     del parent_entry["sub_layers"][sub_code]
-                refresh()
+                request_refresh(select_id=parent_entry["id"])
                 _render(app)
-
-        def _do_add_new_layer():
-            from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton
-            
-            dlg = QDialog(app)
-            dlg.setWindowTitle("Create New Layer")
-            dlg.setMinimumWidth(300)
-            dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
-            
-            v = QVBoxLayout(dlg)
-            v.setContentsMargins(12, 12, 12, 12)
-            v.setSpacing(10)
-            
-            v.addWidget(QLabel("Layer Name:"))
-            txt_name = QLineEdit("New Layer")
-            v.addWidget(txt_name)
-            
-            v.addWidget(QLabel("Geometry Type:"))
-            cmb_geom = QComboBox()
-            cmb_geom.addItems(["Point", "Line", "Polygon"])
-            v.addWidget(cmb_geom)
-            
-            h = QHBoxLayout()
-            h.addStretch()
-            btn_ok = QPushButton("OK")
-            btn_ok.setStyleSheet("font-weight: bold;")
-            btn_cancel = QPushButton("Cancel")
-            h.addWidget(btn_cancel)
-            h.addWidget(btn_ok)
-            v.addLayout(h)
-            
-            btn_ok.clicked.connect(dlg.accept)
-            btn_cancel.clicked.connect(dlg.reject)
-            
-            if dlg.exec() == QDialog.Accepted:
-                name = txt_name.text().strip() or "New Layer"
-                geom = cmb_geom.currentText().lower()
-                
-                entry = register_gis_layer(app, name, "", "vector", "geojson", [], allow_empty=True)
-                if entry:
-                    entry["geom"] = geom
-                    used_colors = set(e.get("color") for e in _registry(app) if e.get("color"))
-                    color_q = _default_color_for(entry.get("id", 0), used_colors)
-                    entry["color"] = color_q.name()
-                    entry["sub_layers"] = {}
-                    
-                    refresh()
-                    _select_id(entry["id"])
 
         def _do_create_sub_layer(e):
             if e is None:
@@ -2126,7 +2247,7 @@ class GisLayersDock:
             from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton
             
             dlg = QDialog(app)
-            dlg.setWindowTitle("Create Sub-layer (Subtype)")
+            dlg.setWindowTitle("Create Display Group")
             dlg.setMinimumWidth(300)
             dlg.setWindowFlags(dlg.windowFlags() | Qt.Tool)
             
@@ -2134,11 +2255,11 @@ class GisLayersDock:
             v.setContentsMargins(12, 12, 12, 12)
             v.setSpacing(10)
             
-            v.addWidget(QLabel("Subtype Name (Label):"))
-            txt_label = QLineEdit("New Subtype")
+            v.addWidget(QLabel("Display Group Name:"))
+            txt_label = QLineEdit("New Display Group")
             v.addWidget(txt_label)
             
-            v.addWidget(QLabel("Subtype Code (Key):"))
+            v.addWidget(QLabel("Internal Key:"))
             txt_code = QLineEdit("new_subtype")
             v.addWidget(txt_code)
             
@@ -2155,7 +2276,7 @@ class GisLayersDock:
             btn_cancel.clicked.connect(dlg.reject)
             
             if dlg.exec() == QDialog.Accepted:
-                label = txt_label.text().strip() or "New Subtype"
+                label = txt_label.text().strip() or "New Display Group"
                 code = txt_code.text().strip() or "new_subtype"
                 
                 if "sub_layers" not in e:
@@ -2175,8 +2296,7 @@ class GisLayersDock:
                     "label": label
                 }
                 
-                refresh()
-                _select_id(e["id"])
+                request_refresh(select_id=e["id"])
 
         def _do_open_table():
             current_item = layer_list.currentItem()
@@ -2303,10 +2423,40 @@ class GisLayersDock:
 
         def _toggle_all_visibility():
             reg = _registry(app)
-            target = not any(e.get("visible") for e in reg)
-            for e in reg:
-                _set_layer_visible(app, e, target)
-            refresh()
+            spatial_entries = [e for e in reg if e.get("kind") != "table"]
+            target = not any(e.get("visible") for e in spatial_entries)
+
+            # Keep the existing QTreeWidgetItems alive.  Calling refresh() here
+            # clears/deletes the current items from inside the tool button's Qt
+            # event handler; PySide/Qt can then dereference a deleted item while
+            # finishing that event (native access violation in Qt6Widgets).
+            for e in spatial_entries:
+                _set_layer_visible(app, e, target, render=False)
+
+            signals_were_blocked = layer_list.blockSignals(True)
+            updates_were_enabled = layer_list.updatesEnabled()
+            layer_list.setUpdatesEnabled(False)
+            try:
+                state = Qt.Checked if target else Qt.Unchecked
+                for index in range(layer_list.topLevelItemCount()):
+                    item = layer_list.topLevelItem(index)
+                    lid = item.data(0, Qt.UserRole)
+                    entry = next(
+                        (e for e in spatial_entries if e.get("id") == lid),
+                        None,
+                    )
+                    if entry is None:
+                        continue
+                    item.setCheckState(0, state)
+                    for child_index in range(item.childCount()):
+                        item.child(child_index).setCheckState(0, state)
+            finally:
+                layer_list.blockSignals(signals_were_blocked)
+                layer_list.setUpdatesEnabled(updates_were_enabled)
+                if updates_were_enabled:
+                    layer_list.viewport().update()
+
+            _render(app)
 
         def _context_menu(pos):
             item = layer_list.itemAt(pos)
@@ -2384,10 +2534,8 @@ class GisLayersDock:
                                 except Exception:
                                     pass
                                     
-                        # Defer refresh and render using QTimer.singleShot to avoid Qt deletion-during-event crashes
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(0, refresh)
-                        QTimer.singleShot(0, lambda: _render(app))
+                        request_refresh(select_id=e["id"])
+                        _render(app)
 
                     if is_child:
                         menu.addAction("Zoom to layer", _do_zoom)
@@ -2400,41 +2548,53 @@ class GisLayersDock:
                         selected_subs = _selected_sub_layers()
                         if len(selected_subs) > 1:
                             menu.addSeparator()
-                            menu.addAction("Merge selected sub-layers…", _do_merge_sub_layers)
+                            menu.addAction("Group selected display categories…", _do_merge_sub_layers)
                             
                         menu.addSeparator()
                         menu.addAction("Remove sub-layer", lambda: _do_remove_sub_layer(e, sub_code))
                     else:
-                        menu.addAction("Zoom to layer", _do_zoom)
-                        menu.addAction("Rename…", _do_rename)
-                        if e.get("kind") in ("vector", "table"):
+                        if e.get("kind") == "table":
                             menu.addAction("Open attribute table", _do_open_table)
-                            menu.addAction("Change Color…", _do_change_color)
-                        if e.get("gdb_path"):
-                            menu.addAction("Workspace Domains…", _do_open_domains)
-                        
-                        # Merging option: only if multiple layers are selected
-                        selections = _selected_entries()
-                        if len(selections) > 1:
+                            menu.addAction("Rename display name…", _do_rename)
+                            if e.get("gdb_path"):
+                                menu.addAction("Workspace Domains…", _do_open_domains)
+                        else:
+                            menu.addAction("Zoom to layer", _do_zoom)
+                            menu.addAction("Rename display name…", _do_rename)
+                            if e.get("kind") == "vector":
+                                menu.addAction("Open attribute table", _do_open_table)
+                                menu.addAction("Change Color…", _do_change_color)
+                            if e.get("gdb_path"):
+                                menu.addAction("Workspace Domains…", _do_open_domains)
+
+                            # Combining actors is safe only for temporary/in-memory
+                            # drawing layers. Native GIS layers must retain their own
+                            # datasource identity, schema, FIDs and attribute tables.
+                            selections = _selected_entries()
+                            temporary_selections = [
+                                x for x in selections
+                                if x.get("kind") == "vector"
+                                and (x.get("temporary") or x.get("storage_model") == "in-memory-drawing")
+                            ]
+                            if len(temporary_selections) > 1 and len(temporary_selections) == len(selections):
+                                menu.addSeparator()
+                                menu.addAction("Combine selected temporary layers…", _do_merge_layers)
+
                             menu.addSeparator()
-                            menu.addAction("Merge selected layers…", _do_merge_layers)
-                        
-                        # Sub-layer creation option
+                            menu.addAction("Create display group…", lambda: _do_create_sub_layer(e))
+
                         menu.addSeparator()
-                        menu.addAction("Create sub-layer (subtype)…", lambda: _do_create_sub_layer(e))
-                        
-                        menu.addSeparator()
-                        menu.addAction("Remove", _do_remove)
+                        menu.addAction("Remove from map", _do_remove)
             else:
-                # Clicked on empty area: global panel actions
-                menu.addAction("Create new layer…", _do_add_new_layer)
-                menu.addAction("Import GIS overlay…", _do_import)
+                # The Layers panel manages what is loaded in the map. Persistent
+                # dataset creation belongs in GIS Catalog.
+                menu.addAction("Add GIS files…", _do_import)
                 
             menu.exec(layer_list.viewport().mapToGlobal(pos))
 
         layer_list.customContextMenuRequested.connect(_context_menu)
         layer_list.itemSelectionChanged.connect(_sync_table_btn)
-        tb_import.clicked.connect(_do_add_new_layer)
+        tb_import.clicked.connect(_do_import)
         tb_eye.clicked.connect(_toggle_all_visibility)
         tb_filter.toggled.connect(_toggle_filter)
         filter_box.textChanged.connect(_apply_filter)
@@ -2463,23 +2623,74 @@ def show_gis_layers_panel(app):
     if panel is None:
         panel = GisLayersDock.create(app)
         setattr(app, _PANEL_ATTR, panel)
-        try:
-            splitter = app.splitter
-            splitter.insertWidget(0, panel)
-            sizes = splitter.sizes()
-            if len(sizes) >= 2:
-                splitter.setSizes([280] + sizes[1:])
-        except Exception:
-            pass
+        # Deferred: GisLayersDock.create() just built a fresh toolbar/tree
+        # subtree (new QToolButtons, tooltips, icons) whose Qt-style-driven
+        # setup (hover/tooltip animations etc., handled by the active style
+        # plugin, not this app's code) may still be settling. Reparenting
+        # that subtree into the splitter in the same tick has coincided with
+        # a native access violation in Qt6Widgets.dll (ChildRemoved/ChildAdded
+        # racing a style animation's DeferredDelete on the same widget).
+        # Letting one event-loop tick pass first keeps the reparent from
+        # overlapping that window.
+        from PySide6.QtCore import QTimer
+
+        def _deferred_insert(_panel=panel):
+            try:
+                splitter = app.splitter
+                splitter.insertWidget(0, _panel)
+                sizes = splitter.sizes()
+                if len(sizes) >= 2:
+                    splitter.setSizes([280] + sizes[1:])
+            except Exception:
+                pass
+            apply_gis_dock_style(_panel)
+            _panel.show()
+            if hasattr(app, "_sync_activity_bar"):
+                try:
+                    app._sync_activity_bar()
+                except Exception:
+                    pass
+
+        QTimer.singleShot(0, _deferred_insert)
+        return panel
     else:
+        # Deferred: callers commonly reach this (e.g. right after a bulk GDB
+        # import) from inside the very Qt event - a button click or drop
+        # event - that just finished a suspend/resume batch. panel.refresh()
+        # clears and rebuilds the whole QTreeWidget; doing that synchronously
+        # here would re-enter Qt's widget/paint machinery while that event is
+        # still on the call stack (the same reentrancy class that crashed
+        # "Hide All" with 0xc0000005 in Qt6Widgets.dll).
+        from PySide6.QtCore import QTimer
+
+        def _deferred_refresh(_panel=panel):
+            try:
+                _panel.refresh()
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _deferred_refresh)
+        # A splitter pane dragged closed to 0px stays Qt-"visible" (isVisible()
+        # reflects show()/hide() state, not pixel size), so toggle_gis_layers_panel's
+        # first click after that drag actually called panel.hide() (believing it
+        # was toggling a visible panel off), and this re-show call only did
+        # panel.show() -- the splitter's stored size for this pane was still 0
+        # from the drag, so the panel came back "visible" but still crushed to
+        # 0 width. Only the very-first-creation branch above restored a real
+        # width; do the same restoration here whenever the pane is too
+        # thin to be usable.
         try:
-            panel.refresh()
+            splitter = getattr(app, "splitter", None)
+            if splitter is not None:
+                idx = splitter.indexOf(panel)
+                if idx != -1:
+                    sizes = splitter.sizes()
+                    if idx < len(sizes) and sizes[idx] < 50:
+                        sizes[idx] = 280
+                        splitter.setSizes(sizes)
         except Exception:
             pass
-    try:
-        panel.setStyleSheet(_build_occ_style())
-    except Exception:
-        pass
+    apply_gis_dock_style(panel)
     panel.show()
     if hasattr(app, "_sync_activity_bar"):
         try:
@@ -2491,7 +2702,14 @@ def show_gis_layers_panel(app):
 
 def toggle_gis_layers_panel(app):
     panel = getattr(app, _PANEL_ATTR, None)
-    if panel is not None and panel.isVisible():
+    # isVisible() alone is not a reliable "is this actually shown" signal
+    # for a splitter pane: dragging its handle to 0px never calls hide(),
+    # so Qt still reports it visible even though nothing is on screen.
+    # Treat a crushed-to-0 pane the same as a hidden one -- restore it
+    # instead of calling hide() on something the user can't already see,
+    # which previously required a confusing second click to reopen.
+    effectively_shown = bool(panel is not None and panel.isVisible() and panel.width() > 10)
+    if effectively_shown:
         panel.hide()
         if hasattr(app, "_sync_activity_bar"):
             try:
@@ -2507,20 +2725,20 @@ def toggle_gis_layers_panel(app):
 # ─────────────────────────────────────────────────────────────────────────────
 def unified_import_overlay(app):
     """
-    One entry point that imports .shp / .tif / .tiff / .geojson, registers each
+    One entry point that adds .shp / .tif / .tiff / .geojson, registers each
     as a managed layer, and opens the Overlay Control Center.
     """
     from PySide6.QtWidgets import QFileDialog, QMessageBox
 
     filt = (
-        "All supported (*.shp *.tif *.tiff *.geojson *.json *.gdb);;"
-        "Shapefile (*.shp);;"
-        "GeoTIFF (*.tif *.tiff);;"
-        "GeoJSON (*.geojson *.json);;"
-        "ESRI File Geodatabase (*.gdb)"
+        "All supported GIS (*.shp *.geojson *.json *.gpkg *.gdb *.kml *.kmz *.gpx *.gml *.fgb *.sqlite *.db *.csv "
+        "*.tif *.tiff *.jp2 *.j2k *.ecw *.img *.vrt *.png *.jpg *.jpeg *.mbtiles);;"
+        "Vector GIS (*.shp *.geojson *.json *.gpkg *.kml *.kmz *.gpx *.gml *.fgb *.sqlite *.db *.csv);;"
+        "Raster GIS (*.tif *.tiff *.jp2 *.j2k *.ecw *.img *.vrt *.png *.jpg *.jpeg *.mbtiles);;"
+        "ESRI File Geodatabase (*.gdb);;GeoPackage (*.gpkg);;Shapefile (*.shp);;GeoJSON (*.geojson *.json)"
     )
     paths, _ = QFileDialog.getOpenFileNames(
-        app, "Import GIS overlay (multiple allowed)", str(Path.home()), filt
+        app, "Add GIS files (multiple allowed)", str(Path.home()), filt
     )
     if not paths:
         return
@@ -2530,6 +2748,11 @@ def unified_import_overlay(app):
         try:
             if _import_one(app, p):
                 ok += 1
+            elif _import_batch_canceled(app):
+                # The user pressed Cancel: stop the batch, do not report it as
+                # a failure to import.
+                print(f"   ⛔ Import batch cancelled by user at {Path(p).name}")
+                break
             else:
                 fail += 1
         except Exception as exc:
@@ -2546,7 +2769,7 @@ def unified_import_overlay(app):
                             "See the console for details.")
 
 
-_RASTER_EXTS = (".tif", ".tiff")
+_RASTER_EXTS = (".tif", ".tiff", ".jp2", ".j2k", ".ecw", ".img", ".vrt", ".png", ".jpg", ".jpeg", ".mbtiles")
 
 
 def sort_imports_vectors_first(paths):
@@ -2625,27 +2848,204 @@ def _show_ecw_dialog(app, path: str) -> None:
     dlg.exec()
 
 
+def _source_identity(path) -> str:
+    """Canonical identity for a GIS source file.
+
+    Case, relative-vs-absolute and symlink differences all have to collapse to
+    one identity, otherwise re-picking the same file through a different path
+    still registers a second copy of the same layer.
+    """
+    try:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        return os.path.normcase(os.path.realpath(os.path.abspath(text)))
+    except Exception:
+        return str(path or "")
+
+
+def find_loaded_layer(app, path, source_layer=None, registry=None):
+    """Return the layer already displaying *path* (+*source_layer*), else None.
+
+    A container (GPKG/GDB/SQLite) exposes many public layers from one file, so
+    those must match on the source layer name as well. Single-layer sources
+    (.shp/.tif/.geojson/...) are identified by their file path alone, which is
+    what stops a second copy of an already-loaded file from being stacked in
+    the Layers panel.
+    """
+    target = _source_identity(path)
+    if not target:
+        return None
+    wanted = str(source_layer).casefold() if source_layer else None
+    entries = registry if registry is not None else _registry(app)
+    for e in list(entries or []):
+        if not isinstance(e, dict):
+            continue
+        if _source_identity(e.get("path")) != target:
+            continue
+        if wanted is None:
+            return e
+        existing = e.get("source_layer")
+        if existing and str(existing).casefold() == wanted:
+            return e
+    return None
+
+
+def _import_batch_canceled(app) -> bool:
+    """True when the import that just finished was stopped by the user's Cancel.
+
+    Batch loops use this to stop cleanly instead of reporting a cancelled file
+    as "could not be imported". ``_import_one`` clears the flag on entry, so it
+    always describes the import that just returned.
+    """
+    if getattr(app, "_gis_import_canceled", False):
+        try:
+            app._gis_import_canceled = False
+        except Exception:
+            pass
+        return True
+    return False
+
+
+def focus_loaded_layer(app, entry) -> None:
+    """Point the user at a layer that is already loaded instead of duplicating it."""
+    if not isinstance(entry, dict):
+        return
+    name = entry.get("name") or Path(str(entry.get("path") or "")).name
+    print(f"   ♻️  '{name}' is already loaded — keeping the existing layer")
+    try:
+        if not entry.get("visible", True):
+            _set_layer_visible(app, entry, True)
+    except Exception:
+        pass
+    dock = getattr(app, _PANEL_ATTR, None)
+    if dock is not None:
+        try:
+            dock.refresh(select_id=entry.get("id"))
+        except Exception:
+            pass
+    try:
+        app.statusBar().showMessage(
+            f"'{name}' is already loaded — reusing the existing layer", 4000
+        )
+    except Exception:
+        pass
+
+
 def _import_one(app, path: str) -> bool:
+    """Import any GIS source supported by Naksha's runtime driver set.
+
+    FileGDB keeps its specialized schema-aware picker. Other vector formats use
+    the common native OGR -> VTK datasource-backed display path. Native
+    loss-minimizing format conversion is handled by conversion_engine.py.
+    """
     ext = Path(path).suffix.lower()
     name = Path(path).name
 
-    if ext == ".ecw":
-        if not _ecw_driver_available():
-            _show_ecw_dialog(app, path)
-            return False
+    try:
+        app._gis_import_canceled = False
+    except Exception:
+        pass
+
+    if str(path).lower().endswith(".gdb"):
+        return _import_gdb(app, path)
+
+    if ext == ".ecw" and not _ecw_driver_available():
+        _show_ecw_dialog(app, path)
+        return False
+
+    if ext in _RASTER_EXTS:
         return _import_raster_layer(app, path, name)
 
-    if ext in (".tif", ".tiff"):
-        return _import_raster_layer(app, path, name)
-    if ext == ".shp":
-        return _import_vector_layer(app, path, name, fmt="shp")
-    if ext in (".geojson", ".json"):
-        return _import_vector_layer(app, path, name, fmt="geojson")
-    if ext == ".gdb":
-        return _import_gdb(app, path)
+    vector_exts = {".shp", ".geojson", ".json", ".gpkg", ".kml", ".kmz",
+                   ".gpx", ".gml", ".fgb", ".sqlite", ".db", ".csv"}
+    if ext in vector_exts:
+        if ext in {".gpkg", ".sqlite", ".db"}:
+            layer_names = _choose_vector_layers(path)
+            if layer_names is False:
+                return False
+            if not layer_names:
+                layer_names = [None]
+            imported_any = False
+            suspend_layer_panel_refresh(app)
+            try:
+                for selected_layer in layer_names:
+                    imported_any = import_vector_layer_from_source(
+                        app, path, layer_name=selected_layer or None
+                    ) or imported_any
+            finally:
+                resume_layer_panel_refresh(app)
+            return imported_any
+        return import_vector_layer_from_source(app, path)
 
     print(f"   ⚠️ Unsupported overlay type: {ext}")
     return False
+
+
+def _choose_vector_layers(path: str):
+    """Choose one or many public layers from a vector container.
+
+    Returns a list of layer names, or ``False`` when the user cancels.  The
+    container itself is never treated as one visual layer.
+    """
+    try:
+        from gui.gis.native_vector import list_public_layers
+        descriptors = list_public_layers(path)
+    except Exception:
+        descriptors = []
+    if not descriptors:
+        return []
+    if len(descriptors) == 1:
+        return [descriptors[0]["name"]]
+
+    try:
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem,
+            QDialogButtonBox, QHBoxLayout, QPushButton, QAbstractItemView,
+        )
+        dlg = QDialog()
+        dlg.setWindowTitle(f"Select GIS Layers — {Path(path).name}")
+        dlg.resize(520, 430)
+        apply_gis_dialog_style(dlg)
+        lay = QVBoxLayout(dlg)
+        compact_layout(lay)
+        lay.addWidget(QLabel("Select the layers/tables to add to the Naksha map/workspace:"))
+        lw = QListWidget()
+        lw.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for desc in descriptors:
+            count = desc.get("feature_count", -1)
+            count_text = f"{count:,}" if isinstance(count, int) and count >= 0 else "?"
+            item = QListWidgetItem(
+                f"{desc.get('name')}    [{desc.get('geometry_type') or desc.get('kind')}; {count_text}]"
+            )
+            item.setData(Qt.UserRole, desc.get("name"))
+            lw.addItem(item)
+            item.setSelected(True)
+        lay.addWidget(lw, 1)
+        quick = QHBoxLayout()
+        all_btn = QPushButton("Select All")
+        none_btn = QPushButton("Select None")
+        all_btn.clicked.connect(lw.selectAll)
+        none_btn.clicked.connect(lw.clearSelection)
+        quick.addWidget(all_btn); quick.addWidget(none_btn); quick.addStretch(1)
+        lay.addLayout(quick)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        return [str(item.data(Qt.UserRole)) for item in lw.selectedItems() if item.data(Qt.UserRole)]
+    except Exception:
+        return [d["name"] for d in descriptors]
+
+
+def _choose_vector_layer(path: str):
+    """Backward-compatible single-layer helper."""
+    selected = _choose_vector_layers(path)
+    if selected is False:
+        return False
+    return selected[0] if selected else None
 
 
 def _import_gdb(app, path: str) -> bool:
@@ -2664,6 +3064,15 @@ def _import_raster_layer(app, path: str, name: str, world_bounds=None,
                          gcp_corners=None) -> bool:
     """Import a GeoTIFF and register the new texture actor(s) as one layer."""
     from gui.vector_export import import_geotiff_as_texture
+
+    # Adding the same file twice used to stack a second identical texture in the
+    # Layers panel (and a second full-resolution texture in VRAM). Re-import
+    # paths - georeferencing, stranded-raster re-fit - remove the old entry
+    # first, so they never match here.
+    already = find_loaded_layer(app, path)
+    if already is not None:
+        focus_loaded_layer(app, already)
+        return True
 
     before = list(getattr(app, "geotiff_actors", []) or [])
     ok = import_geotiff_as_texture(app, path, world_bounds=world_bounds,
@@ -2726,13 +3135,16 @@ def georeference_raster_layer(app, entry: dict):
     cur = _layer_bounds(entry)            # (xmin,xmax,ymin,ymax,zmin,zmax) or None
     prefill = (cur[0], cur[2], cur[1], cur[3]) if cur else (0.0, 0.0, 0.0, 0.0)
 
-    bounds = _ask_georeference(app, entry, prefill)
-    if bounds is None:
+    placement = _ask_georeference(app, entry, prefill)
+    if placement is None:
         return
 
     name = entry.get("name", "raster")
     _remove_layer(app, entry)
-    _import_raster_layer(app, path, name, world_bounds=bounds)
+    if isinstance(placement, dict) and placement.get("gcp_corners"):
+        _import_raster_layer(app, path, name, gcp_corners=placement["gcp_corners"])
+    else:
+        _import_raster_layer(app, path, name, world_bounds=placement)
 
     dock = getattr(app, _PANEL_ATTR, None)
     if dock is not None:
@@ -2753,18 +3165,14 @@ def _ask_georeference(app, entry, prefill):
     )
     from PySide6.QtGui import QDoubleValidator
     from pathlib import Path
-    try:
-        from gui.theme_manager import get_dialog_stylesheet
-    except Exception:
-        def get_dialog_stylesheet():
-            return ""
-
     w0, s0, e0, n0 = prefill
     dlg = QDialog(app)
     dlg.setWindowTitle(f"Georeference — {entry.get('name', '')}")
     dlg.setModal(True)
-    dlg.setStyleSheet(get_dialog_stylesheet())
+    apply_gis_dialog_style(dlg)
     v = QVBoxLayout(dlg)
+    compact_layout(v)
+    dlg._worldfile_corners = None
 
     info = QLabel("Place this image at its true coordinates so it lines up with "
                   "your data.\n• Best: load a world file (.tfw) from the survey.\n"
@@ -2798,9 +3206,11 @@ def _ask_georeference(app, entry, prefill):
         le.setValidator(validator)
         form.addRow(label, le)
         fields[key] = le
+        le.textEdited.connect(lambda _text, d=dlg: setattr(d, "_worldfile_corners", None))
     v.addLayout(form)
 
     def _on_match(idx):
+        dlg._worldfile_corners = None
         lid = combo.itemData(idx)
         if lid is None:
             return
@@ -2835,10 +3245,6 @@ def _ask_georeference(app, entry, prefill):
                                 "Could not read the image size to apply the world file.")
             return
         try:
-            from gui.vector_export import read_world_file_bounds
-            # Parse the chosen world file directly by faking the path's sidecar:
-            # read_world_file_bounds derives candidates from the image path, so
-            # parse the selected file here instead.
             nums = []
             for line in Path(wf).read_text().splitlines():
                 line = line.strip()
@@ -2849,19 +3255,28 @@ def _ask_georeference(app, entry, prefill):
             if len(nums) < 6:
                 raise ValueError("world file needs 6 numbers")
             A, D, B, E, C, F = nums[:6]
-            left = C - A / 2.0
-            top = F - E / 2.0
-            right = left + A * float(width)
-            bottom = top + E * float(height)
-            fields["w"].setText(f"{min(left, right):.4f}")
-            fields["e"].setText(f"{max(left, right):.4f}")
-            fields["south"].setText(f"{min(bottom, top):.4f}")
-            fields["n"].setText(f"{max(bottom, top):.4f}")
+
+            def xy(col, row):
+                return (
+                    A * float(col) + B * float(row) + C,
+                    D * float(col) + E * float(row) + F,
+                )
+
+            tl = xy(-0.5, -0.5)
+            tr = xy(float(width) - 0.5, -0.5)
+            bl = xy(-0.5, float(height) - 0.5)
+            br = xy(float(width) - 0.5, float(height) - 0.5)
+            dlg._worldfile_corners = (bl, br, tl)
+            xs = [tl[0], tr[0], bl[0], br[0]]
+            ys = [tl[1], tr[1], bl[1], br[1]]
+            fields["w"].setText(f"{min(xs):.4f}")
+            fields["e"].setText(f"{max(xs):.4f}")
+            fields["south"].setText(f"{min(ys):.4f}")
+            fields["n"].setText(f"{max(ys):.4f}")
             if abs(D) > 1e-9 or abs(B) > 1e-9:
                 QMessageBox.information(
                     dlg, "World file",
-                    "This world file contains rotation; only the axis-aligned "
-                    "extent is applied (no rotation).")
+                    "This world file contains rotation/shear. Naksha will preserve the full affine placement.")
         except Exception as exc:
             QMessageBox.warning(dlg, "World file", f"Could not read world file:\n{exc}")
     btn_wf.clicked.connect(_load_world_file)
@@ -2880,183 +3295,158 @@ def _ask_georeference(app, entry, prefill):
         return None
     if e == w or n == s:
         return None
+    if getattr(dlg, "_worldfile_corners", None):
+        return {"gcp_corners": dlg._worldfile_corners}
     return (w, s, e, n)
 
 
-def _import_vector_layer(app, path: str, name: str, fmt: str) -> bool:
+def _import_vector_layer(app, path: str, name: str, fmt: str, layer_name=None) -> bool:
+    """Compatibility wrapper for the new generic vector display adapter."""
+    return import_vector_layer_from_source(app, path, layer_name=layer_name, display_name=name, fmt=fmt)
+
+
+def import_vector_layer_from_source(app, path: str, layer_name=None, display_name=None, fmt=None) -> bool:
+    """Import one datasource layer through the native OGR -> VTK pipeline.
+
+    Imported GIS data stays datasource-backed; the Digitizer is no longer used
+    as canonical storage for SHP/GeoJSON/GPKG/KML/GML/FGB/SQLite layers.  A
+    legacy fallback can be enabled explicitly with
+    ``NAKSHA_GIS_LEGACY_DIGITIZER_IMPORT=1`` for troubleshooting only.
     """
-    Import a shapefile/GeoJSON via the digitizer, then group the newly created
-    drawing actors into a single managed layer.
-    """
-    dz = getattr(app, "digitizer", None)
-    drawings = getattr(dz, "drawings", None) if dz is not None else None
-    before_ids = set(id(d.get("actor")) for d in drawings) if isinstance(drawings, list) else set()
+    try:
+        from gui.gis.native_vector import import_native_vector_layer
+        entry = import_native_vector_layer(
+            app,
+            path,
+            layer_name=layer_name,
+            display_name=display_name,
+            fmt=fmt,
+        )
+        if entry is not None:
+            _refit_pixel_rasters(app)
+            return True
+    except Exception as exc:
+        print(f"   ❌ Native GIS import failed for {path}: {exc}")
+        import traceback
+        traceback.print_exc()
 
-    if fmt == "shp":
-        from gui.vector_export import import_drawings_from_shapefile_with_rendering
-        ok = import_drawings_from_shapefile_with_rendering(app, path)
-    else:
-        ok = _import_geojson_via_digitizer(app, path)
-
-    if not ok:
-        return False
-
-    after = getattr(dz, "drawings", None) if dz is not None else None
-    new_actors = []
-    new_drawings = []
-    if isinstance(after, list):
-        for d in after:
-            a = d.get("actor")
-            if a is not None and id(a) not in before_ids:
-                new_actors.append(a)
-                new_drawings.append(d)
-
-    if not new_actors:
-        print(f"   ⚠️ {name}: imported but no new actors were captured")
-        return False
-
-    entry = register_gis_layer(app, name, path, "vector", fmt, new_actors)
-
-    # Record geometry kind + colour so the panel can show a QGIS-style symbol.
-    if entry is not None:
-        _point_types = {"circle", "text"}
-        _line_types = {"smartline", "line", "line_segment", "polyline", "freehand"}
-        counts = {"point": 0, "line": 0, "polygon": 0}
-        for d in new_drawings:
-            t = str(d.get("type", "")).lower()
-            if t in _point_types:
-                counts["point"] += 1
-            elif t in _line_types:
-                counts["line"] += 1
-            else:
-                counts["polygon"] += 1
-        entry["geom"] = max(counts, key=counts.get) if any(counts.values()) else "polygon"
-        # Colour from the first actor's line/fill colour (0..1 → hex).
-        try:
-            c = new_actors[0].GetProperty().GetColor()
-            is_default = (c[0] > 0.99 and c[1] > 0.99 and c[2] > 0.99) or (c[0] > 0.99 and c[1] > 0.99 and c[2] < 0.01)
-            
-            # Retrieve a distinct random color for the layer
-            used_colors = set(e.get("color") for e in _registry(app) if e.get("color"))
-            color_q = _default_color_for(entry.get("id", 0), used_colors)
-            
-            if is_default:
-                vtk_color = (color_q.redF(), color_q.greenF(), color_q.blueF())
-                # Update VTK actors to match this new layer color
-                for a in new_actors:
-                    try:
-                        a.GetProperty().SetColor(*vtk_color)
-                        # If it is a polygon, set edge color too
-                        if hasattr(a.GetProperty(), "GetEdgeVisibility") and a.GetProperty().GetEdgeVisibility():
-                            a.GetProperty().SetEdgeColor(vtk_color[0] * 0.6, vtk_color[1] * 0.6, vtk_color[2] * 0.6)
-                    except Exception:
-                        pass
-                # Update the digitizer drawings list as well, so that line editing / saves keep the correct color
-                for d in new_drawings:
-                    d["color"] = (color_q.red(), color_q.green(), color_q.blue())
-                    if "original_color" in d:
-                        d["original_color"] = vtk_color
-                
-                entry["color"] = color_q.name()
-            else:
-                entry["color"] = "#%02x%02x%02x" % (
-                    int(c[0] * 255), int(c[1] * 255), int(c[2] * 255))
-        except Exception:
-            entry["color"] = "#ffd43b"
-
-    # A raster imported before this vector may be stranded at pixel coords —
-    # now that positioned vector data exists, pull it onto the data extent.
-    _refit_pixel_rasters(app)
-    return True
+    if os.getenv("NAKSHA_GIS_LEGACY_DIGITIZER_IMPORT", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        print("   ⚠️ Falling back to legacy GeoPandas -> Digitizer GIS import")
+        return _import_generic_vector_via_digitizer(app, path, layer_name=layer_name)
+    return False
 
 
-def _import_geojson_via_digitizer(app, path: str) -> bool:
-    """
-    Read a GeoJSON with geopandas and push each feature through the digitizer,
-    mirroring import_drawings_from_shapefile_with_rendering's geometry handling.
-    """
+def _import_generic_vector_via_digitizer(app, path: str, layer_name=None) -> bool:
     try:
         import geopandas as gpd
     except ImportError:
-        print("   ⚠️ geopandas not installed — cannot import GeoJSON")
+        print("   ⚠️ geopandas not installed — cannot import vector GIS data")
         return False
 
     from gui.vector_export import _coords_to_scene_z, _infer_import_scene_z
-
     try:
-        gdf = gpd.read_file(path)
+        kwargs = {"layer": layer_name} if layer_name else {}
+        gdf = gpd.read_file(path, **kwargs)
     except Exception as exc:
-        print(f"   ❌ Could not read GeoJSON: {exc}")
+        print(f"   ❌ Could not read vector source {path}: {exc}")
         return False
 
-    # Establish/confirm the ONE authoritative canvas CRS from this GeoJSON's
-    # own CRS (first trustworthy dataset wins), then reproject into whatever
-    # canvas CRS is authoritative. Reading app.project_crs_epsg directly (the
-    # old behaviour) missed the case where THIS import is the first
-    # georeferenced dataset: the canvas CRS would never get established, and
-    # every later SNT/LAZ/basemap load would have nothing to align against.
+    # Preserve the source CRS before any display/project reprojection.
+    # Source metadata is required for faithful export/round-trip later.
+    _native_source_crs = gdf.crs
     target_crs = None
     try:
         from gui.crs_manager import ensure_canvas_crs, get_canvas_crs
-        if gdf.crs is not None:
-            ensure_canvas_crs(app, gdf.crs, source="GeoJSON CRS", dataset=path)
+        if _native_source_crs is not None:
+            ensure_canvas_crs(app, _native_source_crs, source=f"GIS layer CRS ({Path(path).name})", dataset=path)
         target_crs = get_canvas_crs(app)
-    except Exception as e:
-        print(f"   ⚠️ canvas CRS unavailable: {e}")
+    except Exception as exc:
+        print(f"   ❌ Project CRS setup failed: {exc}")
+        return False
+
+    # Legacy fallback is still fail-closed: never put unknown/raw coordinates
+    # into a georeferenced project, and never continue after reprojection fails.
+    if target_crs is not None and gdf.crs is None:
+        print(
+            f"   ❌ {Path(path).name} has no declared CRS while the Naksha project has "
+            "a Project CRS. Define/repair the source CRS before loading."
+        )
+        return False
     if target_crs is not None and gdf.crs is not None:
         try:
             if not gdf.crs.equals(target_crs):
-                print(f"   🔄 Reprojecting GeoJSON from {gdf.crs} to canvas CRS {target_crs}")
+                print(f"   🔄 Reprojecting {Path(path).name} from {gdf.crs} to canvas CRS {target_crs}")
                 gdf = gdf.to_crs(target_crs)
-        except Exception as e:
-            print(f"   ⚠️ Could not reproject GeoJSON: {e}")
+        except Exception as exc:
+            print(f"   ❌ Could not safely reproject vector source: {exc}")
+            return False
 
     scene_z = _infer_import_scene_z(app)
     dz = getattr(app, "digitizer", None)
     if dz is None:
-        print("   ❌ Digitizer is not initialized — cannot import GeoJSON")
+        print("   ❌ Digitizer is not initialized — cannot import vector GIS data")
         return False
     imported = 0
 
-    def _push(coords, dtype, color=(255, 255, 0)):
-        nonlocal imported
-        data = {"type": dtype, "coordinates": coords, "color": color}
-        if dz.add_drawing_from_data(data):
-            imported += 1
+    try:
+        source_crs_wkt = _native_source_crs.to_wkt() if _native_source_crs is not None else None
+    except Exception:
+        source_crs_wkt = str(_native_source_crs) if _native_source_crs is not None else None
+    try:
+        project_crs_wkt = target_crs.to_wkt() if target_crs is not None else source_crs_wkt
+    except Exception:
+        project_crs_wkt = str(target_crs) if target_crs is not None else source_crs_wkt
 
-    for _, row in gdf.iterrows():
+    def push(coords, dtype, attrs, fid, geometry_type, color=(255,255,0)):
+        nonlocal imported
+        data = {
+            "type": dtype, "coordinates": coords, "color": color,
+            "source_attributes": attrs, "source_fid": fid,
+            "source_layer": layer_name, "source_path": str(path),
+            "source_driver": Path(path).suffix.lower().lstrip("."),
+            "source_crs_wkt": source_crs_wkt,
+            "project_crs_wkt": project_crs_wkt,
+            "source_geometry_type": geometry_type,
+        }
+        if dz.add_drawing_from_data(data): imported += 1
+
+    def coords_for(geom):
+        return _coords_to_scene_z(list(geom.coords), scene_z)
+
+    for idx, row in gdf.iterrows():
         geom = row.geometry
-        if geom is None or geom.is_empty:
-            continue
+        if geom is None or geom.is_empty: continue
+        attrs = {}
+        for key, value in row.items():
+            if key == gdf.geometry.name: continue
+            try:
+                if value is None or (hasattr(value,"item") and callable(value.item)):
+                    value = value.item() if hasattr(value,"item") and callable(value.item) else value
+            except Exception: pass
+            attrs[str(key)] = value
         gt = geom.geom_type
         try:
-            if gt == "Point":
-                has_z = getattr(geom, "has_z", False)
-                raw = [(geom.x, geom.y, geom.z)] if has_z else [(geom.x, geom.y)]
-                _push(_coords_to_scene_z(raw, scene_z), "circle")
-            elif gt == "LineString":
-                _push(_coords_to_scene_z(list(geom.coords), scene_z), "smartline")
-            elif gt == "Polygon":
-                _push(_coords_to_scene_z(list(geom.exterior.coords), scene_z), "polygon")
-            elif gt in ("MultiLineString", "MultiPolygon", "MultiPoint"):
-                for part in geom.geoms:
-                    if part.is_empty:
-                        continue
-                    if part.geom_type == "LineString":
-                        _push(_coords_to_scene_z(list(part.coords), scene_z), "smartline")
-                    elif part.geom_type == "Polygon":
-                        _push(_coords_to_scene_z(list(part.exterior.coords), scene_z), "polygon")
-                    elif part.geom_type == "Point":
-                        has_z = getattr(part, "has_z", False)
-                        raw = [(part.x, part.y, part.z)] if has_z else [(part.x, part.y)]
-                        _push(_coords_to_scene_z(raw, scene_z), "circle")
-            else:
-                print(f"   ⚠️ Unsupported geometry: {gt}")
+            parts = list(geom.geoms) if gt.startswith("Multi") or gt == "GeometryCollection" else [geom]
+            for part in parts:
+                pgt = part.geom_type
+                if pgt == "Point":
+                    has_z = getattr(part,"has_z",False)
+                    raw=[(part.x,part.y,part.z)] if has_z else [(part.x,part.y)]
+                    push(_coords_to_scene_z(raw,scene_z),"circle",attrs,idx,pgt)
+                elif pgt in {"LineString","LinearRing"}:
+                    push(coords_for(part),"smartline",attrs,idx,pgt)
+                elif pgt == "Polygon":
+                    push(_coords_to_scene_z(list(part.exterior.coords),scene_z),"polygon",attrs,idx,pgt)
+                else:
+                    print(f"   ⚠️ Unsupported display geometry: {pgt}")
         except Exception as exc:
             print(f"   ⚠️ Feature skipped ({gt}): {exc}")
-
-    print(f"   ✅ GeoJSON: imported {imported} feature(s)")
+    print(f"   ✅ {Path(path).name}: imported {imported} feature(s)" + (f" from layer {layer_name}" if layer_name else ""))
     return imported > 0
+
+
+def _import_geojson_via_digitizer(app, path: str) -> bool:
+    return _import_generic_vector_via_digitizer(app, path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3089,12 +3479,7 @@ class AttributeTableDialog(QDialog):
         self.setMinimumSize(750, 500)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.Tool)
         
-        # Load theme stylesheet
-        try:
-            from gui.theme_manager import get_dialog_stylesheet
-            self.setStyleSheet(get_dialog_stylesheet())
-        except Exception:
-            pass
+        apply_gis_dialog_style(self)
             
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3117,7 +3502,7 @@ class AttributeTableDialog(QDialog):
         search_layout = QHBoxLayout()
         search_layout.setSpacing(6)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search attributes...")
+        self.search_box.setPlaceholderText("Search current page...")
         self.search_box.setClearButtonEnabled(True)
         try:
             from gui.gis.icons import icon as gicon
@@ -3196,13 +3581,39 @@ class AttributeTableDialog(QDialog):
         """)
         layout.addWidget(self.table)
         
+        # Paged attribute navigation. Only one datasource page is held in memory.
+        pager = QHBoxLayout()
+        pager.setSpacing(6)
+        self.prev_btn = QPushButton("Previous")
+        self.next_btn = QPushButton("Next")
+        self.page_lbl = QLabel("Page 1")
+        self.page_lbl.setAlignment(Qt.AlignCenter)
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        self.prev_btn.clicked.connect(lambda: self._load_page(max(0, self.current_page - 1)))
+        self.next_btn.clicked.connect(lambda: self._load_page(self.current_page + 1))
+        pager.addWidget(self.prev_btn)
+        pager.addWidget(self.page_lbl)
+        pager.addWidget(self.next_btn)
+        pager.addStretch()
+        layout.addLayout(pager)
+
         # Status Label
         self.status_lbl = QLabel("Loading attributes...")
         self.status_lbl.setStyleSheet("font-size: 9pt; color: gray; padding: 2px 0px;")
         layout.addWidget(self.status_lbl)
         
         self.headers = []
-        self.all_rows = []
+        self.all_rows = []          # current page only
+        self.page_size = 500
+        self.current_page = 0
+        self.total_rows = 0
+        self._field_names = []
+        self._fid_column = "FID"
+        self._geometry_column = "Shape"
+        self._field_domain_maps = {}
+        self._subtype_field = None
+        self._server_filter = None
         
         # Wire events
         self.search_box.textChanged.connect(self.filter_table)
@@ -3217,168 +3628,302 @@ class AttributeTableDialog(QDialog):
         else:
             self.populate_table()
 
-    def load_data(self) -> bool:
-        from osgeo import ogr
+    def _open_attribute_layer(self):
+        """Open the source datasource and resolve the exact registered layer."""
+        from osgeo import gdal
+
         path = self.entry.get("path")
         if not path:
-            return False
-            
+            return None, None
         try:
-            ds = ogr.Open(path, 0)
-        except Exception as e:
-            print(f"Error opening OGR datasource at {path}: {e}")
-            return False
-            
+            ds = gdal.OpenEx(str(path), gdal.OF_VECTOR | gdal.OF_READONLY)
+        except Exception as exc:
+            print(f"Error opening OGR datasource at {path}: {exc}")
+            return None, None
         if ds is None:
-            return False
-            
+            return None, None
+
+        layer_name = (
+            self.entry.get("gdb_layer_name")
+            or self.entry.get("source_layer")
+            or self.entry.get("layer_name")
+        )
         lyr = None
-        gdb_layer_name = self.entry.get("gdb_layer_name")
-        if gdb_layer_name:
+        if layer_name:
             try:
-                lyr = ds.GetLayerByName(gdb_layer_name)
+                lyr = ds.GetLayerByName(str(layer_name))
             except Exception:
-                pass
+                lyr = None
             if lyr is None:
-                for i in range(ds.GetLayerCount()):
-                    cand = ds.GetLayerByIndex(i)
-                    if cand and cand.GetName().lower() == gdb_layer_name.lower():
-                        lyr = cand
-                        break
+                try:
+                    wanted = str(layer_name).casefold()
+                    for i in range(ds.GetLayerCount()):
+                        cand = ds.GetLayerByIndex(i)
+                        if cand is not None and str(cand.GetName()).casefold() == wanted:
+                            lyr = cand
+                            break
+                except Exception:
+                    lyr = None
         else:
             try:
-                lyr = ds.GetLayer(0)
+                if ds.GetLayerCount() == 1:
+                    lyr = ds.GetLayerByIndex(0)
+                else:
+                    lyr = ds.GetLayerByIndex(0)
             except Exception:
-                pass
-                
+                lyr = None
         if lyr is None:
             ds = None
-            return False
-            
+            return None, None
+        return ds, lyr
+
+    def _setup_attribute_filter(self, lyr):
+        self._server_filter = None
+        if not (self.sub_code and self._subtype_field and self.sub_code != "default"):
+            return
         try:
-            # Get subtype_field and GDB engine
+            try:
+                code = int(self.sub_code)
+                expr = f'"{self._subtype_field}" = {code}'
+            except (TypeError, ValueError):
+                escaped = str(self.sub_code).replace("'", "''")
+                expr = f'"{self._subtype_field}" = \'{escaped}\''
+            if lyr.SetAttributeFilter(expr) == 0:
+                self._server_filter = expr
+        except Exception as exc:
+            print(f"Error applying OGR attribute filter: {exc}")
+
+    def _feature_matches_subtype(self, feat) -> bool:
+        if not (self.sub_code and self._subtype_field):
+            return True
+        try:
+            val = feat.GetField(self._subtype_field)
+            code = str(val).strip() if val is not None else "default"
+            try:
+                code = str(int(float(code)))
+            except Exception:
+                pass
+        except Exception:
+            code = "default"
+        sub_layers = self.entry.get("sub_layers", {}) or {}
+        if code not in sub_layers:
+            code = "default"
+        return code == str(self.sub_code)
+
+    @staticmethod
+    def _shape_display_value(feat):
+        geometry = feat.GetGeometryRef()
+        if geometry is None:
+            return "<Null>"
+        try:
+            from osgeo import ogr
+            geometry_type = ogr.wkbFlatten(geometry.GetGeometryType())
+            names = {
+                ogr.wkbPoint: "Point",
+                ogr.wkbMultiPoint: "Multipoint",
+                ogr.wkbLineString: "Polyline",
+                ogr.wkbMultiLineString: "Polyline",
+                ogr.wkbPolygon: "Polygon",
+                ogr.wkbMultiPolygon: "Polygon",
+            }
+            return names.get(geometry_type, ogr.GeometryTypeToName(geometry_type))
+        except Exception:
+            try:
+                return str(geometry.GetGeometryName()).title()
+            except Exception:
+                return "Geometry"
+
+    def _row_from_feature(self, feat):
+        row = [str(feat.GetFID()), self._shape_display_value(feat)]
+        for fname in self._field_names:
+            val = feat.GetField(fname)
+            if val is None:
+                row.append("")
+                continue
+            sval = str(val).strip()
+            if sval.startswith(":") or sval.startswith(";"):
+                sval = sval[1:].lstrip()
+            domain_map = self._field_domain_maps.get(fname)
+            if domain_map:
+                decoded = domain_map.get(sval)
+                if decoded is None:
+                    try:
+                        iv = int(float(sval))
+                        decoded = domain_map.get(iv) or domain_map.get(str(iv))
+                    except Exception:
+                        decoded = None
+                if decoded is not None:
+                    sval = f"{sval} ({decoded})"
+            row.append(sval)
+        return row
+
+    def load_data(self) -> bool:
+        """Load only schema/count metadata; feature rows are fetched page-by-page."""
+        ds, lyr = self._open_attribute_layer()
+        if ds is None or lyr is None:
+            return False
+        try:
             subtype_field = None
             engine = None
             gdb_path = self.entry.get("gdb_path")
-            if self.sub_code:
-                if gdb_path and gdb_layer_name:
-                    try:
-                        from gui.gis.gdb.engine import get_engine
-                        engine = get_engine(gdb_path)
-                        cascade = engine.get_cascade_data(gdb_layer_name) if engine else None
-                        if cascade and cascade.get("subtype_field"):
-                            subtype_field = cascade["subtype_field"]
-                    except Exception as e:
-                        print(f"Error getting subtype field for attribute table: {e}")
-            elif gdb_path and gdb_layer_name:
+            gdb_layer_name = self.entry.get("gdb_layer_name") or self.entry.get("source_layer")
+            if gdb_path and gdb_layer_name:
                 try:
                     from gui.gis.gdb.engine import get_engine
                     engine = get_engine(gdb_path)
-                except Exception:
-                    pass
+                    if self.sub_code:
+                        cascade = engine.get_cascade_data(gdb_layer_name) if engine else None
+                        if cascade and cascade.get("subtype_field"):
+                            subtype_field = cascade["subtype_field"]
+                except Exception as exc:
+                    print(f"Error getting GDB metadata for attribute table: {exc}")
+            self._subtype_field = subtype_field
 
-            # Fields introspection
             defn = lyr.GetLayerDefn()
-            field_names = []
+            self._field_names = []
             if defn:
                 for i in range(defn.GetFieldCount()):
-                    field_names.append(defn.GetFieldDefn(i).GetName())
-                    
-            # Retrieve domain mapping from GDB Engine
-            field_domain_maps = {}
+                    self._field_names.append(defn.GetFieldDefn(i).GetName())
+            try:
+                driver_name = str(ds.GetDriver().GetDescription() or "")
+            except Exception:
+                driver_name = ""
+            if driver_name in {"OpenFileGDB", "FileGDB"}:
+                # ArcGIS presents maintained geometry measures before fields
+                # supplied by the user. The driver creates these fields and
+                # updates their values whenever geometry changes.
+                managed_order = ("shape_length", "shape_area")
+                managed = {
+                    name.casefold(): name for name in self._field_names
+                    if name.casefold() in managed_order
+                }
+                user_fields = [
+                    name for name in self._field_names
+                    if name.casefold() not in managed_order
+                ]
+                self._field_names = [
+                    managed[key] for key in managed_order if key in managed
+                ] + user_fields
+
+            try:
+                self._fid_column = str(lyr.GetFIDColumn() or "").strip() or "FID"
+            except Exception:
+                self._fid_column = "FID"
+            try:
+                self._geometry_column = str(lyr.GetGeometryColumn() or "").strip() or "Shape"
+            except Exception:
+                self._geometry_column = "Shape"
+
+            self._field_domain_maps = {}
             if gdb_path and gdb_layer_name and engine:
                 try:
                     layer_key = engine._layer_key(gdb_layer_name)
                     field_domains = engine._field_domains.get(layer_key, {})
-                    for fname in field_names:
+                    for fname in self._field_names:
                         dname = field_domains.get(fname)
                         if dname and dname in engine.all_domains:
-                            field_domain_maps[fname] = engine.all_domains[dname]
-                except Exception as e:
-                    print(f"Error reading field domain mapping: {e}")
+                            self._field_domain_maps[fname] = engine.all_domains[dname]
+                except Exception as exc:
+                    print(f"Error reading field domain mapping: {exc}")
 
-            self.headers = ["FID"] + field_names
+            self.headers = [self._fid_column, self._geometry_column] + self._field_names
             self.table.setColumnCount(len(self.headers))
             self.table.setHorizontalHeaderLabels(self.headers)
             self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self.table.horizontalHeader().setStretchLastSection(False)
             self.table.verticalHeader().setDefaultSectionSize(20)
             self.table.verticalHeader().setMinimumSectionSize(16)
-            
-            # Apply server-side OGR attribute filter if subtype is selected & not default
-            if self.sub_code and subtype_field and self.sub_code != "default":
+
+            self._setup_attribute_filter(lyr)
+            # Prefer the already-known source feature count; subtype entries carry
+            # their own exact counts from the native GDB reader.
+            count_hint = None
+            if self.sub_code:
                 try:
-                    try:
-                        int_code = int(self.sub_code)
-                        filter_str = f"{subtype_field} = {int_code}"
-                    except ValueError:
-                        filter_str = f"{subtype_field} = '{self.sub_code}'"
-                    lyr.SetAttributeFilter(filter_str)
-                except Exception as e:
-                    print(f"Error applying OGR attribute filter: {e}")
-
-            # Extract features
-            lyr.ResetReading()
-            feat = lyr.GetNextFeature()
-            self.all_rows = []
-            while feat is not None:
-                # Fallback subclass filtering (in case driver filter is partially supported)
-                if self.sub_code and subtype_field:
-                    try:
-                        val = feat.GetField(subtype_field)
-                        feat_sub_code = str(val).strip() if val is not None else "default"
-                        try:
-                            feat_sub_code = str(int(float(feat_sub_code)))
-                        except Exception:
-                            pass
-                    except Exception:
-                        feat_sub_code = "default"
-                    
-                    sub_layers = self.entry.get("sub_layers", {})
-                    if feat_sub_code not in sub_layers:
-                        feat_sub_code = "default"
-                        
-                    if feat_sub_code != self.sub_code:
-                        feat = lyr.GetNextFeature()
-                        continue
-
-                fid = feat.GetFID()
-                row = [str(fid)]
-                for fname in field_names:
-                    val = feat.GetField(fname)
-                    if val is None:
-                        row.append("")
-                    else:
-                        sval = str(val).strip()
-                        # Strip leading colons or semicolons
-                        if sval.startswith(":") or sval.startswith(";"):
-                            sval = sval[1:].lstrip()
-                        
-                        # Decoded domain matching
-                        if fname in field_domain_maps:
-                            domain_map = field_domain_maps[fname]
-                            decoded_val = domain_map.get(sval)
-                            if decoded_val is None:
-                                try:
-                                    int_val = int(float(sval))
-                                    decoded_val = domain_map.get(int_val) or domain_map.get(str(int_val))
-                                except Exception:
-                                    pass
-                            if decoded_val is not None:
-                                sval = f"{sval} ({decoded_val})"
-                                
-                        row.append(sval)
-                self.all_rows.append(row)
-                feat = lyr.GetNextFeature()
+                    count_hint = (self.entry.get("sub_layers") or {}).get(self.sub_code, {}).get("feature_count")
+                except Exception:
+                    count_hint = None
+            if count_hint is None:
+                try:
+                    count_hint = lyr.GetFeatureCount(0)
+                except Exception:
+                    count_hint = self.entry.get("feature_count", -1)
+            try:
+                parsed_count = int(count_hint)
+            except Exception:
+                parsed_count = -1
+            self.total_rows = parsed_count if parsed_count >= 0 else -1
         finally:
             try:
                 lyr.SetAttributeFilter(None)
             except Exception:
                 pass
             ds = None
-            import gc
-            gc.collect()
-            
+
+        return self._load_page(0)
+
+    def _load_page(self, page: int) -> bool:
+        page = max(0, int(page))
+        ds, lyr = self._open_attribute_layer()
+        if ds is None or lyr is None:
+            return False
+        rows = []
+        try:
+            self._setup_attribute_filter(lyr)
+            target_skip = page * self.page_size
+            matched_seen = 0
+            lyr.ResetReading()
+
+            # SetNextByIndex is efficient for ordinary layers and for server-side
+            # subtype filters. Default/fallback subtype classification still needs
+            # a scan because its meaning is "anything not assigned to a known code".
+            can_seek = not (self.sub_code and self._subtype_field and self.sub_code == "default")
+            if can_seek and target_skip:
+                try:
+                    rc = lyr.SetNextByIndex(target_skip)
+                    if rc == 0:
+                        matched_seen = target_skip
+                    else:
+                        can_seek = False
+                except Exception:
+                    can_seek = False
+
+            while len(rows) < self.page_size:
+                feat = lyr.GetNextFeature()
+                if feat is None:
+                    break
+                if not self._feature_matches_subtype(feat):
+                    feat = None
+                    continue
+                if matched_seen < target_skip:
+                    matched_seen += 1
+                    feat = None
+                    continue
+                rows.append(self._row_from_feature(feat))
+                matched_seen += 1
+                feat = None
+        finally:
+            try:
+                lyr.SetAttributeFilter(None)
+            except Exception:
+                pass
+            ds = None
+
+        self.current_page = page
+        self.all_rows = rows
+        self.populate_table()
+        if self.total_rows >= 0:
+            total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+            self.page_lbl.setText(f"Page {page + 1} of {total_pages}")
+        else:
+            self.page_lbl.setText(f"Page {page + 1}")
+        self.prev_btn.setEnabled(page > 0)
+        # If total count is reliable, use it. The page-size fallback still works
+        # for drivers that return an unknown/approximate count.
+        if self.total_rows >= 0:
+            self.next_btn.setEnabled((page + 1) * self.page_size < self.total_rows)
+        else:
+            self.next_btn.setEnabled(len(rows) >= self.page_size)
         return True
 
     def populate_table(self):
@@ -3386,63 +3931,80 @@ class AttributeTableDialog(QDialog):
 
     def filter_table(self, query: str):
         query = query.strip().lower()
-        filtered_rows = []
-        for row in self.all_rows:
-            if not query:
-                filtered_rows.append(row)
-            else:
-                match = False
-                for val in row:
-                    if query in val.lower():
-                        match = True
-                        break
-                if match:
-                    filtered_rows.append(row)
-                    
-        # Performance protection threshold
-        MAX_ROWS = 2000
-        shown_count = min(len(filtered_rows), MAX_ROWS)
-        
-        self.table.setRowCount(shown_count)
-        for r in range(shown_count):
-            row_vals = filtered_rows[r]
+        filtered_rows = [
+            row for row in self.all_rows
+            if not query or any(query in str(val).lower() for val in row)
+        ]
+        self.table.setRowCount(len(filtered_rows))
+        for r, row_vals in enumerate(filtered_rows):
             for col, val in enumerate(row_vals):
-                item = QTableWidgetItem(val)
-                if len(val) > 30:
-                    item.setToolTip(val)
+                text = str(val)
+                item = QTableWidgetItem(text)
+                if len(text) > 30:
+                    item.setToolTip(text)
                 self.table.setItem(r, col, item)
-                
-        total = len(self.all_rows)
-        filtered = len(filtered_rows)
-        if filtered > MAX_ROWS:
-            self.status_lbl.setText(f"Showing first {MAX_ROWS} of {filtered} matching features (Total: {total})")
-        elif query:
-            self.status_lbl.setText(f"Showing {filtered} of {total} features (Filter: '{query}')")
+
+        page_start = self.current_page * self.page_size + 1 if self.all_rows else 0
+        page_end = self.current_page * self.page_size + len(self.all_rows)
+        total_text = f"{self.total_rows:,}" if self.total_rows >= 0 else "unknown"
+        if query:
+            self.status_lbl.setText(
+                f"{len(filtered_rows)} match(es) on current page; rows {page_start}-{page_end} "
+                f"of {total_text} total."
+            )
         else:
-            self.status_lbl.setText(f"Total features: {total}")
-            
-        self.table.resizeColumnsToContents()
+            self.status_lbl.setText(
+                f"Rows {page_start}-{page_end} of {total_text} total; "
+                f"{self.page_size} rows per page."
+            )
+        # Avoid resizeColumnsToContents() on every keystroke for very wide tables.
+        if not query:
+            self.table.resizeColumnsToContents()
 
     def export_to_csv(self):
+        """Stream the entire source layer to CSV without loading it all into memory."""
         from PySide6.QtWidgets import QFileDialog, QMessageBox
         import csv
-        
-        if not self.all_rows:
+
+        if not self.headers:
             QMessageBox.information(self, "Export CSV", "No attributes to export.")
             return
-            
         default_name = f"{self.layer_name}_attributes.csv"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Attribute Table to CSV", default_name, "CSV Files (*.csv)"
         )
         if not path:
             return
-            
+
+        ds, lyr = self._open_attribute_layer()
+        if ds is None or lyr is None:
+            QMessageBox.critical(self, "Export CSV", "Could not reopen the source GIS layer.")
+            return
         try:
+            self._setup_attribute_filter(lyr)
+            lyr.ResetReading()
+            written = 0
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(self.headers)
-                writer.writerows(self.all_rows)
-            QMessageBox.information(self, "Export CSV", f"Successfully exported attributes to:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export CSV", f"Failed to export CSV:\n{e}")
+                while True:
+                    feat = lyr.GetNextFeature()
+                    if feat is None:
+                        break
+                    if not self._feature_matches_subtype(feat):
+                        feat = None
+                        continue
+                    writer.writerow(self._row_from_feature(feat))
+                    written += 1
+                    feat = None
+            QMessageBox.information(
+                self, "Export CSV", f"Exported {written:,} feature row(s) to:\n{path}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export CSV", f"Failed to export CSV:\n{exc}")
+        finally:
+            try:
+                lyr.SetAttributeFilter(None)
+            except Exception:
+                pass
+            ds = None

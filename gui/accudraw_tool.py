@@ -287,14 +287,16 @@ class AccuDrawTool(QObject):
 
         self._rebuild_or_create_drawing()
 
-        if self.drawing is not None:
-            self.drawing["type"] = "polyline"
-            self.drawing["source"] = "accudraw"
-            self.drawing["coords"] = list(self.points)
-            self.drawing["finalized"] = True
-            self.drawing["committed"] = True
-            self.drawing["layer"] = self.drawing.get("layer", "DIGITIZER")
-
+        finished_drawing = self.drawing
+        if finished_drawing is not None:
+            finished_drawing["type"] = "polyline"
+            finished_drawing["source"] = "accudraw"
+            finished_drawing["coords"] = list(self.points)
+            finished_drawing["finalized"] = True
+            finished_drawing["committed"] = True
+            finished_drawing["layer"] = finished_drawing.get("layer", "DIGITIZER")
+            if hasattr(self.digitizer, "_emit_drawing_finalized"):
+                self.digitizer._emit_drawing_finalized(finished_drawing)
         finished_count = len(self.points)
 
         # Detach committed drawing from active AccuDraw draft.
@@ -851,6 +853,7 @@ class AccuDrawTool(QObject):
         """
         raw = np.asarray(self._clean_point(raw_point), dtype=np.float64)
 
+        was_locked = self._angle_highlight_active
         self._angle_highlight_active = False
 
         if not self.points:
@@ -897,8 +900,20 @@ class AccuDrawTool(QObject):
         # Smallest angle difference.
         diff = abs((actual_angle - target_angle + 180.0) % 360.0 - 180.0)
 
+        # Sticky snap: entering the lock still requires the cursor within
+        # the configured tolerance, but once locked, small hand jitter
+        # while dragging out along that exact angle (to set the segment's
+        # length) must not immediately kick it back out to the raw cursor
+        # angle - that made it feel like the line wouldn't actually hold
+        # the target angle. Staying locked instead uses a wider exit
+        # tolerance, so the line only lets go once you deliberately steer
+        # the cursor well away from the target angle. The user can still
+        # move the cursor freely the whole time - only the angle is held,
+        # never the distance.
+        effective_tolerance = tolerance * 3.5 if was_locked else tolerance
+
         # If mouse comes near the user-given angle, highlight and snap.
-        if diff <= tolerance:
+        if diff <= effective_tolerance:
             theta = math.radians(target_angle)
             direction = np.asarray([math.cos(theta), math.sin(theta)], dtype=np.float64)
 

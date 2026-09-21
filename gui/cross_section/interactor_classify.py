@@ -17,10 +17,20 @@
 # )
 # from PySide6.QtCore import QTimer, QObject, QEvent
 # from PySide6.QtCore import Qt, QPoint, QPointF, QLineF
-# from PySide6.QtGui import QPainter, QColor, QPen
+# from PySide6.QtGui import QPainter, QColor, QPen, QMouseEvent
 # import pyvista as pv
 
-# _INTERACTOR_DEBUG = False
+# _INTERACTOR_DEBUG = True
+
+# # MicroStation-style tap-vs-drag for above/below/parallel-line tools: a brief
+# # settle window right after press during which mouse movement is never
+# # counted toward drag detection (a real fast tap's hand jitter happens almost
+# # entirely within this window), plus the distance threshold (top of
+# # MicroStation's own stated 4-6px range) that decides drag once past it.
+# # Shared by _on_mouse_move_with_preview (accumulation) and on_left_release
+# # (the tap-vs-drag decision) so both stay in sync.
+# _LINE_TAP_GRACE_SEC = 0.12
+# _LINE_TAP_DRAG_THRESHOLD_PX = 6.0
 
 
 # def print(*args, **kwargs):  # type: ignore[override]
@@ -296,14 +306,115 @@
 
 
 # class ClassificationDoubleClickFilter(QObject):
-#     def __init__(self, parent=None):
+#     def __init__(self, parent=None, owner=None):
 #         super().__init__(parent)
 #         self.ignore_until = 0.0
+#         # Wrapping ClassificationInteractor, if provided — lets this filter know
+#         # which classify tool is active without importing app_window here.
+#         self.owner = owner
 
 #     def eventFilter(self, obj, event):
 #         if event is not None:
 #             et = event.type()
 #             if et in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
+#                 # ✅ MicroStation tap-tap tools (above/below/parallel line) are two
+#                 # deliberate clicks placed fast — well inside the OS double-click
+#                 # window. Swallowing that here as a "double click" would eat the
+#                 # second tap entirely (and block clicks for 500ms after), making
+#                 # fast continuous classification look like it randomly stalls.
+#                 # These tools don't use double-click for anything, so let every
+#                 # click pass straight through untouched.
+#                 app = getattr(self.owner, "app", None)
+#                 if getattr(app, "active_classify_tool", None) in (
+#                     "above_line", "below_line", "parallel_line"
+#                 ):
+#                     # This filter exists only to normalize rapid LEFT-button
+#                     # tap/tap input. Never translate middle-button pan (or
+#                     # right-button navigation) into a synthetic left click.
+#                     try:
+#                         event_button = event.button()
+#                         held_buttons = event.buttons()
+#                         if (
+#                             event_button == Qt.MiddleButton
+#                             or bool(held_buttons & Qt.MiddleButton)
+#                         ):
+#                             return False
+#                         if (
+#                             event_button not in (Qt.LeftButton, Qt.NoButton)
+#                             and not bool(held_buttons & Qt.LeftButton)
+#                         ):
+#                             return False
+#                     except Exception:
+#                         return False
+
+#                     # ROOT CAUSE of "classification silently stops responding
+#                     # mid-session" — two distinct bugs, both bypassed here by
+#                     # driving VTK's interactor directly instead of going
+#                     # through Qt's mousePressEvent/mouseReleaseEvent:
+#                     #
+#                     # 1) Under rapid tap-tap clicking, Qt/Windows can deliver a
+#                     #    Press or Release QMouseEvent where event.button()
+#                     #    intermittently comes back NoButton even though
+#                     #    event.buttons() (the held-button bitmask) correctly
+#                     #    shows LeftButton. QVTKRenderWindowInteractor's
+#                     #    mousePressEvent/mouseReleaseEvent gate purely on
+#                     #    event.button(), so the click is silently swallowed —
+#                     #    no exception, no crash, just dead silence forever
+#                     #    after. A coalesced second tap can also arrive as a
+#                     #    genuine MouseButtonDblClick, which this VTK class
+#                     #    never overrides either.
+#                     #
+#                     # 2) PyVista's own RenderWindowInteractor caches the style
+#                     #    it thinks is active and periodically reasserts it via
+#                     #    its own internal chart/context-style bookkeeping.
+#                     #    Since we set styles by calling SetInteractorStyle
+#                     #    directly on the raw VTK interactor (bypassing
+#                     #    pyvista's `.style` property), that cache goes stale
+#                     #    and pyvista silently stomps our style back to its own
+#                     #    default TrackballCamera mid-session.
+#                     try:
+#                         if et == QEvent.MouseButtonDblClick:
+#                             # Re-run SetInteractorStyle with our own style —
+#                             # this is the exact call
+#                             # attach_classification_to_all_section_views()
+#                             # makes when re-arming a tool onto an unchanged
+#                             # interactor, which reliably un-freezes a stuck
+#                             # session. Do it proactively here too.
+#                             style = getattr(self.owner, "style", None)
+#                             if style is not None:
+#                                 try:
+#                                     obj.SetInteractorStyle(style)
+#                                 except Exception:
+#                                     pass
+#                         pos = event.position()
+#                         ctrl = bool(event.modifiers() & Qt.ControlModifier)
+#                         shift = bool(event.modifiers() & Qt.ShiftModifier)
+#                         if hasattr(obj, "_setEventInformation"):
+#                             obj._setEventInformation(pos.x(), pos.y(), ctrl, shift, chr(0), 0, None)
+#                         iren = getattr(obj, "_Iren", obj)
+#                         # Self-heal bug (2): if the live style on the render
+#                         # window has drifted from ours, restore it before
+#                         # dispatching — every time, unconditionally, rather
+#                         # than trying to catch every place pyvista might do
+#                         # this internally.
+#                         try:
+#                             live_style = iren.GetInteractorStyle() if hasattr(iren, "GetInteractorStyle") else None
+#                             mine = getattr(self.owner, "style", None)
+#                             if live_style is not None and mine is not None and str(live_style) != str(mine):
+#                                 obj.SetInteractorStyle(mine)
+#                         except Exception:
+#                             pass
+#                         if hasattr(iren, "GetEnabled") and not iren.GetEnabled():
+#                             iren.Enable()
+#                         obj._ActiveButton = Qt.LeftButton
+#                         if et == QEvent.MouseButtonRelease:
+#                             iren.LeftButtonReleaseEvent()
+#                         else:
+#                             iren.LeftButtonPressEvent()
+#                     except Exception:
+#                         pass
+#                     event.accept()
+#                     return True
 #                 try:
 #                     import time
 #                     now = time.time()
@@ -387,11 +498,29 @@
 #         self.interactor.SetInteractorStyle(self.style)
 
 #         # Block Qt-level double clicks to prevent propagation to QDockWidget (which causes deactivation)
-#         self._dblclick_filter = ClassificationDoubleClickFilter(self.interactor)
+#         self._dblclick_filter = ClassificationDoubleClickFilter(self.interactor, owner=self)
 #         self.interactor.installEventFilter(self._dblclick_filter)
 
 #         # disable double-click reset and abort event
-#         self.style.AddObserver("LeftButtonDoubleClickEvent", lambda o, e: o.AbortFlagOn() if hasattr(o, "AbortFlagOn") else None)
+#         #
+#         # ROOT CAUSE of "classification silently stops responding mid-session":
+#         # when two taps land close enough together for the OS to coalesce them,
+#         # Qt delivers a MouseButtonDblClick, and QVTKRenderWindowInteractor's own
+#         # mousePressEvent sets repeat=1 for it. VTK's interactor then fires
+#         # "LeftButtonDoubleClickEvent" INSTEAD OF "LeftButtonPressEvent" for that
+#         # click. Previously we just AbortFlagOn()'d it here (to block VTK's
+#         # default double-click camera behavior) — which silently ate the tap
+#         # entirely for above/below/parallel-line tools. Since that tap never
+#         # reached on_left_press, click_to_finalize/P1 state was left dangling,
+#         # and the interaction looked "stuck" even though every later real click
+#         # kept arriving fine (confirmed via QApplication.notify tracing).
+#         def _on_left_dbl_click(o, e):
+#             tool = getattr(getattr(self, "app", None), "active_classify_tool", None)
+#             if tool in ("above_line", "below_line", "parallel_line"):
+#                 self.on_left_press(o, e)
+#             if hasattr(o, "AbortFlagOn"):
+#                 o.AbortFlagOn()
+#         self.style.AddObserver("LeftButtonDoubleClickEvent", _on_left_dbl_click)
 
 #         # attach events
 #         self.style.AddObserver("LeftButtonPressEvent", self.on_left_press)
@@ -510,6 +639,103 @@
 #             self.is_drawing_freehand = False
 #             self._clear_all_previews()
 #             self._last_active_tool = current_tool
+
+#     def _has_incomplete_classification_gesture(self):
+#         """Return whether this view owns classification input that is not finished."""
+#         gesture_tool = (
+#             getattr(self, "_gesture_tool", None)
+#             or getattr(getattr(self, "app", None), "active_classify_tool", None)
+#         )
+#         # Brush changes are applied continuously while dragging and its release
+#         # path records the undo entry. Never discard that transactional state as
+#         # if it were a preview-only gesture.
+#         if gesture_tool == "brush":
+#             return False
+
+#         drawing_points = getattr(self, "drawing_points", None)
+#         cut_drawing_points = getattr(self, "drawing_points_display_cut", None)
+#         cut_world_points = getattr(self, "drawing_points_world_cut", None)
+
+#         return bool(
+#             getattr(self, "P1", None) is not None
+#             or getattr(self, "P1_display_cut", None) is not None
+#             or getattr(self, "is_dragging", False)
+#             or getattr(self, "click_to_finalize", False)
+#             or getattr(self, "is_drawing_freehand", False)
+#             or (drawing_points is not None and len(drawing_points) > 0)
+#             or (cut_drawing_points is not None and len(cut_drawing_points) > 0)
+#             or (cut_world_points is not None and len(cut_world_points) > 0)
+#         )
+
+#     def _cancel_incomplete_classification_gesture(self):
+#         """Cancel this view's transient gesture without changing the active tool."""
+#         if not self._has_incomplete_classification_gesture():
+#             return False
+
+#         try:
+#             self._stop_deferred_left_release_watch()
+#         except Exception:
+#             pass
+#         try:
+#             self._suppress_snt_text(False)
+#         except Exception:
+#             pass
+
+#         self._gesture_tool = None
+#         self._press_pos = None
+#         self._line_press_max_move_px = 0.0
+#         self._last_line_preview_P2 = None
+#         self._last_rectangle_preview_P2 = None
+#         self._last_circle_preview_P2 = None
+
+#         app = getattr(self, "app", None)
+#         if app is not None:
+#             app._classification_preview_active = False
+#             app._suppress_section_refresh = False
+
+#         self._clear_all_previews()
+#         return True
+
+#     def _cancel_incomplete_classification_gestures_in_other_views(self):
+#         """Make an unfinished classification gesture exclusive to one section view."""
+#         app = getattr(self, "app", None)
+#         if app is None:
+#             return 0
+
+#         peers = []
+#         section_interactors = getattr(app, "classify_interactors", None)
+#         if isinstance(section_interactors, dict):
+#             peers.extend(section_interactors.values())
+
+#         cut_interactor = getattr(app, "cut_classify_interactor", None)
+#         if cut_interactor is not None:
+#             peers.append(cut_interactor)
+
+#         cancelled = 0
+#         seen = set()
+#         for peer in peers:
+#             if peer is None or peer is self:
+#                 continue
+#             marker = id(peer)
+#             if marker in seen:
+#                 continue
+#             seen.add(marker)
+
+#             cancel = getattr(peer, "_cancel_incomplete_classification_gesture", None)
+#             if not callable(cancel):
+#                 continue
+#             try:
+#                 if cancel():
+#                     cancelled += 1
+#             except Exception as exc:
+#                 print(f"⚠️ Failed to clear classification preview in another view: {exc}")
+
+#         if cancelled:
+#             print(
+#                 f"🧹 Cleared unfinished classification gesture from "
+#                 f"{cancelled} other view(s)"
+#             )
+#         return cancelled
 
 #     def _notify_style_left_button_up(self):
 #         """
@@ -1185,12 +1411,6 @@
 #                         f"✅ {len(indices):,} points → class {to_class}", 3000
 #                     )
 
-#                 # 🖌️ Final exact stroke count → top bar center
-#                 try:
-#                     self.app._update_classify_count_display(int(len(indices)))
-#                 except Exception:
-#                     pass
-
 #             if getattr(self.app, "display_mode", "class") != "shaded_class":
 #                 self.app._gpu_sync_done = True
 #                 self.app._section_visibility_refresh_required = False
@@ -1524,21 +1744,6 @@
 #             if self.interactor is None:
 #                 return
             
-#             # ═══════════════════════════════════════════════════════════════
-#             # ✅ CRITICAL: Verify middle button is actually pressed via Qt
-#             # VTK sends phantom MiddleButtonPressEvent after classification
-#             # ═══════════════════════════════════════════════════════════════
-#             try:
-#                 from PySide6.QtWidgets import QApplication
-#                 from PySide6.QtCore import Qt
-#                 buttons = QApplication.mouseButtons()
-#                 is_valid_press = bool(buttons & Qt.MiddleButton)
-#                 if not is_valid_press:
-#                     # Phantom event - ignore completely
-#                     return
-#             except Exception:
-#                 pass
-            
 #             self._is_panning = True
 #             self._last_pan_pos = self.interactor.GetEventPosition()
 
@@ -1605,31 +1810,12 @@
 
 #     def _do_safe_pan(self):
 #         """
-#         Execute pan: move camera by mouse delta.
-#         ✅ CRITICAL FIX: Verify middle button is ACTUALLY pressed before panning.
-#         This prevents phantom pan from corrupted VTK interactor state.
+#         Execute pan from the VTK middle-button press/release state.
+
+#         Qt's global mouse-button state is intentionally not consulted here:
+#         QVTK delivery can clear it before this callback even though the
+#         physical middle-button gesture is still active.
 #         """
-#         # ═══════════════════════════════════════════════════════════════════
-#         # ✅ CRITICAL: Check Qt button state, not just our flag
-#         # VTK can send phantom MiddleButtonPressEvent after classification
-#         # tools complete, setting _is_panning=True incorrectly.
-#         # ═══════════════════════════════════════════════════════════════════
-#         try:
-#             from PySide6.QtWidgets import QApplication
-#             from PySide6.QtCore import Qt
-#             buttons = QApplication.mouseButtons()
-#             middle_actually_pressed = bool(buttons & Qt.MiddleButton)
-            
-#             if not middle_actually_pressed:
-#                 # Middle button not pressed - reset our flag if it was set
-#                 if self._is_panning:
-#                     self._is_panning = False
-#                 return
-#         except Exception:
-#             # Fallback: use our flag only
-#             if not getattr(self, '_is_panning', False):
-#                 return
-        
 #         if not getattr(self, '_is_panning', False):
 #             return
         
@@ -1796,9 +1982,15 @@
 #         if self._cached_renderer is None:
 #             return (0.0, 0.0, 0.0)
 
-#         coord = vtk.vtkCoordinate()
-#         coord.SetCoordinateSystemToDisplay()
-#         coord.SetValue(x, y, 0)
+#         # Reuse the VTK coordinate object. Main-view freehand now captures
+#         # native mouse samples before the preview-render throttle, so creating
+#         # a SWIG object per MouseMove would add avoidable interaction jitter.
+#         coord = getattr(self, "_display_to_world_coord", None)
+#         if coord is None:
+#             coord = vtk.vtkCoordinate()
+#             coord.SetCoordinateSystemToDisplay()
+#             self._display_to_world_coord = coord
+#         coord.SetValue(float(x), float(y), 0.0)
 #         try:
 #             return coord.GetComputedWorldValue(self._cached_renderer)
 #         except Exception:
@@ -2874,6 +3066,96 @@
 #         result.append(list(pts[-1]))
 #         return result
 
+
+#     @staticmethod
+#     def _centripetal_catmull_rom_smooth(points, steps=4):
+#         """Corner-safe MAIN-view freehand spline for uneven mouse samples."""
+#         import numpy as _np
+#         pts = _np.asarray(points, dtype=_np.float64)
+#         n = len(pts)
+#         if n < 2:
+#             return [tuple(map(float, p)) for p in pts]
+#         if n == 2:
+#             return [tuple(map(float, p)) for p in pts]
+
+#         steps = max(2, int(steps))
+#         eps = 1.0e-9
+#         out = []
+
+#         def _tj(ti, pa, pb):
+#             dist = float(_np.linalg.norm(pb - pa))
+#             return ti + max(dist ** 0.5, 1.0e-6)
+
+#         def _blend(pa, pb, ta, tb, t):
+#             den = tb - ta
+#             if abs(den) <= eps:
+#                 return pa.copy()
+#             return ((tb - t) / den) * pa + ((t - ta) / den) * pb
+
+#         for i in range(n - 1):
+#             p1 = pts[i]
+#             p2 = pts[i + 1]
+#             p0 = pts[i - 1] if i > 0 else (2.0 * p1 - p2)
+#             p3 = pts[i + 2] if (i + 2) < n else (2.0 * p2 - p1)
+
+#             t0 = 0.0
+#             t1 = _tj(t0, p0, p1)
+#             t2 = _tj(t1, p1, p2)
+#             t3 = _tj(t2, p2, p3)
+
+#             taus = _np.linspace(t1, t2, steps, endpoint=False)
+#             chord = p2 - p1
+#             chord2 = float(_np.dot(chord, chord))
+
+#             for t in taus:
+#                 a1 = _blend(p0, p1, t0, t1, t)
+#                 a2 = _blend(p1, p2, t1, t2, t)
+#                 a3 = _blend(p2, p3, t2, t3, t)
+#                 b1 = _blend(a1, a2, t0, t2, t)
+#                 b2 = _blend(a2, a3, t1, t3, t)
+#                 q = _blend(b1, b2, t1, t2, t)
+
+#                 if chord2 > eps:
+#                     progress = float(_np.dot(q - p1, chord) / chord2)
+#                     tau01 = float((t - t1) / max(t2 - t1, eps))
+#                     if (not _np.isfinite(progress)) or progress < -0.02 or progress > 1.02:
+#                         q = p1 + tau01 * chord
+
+#                 if _np.all(_np.isfinite(q)):
+#                     out.append((float(q[0]), float(q[1])))
+
+#         out.append((float(pts[-1, 0]), float(pts[-1, 1])))
+#         return out
+
+#     def _capture_main_freehand_sample(self, dx, dy, min_pixel_step=2.0):
+#         """Capture MAIN freehand path at native MouseMove cadence, without rendering."""
+#         if not getattr(self, "is_drawing_freehand", False):
+#             return False
+#         if not self._is_main_view():
+#             return False
+
+#         try:
+#             dx = float(dx)
+#             dy = float(dy)
+#             last = getattr(self, "_last_freehand_display_pos", None)
+#             if last is not None:
+#                 ddx = dx - float(last[0])
+#                 ddy = dy - float(last[1])
+#                 if (ddx * ddx + ddy * ddy) < float(min_pixel_step) ** 2:
+#                     return False
+
+#             pt = self._display_to_world_fast(dx, dy)
+#             u, v = self._get_view_coordinates(pt)
+#             if not (np.isfinite(float(u)) and np.isfinite(float(v))):
+#                 return False
+
+#             self.drawing_points.append((float(u), float(v)))
+#             self._last_freehand_display_pos = (dx, dy)
+#             self._freehand_native_samples = int(getattr(self, "_freehand_native_samples", 0)) + 1
+#             return True
+#         except Exception:
+#             return False
+
 #     def _draw_freehand_preview(self, live_point=None):
 #         """
 #         ✅ PERFORMANCE FIX: Reuse VTK actor — NO RemoveActor/AddActor per frame.
@@ -3375,27 +3657,6 @@
 #             """
 #             self._check_tool_changed()
 
-#             # Capture deliberate line-drag distance before preview throttling.
-#             # Quick taps often contain normal OS/VTK pointer jitter.
-#             active_tool = getattr(self.app, "active_classify_tool", None)
-#             press_pos = getattr(self, "_press_pos", None)
-#             if (
-#                 active_tool in ("above_line", "below_line", "parallel_line")
-#                 and press_pos is not None
-#                 and not getattr(self, "click_to_finalize", False)
-#             ):
-#                 try:
-#                     move_x, move_y = self.interactor.GetEventPosition()
-#                     movement = (
-#                         (move_x - press_pos[0]) ** 2
-#                         + (move_y - press_pos[1]) ** 2
-#                     ) ** 0.5
-#                     self._line_press_max_move_px = max(
-#                         float(getattr(self, "_line_press_max_move_px", 0.0)),
-#                         float(movement),
-#                     )
-#                 except Exception:
-#                     pass
 #             import numpy as np  # ✅ IMPORTANT: prevents UnboundLocalError for np in this method
 
 #             # ══════════════════════════════════════════════════════════════════
@@ -3417,6 +3678,50 @@
 #                 except Exception:
 #                     pass
 #                 return
+
+#             # ══════════════════════════════════════════════════════════════════
+#             # LINE TAP-VS-DRAG: track the MAXIMUM distance moved from the press
+#             # point while the button is held — not just the final displacement
+#             # at release. MicroStation's own state machine commits to DRAGGING
+#             # the instant the threshold is crossed and stays committed even if
+#             # the cursor drifts back near the origin before release; checking
+#             # only net (press→release) displacement would wrongly reclassify
+#             # a "dragged out and back" gesture as a tap. This runs unthrottled
+#             # (before the 16ms preview-rate skip below) so a fast drag can't
+#             # slip past the peak between throttled frames.
+#             #
+#             # Movement during the initial grace window (_LINE_TAP_GRACE_SEC,
+#             # matching on_left_release) is never accumulated at all — a real
+#             # fast tap's natural hand jitter happens almost entirely within
+#             # this window, and MicroStation itself does not start counting
+#             # distance toward drag detection until this brief settle period
+#             # has passed.
+#             # ══════════════════════════════════════════════════════════════════
+#             if getattr(self, 'is_dragging', False) and getattr(self, '_press_pos', None) is not None:
+#                 _mm_tool = getattr(getattr(self, 'app', None), "active_classify_tool", None)
+#                 if (_mm_tool in ("above_line", "below_line", "parallel_line")
+#                         and (time.time() - getattr(self, '_line_press_time', 0.0)) >= _LINE_TAP_GRACE_SEC):
+#                     try:
+#                         _cx, _cy = self.interactor.GetEventPosition()
+#                         _px, _py = self._press_pos
+#                         _d = ((_cx - _px) ** 2 + (_cy - _py) ** 2) ** 0.5
+#                         if _d > getattr(self, '_line_press_max_move_px', 0.0):
+#                             self._line_press_max_move_px = _d
+#                     except Exception:
+#                         pass
+
+#             # MAIN FREEHAND ONLY: capture geometry before the generic preview
+#             # throttle. Rendering may stay at 30 FPS on huge point clouds, but
+#             # the hand path itself is sampled at native mouse-event cadence.
+#             try:
+#                 _pre_tool = getattr(getattr(self, "app", None), "active_classify_tool", None)
+#                 if (_pre_tool == "freehand"
+#                         and getattr(self, "is_drawing_freehand", False)
+#                         and self._is_main_view()):
+#                     _fh_dx, _fh_dy = self._get_display_point()
+#                     self._capture_main_freehand_sample(_fh_dx, _fh_dy, min_pixel_step=2.0)
+#             except Exception:
+#                 pass
 
 #             current_time = time.time()
 
@@ -3690,6 +3995,15 @@
 #                                     fresh = fresh[np.isin(classes[fresh], visible_classes_arr)]
 
 #                                 if len(fresh) > 0:
+#                                     from gui.flight_line_filter import filter_visible_flight_line_indices
+#                                     fresh = filter_visible_flight_line_indices(
+#                                         self.app,
+#                                         fresh,
+#                                         len(classes),
+#                                         slot=self._active_flight_line_slot(),
+#                                     )
+
+#                                 if len(fresh) > 0:
 #                                     # 1. Unique and capture for undo
 #                                     fresh = np.unique(fresh)
 #                                     if not hasattr(self, "_brush_old_classes_arrays"):
@@ -3702,14 +4016,6 @@
 #                                     # 2. CPU classify immediately
 #                                     classes[fresh] = to_class
 #                                     self._brush_accumulated_mask[fresh] = True
-
-#                                     # 🖌️ Live brush stroke total → top bar center
-#                                     try:
-#                                         self.app._update_classify_count_display(
-#                                             int(np.count_nonzero(self._brush_accumulated_mask))
-#                                         )
-#                                     except Exception:
-#                                         pass
 
 #                                     # 3. Accumulate for GPU tick
 #                                     self._brush_frame_chunks.append(fresh)
@@ -3960,6 +4266,18 @@
 #                                                 # Apply filters
 #                                                 fresh_local = fresh_local[keep_mask]
 #                                                 global_indices = global_indices[keep_mask]
+
+#                                                 from gui.flight_line_filter import flight_line_visibility_mask
+#                                                 line_mask = flight_line_visibility_mask(
+#                                                     self.app,
+#                                                     len(classes),
+#                                                     slot=self._active_flight_line_slot(),
+#                                                 )
+#                                                 line_keep = line_mask[global_indices]
+#                                                 fresh_local = fresh_local[line_keep]
+#                                                 global_indices = global_indices[line_keep]
+#                                                 if len(global_indices) == 0:
+#                                                     return
                                                 
 #                                                 # 1. Unique and capture for undo
 #                                                 fresh_local = np.unique(fresh_local)
@@ -3975,14 +4293,6 @@
 #                                                 # 2. CPU classify immediately
 #                                                 classes[global_indices] = to_class
 #                                                 self._brush_section_local_mask[fresh_local] = True
-
-#                                                 # 🖌️ Live brush stroke total → top bar center
-#                                                 try:
-#                                                     self.app._update_classify_count_display(
-#                                                         int(np.count_nonzero(self._brush_section_local_mask))
-#                                                     )
-#                                                 except Exception:
-#                                                     pass
 
 #                                 self._last_brush_center_uv = (u, z)
 
@@ -4043,15 +4353,16 @@
 #             elif tool == "freehand" and self.is_drawing_freehand:
 #                 u, v = self._get_view_coordinates(P2)
 
-#                 if len(self.drawing_points) == 0:
+#                 if self._is_main_view():
+#                     # Main path already sampled above before preview throttling.
+#                     pass
+#                 elif len(self.drawing_points) == 0:
 #                     self.drawing_points.append((u, v))
 #                     self._last_freehand_display_pos = (dx, dy)
 #                 else:
-#                     # ✅ FIX: Pixel-based threshold for smooth drawing at all zoom levels
+#                     # Preserve established section/cut sampling behaviour.
 #                     last_disp = getattr(self, "_last_freehand_display_pos", (0.0, 0.0))
 #                     pixel_dist = np.sqrt((dx - last_disp[0])**2 + (dy - last_disp[1])**2)
-                    
-#                     # Add point if mouse moved > 3 pixels
 #                     if pixel_dist > 3.0:
 #                         self.drawing_points.append((u, v))
 #                         self._last_freehand_display_pos = (dx, dy)
@@ -4140,6 +4451,13 @@
 #                 if len(fresh) == 0:
 #                     return
 
+#             from gui.flight_line_filter import filter_visible_flight_line_indices
+#             fresh = filter_visible_flight_line_indices(
+#                 self.app, fresh, len(classes), slot=0
+#             )
+#             if len(fresh) == 0:
+#                 return
+
 #             # Save old classes for undo (Unified array-based)
 #             old_cls = classes[fresh].copy()
             
@@ -4155,14 +4473,6 @@
 #             self._brush_accumulated_mask[fresh] = True
 #             self._brush_frame_chunks.append(fresh)
 #             self._brush_needs_render = True
-
-#             # 🖌️ Live brush stroke total → top bar center
-#             try:
-#                 self.app._update_classify_count_display(
-#                     int(np.count_nonzero(self._brush_accumulated_mask))
-#                 )
-#             except Exception:
-#                 pass
 
 #         except Exception as e:
 #             print(f"⚠️ _on_brush_worker_result: {e}")
@@ -4205,6 +4515,8 @@
 
 #         self._check_tool_changed()
 #         tool = getattr(self.app, "active_classify_tool", None)
+#         if tool is not None:
+#             self._cancel_incomplete_classification_gestures_in_other_views()
 #         if tool in ("above_line", "below_line", "parallel_line"):
 #             self.app._classification_preview_active = True
 #         if getattr(self, "click_to_finalize", False) and tool in ("above_line", "below_line", "parallel_line"):
@@ -4251,6 +4563,7 @@
 
 #         self._press_pos = self.interactor.GetEventPosition()
 #         self._line_press_max_move_px = 0.0
+#         self._line_press_time = time.time()
 
 #         # ════════════════════════════════════════════════════════════════
 #         # ✅ CRITICAL: Cancel any pending deferred rebuild immediately
@@ -4394,6 +4707,7 @@
 #         if tool == "freehand":
 #             self.is_drawing_freehand = True
 #             self.drawing_points = []
+#             self._freehand_native_samples = 0
 #             if is_cut_interaction:
 #                 self.drawing_points_display_cut = [(x, y)]
 #             try:
@@ -4422,6 +4736,13 @@
 #         # new classification is never skipped by the 16 ms guard.
 #         self._last_render_time     = 0.0
 #         self._last_mouse_move_time = 0.0
+
+#         # ✅ MicroStation tap-tap AND drag, combined: whether this gesture
+#         # becomes a tap (arm click_to_finalize, wait for the confirming
+#         # second tap) or a drag (classify immediately on release using
+#         # press→release as the line) is now decided in on_left_release by
+#         # how far the mouse actually moved — not forced here. See the
+#         # "LINE TAP-VS-DRAG" block at the top of on_left_release.
 #         # ❌ REMOVED: self.app._suppress_section_refresh = Tru
 
 #         # ⚡ Fix 11 — Cancel any pending deferred main-view render and enter
@@ -4661,11 +4982,66 @@
 #                 not getattr(self, 'is_dragging', False)):
 #             return
 
+#         # ✅ LINE TAP-VS-DRAG (MicroStation-style, combined): a first release
+#         # for above/below/parallel-line hasn't been classified as tap or drag
+#         # yet at this point (is_dragging=True from press, click_to_finalize
+#         # still False). Decide now using the MAXIMUM distance moved from the
+#         # press point at any point during the gesture (tracked continuously
+#         # in _on_mouse_move_with_preview) — not just the net press→release
+#         # displacement. MicroStation's engine commits to DRAGGING the instant
+#         # the threshold is crossed and stays committed even if the cursor
+#         # drifts back near the origin before release; using only the final
+#         # displacement would wrongly reclassify a "dragged out and back"
+#         # gesture as a tap.
+#         #   - never exceeded threshold → TAP. Arm click_to_finalize and
+#         #     return without classifying; the confirming second tap's PRESS
+#         #     (handled at the top of on_left_press) finalizes exactly as
+#         #     before — tap-tap behavior is completely unaffected.
+#         #   - threshold exceeded       → DRAG. Fall through to the existing
+#         #     Branch D drag-classify path below (untouched code that already
+#         #     handles above_line/below_line/parallel_line correctly using
+#         #     self.P1 as the press point and P2 resolved just below), so it
+#         #     classifies immediately on release, MicroStation-style.
+#         # A release that lands inside the initial settle window
+#         # (_LINE_TAP_GRACE_SEC) is always a tap — a real fast click's own
+#         # press→release displacement can otherwise exceed the pixel
+#         # threshold purely from hand jitter, well before any deliberate drag
+#         # motion is possible. _on_mouse_move_with_preview applies the same
+#         # grace window to the accumulated max-distance tracking, so both
+#         # sides of this check stay consistent.
+#         if (_tool_quick in ("above_line", "below_line", "parallel_line") and
+#                 getattr(self, 'is_dragging', False) and
+#                 not getattr(self, 'click_to_finalize', False) and
+#                 self.P1 is not None):
+#             held_sec = time.time() - getattr(self, '_line_press_time', 0.0)
+#             if held_sec < _LINE_TAP_GRACE_SEC:
+#                 moved_px = 0.0
+#             else:
+#                 try:
+#                     rx, ry = self.interactor.GetEventPosition()
+#                     press_pos = getattr(self, '_press_pos', None) or (rx, ry)
+#                     release_moved_px = ((rx - press_pos[0]) ** 2 + (ry - press_pos[1]) ** 2) ** 0.5
+#                     moved_px = max(release_moved_px, getattr(self, '_line_press_max_move_px', 0.0))
+#                 except Exception:
+#                     moved_px = 0.0
+#             if moved_px < _LINE_TAP_DRAG_THRESHOLD_PX:
+#                 self.click_to_finalize = True
+#                 return
+#             # else: genuine drag — continue past this block into the normal
+#             # release-classify path further down, unchanged.
+
+#         # ✅ MicroStation tap-tap only: if a stray release arrives while
+#         # click_to_finalize is still armed (waiting on the confirming second
+#         # tap), it must never run the drag-classify path — it would
+#         # double-classify or misfire.
+#         if (_tool_quick in ("above_line", "below_line", "parallel_line") and
+#                 getattr(self, 'click_to_finalize', False)):
+#             return
+
 #         # 3. Debounce (20ms) — guards against accidental double-fires from a
 #         # single physical click, but lets a fast user fire 30+ classifications
 #         # per second (Microstation cadence). Raised back to 100ms = silently
 #         # dropped clicks during streaks.
-#         import time
 #         current_time = time.time()
 #         if hasattr(self, '_last_release_time'):
 #             if current_time - self._last_release_time < 0.02:
@@ -4674,29 +5050,6 @@
 
 #         self._check_tool_changed()
 #         tool = getattr(self.app, "active_classify_tool", None)
-#         if tool in ("above_line", "below_line", "parallel_line"):
-#             # Get current event position
-#             x, y = self.interactor.GetEventPosition()
-#             press_pos = getattr(self, "_press_pos", None)
-#             if press_pos is not None:
-#                 dist = ((x - press_pos[0])**2 + (y - press_pos[1])**2) ** 0.5
-#                 max_move = max(
-#                     float(dist),
-#                     float(getattr(self, "_line_press_max_move_px", 0.0)),
-#                 )
-#                 if max_move <= 12.0 and not getattr(self, "click_to_finalize", False):
-#                     # Drag is the default path. A near-zero-move release arms
-#                     # the optional tap-to-finalize mode and keeps the preview
-#                     # alive for the next interaction.
-#                     self.click_to_finalize = True
-#                     self._press_pos = None
-#                     self._line_press_max_move_px = 0.0
-#                     # Clear throttles so the very next hover after the first tap
-#                     # paints the preview immediately instead of waiting a frame.
-#                     self._last_mouse_move_time = 0.0
-#                     self._last_render_time = 0.0
-#                     print("👉 Click-to-finalize mode activated for", tool)
-#                     return
 
 #         from ..classification_tools import (
 #             classify_above_line, classify_below_line,
@@ -4790,13 +5143,6 @@
 #                     _count = len(indices) if 'indices' in locals() else 0
 #                     elapsed = (time.time() - start) * 1000
 #                     print(f"✅ Main Brush stroke complete: {_count:,} points in {elapsed:.0f}ms")
-
-#                     # 🖌️ Final exact stroke count → top bar center
-#                     if _count > 0:
-#                         try:
-#                             self.app._update_classify_count_display(int(_count))
-#                         except Exception:
-#                             pass
 
 #                 # ── Save mask BEFORE nulling — needed for shading refresh below ──
 #                 _final_mask = self._brush_accumulated_mask
@@ -5118,7 +5464,19 @@
 #                     self._classify_circle_main(center, radius, to_class)
 
 #                 elif tool == "freehand" and len(self.drawing_points) > 2:
-#                     _smooth_fh = self._catmull_rom_smooth(self.drawing_points, steps=10)
+#                     # Same corner-safe curve as MAIN preview so geometry matches.
+#                     _smooth_fh = self._centripetal_catmull_rom_smooth(
+#                         self.drawing_points, steps=4
+#                     )
+#                     if getattr(self.app, "_debug_perf", False):
+#                         print(
+#                             "FREEHAND_MAIN_PROFILE "
+#                             f"native_samples={getattr(self, '_freehand_native_samples', 0)} "
+#                             f"control_points={len(self.drawing_points)} "
+#                             f"curve_points={len(_smooth_fh)} "
+#                             f"preview_interval_ms={self._preview_interval_sec() * 1000.0:.1f} "
+#                             "smoother=centripetal corner_guard=on"
+#                         )
 
 #                     # Clear preview BEFORE classification for Surface mode safety.
 #                     self._clear_all_previews()
@@ -5513,6 +5871,11 @@
 #                         origin_view="cross_section",
 #                     )
 #                     if shaded_refresh_ok:
+#                         # guarantee_main_view_visual_refresh (above) now also
+#                         # refreshes every open section's Shaded/Surface mesh
+#                         # itself (centralized there since every classify/
+#                         # undo/redo commit path funnels through it) -- no
+#                         # separate call needed here.
 #                         self.app._gpu_sync_done = False
 #                         return
 #                     print(
@@ -5530,6 +5893,20 @@
 #                 # fallback path below instead of suppressing the refresh.
 #                 self.app._gpu_sync_done = False
 #             else:
+#                 # display_mode here is MAIN VIEW's mode, not any section's --
+#                 # a section can be in Shaded/Surface mode independently of
+#                 # Main View (e.g. Main View in Class, section in Shaded).
+#                 # This branch used to return immediately, so that case never
+#                 # got a section mesh refresh on classify at all (only undo/
+#                 # redo did, since those call this unconditionally).
+#                 try:
+#                     from gui.cross_section.section_shaded_surface import (
+#                         refresh_all_shaded_surface_sections_after_classify,
+#                     )
+#                     refresh_all_shaded_surface_sections_after_classify(self.app)
+#                 except Exception as _mesh_refresh_err:
+#                     print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+#                         f"failed: {_mesh_refresh_err}")
 #                 self.app._gpu_sync_done = False
 #                 return
 
@@ -5671,6 +6048,14 @@
 #                     print(f"   ⚠️ Unified actor not ready — triggering build")
 #                     from gui.class_display import update_class_mode
 #                     update_class_mode(app, force_refresh=True)
+#                 try:
+#                     from gui.cross_section.section_shaded_surface import (
+#                         refresh_all_shaded_surface_sections_after_classify,
+#                     )
+#                     refresh_all_shaded_surface_sections_after_classify(app)
+#                 except Exception as _mesh_refresh_err:
+#                     print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+#                         f"failed: {_mesh_refresh_err}")
 
 #             elif display_mode == "shaded_class":
 #                 print(f"   🌗 Shaded mode – forcing rebuild...")
@@ -5679,6 +6064,14 @@
 #                 ambient = getattr(app, "shade_ambient", 0.2)
 #                 from gui.shading_display import update_shaded_class
 #                 update_shaded_class(app, azimuth, angle, ambient)
+#                 try:
+#                     from gui.cross_section.section_shaded_surface import (
+#                         refresh_all_shaded_surface_sections_after_classify,
+#                     )
+#                     refresh_all_shaded_surface_sections_after_classify(app)
+#                 except Exception as _mesh_refresh_err:
+#                     print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+#                         f"failed: {_mesh_refresh_err}")
 
 #             elif display_mode == "surface":
 #                 print("   🏔️ Surface mode – forcing mesh rebuild after cross-section classification...")
@@ -5689,6 +6082,14 @@
 #                     )
 #                 except Exception as e:
 #                     print(f"   ⚠️ Surface refresh failed: {e}")
+#                 try:
+#                     from gui.cross_section.section_shaded_surface import (
+#                         refresh_all_shaded_surface_sections_after_classify,
+#                     )
+#                     refresh_all_shaded_surface_sections_after_classify(app)
+#                 except Exception as _mesh_refresh_err:
+#                     print(f"   ⚠️ Section Shaded/Surface refresh-after-classify "
+#                         f"failed: {_mesh_refresh_err}")
 #             else:
 #                 # We are in depth, intensity, elevation, or rgb mode.
 #                 # Guard: keep current non-class main-view buffer untouched until mode switch.
@@ -6208,8 +6609,12 @@
 #         if len(all_pts) < 2:
 #             return
 
-#         # ── SMOOTH: Catmull-Rom spline → true curves, not straight segments ──
-#         all_pts = self._catmull_rom_smooth(all_pts, steps=10)
+#         # MAIN: dense native-event samples + corner-safe centripetal spline.
+#         # SECTION/CUT: preserve the established smoother unchanged.
+#         if self._is_main_view():
+#             all_pts = self._centripetal_catmull_rom_smooth(all_pts, steps=4)
+#         else:
+#             all_pts = self._catmull_rom_smooth(all_pts, steps=10)
 
 #         # ── ONE-TIME PIPELINE INIT ───────────────────────────────────────────
 #         if not hasattr(self, "_freehand_pts") or self.freehand_actor is None:
@@ -6360,6 +6765,87 @@
 #         print(f"🎯 Point cursor drawn (filled circle, radius={radius:.2f})")
 
 #      # ======== MAIN-VIEW CLASSIFIERS (Plan View: XY) ========
+
+#     def _queue_main_view_focus_after_classification_commit(self):
+#         """
+#         Re-assert keyboard focus on the main VTK canvas after a successful
+#         MAIN-view classification commit.
+
+#         Why this exists:
+#         - Cross-section docks and the persistent cross-view selector are
+#           top-level Qt windows. After they have been opened, section refreshes
+#           performed by a main-view classify can leave keyboard focus owned by
+#           one of those companion windows even though the classify itself was
+#           drawn on the main canvas.
+#         - The classification undo record is already valid at this point; only
+#           Ctrl+Z/Ctrl+Y routing is lost until another tool/shortcut explicitly
+#           calls the established main-view focus handoff.
+
+#         The handoff is queued for the next Qt event-loop turn so the current
+#         VTK mouse-release callback can finish first. It is intentionally
+#         main-view-only and does not activate/close/reconfigure Cross Section,
+#         Cut Section, ClassPicker, or any classification tool.
+#         """
+#         try:
+#             if not self._is_main_view():
+#                 return
+#         except Exception:
+#             return
+
+#         app = self.app
+
+#         def _restore_focus():
+#             try:
+#                 # Do not steal focus after classification has been stood down.
+#                 if getattr(app, "active_classify_tool", None) is None:
+#                     return
+
+#                 vtk_widget = getattr(app, "vtk_widget", None)
+#                 if vtk_widget is None:
+#                     return
+
+#                 # A real modal input owns focus.  Main-view classification does
+#                 # not need to fight a dialog that appeared after the commit.
+#                 from PySide6.QtWidgets import QApplication
+#                 if QApplication.activeModalWidget() is not None:
+#                     return
+
+#                 before = QApplication.focusWidget()
+#                 before_name = type(before).__name__ if before is not None else "None"
+
+#                 # Mirror gui.execute_tool._return_focus_to_main_view(), which is
+#                 # already the proven path that makes the next shortcut work.
+#                 vtk_widget.setFocus(Qt.OtherFocusReason)
+
+#                 after = QApplication.focusWidget()
+#                 after_name = type(after).__name__ if after is not None else "None"
+#                 print(
+#                     "MAIN_CLASSIFY_FOCUS_HANDOFF "
+#                     f"reason=main_view_commit before={before_name} "
+#                     f"after={after_name}"
+#                 )
+#             except (RuntimeError, ReferenceError):
+#                 pass
+#             except Exception as _focus_err:
+#                 # Focus recovery must never turn a successful classification
+#                 # into a failed operation.
+#                 print(f"MAIN_CLASSIFY_FOCUS_HANDOFF status=skipped error={_focus_err}")
+
+#         QTimer.singleShot(0, _restore_focus)
+
+#     def _active_flight_line_slot(self):
+#         """Map the active classification interactor to its Display Mode slot."""
+#         if self._is_main_view():
+#             return 0
+#         try:
+#             active = self._get_active_vtk_widget()
+#             ctrl = getattr(self.app, "cut_section_controller", None)
+#             if ctrl is not None and active == getattr(ctrl, "cut_vtk", None):
+#                 return 5
+#         except Exception:
+#             pass
+#         view_idx = self._get_view_index_from_interactor()
+#         return int(view_idx) + 1 if view_idx is not None else 0
  
 #     def _apply_mask_and_record(self, mask, to_class):
 #         """
@@ -6449,6 +6935,12 @@
 #         # np.flatnonzero, classes[mask] = to_class). Working in index-space
 #         # below saves ~3 full-array scans (~300-400 ms per classify on 300M pts).
 #         changed_indices = np.flatnonzero(mask).astype(np.int64, copy=False)
+#         # Disabled LAS flight lines are protected for every tool and view,
+#         # independent of the active display colour mode.
+#         from gui.flight_line_filter import filter_visible_flight_line_indices
+#         changed_indices = filter_visible_flight_line_indices(
+#             self.app, changed_indices, len(classes), slot=self._active_flight_line_slot()
+#         )
 #         if changed_indices.size == 0:
 #             if hasattr(self.app, 'statusBar'):
 #                 self.app.statusBar().showMessage("No visible/from-class points in selection.", 2500)
@@ -6468,15 +6960,11 @@
 #         self.app.redo_stack.clear()
 
 #         classes[changed_indices] = to_class
+#         # Downstream partial refreshes must use the final protected set.
+#         mask = np.zeros_like(mask, dtype=bool)
+#         mask[changed_indices] = True
 #         self.app._last_changed_mask = mask
 #         self.app._last_changed_indices = changed_indices.copy()
-
-#         # 🎯 Exact classified count → top bar center (point tool, main-view
-#         # circle/rect/polygon/freehand via interactor, etc.)
-#         try:
-#             self.app._update_classify_count_display(int(changed_indices.size))
-#         except Exception:
-#             pass
 
 #         # ✅ Store from_classes for undo
 #         self.app._last_from_classes = list(getattr(self.app, "from_classes", []) or [])
@@ -6566,16 +7054,24 @@
 #             # Mark active-classify timestamp so MemoryLeakGuard defers its
 #             # gen-2 GC while the user is mid-streak.
 #             self.app._last_classify_ts = time.time()
-            
+
+#             # Main-view classify must leave keyboard ownership on the main
+#             # canvas. This is queued until after the current VTK mouse-release
+#             # event completes; otherwise Qt/VTK can overwrite an immediate
+#             # setFocus() when Cross Section companion windows are open.
+#             self._queue_main_view_focus_after_classification_commit()
+
 #             # The guarantee above is the sole shaded-class updater and presenter
-#             # for this commit. Repeating the shading refresh here traversed the
-#             # facet colors twice and scheduled another render of the same mask.
+#             # for this commit, and it also refreshes every open section's
+#             # Shaded/Surface mesh itself (centralized there since every
+#             # classify/undo/redo commit path funnels through it).
 
 #         except Exception as e:
 #             print(f"⚠️ Fast injection failed, falling back to full refresh: {e}")
 #             import traceback
 #             traceback.print_exc()
 #             self._refresh_all_views_after_classification(to_class)
+#             self._queue_main_view_focus_after_classification_commit()
 #             return True
 
 #         return True
@@ -8909,6 +9405,41 @@
 
 #     def on_right_press(self, obj, evt):
 #         """Right-click handler for cross-section views."""
+#         # ✅ MicroStation "Reset Button" behavior: a right-click at any point
+#         # during an in-progress above/below/parallel-line gesture (awaiting
+#         # the confirming second tap, or mid-drag) must immediately cancel it
+#         # and revert to IDLE — never let it silently finalize against a
+#         # stale P1 on the next left click.
+#         _rc_tool = getattr(self.app, "active_classify_tool", None)
+#         if _rc_tool in ("above_line", "below_line", "parallel_line") and (
+#             getattr(self, "P1", None) is not None
+#             or getattr(self, "is_dragging", False)
+#             or getattr(self, "click_to_finalize", False)
+#         ):
+#             try:
+#                 if hasattr(obj, "AbortFlagOn"):
+#                     obj.AbortFlagOn()
+#                 elif hasattr(obj, "SetAbortFlag"):
+#                     obj.SetAbortFlag(1)
+#             except Exception:
+#                 pass
+#             self.P1 = None
+#             self.is_dragging = False
+#             self.click_to_finalize = False
+#             self._press_pos = None
+#             self._line_press_max_move_px = 0.0
+#             self._last_line_preview_P2 = None
+#             try:
+#                 self._clear_all_previews()
+#             except Exception:
+#                 pass
+#             if hasattr(self.app, "statusBar"):
+#                 try:
+#                     self.app.statusBar().showMessage("Line classification cancelled.", 2000)
+#                 except Exception:
+#                     pass
+#             return
+
 #         if getattr(self.app, "active_classify_tool", None) == "polygon":
 #             try:
 #                 if hasattr(obj, "AbortFlagOn"):
@@ -9493,14 +10024,23 @@
 #         import numpy as np
 
 #         classification = self.app.data["classification"]
-#         old_classes = classification[mask].copy()
+#         from gui.flight_line_filter import filter_visible_flight_line_indices
+#         changed_indices = filter_visible_flight_line_indices(
+#             self.app, np.flatnonzero(mask), len(classification),
+#             slot=self._active_flight_line_slot(),
+#         )
+#         if changed_indices.size == 0:
+#             return False
+#         mask = np.zeros_like(mask, dtype=bool)
+#         mask[changed_indices] = True
+#         old_classes = classification[changed_indices].copy()
 
 #         # Apply to ground truth
-#         classification[mask] = to_class
+#         classification[changed_indices] = to_class
 
 #         # Push undo step
 #         step = {
-#             "indices": np.flatnonzero(mask).astype(np.int64, copy=False),
+#             "indices": changed_indices,
 #             "old_classes": old_classes,
 #             "new_classes": np.full(mask.sum(), to_class, dtype=classification.dtype),
 #         }
@@ -10132,6 +10672,8 @@ class ClassificationInteractor:
         # Brush stroke state (initialized here so cleanup() is always safe)
         self._brush_accumulated_mask = None
         self._brush_old_classes = {}
+        self._brush_old_classes_arrays = []
+        self._brush_indices_arrays = []
         self._brush_frame_chunks = []
         self._brush_stroke_positions = []
         self._last_brush_center = None
@@ -10898,16 +11440,29 @@ class ClassificationInteractor:
 
         mask = getattr(self, "_brush_accumulated_mask", None)
         old_classes_dict = getattr(self, "_brush_old_classes", None) or {}
+        index_chunks = getattr(self, "_brush_indices_arrays", None) or []
+        old_class_chunks = getattr(self, "_brush_old_classes_arrays", None) or []
         to_class = getattr(self.app, "to_class", None)
         undo_mask = None
 
         if mask is not None and np.any(mask):
-            if old_classes_dict and to_class is not None:
+            indices = None
+            old_cls = None
+            if index_chunks and len(index_chunks) == len(old_class_chunks):
+                indices = np.concatenate(index_chunks).astype(np.int64, copy=False)
+                old_cls = np.concatenate(old_class_chunks)
+                if indices.size:
+                    _, first_idx = np.unique(indices, return_index=True)
+                    indices = indices[first_idx]
+                    old_cls = old_cls[first_idx]
+            elif old_classes_dict:
                 indices = np.array(sorted(old_classes_dict.keys()), dtype=np.int64)
                 old_cls = np.array(
                     [old_classes_dict[int(i)] for i in indices],
                     dtype=self.app.data["classification"].dtype,
                 )
+
+            if indices is not None and indices.size and to_class is not None:
                 new_cls = np.full(len(indices), to_class, dtype=old_cls.dtype)
 
                 undo_mask = np.zeros(len(self.app.data["xyz"]), dtype=bool)
@@ -11057,6 +11612,33 @@ class ClassificationInteractor:
         self.is_dragging = False
 
         return undo_mask
+
+    def finalize_pending_brush_for_history(self):
+        """Commit an applied brush stroke before an immediate undo/redo request."""
+        if getattr(self.app, "active_classify_tool", None) != "brush":
+            return False
+
+        stack = getattr(self.app, "undo_stack", None)
+        before = len(stack) if stack is not None else 0
+
+        if self._is_main_view():
+            self._finalize_pending_main_brush_stroke()
+        else:
+            has_chunks = bool(getattr(self, "_brush_indices_arrays", None))
+            has_selection = bool(np.any(
+                getattr(self, "_brush_section_local_mask", None)
+            )) if getattr(self, "_brush_section_local_mask", None) is not None else False
+            if not getattr(self, "is_dragging", False) or not (
+                    has_chunks or has_selection):
+                return False
+            # A Qt focus/shortcut transition can occasionally prevent VTK from
+            # delivering the physical release. Run the established section
+            # release path once so its already-applied points become undoable.
+            self._last_release_time = 0.0
+            self.on_left_release(self.style, "HistoryFinalizePendingBrush")
+
+        after = len(stack) if stack is not None else 0
+        return after > before
 
     # ═══════════════════════════════════════════════════════════════════════
     # ✅ SAFE RENDER GUARDS - Prevents crash on stale VTK render windows
@@ -13844,28 +14426,48 @@ class ClassificationInteractor:
                                         sw = None
 
                                     if actor and hasattr(actor, '_naksha_rgb_ptr'):
-                                            # Only poke if it's been long enough since last poke
+                                            # Only poke if it's been long enough since last poke.
+                                            # IMPORTANT: brush is the only section-classification
+                                            # path that writes the live RGB buffer during drag.
+                                            # Never replace Depth/Line/RGB/Intensity/Elevation
+                                            # colors with classification colors.
                                             now = time.time()
                                             if (now - getattr(self, '_last_sec_poke', 0)) > 0.033:
-                                                rgb_ptr = actor._naksha_rgb_ptr
-                                                if rgb_ptr.flags.writeable:
-                                                    # Get color for target class
-                                                    palette = self._get_active_palette()
-                                                    entry = palette.get(int(to_class), {"color": (255, 255, 0)})
-                                                    color = entry.get("color", (255, 255, 0)) if entry.get("show", True) else (0, 0, 0)
-                                                    
-                                                    # Get local indices that are set in the mask
-                                                    local_hit = np.flatnonzero(self._brush_section_local_mask)
-                                                    rgb_ptr[local_hit] = color
-                                                    
-                                                    # Update VTK
-                                                    v_arr = getattr(actor, '_naksha_vtk_array', None)
-                                                    if v_arr:
-                                                        v_arr.Modified()
-                                                    
-                                                    # Render
-                                                    self._safe_render_pyvista(sw)
-                                                    self._last_sec_poke = now
+                                                from gui.unified_actor_manager import _slot_uses_class_rgb
+
+                                                slot_idx = (
+                                                    5 if (v_idx is None and is_cut_section)
+                                                    else int(v_idx) + 1
+                                                )
+                                                allow_class_rgb_poke = _slot_uses_class_rgb(
+                                                    self.app, slot_idx, actor
+                                                )
+
+                                                if allow_class_rgb_poke:
+                                                    rgb_ptr = actor._naksha_rgb_ptr
+                                                    if rgb_ptr.flags.writeable:
+                                                        # Get color for target class
+                                                        palette = self._get_active_palette()
+                                                        entry = palette.get(int(to_class), {"color": (255, 255, 0)})
+                                                        color = entry.get("color", (255, 255, 0)) if entry.get("show", True) else (0, 0, 0)
+                                                        
+                                                        # Get local indices that are set in the mask
+                                                        local_hit = np.flatnonzero(self._brush_section_local_mask)
+                                                        rgb_ptr[local_hit] = color
+                                                        
+                                                        # Update VTK
+                                                        v_arr = getattr(actor, '_naksha_vtk_array', None)
+                                                        if v_arr:
+                                                            v_arr.Modified()
+                                                        
+                                                        # Render
+                                                        self._safe_render_pyvista(sw)
+
+                                                # Throttle both paths equally. The canonical class
+                                                # array was already updated above; non-class modes
+                                                # are refreshed normally on commit without touching
+                                                # their current RGB representation.
+                                                self._last_sec_poke = now
 
                         except Exception as e:
                             print(f"⚠️ Section/Cut brush real-time update failed: {e}")
@@ -16297,6 +16899,73 @@ class ClassificationInteractor:
 
      # ======== MAIN-VIEW CLASSIFIERS (Plan View: XY) ========
 
+    def _queue_main_view_focus_after_classification_commit(self):
+        """
+        Re-assert keyboard focus on the main VTK canvas after a successful
+        MAIN-view classification commit.
+
+        Why this exists:
+        - Cross-section docks and the persistent cross-view selector are
+          top-level Qt windows. After they have been opened, section refreshes
+          performed by a main-view classify can leave keyboard focus owned by
+          one of those companion windows even though the classify itself was
+          drawn on the main canvas.
+        - The classification undo record is already valid at this point; only
+          Ctrl+Z/Ctrl+Y routing is lost until another tool/shortcut explicitly
+          calls the established main-view focus handoff.
+
+        The handoff is queued for the next Qt event-loop turn so the current
+        VTK mouse-release callback can finish first. It is intentionally
+        main-view-only and does not activate/close/reconfigure Cross Section,
+        Cut Section, ClassPicker, or any classification tool.
+        """
+        try:
+            if not self._is_main_view():
+                return
+        except Exception:
+            return
+
+        app = self.app
+
+        def _restore_focus():
+            try:
+                # Do not steal focus after classification has been stood down.
+                if getattr(app, "active_classify_tool", None) is None:
+                    return
+
+                vtk_widget = getattr(app, "vtk_widget", None)
+                if vtk_widget is None:
+                    return
+
+                # A real modal input owns focus.  Main-view classification does
+                # not need to fight a dialog that appeared after the commit.
+                from PySide6.QtWidgets import QApplication
+                if QApplication.activeModalWidget() is not None:
+                    return
+
+                before = QApplication.focusWidget()
+                before_name = type(before).__name__ if before is not None else "None"
+
+                # Mirror gui.execute_tool._return_focus_to_main_view(), which is
+                # already the proven path that makes the next shortcut work.
+                vtk_widget.setFocus(Qt.OtherFocusReason)
+
+                after = QApplication.focusWidget()
+                after_name = type(after).__name__ if after is not None else "None"
+                print(
+                    "MAIN_CLASSIFY_FOCUS_HANDOFF "
+                    f"reason=main_view_commit before={before_name} "
+                    f"after={after_name}"
+                )
+            except (RuntimeError, ReferenceError):
+                pass
+            except Exception as _focus_err:
+                # Focus recovery must never turn a successful classification
+                # into a failed operation.
+                print(f"MAIN_CLASSIFY_FOCUS_HANDOFF status=skipped error={_focus_err}")
+
+        QTimer.singleShot(0, _restore_focus)
+
     def _active_flight_line_slot(self):
         """Map the active classification interactor to its Display Mode slot."""
         if self._is_main_view():
@@ -16519,6 +17188,12 @@ class ClassificationInteractor:
             # gen-2 GC while the user is mid-streak.
             self.app._last_classify_ts = time.time()
 
+            # Main-view classify must leave keyboard ownership on the main
+            # canvas. This is queued until after the current VTK mouse-release
+            # event completes; otherwise Qt/VTK can overwrite an immediate
+            # setFocus() when Cross Section companion windows are open.
+            self._queue_main_view_focus_after_classification_commit()
+
             # The guarantee above is the sole shaded-class updater and presenter
             # for this commit, and it also refreshes every open section's
             # Shaded/Surface mesh itself (centralized there since every
@@ -16529,6 +17204,7 @@ class ClassificationInteractor:
             import traceback
             traceback.print_exc()
             self._refresh_all_views_after_classification(to_class)
+            self._queue_main_view_focus_after_classification_commit()
             return True
 
         return True

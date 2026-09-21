@@ -9,18 +9,211 @@ import os
 from gui.theme_manager import ThemeColors, get_dialog_stylesheet
 
 _COLOR_ICON_CACHE = {}
+_USE_EXISTING_SELECTION = object()
 
 try:
-    from shiboken6 import isValid as _qt_object_is_valid
+    from shiboken6 import isValid as _shiboken_is_valid
 except ImportError:
-    def _qt_object_is_valid(obj):
-        return obj is not None
+    _shiboken_is_valid = None
+
+
+def _qt_object_is_valid(obj):
+    if obj is None:
+        return False
+    if _shiboken_is_valid is None:
+        return True
+    try:
+        return bool(_shiboken_is_valid(obj))
+    except TypeError:
+        # Tests and lightweight integrations may expose a non-QObject dialog
+        # facade; ordinary Python objects are valid for metadata reads.
+        return True
 
 
 def _normalize_rgb(rgb):
     if isinstance(rgb, QColor):
         return (rgb.red(), rgb.green(), rgb.blue())
     return tuple(int(c) for c in rgb[:3])
+
+
+def _normalize_palette(palette):
+    """Return one palette entry per numeric class code."""
+    normalized = {}
+    if not isinstance(palette, dict):
+        return normalized
+
+    for raw_code, raw_info in palette.items():
+        try:
+            code = int(raw_code)
+        except (TypeError, ValueError):
+            continue
+        info = dict(raw_info) if isinstance(raw_info, dict) else {}
+        existing = normalized.get(code)
+        if existing is None:
+            normalized[code] = info
+            continue
+
+        # QSettings and older presets can leave both "17" and 17 keys behind.
+        # Runtime integer keys win; string-key records only fill missing fields.
+        for key, value in info.items():
+            current = existing.get(key)
+            if isinstance(raw_code, int) or current is None or (
+                isinstance(current, str) and not current.strip()
+            ):
+                existing[key] = value
+    return normalized
+
+
+def _display_table_palette(app):
+    dialog = getattr(app, "display_mode_dialog", None)
+    if dialog is None:
+        dialog = getattr(app, "display_dialog", None)
+    if dialog is not None and not _qt_object_is_valid(dialog):
+        return {}
+    table = getattr(dialog, "table", None) if dialog is not None else None
+    if table is None:
+        return {}
+
+    palette = {}
+    try:
+        row_count = table.rowCount()
+    except (RuntimeError, ReferenceError):
+        return {}
+
+    for row in range(row_count):
+        code_item = table.item(row, 1)
+        if code_item is None:
+            continue
+        try:
+            code = int(str(code_item.text()).strip())
+        except (TypeError, ValueError):
+            continue
+
+        def item_text(column):
+            item = table.item(row, column)
+            return item.text() if item is not None else ""
+
+        entry = {
+            "description": item_text(2),
+            "draw": item_text(3),
+            "lvl": item_text(4),
+        }
+        color_item = table.item(row, 5)
+        if color_item is not None:
+            try:
+                brush = color_item.background()
+                if brush.style() != Qt.BrushStyle.NoBrush:
+                    entry["color"] = brush.color().getRgb()[:3]
+            except Exception:
+                pass
+        palette[code] = entry
+    return palette
+
+
+def _is_meaningful_name(value, code):
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in {
+        str(code).lower(), f"class {code}".lower(), f"code {code}".lower(), "-",
+    }
+
+
+def resolve_class_catalog(app):
+    """Resolve the current class catalog from the loaded PTC schema.
+
+    Class identity (code/name/description/draw/color) must have exactly one
+    authority.  When the Display Mode table contains classes, it represents the
+    currently loaded/edited PTC and therefore owns the class set and identity
+    metadata.  ``active_ptc_schema`` is the next fallback when the dialog/table
+    is unavailable.  Runtime/view palettes may contribute only presentation
+    state (show/weight); they must never rename, recolor, add, or resurrect a
+    class that is not present in the current PTC schema.
+
+    This function is read-only: it never mutates app/view palettes.
+    """
+    live = _normalize_palette(getattr(app, "class_palette", {}) or {})
+    table = _display_table_palette(app)
+    active = _normalize_palette(getattr(app, "active_ptc_schema", {}) or {})
+
+    app_views = getattr(app, "view_palettes", {}) or {}
+    app_slot_zero = _normalize_palette(
+        app_views.get(0, {}) if isinstance(app_views, dict) else {}
+    )
+
+    dialog = getattr(app, "display_mode_dialog", None)
+    if dialog is None:
+        dialog = getattr(app, "display_dialog", None)
+    if dialog is not None and not _qt_object_is_valid(dialog):
+        dialog = None
+
+    dialog_views = getattr(dialog, "view_palettes", {}) if dialog is not None else {}
+    dialog_slot_zero = _normalize_palette(
+        dialog_views.get(0, {}) if isinstance(dialog_views, dict) else {}
+    )
+
+    # PTC authority order:
+    #   1) current Display Mode table (also reflects unsaved Add/Edit/Delete)
+    #   2) last explicitly activated PTC schema
+    #   3) runtime palette only when no PTC schema is available
+    if table:
+        schema = table
+        schema_source = "display_table"
+    elif active:
+        schema = active
+        schema_source = "active_ptc_schema"
+    elif live:
+        schema = live
+        schema_source = "class_palette_fallback"
+    elif app_slot_zero:
+        schema = app_slot_zero
+        schema_source = "app_view0_fallback"
+    else:
+        schema = dialog_slot_zero
+        schema_source = "dialog_view0_fallback"
+
+    class_codes = set(schema)
+    catalog = {}
+
+    # Runtime palettes are allowed to retain presentation state only.
+    presentation_sources = (live, app_slot_zero, dialog_slot_zero)
+
+    for code in sorted(class_codes):
+        identity = dict(schema.get(code, {}))
+
+        # Do not backfill identity from an older runtime/activated schema when
+        # the Display Mode table is available. A blank field in the currently
+        # loaded PTC stays blank (and receives only a neutral UI label later)
+        # rather than inheriting a stale semantic name or color.
+
+        entry = dict(identity)
+
+        # show/weight are presentation state. Prefer the live Main View state,
+        # then the per-view snapshots, and finally the PTC/default value.
+        presentation = next(
+            (source[code] for source in presentation_sources if code in source),
+            {},
+        )
+        entry["show"] = bool(
+            presentation.get("show", identity.get("show", True))
+        )
+        try:
+            entry["weight"] = float(
+                presentation.get("weight", identity.get("weight", 1.0))
+            )
+        except (TypeError, ValueError):
+            entry["weight"] = 1.0
+
+        # Normalize identity without inventing a semantic class name.
+        entry["lvl"] = str(identity.get("lvl", "") or "").strip()
+        entry["description"] = str(identity.get("description", "") or "").strip()
+        entry["draw"] = str(identity.get("draw", "") or "").strip()
+        try:
+            entry["color"] = _normalize_rgb(identity.get("color", (128, 128, 128)))
+        except Exception:
+            entry["color"] = (128, 128, 128)
+
+        catalog[code] = entry
+
+    return catalog
 
 
 def make_color_icon(rgb):
@@ -57,6 +250,59 @@ def make_color_icon(rgb):
     icon = QIcon(pix)
     _COLOR_ICON_CACHE[rgb] = icon
     return icon
+
+
+class WheelClassComboBox(QComboBox):
+    """QComboBox with reliable mouse-wheel class selection.
+
+    The previous protection that swallowed wheel events made the ClassPicker
+    require a manual click for every "To class" change.  This implementation
+    keeps normal popup behaviour, but when the combo is collapsed one wheel
+    notch moves exactly one class and emits the normal currentIndexChanged
+    signal, so the existing app.to_class persistence logic remains untouched.
+    """
+
+    def wheelEvent(self, event):
+        # When the popup list is open, keep Qt's normal popup/list behaviour.
+        # In practice the popup view receives the wheel event directly, but
+        # this guard avoids forcing a selection if the combo receives it.
+        try:
+            if self.view() is not None and self.view().isVisible():
+                super().wheelEvent(event)
+                return
+        except (RuntimeError, ReferenceError):
+            pass
+
+        if not self.isEnabled() or self.count() <= 1:
+            super().wheelEvent(event)
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            # High-resolution touchpads can report pixelDelta instead.
+            delta = event.pixelDelta().y()
+
+        if delta == 0:
+            event.ignore()
+            return
+
+        current = self.currentIndex()
+        if current < 0:
+            current = 0
+
+        # Windows mouse wheels normally report +/-120 per notch.  Preserve
+        # multi-notch events while still responding to high-resolution wheels.
+        notches = max(1, abs(int(delta)) // 120)
+        direction = -1 if delta > 0 else 1
+        new_index = max(0, min(self.count() - 1, current + direction * notches))
+
+        if new_index != current:
+            self.setCurrentIndex(new_index)
+
+        # Do not bubble the wheel to the parent ClassPicker/list and cause an
+        # unrelated scroll.
+        event.accept()
+
 
 class ClassPicker(QWidget):
     """
@@ -115,32 +361,15 @@ class ClassPicker(QWidget):
         any_item.setData(Qt.UserRole, None)
         self.from_list.addItem(any_item)
 
-        # Populate from classes
-        for code, entry in sorted(app.class_palette.items()):
-            desc = entry.get("description", "")
-            lvl = entry.get("lvl", "")
-            color = entry.get("color", (128, 128, 128))
-            text = f"{code} - {lvl}"
-            if desc:
-                text += f" ({desc})"
-            item = QListWidgetItem(make_color_icon(color), text)
-            item.setData(Qt.UserRole, code)
-            self.from_list.addItem(item)
-
         layout.addWidget(self.from_list, stretch=1)   # ← stretch=1 makes it expand
 
         # --- To class dropdown (single selection)
         layout.addWidget(QLabel("To class:"))
-        self.to_combo = QComboBox()
-
-        for code, entry in app.class_palette.items():
-            desc = entry.get("description", "")
-            lvl = entry.get("lvl", "")
-            color = entry.get("color", (128, 128, 128))
-            text = f"{code} - {lvl}"
-            if desc:
-                text += f" ({desc})"
-            self.to_combo.addItem(make_color_icon(color), text, code)
+        # Mouse wheel must be a first-class input for classification users.
+        # This only changes the selected class; PTC/catalog ownership remains
+        # entirely in resolve_class_catalog().
+        self.to_combo = WheelClassComboBox()
+        self.to_combo.setFocusPolicy(Qt.StrongFocus)
         layout.addWidget(self.to_combo, stretch=0)    # ← stretch=0 stays fixed size
 
         # --- Invert button
@@ -300,8 +529,10 @@ class ClassPicker(QWidget):
         self.activateWindow()
 
     def ensure_visible(self):
-        """Force the ClassPicker to be visible and active."""
+        """Force the ClassPicker visible, first reconciling it with live PTC state."""
         print(f"🔄 Ensuring ClassPicker is visible...")
+        self.sync_with_app()
+
         if self.isMinimized():
             self.showNormal()
         if not self.isVisible():
@@ -411,6 +642,20 @@ class ClassPicker(QWidget):
     
     def sync_with_app(self):
         """Call this whenever tool/classes change externally."""
+        signature = self._current_class_signature()
+        if (
+            self._last_class_signature is not None
+            and signature != self._last_class_signature
+        ):
+            # Classification shortcuts enter through sync_with_app(). Rebuild
+            # here before displaying the shortcut's From/To selections.
+            self.populate_dropdowns(
+                to_class_override=getattr(self.app, "to_class", None),
+                from_classes_override=getattr(self.app, "from_classes", None),
+            )
+            self._update_title()
+            return
+
         self.from_list.blockSignals(True)
         self.to_combo.blockSignals(True)
 
@@ -429,13 +674,9 @@ class ClassPicker(QWidget):
 
     def _current_class_signature(self):
         """Build a lightweight signature so unchanged palettes skip full UI rebuilds."""
-        palette = getattr(self.app, "class_palette", {}) or {}
+        palette = resolve_class_catalog(self.app)
         signature = []
-        for code, info in sorted(palette.items()):
-            try:
-                class_code = int(code)
-            except Exception:
-                continue
+        for class_code, info in palette.items():
             signature.append((
                 class_code,
                 str(info.get("lvl", "")),
@@ -500,7 +741,12 @@ class ClassPicker(QWidget):
         print(f"   ⚠️ Could not find class {old_value}")
         return False
 
-    def populate_dropdowns(self):
+    def populate_dropdowns(
+        self,
+        *,
+        to_class_override=_USE_EXISTING_SELECTION,
+        from_classes_override=_USE_EXISTING_SELECTION,
+    ):
         """
         Build class dropdowns with FORCEFUL defaults.
         ✅ FIXED: Preserves "To class" and "From class" selections across rebuilds
@@ -513,50 +759,37 @@ class ClassPicker(QWidget):
         # Priority order: saved instance var > current UI > app state
         
         # Get "To class" to preserve
-        to_class_to_restore = self._saved_to_class
-        if to_class_to_restore is None:
-            to_class_to_restore = self.to_combo.currentData() if self.to_combo.count() > 0 else None
-        if to_class_to_restore is None:
-            to_class_to_restore = getattr(self.app, 'to_class', None)
+        if to_class_override is not _USE_EXISTING_SELECTION:
+            to_class_to_restore = to_class_override
+        else:
+            to_class_to_restore = self._saved_to_class
+            if to_class_to_restore is None:
+                to_class_to_restore = (
+                    self.to_combo.currentData()
+                    if self.to_combo.count() > 0
+                    else None
+                )
+            if to_class_to_restore is None:
+                to_class_to_restore = getattr(self.app, 'to_class', None)
         
         # Get "From classes" to preserve
-        from_classes_to_restore = self._saved_from_classes
-        if from_classes_to_restore is None:
-            selected_items = self.from_list.selectedItems()
-            if selected_items:
-                from_classes_to_restore = [item.data(Qt.UserRole) for item in selected_items 
-                                           if item.data(Qt.UserRole) is not None]
-        if from_classes_to_restore is None:
-            from_classes_to_restore = getattr(self.app, 'from_classes', None)
+        if from_classes_override is not _USE_EXISTING_SELECTION:
+            from_classes_to_restore = from_classes_override
+        else:
+            from_classes_to_restore = self._saved_from_classes
+            if from_classes_to_restore is None:
+                selected_items = self.from_list.selectedItems()
+                if selected_items:
+                    from_classes_to_restore = [
+                        item.data(Qt.UserRole)
+                        for item in selected_items
+                        if item.data(Qt.UserRole) is not None
+                    ]
+            if from_classes_to_restore is None:
+                from_classes_to_restore = getattr(self.app, 'from_classes', None)
         
         print(f"   📌 Will restore - To: {to_class_to_restore}, From: {from_classes_to_restore}")
         
-        # ---------------------------------------------------------
-        # Define Forceful Defaults (Safety Net)
-        # ---------------------------------------------------------
-        STANDARD_LEVELS = {
-            0: "Created",
-            1: "Ground",
-            2: "Low vegetation",
-            3: "Medium vegetation",
-            4: "High vegetation",
-            5: "Buildings",
-            6: "Water",
-            7: "Railways",
-            8: "Railways (structure)",
-            9: "Type 1 Street",
-            10: "Type 2 Street",
-            11: "Type 3 Street",
-            12: "Type 4 Street",
-            13: "Bridge",
-            14: "Bare Conductors",
-            15: "Elicord Overhead Cables",
-            16: "Pylons or Poles",
-            17: "HV Overhead Lines",
-            18: "MV Overhead Lines",
-            19: "LV Overhead Lines",
-        }
-
         # Block signals during rebuild
         self.setUpdatesEnabled(False)
         self.from_list.blockSignals(True)
@@ -568,32 +801,11 @@ class ClassPicker(QWidget):
         
         class_list = []
         
-        # Get classes from Display Mode
-        display_dialog = getattr(self.app, 'display_mode_dialog', getattr(self.app, 'display_dialog', None))
-
-        if display_dialog:
-            table = display_dialog.table
-            for row in range(table.rowCount()):
-                try:
-                    code_item = table.item(row, 1)
-                    if not code_item: continue
-                    
-                    code = int(code_item.text())
-                    desc = table.item(row, 2).text()
-                    
-                    lvl_item = table.item(row, 4)
-                    lvl = lvl_item.text() if lvl_item else ""
-                    
-                    color_item = table.item(row, 5)
-                    color = color_item.background().color() if color_item else QColor(128, 128, 128)
-                    
-                    class_list.append({'code': code, 'desc': desc, 'lvl': lvl, 'color': color})
-                except Exception:
-                    continue
-                    
-        # Fallback: Use app's class_palette
-        if not class_list and hasattr(self.app, 'class_palette'):
-            for code, info in sorted(self.app.class_palette.items()):
+        # Resolve metadata by numeric code so a shortcut cannot substitute
+        # stale names from an older per-view palette.
+        palette = resolve_class_catalog(self.app)
+        if palette:
+            for code, info in palette.items():
                 color_tuple = info.get('color', (128, 128, 128))
                 class_list.append({
                     'code': code,
@@ -624,15 +836,18 @@ class ClassPicker(QWidget):
         
         for cls in class_list:
             code = cls['code']
-            lvl = cls['lvl']
-            
-            if not lvl or lvl.strip() == "":
-                lvl = STANDARD_LEVELS.get(code, str(code))
+            raw_lvl = str(cls['lvl'] or '').strip()
+            desc = str(cls['desc'] or '').strip()
+
+            # Loaded PTC metadata is authoritative.  Never substitute a hard-coded
+            # semantic class name: if the PTC provides neither lvl nor description,
+            # use a neutral label so a stale standard cannot misidentify the code.
+            lvl = raw_lvl or desc or f"Class {code}"
             
             icon = make_color_icon(cls['color'])
-            
-            desc = cls['desc']
-            label = f"{code} - {lvl} ({desc})" if desc else f"{code} - {lvl}"
+            label = f"{code} - {lvl}"
+            if desc and desc != lvl:
+                label += f" ({desc})"
             
             # Add to "From" List
             item = QListWidgetItem(icon, label)

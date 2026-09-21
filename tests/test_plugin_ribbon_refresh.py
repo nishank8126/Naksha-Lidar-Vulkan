@@ -80,9 +80,13 @@ class PluginRibbonRefreshTests(unittest.TestCase):
 
     def test_uninstall_rebuilds_only_once(self):
         with tempfile.TemporaryDirectory() as temp:
+            original_dir = plugin_manager_module.PLUGINS_DIR
+            plugin_manager_module.PLUGINS_DIR = Path(temp)
             plugin_dir = Path(temp) / "test_plugin"
             plugin_dir.mkdir()
-            instance = SimpleNamespace(on_unload=lambda: None)
+            instance = SimpleNamespace(
+                on_unload=lambda: (_ for _ in ()).throw(RuntimeError("broken hook"))
+            )
             manager = plugin_manager_module.PluginManager(SimpleNamespace())
             manager.loaded_plugins["Test"] = {
                 "instance": instance,
@@ -95,6 +99,9 @@ class PluginRibbonRefreshTests(unittest.TestCase):
             )
             rebuilds = []
             manager._rebuild_plugins_ribbon = lambda: rebuilds.append(True)
+            cached_archive = manager._cached_archive_path("Test")
+            cached_archive.parent.mkdir(parents=True)
+            cached_archive.write_bytes(b"cached package")
 
             try:
                 ok, _ = manager.uninstall_plugin("Test")
@@ -102,8 +109,11 @@ class PluginRibbonRefreshTests(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertEqual(len(rebuilds), 1)
                 self.assertNotIn(private_module, sys.modules)
+                self.assertFalse(plugin_dir.exists())
+                self.assertFalse(cached_archive.exists())
             finally:
                 sys.modules.pop(private_module, None)
+                plugin_manager_module.PLUGINS_DIR = original_dir
 
     def test_reinstall_rebuilds_only_once(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -145,6 +155,17 @@ class PluginRibbonRefreshTests(unittest.TestCase):
 
                 self.assertTrue(ok)
                 self.assertEqual(len(rebuilds), 1)
+                cached_archive = manager._cached_archive_path("Test")
+                self.assertTrue(cached_archive.exists())
+
+                installed_entry = manager.loaded_plugins["Test"]["dir"] / "plugin.py"
+                installed_entry.write_text("raise RuntimeError('corrupt')\n", encoding="utf-8")
+
+                ok, _ = manager.reinstall_plugin("Test")
+
+                self.assertTrue(ok)
+                self.assertEqual(installed_entry.read_text(encoding="utf-8"), source)
+                self.assertEqual(len(rebuilds), 2)
             finally:
                 plugin_manager_module.PLUGINS_DIR = original_dir
 

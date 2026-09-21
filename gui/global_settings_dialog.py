@@ -605,6 +605,15 @@ class GlobalSettingsDialog(QDialog):
         self.cut_width_spin.setSingleStep(0.25)
         self.cut_width_spin.setSuffix(" m")
         size_form.addRow("Default cut width:", self.cut_width_spin)
+
+        self.cross_dock_layout_combo = QComboBox()
+        self.cross_dock_layout_combo.addItem("Rows (Vertical)", "rows")
+        self.cross_dock_layout_combo.addItem("Columns (Side by Side)", "columns")
+        self.cross_dock_layout_combo.setToolTip(
+            "Choose how multiple cross-section windows are arranged when they "
+            "are attached to the right side of the application."
+        )
+        size_form.addRow("Multiple view layout:", self.cross_dock_layout_combo)
         form.addLayout(size_form)
 
         color_row = QHBoxLayout()
@@ -796,7 +805,7 @@ class GlobalSettingsDialog(QDialog):
         self.panning_button_combo = QComboBox()
         self.panning_button_combo.addItem("Scroll Button (Middle Click)", "scroll")
         self.panning_button_combo.addItem("Left Mouse Button", "left")
-        self.panning_button_combo.addItem("Tap-Tap Pan (MicroStation)", "tap")
+        self.panning_button_combo.addItem("Tap-Tap Pan", "tap")
         self.panning_button_combo.currentIndexChanged.connect(self._update_navigation_summary)
         form.addRow("Panning button:", self.panning_button_combo)
 
@@ -838,6 +847,9 @@ class GlobalSettingsDialog(QDialog):
         self.theme_combo.currentIndexChanged.connect(lambda _: self._mark_dirty(0))
         self.canvas_theme_combo.currentIndexChanged.connect(lambda _: self._mark_dirty(0))
         self.cut_width_spin.valueChanged.connect(lambda _: self._mark_dirty(2))
+        self.cross_dock_layout_combo.currentIndexChanged.connect(
+            lambda _: self._mark_dirty(2)
+        )
         self.cross_width_slider.valueChanged.connect(lambda _: self._mark_dirty(2))
         self.cross_style_combo.currentTextChanged.connect(lambda _: self._mark_dirty(2))
         self.draw_width_slider.valueChanged.connect(lambda _: self._mark_dirty(3))
@@ -913,6 +925,16 @@ class GlobalSettingsDialog(QDialog):
 
         style = self.settings.value("cross_line_style", "solid", type=str)
         self.cross_style_combo.setCurrentText(self._pretty_style_name(style))
+
+        dock_layout = self.settings.value(
+            "cross_section_dock_layout",
+            getattr(self.app, "cross_section_dock_layout", "rows"),
+            type=str,
+        )
+        layout_index = self.cross_dock_layout_combo.findData(dock_layout)
+        self.cross_dock_layout_combo.setCurrentIndex(
+            layout_index if layout_index >= 0 else 0
+        )
 
         self._update_cross_preview()
 
@@ -1160,14 +1182,17 @@ class GlobalSettingsDialog(QDialog):
         self._update_color_button(self.cross_color_btn, self._cross_color)
         self.cross_width_slider.setValue(3)
         self.cross_style_combo.setCurrentText("Solid")
+        self.cross_dock_layout_combo.setCurrentIndex(0)
         self._update_cross_preview()
 
     def _update_cross_preview(self):
         style = self._style_key_from_text(self.cross_style_combo.currentText())
         self.cross_preview.set_state(self._cross_color, self.cross_width_slider.value(), style)
+        dock_layout = self.cross_dock_layout_combo.currentText().lower()
         self.cross_summary.setText(
             f"Cut width: +/- {self.cut_width_spin.value():.2f} m | "
-            f"Line: {self._cross_color.name()}, {self.cross_width_slider.value()} px, {style}"
+            f"Line: {self._cross_color.name()}, {self.cross_width_slider.value()} px, {style} | "
+            f"Attached views: {dock_layout}"
         )
 
     def _on_draw_tool_changed(self):
@@ -1403,10 +1428,20 @@ class GlobalSettingsDialog(QDialog):
         )
         self.app.cross_line_width = self.cross_width_slider.value()
         self.app.cross_line_style = style
+        self.app.cross_section_dock_layout = (
+            self.cross_dock_layout_combo.currentData() or "rows"
+        )
 
         self.settings.setValue("cross_line_color", self._cross_color.name())
         self.settings.setValue("cross_line_width", self.cross_width_slider.value())
         self.settings.setValue("cross_line_style", style)
+        self.settings.setValue(
+            "cross_section_dock_layout", self.app.cross_section_dock_layout
+        )
+
+        arrange_docks = getattr(self.app, "_arrange_cross_section_docks", None)
+        if callable(arrange_docks):
+            arrange_docks()
 
         if hasattr(self.app, "section_controller"):
             sc = self.app.section_controller

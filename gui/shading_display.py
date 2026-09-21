@@ -3711,7 +3711,9 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
         and getattr(app, 'vtk_widget', None) is not None
         and "shaded_mesh" in app.vtk_widget.actors
     )
-    if rendered_cache_key == requested_cache_key and _actor_still_live and cache.is_fully_current(xyz_raw, vc, azimuth, angle, ambient, app):
+    if (not force_rebuild and rendered_cache_key == requested_cache_key
+            and _actor_still_live
+            and cache.is_fully_current(xyz_raw, vc, azimuth, angle, ambient, app)):
         _hide_point_cloud_actors_for_shading(app)
         try:
             app.vtk_widget.render()

@@ -3672,9 +3672,19 @@ def _wire_actor_metadata(actor, mesh, vtk_ca, _vtk_rgb, _vtk_cls, class_vtk,
     actor._naksha_rgb_ptr = _vtk_rgb
     actor._naksha_vtk_array = vtk_ca
     actor._naksha_vtk_rgb_ref = vtk_ca
-    actor._naksha_class_vtk_ref = class_vtk
+    # Cache the Classification array from the mapper's ACTUAL input mesh.
+    # ``class_vtk`` is the construction-time array; after PyVista/mapper
+    # handoff it is safer to retain the exact array consumed by the shader.
+    _live_class_vtk = (
+        mesh.GetPointData().GetArray("Classification")
+        if mesh is not None else None
+    )
+    actor._naksha_class_vtk_ref = (_live_class_vtk if _live_class_vtk is not None else class_vtk)
     actor._naksha_mesh = mesh
-    actor._naksha_section_class = _vtk_cls
+    actor._naksha_section_class = (
+        numpy_support.vtk_to_numpy(_live_class_vtk)
+        if _live_class_vtk is not None else _vtk_cls
+    )
     actor._naksha_section_mask = combined_global_mask
     actor._naksha_global_to_local_arr = None
     actor._naksha_global_indices = None
@@ -4965,6 +4975,41 @@ def _refresh_actor_boundary_flags(actor, reason="structured-border"):
 # ─────────────────────────────────────────────────────────────────────────────
 # sync_palette_to_gpu — called by Display Mode dialog Apply
 # ─────────────────────────────────────────────────────────────────────────────
+def _slot_uses_class_rgb(app, slot_idx: int, actor=None) -> bool:
+    """Return whether a slot's live point RGB buffer represents classification."""
+    if slot_idx == 0:
+        mode = str(getattr(app, "display_mode", "class") or "class").lower()
+        return mode in ("class", "shaded_class")
+
+    if 1 <= slot_idx <= 4:
+        # The actor is the rendered state. Dialog state can briefly say Class
+        # while shortcut/preset code is rebuilding UI around a section that is
+        # still displaying Depth/Line/RGB/Intensity/Elevation.
+        live_mode = str(getattr(actor, "_naksha_color_mode", "") or "").lower()
+        if live_mode:
+            return live_mode in ("class", "shaded_class")
+
+        vtk_widget = (getattr(app, "section_vtks", {}) or {}).get(slot_idx - 1)
+        live_mode = str(
+            getattr(vtk_widget, "_naksha_color_mode", "") or ""
+        ).lower()
+        if live_mode:
+            return live_mode in ("class", "shaded_class")
+
+        dialog = (getattr(app, "display_mode_dialog", None)
+                  or getattr(app, "display_dialog", None))
+        view_modes = getattr(dialog, "view_color_modes", None) if dialog else None
+        if not isinstance(view_modes, dict):
+            view_modes = getattr(app, "view_color_modes", {})
+        try:
+            mode_idx = int((view_modes or {}).get(slot_idx, 0) or 0)
+        except (TypeError, ValueError):
+            mode_idx = 0
+        return mode_idx in (0, 1)
+
+    # Cut Section remains classification-only.
+    return slot_idx == 5
+
 def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
                         border: Optional[float] = None, render: bool = True,
                         rewrite_rgb: Optional[bool] = None, **kwargs):
@@ -5076,14 +5121,10 @@ def sync_palette_to_gpu(app, slot_idx: int = 0, palette: Optional[dict] = None,
         app.view_borders[slot_idx] = float(border)
 
     if rewrite_rgb is None:
-        if slot_idx == 0:
-            # Keep main-view mode colors stable in non-class modes.
-            # Slot-0 palette sync should still update shader LUT uniforms (visibility/weights/border),
-            # but must not overwrite the current RGB buffer used by intensity/depth/rgb/elevation.
-            current_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-            rewrite_rgb = current_mode in ("class", "shaded_class")
-        else:
-            rewrite_rgb = True
+        # Palette sync also runs during classification to refresh visibility
+        # uniforms. Preserve any non-class RGB buffer currently displayed by
+        # Main View or an independent cross-section slot.
+        rewrite_rgb = _slot_uses_class_rgb(app, slot_idx, actor)
 
     rgb_ptr = getattr(actor, '_naksha_rgb_ptr', None)
     if bool(rewrite_rgb) and rgb_ptr is not None and _is_writable(rgb_ptr):
@@ -5284,7 +5325,44 @@ def refresh_section_after_weight_change(
                 and len(global_indices) > 0
                 and int(np.max(global_indices)) < len(classification)
             ):
-                actor._naksha_section_class = classification[global_indices].copy()
+                # CRITICAL: _naksha_section_class must stay a NumPy VIEW of the
+                # mapper's live VTK ``Classification`` array. Replacing it with
+                # ``classification[global_indices].copy()`` detaches the mirror
+                # from the GPU vertex attribute. RGB then changes correctly on
+                # classification, but the shader still sees the OLD class_code
+                # and therefore keeps the OLD point weight/size.
+                #
+                # Sync canonical classes into the actual mapped VTK array in
+                # place and rebind the mirror to that same storage. This is
+                # class-code based only; it works for every PTC without any
+                # hard-coded class names or class numbers.
+                mesh = getattr(actor, '_naksha_mesh', None)
+                if mesh is None:
+                    mapper = actor.GetMapper()
+                    mesh = mapper.GetInput() if mapper is not None else None
+
+                class_vtk_arr = (
+                    mesh.GetPointData().GetArray("Classification")
+                    if mesh is not None else None
+                )
+                if class_vtk_arr is not None:
+                    cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
+                    fresh_classes = classification[global_indices]
+                    if len(cls_np) == len(fresh_classes):
+                        np.copyto(
+                            cls_np,
+                            fresh_classes.astype(cls_np.dtype, copy=False),
+                        )
+                        class_vtk_arr.Modified()
+                        mesh.GetPointData().Modified()
+                        mesh.Modified()
+                        actor._naksha_section_class = cls_np
+                        actor._naksha_class_vtk_ref = class_vtk_arr
+                    else:
+                        print(
+                            f"   ⚠️ Section {view_idx+1}: Classification array length "
+                            f"mismatch ({len(cls_np)} vs {len(fresh_classes)})"
+                        )
         except Exception as _mirror_sync_err:
             print(f"   ⚠️ Section {view_idx+1}: mirror resync before class-mode "
                   f"recolor failed: {_mirror_sync_err}")
@@ -5297,6 +5375,11 @@ def refresh_section_after_weight_change(
                 vtk_ca.Modified()
             _mark_actor_dirty(actor)
 
+    # Persist the mode that is actually represented by this actor's RGB
+    # buffer. Classification refreshes must not rely on transient dialog state.
+    actor._naksha_color_mode = str(mode or "class").lower()
+    vtk_widget._naksha_color_mode = actor._naksha_color_mode
+
     _push_uniforms_direct(actor, ctx)
 
     try:
@@ -5304,8 +5387,24 @@ def refresh_section_after_weight_change(
     except Exception:
         pass
 
+    try:
+        _custom_weights = [
+            float(info.get('weight', 1.0))
+            for info in (palette or {}).values()
+            if isinstance(info, dict)
+            and abs(float(info.get('weight', 1.0)) - 1.0) > 1e-6
+        ]
+        _weight_summary = (
+            f", custom_weights={len(_custom_weights)}, "
+            f"range={min(_custom_weights):.2f}-{max(_custom_weights):.2f}"
+            if _custom_weights else ", custom_weights=0"
+        )
+    except Exception:
+        _weight_summary = ""
+
     print(f"   ✅ refresh_section_after_weight_change: view={view_idx+1} "
-          f"(slot={slot_idx}, border={border_percent}%, base_size={base_point_size})")
+          f"(slot={slot_idx}, border={border_percent}%, "
+          f"base_size={base_point_size}{_weight_summary})")
     return True
 
 
@@ -5616,16 +5715,17 @@ def build_unified_actor(
         print("      ℹ️ All flight lines are off — main point cloud hidden")
         return None
 
-    cloud     = pv.PolyData(vis_xyz)
+    cloud = pv.PolyData(vis_xyz)
+    cloud_bounds = tuple(float(v) for v in cloud.GetBounds())
     print(
         "      COORD_TRACE PRE-VTK/POLYDATA: "
-        f"X=[{vis_xyz[:, 0].min():.3f}, {vis_xyz[:, 0].max():.3f}] "
-        f"Y=[{vis_xyz[:, 1].min():.3f}, {vis_xyz[:, 1].max():.3f}] "
-        f"polydata={tuple(float(v) for v in cloud.GetBounds())}"
+        f"X=[{cloud_bounds[0]:.3f}, {cloud_bounds[1]:.3f}] "
+        f"Y=[{cloud_bounds[2]:.3f}, {cloud_bounds[3]:.3f}] "
+        f"polydata={cloud_bounds}"
     )
-    # Keep main classification array independent of temporary NumPy views.
-    class_vtk = numpy_support.numpy_to_vtk(vis_class.astype(np.float32, copy=False),
-                                            deep=True)
+    # One zero-copy float32 mirror serves both VTK and later GPU updates.
+    _cls_np_f32 = vis_class.astype(np.float32, copy=False)
+    class_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
     class_vtk.SetName("Classification")
     cloud.GetPointData().AddArray(class_vtk)
 
@@ -5661,7 +5761,10 @@ def build_unified_actor(
     cloud.GetPointData().SetScalars(rgb_vtk)
 
     lut = _get_lut("main")
-    np.copyto(app._rgb_buffer, lut.map_classes(vis_class, palette))
+    np.take(
+        lut.build(palette, int(vis_class.max()) + 1),
+        vis_class, axis=0, out=app._rgb_buffer, mode="clip",
+    )
 
     n_pts             = len(xyz)
     actual_point_size = _BASE_POINT_SIZE
@@ -5717,13 +5820,9 @@ def build_unified_actor(
             raise RuntimeError("build_unified_actor: mesh scalars missing")
 
         _vtk_rgb = numpy_support.vtk_to_numpy(vtk_ca)
-        np.copyto(_vtk_rgb, app._rgb_buffer)
+        if not np.shares_memory(_vtk_rgb, app._rgb_buffer):
+            np.copyto(_vtk_rgb, app._rgb_buffer)
         vtk_ca.Modified()
-
-        _cls_np_f32 = vis_class.astype(np.float32)
-        _cls_vtk = numpy_support.numpy_to_vtk(_cls_np_f32, deep=False)
-        _cls_vtk.SetName("Classification")
-        mesh.GetPointData().AddArray(_cls_vtk)
 
         actor._naksha_rgb_ptr         = _vtk_rgb
         actor._naksha_point_count     = len(vis_xyz)
@@ -5749,7 +5848,7 @@ def build_unified_actor(
             actor._naksha_boundary_point_count = len(vis_class)
             _step = max(1, len(vis_class) // 2000)
             actor._naksha_boundary_checksum = int(
-                vis_class.astype(np.int32)[::_step].sum()
+                vis_class[::_step].astype(np.int64, copy=False).sum()
             )
         app._unified_actor            = actor
 
@@ -6684,6 +6783,15 @@ def build_section_unified_actor(
         if actor is None:
             return None
         _wire_actor_metadata(actor, mesh, vtk_ca, _vtk_rgb, _vtk_cls, class_vtk, bf_vtk, combined_global_mask, actual_pt_size)
+
+        # A freshly built section unified actor is CLASS-colored by definition.
+        # Stamp the live mode immediately so classification refresh does not
+        # inherit a stale Depth/RGB/Intensity/Elevation/Line mode from the
+        # previous actor/widget state.  _slot_uses_class_rgb() intentionally
+        # trusts this live metadata before dialog state.
+        actor._naksha_color_mode = "class"
+        vtk_widget._naksha_color_mode = "class"
+
         actor._naksha_global_indices = all_global_indices
         vtk_widget._naksha_full_detail_actor = actor
         try:
@@ -6714,6 +6822,12 @@ def build_section_unified_actor(
     if lod_actor is None:
         return None
     _wire_actor_metadata(lod_actor, lod_mesh, lod_vtk_ca, lod_vtk_rgb, lod_vtk_cls, lod_class_vtk, lod_bf_vtk, combined_global_mask, actual_pt_size)
+
+    # The first-frame LOD actor also starts as CLASS-colored.  Do not let the
+    # section widget keep the mode of the actor that this rebuild replaced.
+    lod_actor._naksha_color_mode = "class"
+    vtk_widget._naksha_color_mode = "class"
+
     lod_actor._naksha_global_indices = all_global_indices[lod_sel]
     lod_actor._naksha_lod_source_indices = lod_sel
     vtk_widget._naksha_section_render_mode = "unified_lod"
@@ -6767,6 +6881,12 @@ def build_section_unified_actor(
                             pass
                         return
                     _wire_actor_metadata(full_actor, full_mesh, full_vtk_ca, full_vtk_rgb, full_vtk_cls, full_class_vtk, full_bf_vtk, combined_global_mask, actual_pt_size)
+
+                    # Preserve the same CLASS live-mode invariant when the
+                    # background full-resolution actor replaces the LOD actor.
+                    full_actor._naksha_color_mode = "class"
+                    vtk_widget._naksha_color_mode = "class"
+
                     full_actor._naksha_global_indices = all_global_indices
                     if interaction_actor_name in vtk_widget.actors:
                         vtk_widget._naksha_full_detail_actor = full_actor
@@ -6860,7 +6980,28 @@ def fast_partial_cross_section_update(app, view_idx: int, global_changed_mask: n
         return True
 
     try:
-        _patch_actor_memory(app, actor, local_indices, slot_idx=view_idx + 1)
+        slot_idx = view_idx + 1
+        _patch_actor_memory(app, actor, local_indices, slot_idx=slot_idx)
+
+        # Weight is a slot-local display property. Classification changes only
+        # the class code; the destination point size must therefore come from
+        # the CURRENT slot palette. Normally the context is already current,
+        # so load_from_palette() is a no-op. If a palette/weight change reached
+        # memory before the actor, this self-heals the LUT without rebuilding
+        # geometry or touching another view.
+        ctx = getattr(actor, '_naksha_shader_ctx', None)
+        if ctx is not None:
+            palette = _get_slot_palette(app, slot_idx) or {}
+            border_percent = float(
+                getattr(app, 'view_borders', {}).get(slot_idx, 0.0) or 0.0
+            )
+            base_point_size = float(
+                getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE)
+            )
+            if ctx.load_from_palette(palette, border_percent, base_point_size):
+                _set_context_border_logic_mode(app, slot_idx, ctx)
+                _push_uniforms_direct(actor, ctx)
+                actor._last_uniform_generation = ctx._generation
     except Exception as e:
         print(f"⚠️ fast_partial_cross_section_update patch failed (view={view_idx}): {e}")
         return False
@@ -7082,6 +7223,34 @@ def fast_cross_section_update(
     if actor is None:
         return False
 
+    # A classification commit changes each point's class ID. Point size is
+    # shader-driven from this slot's weight LUT, so make sure the actor still
+    # carries the CURRENT Cross/Cut palette before the changed class IDs are
+    # consumed. This is slot-local and never rebuilds section geometry.
+    try:
+        _weights_applied = getattr(app, '_slot_weights_applied', set()) or set()
+        _has_custom_weight = any(
+            abs(float(info.get('weight', 1.0)) - 1.0) > 1e-6
+            for info in (palette or {}).values()
+            if isinstance(info, dict)
+        )
+        if slot_idx in _weights_applied or _has_custom_weight:
+            _ctx = getattr(actor, '_naksha_shader_ctx', None)
+            if _ctx is not None:
+                _base_sz = float(
+                    getattr(actor, '_naksha_base_point_size', _BASE_POINT_SIZE)
+                )
+                _ctx.force_reload()
+                _ctx.load_from_palette(palette, border_percent, _base_sz)
+                _set_context_border_logic_mode(app, slot_idx, _ctx)
+                _push_uniforms_direct(actor, _ctx)
+                actor._last_uniform_generation = _ctx._generation
+    except Exception as _weight_sync_err:
+        print(
+            f"   ⚠️ Section {view_idx+1} weight LUT refresh skipped: "
+            f"{_weight_sync_err}"
+        )
+
     actor_global_indices = getattr(actor, "_naksha_global_indices", None)
     if (
         isinstance(actor_global_indices, np.ndarray)
@@ -7161,10 +7330,7 @@ def fast_cross_section_update(
     # reverting Line/Depth/RGB/Intensity/Elevation back to Class colors
     # after any classify action -- Main View never had this problem
     # because it already had this exact check.
-    dlg_for_mode = getattr(app, 'display_mode_dialog', None)
-    _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
-    section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
-    section_is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    section_is_class_like = _slot_uses_class_rgb(app, slot_idx, actor)
 
     if n_changed > 0 and section_is_class_like:
         if changed_idx.max(initial=-1) >= len(rgb_ptr):
@@ -7184,27 +7350,33 @@ def fast_cross_section_update(
         if vtk_rgb_arr is not None:
             vtk_rgb_arr.Modified()
 
-        cls_np = getattr(actor, "_naksha_section_class", None)
-        class_vtk_arr = getattr(actor, "_naksha_class_vtk_ref", None)
-        max_local = int(changed_idx.max()) if changed_idx.size > 0 else -1
-        if cls_np is not None and len(cls_np) > max_local:
-            try:
+        # The shader's ``class_code`` vertex attribute is mapped from the
+        # mapper input's VTK ``Classification`` array. Do NOT update only the
+        # Python mirror here: a prior weight/display refresh may have replaced
+        # that mirror with detached memory in older builds. Always patch the
+        # exact VTK array consumed by the mapper, then bind the mirror back to
+        # that live array. This is what makes a newly classified point pick up
+        # the destination class's weight immediately.
+        class_vtk_arr = poly.GetPointData().GetArray("Classification")
+        if class_vtk_arr is not None:
+            cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
+            valid = changed_idx < len(cls_np)
+            if not np.all(valid):
+                changed_idx = changed_idx[valid]
+                new_classes = new_classes[valid]
+                n_changed = int(changed_idx.size)
+            if changed_idx.size > 0:
                 cls_np[changed_idx] = new_classes.astype(cls_np.dtype, copy=False)
-            except Exception:
-                cls_np[changed_idx] = new_classes
-            if class_vtk_arr is None:
-                class_vtk_arr = poly.GetPointData().GetArray("Classification")
-                actor._naksha_class_vtk_ref = class_vtk_arr
-            if class_vtk_arr is not None:
                 class_vtk_arr.Modified()
-        else:
-            class_vtk_arr = poly.GetPointData().GetArray("Classification")
-            if class_vtk_arr is not None:
-                cls_np = numpy_support.vtk_to_numpy(class_vtk_arr)
-                cls_np[changed_idx] = new_classes.astype(cls_np.dtype, copy=False)
-                class_vtk_arr.Modified()
+                poly.GetPointData().Modified()
                 actor._naksha_section_class = cls_np
                 actor._naksha_class_vtk_ref = class_vtk_arr
+        else:
+            # Legacy fallback only. Current unified section actors always have
+            # the named Classification array.
+            cls_np = getattr(actor, "_naksha_section_class", None)
+            if cls_np is not None and len(cls_np) > int(changed_idx.max(initial=-1)):
+                cls_np[changed_idx] = new_classes.astype(cls_np.dtype, copy=False)
 
         vtk_scalars.Modified()
         poly.Modified()
@@ -7375,28 +7547,30 @@ def _patch_actor_memory(app, actor, local_indices: np.ndarray,
     # unconditionally) -- so undo and partial-classify updates always
     # repainted a section's RGB buffer with classification colors even
     # while that section was showing Line/Depth/RGB/Intensity/Elevation,
-    # silently reverting those modes back to Class colors. Now checks each
-    # section's own remembered mode (dlg.view_color_modes[slot_idx]), same
-    # source of truth used everywhere else this session.
-    if slot_idx == 0:
-        display_mode = str(getattr(app, "display_mode", "class") or "class").lower()
-        is_class_like = display_mode in ("class", "shaded_class")
-    else:
-        dlg_for_mode = getattr(app, 'display_mode_dialog', None)
-        _view_color_modes = getattr(dlg_for_mode, 'view_color_modes', {}) if dlg_for_mode else {}
-        section_mode_idx = int(_view_color_modes.get(slot_idx, 0) or 0)
-        is_class_like = section_mode_idx in (0, 1)  # 0=class, 1=shaded_class
+    # silently reverting those modes back to Class colors. The actor's live
+    # render-mode tag is authoritative; dialog state is only a legacy fallback.
+    is_class_like = _slot_uses_class_rgb(app, slot_idx, actor)
     if is_class_like:
-        if hasattr(actor, "_naksha_section_class"):
-            actor._naksha_section_class[local_indices] = reverted_cls
-
+        # Never use the Python mirror as the write target here. It may come
+        # from an older actor state. The mapper's named Classification array
+        # below is the GPU vertex attribute source of truth.
         mesh = getattr(actor, '_naksha_mesh', None)
+        if mesh is None:
+            try:
+                mapper = actor.GetMapper()
+                mesh = mapper.GetInput() if mapper is not None else None
+            except Exception:
+                mesh = None
         if mesh is not None:
             class_vtk = mesh.GetPointData().GetArray("Classification")
             if class_vtk is not None:
-                numpy_support.vtk_to_numpy(class_vtk)[local_indices] = (
-                    reverted_cls.astype(np.float32))
+                cls_ptr = numpy_support.vtk_to_numpy(class_vtk)
+                cls_ptr[local_indices] = reverted_cls.astype(cls_ptr.dtype, copy=False)
                 class_vtk.Modified()
+                mesh.GetPointData().Modified()
+                # Keep the Python mirror tied to the exact GPU-backed array.
+                actor._naksha_section_class = cls_ptr
+                actor._naksha_class_vtk_ref = class_vtk
 
         rgb_ptr = getattr(actor, "_naksha_rgb_ptr", None)
         if rgb_ptr is not None and _is_writable(rgb_ptr):
@@ -7855,8 +8029,8 @@ def _compute_boundary_flags(xyz: np.ndarray, classification: np.ndarray = None,
     has_class = classification is not None
     if has_class:
         class_grid = np.full((gx_max, gy_max), -1, dtype=np.int32)
-        class_grid[gx, gy] = classification.astype(np.int32)
-        my_class = classification.astype(np.int32)
+        my_class = np.asarray(classification, dtype=np.int32)
+        class_grid[gx, gy] = my_class
 
     _DIRS = [(-1, -1), (-1, 0), (-1, 1),
              ( 0, -1),          ( 0, 1),

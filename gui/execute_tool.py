@@ -74,6 +74,35 @@ def _class_picker_is_visible(picker) -> bool:
         return False
 
 
+def _deactivate_pan_navigation_safely(app_window) -> None:
+    """Release latched pan state in main, cross, and cut viewports."""
+    app_window._left_pan_shortcut_active = False
+
+    release_main = getattr(app_window, "_handle_fast_main_pan_release", None)
+    if callable(release_main) and getattr(app_window, "_qt_main_pan_active", False):
+        try:
+            release_main()
+        except Exception:
+            pass
+
+    widgets = [getattr(app_window, "sec_vtk", None)]
+    widgets.extend(getattr(app_window, "section_vtks", {}).values())
+    cut = getattr(app_window, "cut_section_controller", None)
+    widgets.append(getattr(cut, "cut_vtk", None) if cut is not None else None)
+
+    seen = set()
+    for widget in widgets:
+        if widget is None or id(widget) in seen:
+            continue
+        seen.add(id(widget))
+        pan_filter = getattr(widget, "_naksha_section_wheel_filter", None)
+        finish = getattr(pan_filter, "_finish_tap_pan", None)
+        if callable(finish):
+            try:
+                finish()
+            except Exception:
+                pass
+
 def _apply_display_visibility_preset(app_window, preset) -> int:
     """Apply a saved class-visibility map without replacing live metadata."""
     if not isinstance(preset, dict):
@@ -209,36 +238,52 @@ def _schedule_curve_tool_resume(app_window, reason="mode switch"):
     QTimer.singleShot(0, _do_resume)
 
 
-def _deactivate_curve_tool_safely(app_window, reason="switching tools"):
+def _deactivate_curve_tool_safely(app_window, reason="switching tools", *, exclusive=False):
     """
     Safely deactivate curve tool in all modes.
     Called when switching to any other tool context.
+
+    exclusive=True is for tool contexts curve must not silently fight for
+    input with once you've switched away - classification, cut-section,
+    CutFromCross/CutFromCut, temp fence. Without it, suspend()+schedule-
+    resume (below) re-arms curve_tool on the very next Qt tick because
+    `_draw_curve_context_active` is never cleared, so curve keeps its VTK
+    observers live and intercepts clicks meant for the tool you just
+    switched to - unlike SmartLine/Polyline, which fully stand down via
+    digitizer.set_tool(None) and never come back on their own. Mirrors
+    the existing resume_after_switch=False guard in
+    app_window._suspend_curve_tool_safely, used for the same reason when
+    entering cross-section.
     """
     if not hasattr(app_window, 'curve_tool') or app_window.curve_tool is None:
         return
-    
+
     ct = app_window.curve_tool
-    
+
     # Check if curve tool has any active mode
     is_active = ct.active
     is_select_mode = getattr(ct, '_select_mode', False)
-    
+
     if not is_active and not is_select_mode:
         return
-    
+
     print(f"   🎨 Deactivating curve tool ({reason})")
-    
+
+    if exclusive:
+        app_window._draw_curve_context_active = False
+
     # Cancel active drawing if in progress
     if is_active:
         if hasattr(ct, "suspend"):
             ct.suspend()
-            # ✅ FIX: don't leave it suspended — re-arm it once this mode
-            # switch finishes, so the very next canvas click continues the
-            # curve instead of requiring the user to reselect the tool.
-            _schedule_curve_tool_resume(app_window, reason)
+            if not exclusive:
+                # ✅ FIX: don't leave it suspended — re-arm it once this mode
+                # switch finishes, so the very next canvas click continues the
+                # curve instead of requiring the user to reselect the tool.
+                _schedule_curve_tool_resume(app_window, reason)
         else:
             ct._cancel_curve()
-    
+
     # Exit select mode if active
     if is_select_mode:
         ct.deactivate_select_mode()
@@ -446,20 +491,13 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
             print(f"🎨 APPLYING DISPLAYMODE PRESET")
             print(f"{'='*60}")
             
-            # ✅ CRITICAL: Initialize app_window.view_palettes with CORRECT WEIGHTS
-            if not hasattr(app_window, 'view_palettes'):
+            # Keep unrelated view slots intact.  A shortcut may target one view;
+            # clearing all six here used to erase Cross/Cut PTC schemas.
+            if not hasattr(app_window, 'view_palettes') or not isinstance(app_window.view_palettes, dict):
                 app_window.view_palettes = {}
             
-            # Set default weights based on view type
-            for view_idx in range(6):  # 0=Main, 1-4=Cross-sections, 5=Cut
-                if view_idx == 0:
-                    default_weight = 1.0  # Main View
-                else:
-                    default_weight = 0.5  # All others
-                
-                app_window.view_palettes[view_idx] = {}
-            
-            # ✅ Now apply preset values, overriding defaults only where preset has data
+            # Apply only the view(s) carried by the rebased preset.  Rebase already
+            # contains the complete current PTC schema for each target view.
             for view_idx_str, classes in views.items():
                 view_idx = int(view_idx_str)
                 
@@ -467,6 +505,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 
                 # Get default weight for this view type
                 default_weight = 1.0 if view_idx == 0 else 0.5
+                app_window.view_palettes[view_idx] = {}
                 
                 # Copy all class info from preset
                 for code_str, info in classes.items():
@@ -492,19 +531,11 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
                 print(f"      📊 Visible: {visible}")
                 print(f"      ⚖️ Weights: {weights}")
             
-            # ✅ Also update class_palette from view 0
+            # Main runtime palette mirrors the fully-rebased Main slot.  Because
+            # the rebase is schema-complete, this cannot delete newly-added PTC classes.
             if 0 in views:
-                app_window.class_palette = {}
-                for code_str, info in views[0].items():
-                    code_int = int(code_str)
-                    app_window.class_palette[code_int] = {
-                        "show": info.get("show", False),
-                        "description": info.get("description", ""),
-                        "color": info.get("color", (128, 128, 128)),
-                        "weight": info.get("weight", 1.0),
-                        "draw": info.get("draw", ""),
-                        "lvl": info.get("lvl", "")
-                    }
+                from gui.display_mode import clone_palette
+                app_window.class_palette = clone_palette(app_window.view_palettes.get(0, {}))
             
             # Trigger refresh
             from gui.class_display import update_class_mode
@@ -1145,6 +1176,9 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # CROSS-SECTION TOOL (Non-classification)
     # ========================================================================
     if tool_name == "cross_section":
+        # The locator now owns input on the main view. Release any Pan
+        # shortcut/tap session left active in the viewport that had focus.
+        _deactivate_pan_navigation_safely(app_window)
         print("🔧 Activating Cross Section tool - SHOWING POPUP DIALOG")
 
         # Curve deactivation is handled inside the cross-section entry point.
@@ -1214,7 +1248,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
         print("🔧 Activating Cut Section tool")
         
         # ✅ Deactivate curve tool when switching to cut-section
-        _deactivate_curve_tool_safely(app_window, "switching to cut-section")
+        _deactivate_curve_tool_safely(app_window, "switching to cut-section", exclusive=True)
         
         # ✅ Deactivate measurement tool
         _deactivate_measurement_tool_safely(app_window, "switching to cut-section")
@@ -1241,7 +1275,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # ========================================================================
     if tool_name == "CutFromCross":
         # ✅ Deactivate curve tool
-        _deactivate_curve_tool_safely(app_window, "switching to CutFromCross")
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCross", exclusive=True)
 
         # ✅ Stand down temp fence tool
         _deactivate_temp_fence_safely(app_window, "switching to CutFromCross")
@@ -1252,7 +1286,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
 
     if tool_name == "CutFromCut":
         # ✅ Deactivate curve tool
-        _deactivate_curve_tool_safely(app_window, "switching to CutFromCut")
+        _deactivate_curve_tool_safely(app_window, "switching to CutFromCut", exclusive=True)
 
         # ✅ Stand down temp fence tool
         _deactivate_temp_fence_safely(app_window, "switching to CutFromCut")
@@ -1265,7 +1299,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     # TEMP FENCE (standalone fence tool — no ClassPicker, no classification)
     # ========================================================================
     if tool_name == "temp_fence":
-        _deactivate_curve_tool_safely(app_window, "switching to temp fence")
+        _deactivate_curve_tool_safely(app_window, "switching to temp fence", exclusive=True)
         _deactivate_measurement_tool_safely(app_window, "switching to temp fence")
         if hasattr(app_window, "set_classify_tool"):
             app_window.set_classify_tool("temp_fence")
@@ -1298,7 +1332,7 @@ def execute_tool(app_window, tool, from_cls=None, to_cls=None, preset=None, key_
     print(f"🎯 Activating classification tool: {tool_name}")
     
     # ✅ CRITICAL: Deactivate curve tool when switching to classification
-    _deactivate_curve_tool_safely(app_window, "switching to classification")
+    _deactivate_curve_tool_safely(app_window, "switching to classification", exclusive=True)
     
     # ✅ CRITICAL: Deactivate measurement tool when switching to classification
     _deactivate_measurement_tool_safely(app_window, "switching to classification")

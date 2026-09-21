@@ -11,7 +11,7 @@ from PySide6.QtCore import Signal, Qt, QSettings, QEvent
 from PySide6.QtGui import QColor, QAction, QActionGroup
 from torch import layout
 
-from .class_picker import ClassPicker
+from .class_picker import ClassPicker, resolve_class_catalog
 from .theme_manager import get_dialog_stylesheet
 from .shading_preset_quality import (
     SHADING_QUALITY_CHOICES,
@@ -333,49 +333,66 @@ def decode_display_preset(text):
         print(f"❌ decode_display_preset error: {e}")
         return None
 def rebase_display_preset_to_current_ptc(preset: dict, app_window) -> dict:
-    """
-    Rebuild a DisplayMode preset's per-class data using the CURRENTLY
-    LOADED PTC's app.class_palette.
+    """Rebase DisplayMode state onto the *current* PTC schema.
 
-    - Preserves: shortcut's show/weight values, border_percent,
-      border_type, force_refresh.
-    - Replaces:  description/color/draw/lvl with the live values from
-      app.class_palette (so a stale preset from a different PTC can
-      never reapply old class metadata).
-    - Classes present in the preset but missing from the current PTC's
-      class_palette are dropped.
+    A shortcut owns presentation choices (show/weight/border/mode).  It does
+    **not** own PTC identity metadata.  In particular, a shortcut created before
+    a new class was added must not delete that class when pressed.
     """
-    current_palette = getattr(app_window, "class_palette", {}) or {}
+    if not isinstance(preset, dict):
+        return preset
+
+    app_views = getattr(app_window, "view_palettes", {}) or {}
+    current_palette = resolve_class_catalog(app_window)
+
+    if not current_palette:
+        # Fail safe: never replace a valid shortcut with an empty schema merely
+        # because a load is between phases.
+        return dict(preset)
 
     rebased_views = {}
-    for view_idx, classes in (preset.get("views", {}) or {}).items():
-        view_idx = int(view_idx)
-        rebased = {}
+    for raw_view_idx, raw_classes in (preset.get("views", {}) or {}).items():
+        view_idx = int(raw_view_idx)
+        saved_classes = raw_classes if isinstance(raw_classes, dict) else {}
+        view_live = app_views.get(view_idx, {}) if isinstance(app_views, dict) else {}
+        if not isinstance(view_live, dict):
+            view_live = {}
 
-        for code, info in classes.items():
-            code = int(code)
-            live = current_palette.get(code)
-            if live is None:
-                # Class no longer exists in the newly loaded PTC — skip it.
-                continue
+        rebased = {}
+        # Iterate the CURRENT PTC, not the old shortcut.  This is what keeps
+        # newly-added classes alive and drops only classes truly removed from PTC.
+        for code, live in sorted(current_palette.items()):
+            saved = saved_classes.get(code)
+            if saved is None:
+                saved = saved_classes.get(str(code))
+            saved = saved if isinstance(saved, dict) else None
+
+            slot_entry = view_live.get(code)
+            if slot_entry is None:
+                slot_entry = view_live.get(str(code))
+            slot_entry = slot_entry if isinstance(slot_entry, dict) else {}
+
+            show_fallback = slot_entry.get("show", live.get("show", True))
+            weight_fallback = slot_entry.get("weight", live.get("weight", 1.0))
             rebased[code] = {
-                "show":        bool(info.get("show", False)),
-                "weight":      float(info.get("weight", 1.0)),
-                "description": live.get("description", ""),
-                "color":       tuple(live.get("color", (128, 128, 128))),
-                "draw":        live.get("draw", ""),
-                "lvl":         live.get("lvl", ""),
+                "show": bool(saved.get("show", show_fallback)) if saved else bool(show_fallback),
+                "weight": float(saved.get("weight", weight_fallback)) if saved else float(weight_fallback),
+                "description": str(live.get("description", "")),
+                "color": tuple(live.get("color", (128, 128, 128))),
+                "draw": str(live.get("draw", "")),
+                "lvl": str(live.get("lvl", "")),
             }
 
         rebased_views[view_idx] = rebased
 
-    return {
-        "display_mode":   str(preset.get("display_mode", "class") or "class"),
-        "border_percent": float(preset.get("border_percent", 0.0)),
-        "border_type":    int(preset.get("border_type", 0)),
-        "force_refresh":  bool(preset.get("force_refresh", True)),
-        "views":          rebased_views,
-    }
+    # Preserve quality_mode, flight_lines, and any future top-level fields.
+    result = dict(preset)
+    result["display_mode"] = str(preset.get("display_mode", "class") or "class")
+    result["border_percent"] = float(preset.get("border_percent", 0.0))
+    result["border_type"] = int(preset.get("border_type", 0))
+    result["force_refresh"] = bool(preset.get("force_refresh", True))
+    result["views"] = rebased_views
+    return result
 
 
 def summarize_display_like_preset(preset: dict, prefix: str = "Preset") -> str:
@@ -449,7 +466,7 @@ QWidget {
 /* Table styling */
 QTableWidget {
     background-color: #252526;
-    gridline-color: #3e3e42;
+    gridline-color: #FFFFFF;
     border: 1px solid #3e3e42;
     selection-background-color: #0e639c;
     alternate-background-color: #2d2d30;
@@ -480,8 +497,8 @@ QHeaderView::section {
     background-color: #2d2d30;
     border: none;
     padding: 8px;
-    border-bottom: 1px solid #3e3e42;
-    border-right: 1px solid #3e3e42;
+    border-bottom: 1px solid #FFFFFF;
+    border-right: 1px solid #FFFFFF;
     font-weight: bold;
     color: #cccccc;
 }
@@ -494,6 +511,7 @@ QHeaderView::section:hover {
 QComboBox {
     background-color: #3c3c3c;
     border: 1px solid #404040;
+    border-right: 2px solid #FFFFFF;
     border-radius: 4px;
     padding: 4px 8px;
     color: #e0e0e0;
@@ -1385,9 +1403,9 @@ class ClassVisibilityPicker(QDialog):
     def _save_col_widths(widths):
         QSettings("NakshaAI", "LidarApp").setValue(_COL_WIDTHS_KEY, widths)
 
-    def _resolve_shading_palette_source(self):
+    def _resolve_class_metadata_palette_source(self):
         """
-        Build a current palette with complete metadata for Shading and Surface.
+        Build a current palette with complete metadata for preset editors.
 
         The first live source defines the current class set and state. Later
         sources only backfill missing metadata, preventing a stale slot palette
@@ -2213,8 +2231,8 @@ class ClassVisibilityPicker(QDialog):
             self.class_checkboxes.clear()
             self.weight_spinboxes = {}
 
-            if self.mode in CLASS_VISIBILITY_PICKER_MODES:
-                palette_source = self._resolve_shading_palette_source()
+            if self.mode == "display" or self.mode in CLASS_VISIBILITY_PICKER_MODES:
+                palette_source = self._resolve_class_metadata_palette_source()
             else:
                 palette_source = getattr(self.app_window, 'class_palette', {}) or {}
 
@@ -2392,8 +2410,8 @@ class ClassVisibilityPicker(QDialog):
         """Return dict of selected classes with their info + updated weights"""
         result = {}
         palette_source = (
-            self._resolve_shading_palette_source()
-            if self.mode in CLASS_VISIBILITY_PICKER_MODES
+            self._resolve_class_metadata_palette_source()
+            if self.mode == "display" or self.mode in CLASS_VISIBILITY_PICKER_MODES
             else (getattr(self.app_window, "class_palette", {}) or {})
         )
         for code, checkbox in self.class_checkboxes.items():
@@ -2883,7 +2901,7 @@ class ShortcutManager(QWidget):
         search_layout.setSpacing(8)
         search_layout.setContentsMargins(0, 4, 0, 8)
 
-        search_label = QLabel("🔍 Search:")
+        search_label = QLabel("Search:")
         search_label.setObjectName("dialogInlineNote")
         search_layout.addWidget(search_label)
 
@@ -3413,6 +3431,8 @@ class ShortcutManager(QWidget):
         self.table.setCellWidget(row, self.COL_TOOL, tool_combo)
 
         self._update_row_header(row)
+        # ✅ Grey out already-used keys for this row's modifier
+        QTimer.singleShot(0, lambda r=row: self._update_key_combo_availability(r))
 
     # ─────────────────────────────────────────────────────────────────
     # TABLE BODY right-click context menu
@@ -3509,6 +3529,9 @@ class ShortcutManager(QWidget):
         if new_row >= 0:
             self._set_current_row(new_row)
 
+        # ✅ Keys freed by deletion may now be available in other rows
+        self._refresh_all_key_availability()
+
     def on_item_clicked(self, item):
         """Prevent Classes column from being edited with single click"""
         if item.column() == self.COL_CLASSES:
@@ -3528,6 +3551,22 @@ class ShortcutManager(QWidget):
                     return True, row
         return False, -1
 
+    # ── Predefined shortcuts that cannot be reassigned ────────────────
+    _PREDEFINED_SHORTCUTS = {
+        # (modifier_lower, key_upper): description shown in warning
+        ("ctrl", "Z"): "UNDO operations",
+        ("ctrl", "Y"): "REDO operations",
+        ("shift", "P"): "3D View mode",
+        ("shift", "F"): "Fit View mode",
+        ("ctrl+shift", "F"): "Lock to Fit View mode",
+    }
+
+    def _is_predefined_shortcut(self, mod, key):
+        """Check if this modifier+key combo is reserved for a predefined action."""
+        mod_lower = mod.lower().strip()
+        key_upper = key.upper().strip()
+        return self._PREDEFINED_SHORTCUTS.get((mod_lower, key_upper))
+
     def _on_key_changed(self, row):
         """Called when modifier or key changes — check for duplicates."""
         if self._is_loading_shortcuts:
@@ -3538,17 +3577,65 @@ class ShortcutManager(QWidget):
             return
         mod = mod_combo.currentText()
         key = key_combo.currentText()
-        is_dup, dup_row = self._is_key_duplicate(mod, key, row)
-        if is_dup:
+
+        # ✅ Check predefined / reserved shortcuts first
+        predefined_desc = self._is_predefined_shortcut(mod, key)
+        if predefined_desc:
             QMessageBox.warning(
                 self,
-                "Duplicate Shortcut",
-                f"⚠️ {mod}+{key} is already assigned to row {dup_row + 1}!\n\n"
-                "Each shortcut key can only be used once.\n"
-                "Please choose a different key or modifier."
+                "Reserved Shortcut",
+                f"This Shortcut Keys combination is already predefined for {predefined_desc}, use other keys"
             )
-            # ✅ Reset to F1 to avoid conflict (restored from old code)
+            key_combo.blockSignals(True)
             key_combo.setCurrentText("F1")
+            key_combo.blockSignals(False)
+            return
+
+        # ✅ Refresh key availability highlighting for all rows
+        self._refresh_all_key_availability()
+
+    def _get_used_keys_for_modifier(self, mod):
+        """Return the set of keys already used for a given modifier across all rows."""
+        used = set()
+        mod_lower = mod.lower().strip()
+        for r in range(self.table.rowCount()):
+            mc = self.table.cellWidget(r, self.COL_MODIFIER)
+            kc = self.table.cellWidget(r, self.COL_KEY)
+            if mc and kc:
+                if mc.currentText().lower().strip() == mod_lower:
+                    used.add(kc.currentText().upper().strip())
+        # Also include predefined shortcuts for this modifier
+        for (pre_mod, pre_key) in self._PREDEFINED_SHORTCUTS:
+            if pre_mod == mod_lower:
+                used.add(pre_key)
+        return used
+
+    def _update_key_combo_availability(self, row):
+        """Grey out keys that are already used for the current modifier in other rows."""
+        mod_combo = self.table.cellWidget(row, self.COL_MODIFIER)
+        key_combo = self.table.cellWidget(row, self.COL_KEY)
+        if not mod_combo or not key_combo:
+            return
+        current_mod = mod_combo.currentText().lower().strip()
+        current_key = key_combo.currentText().upper().strip()
+        used_keys = self._get_used_keys_for_modifier(current_mod)
+        model = key_combo.model()
+        for i in range(key_combo.count()):
+            item = model.item(i)
+            key_text = key_combo.itemText(i).upper().strip()
+            if key_text in used_keys:
+                item.setEnabled(False)
+                item.setForeground(QColor("#000000"))
+            else:
+                item.setEnabled(True)
+                item.setForeground(QColor("#FFFFFF"))
+
+    def _refresh_all_key_availability(self):
+        """Update key combo grey-out state for every row."""
+        if self._is_loading_shortcuts:
+            return
+        for r in range(self.table.rowCount()):
+            self._update_key_combo_availability(r)
 
     def on_add(self):
         # A filtered table can hide the appended row. Adding starts a new edit,
@@ -3696,6 +3783,11 @@ class ShortcutManager(QWidget):
 
             # ✅ ONLY update the shortcuts lookup table — nothing else
             app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
 
             if hasattr(app_window, 'statusBar'):
                 app_window.statusBar().showMessage(
@@ -4908,6 +5000,13 @@ class ShortcutManager(QWidget):
             return cleanly instead of crashing with
             "Signal source has been deleted".
         """
+        if not self.isVisible():
+            # Defensive guard for old/stale signal connections from a hidden
+            # manager window.  Runtime ClassPicker changes must never edit .mnu.
+            self.is_editing_shortcuts = False
+            self._active_row = None
+            return
+
         if not self.is_editing_shortcuts:
             print("⏭️ update_classes_from_picker: Not in editing mode")
             return
@@ -5512,6 +5611,11 @@ class ShortcutManager(QWidget):
                     print(f"   Row {row}: {mod}+{key} → {tool}, from={from_cls}, to={to_cls}")
 
             self.app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(self.app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
 
             if not hasattr(self.app_window, 'view_palettes'):
                 self.app_window.view_palettes = {}
@@ -5539,9 +5643,32 @@ class ShortcutManager(QWidget):
         finally:
             self._applying_shortcuts = False
 
-    def on_cancel(self):
+    def _end_class_picker_edit_session(self):
+        """Detach ShortcutManager from the runtime ClassPicker.
+
+        ClassPicker is shared with normal classification tools.  Leaving these
+        signal connections armed after the Shortcut Manager is hidden lets later
+        runtime shortcut/tool changes silently rewrite the shortcut row.
+        """
         self.is_editing_shortcuts = False
-        
+        self._active_row = None
+        picker = getattr(self.app_window, "class_picker", None)
+        if (
+            self._qobject_alive(picker)
+            and self._qobject_alive(getattr(picker, "from_list", None))
+            and self._qobject_alive(getattr(picker, "to_combo", None))
+        ):
+            self._safe_disconnect(
+                picker.from_list.itemSelectionChanged,
+                self.update_classes_from_picker,
+            )
+            self._safe_disconnect(
+                picker.to_combo.currentIndexChanged,
+                self.update_classes_from_picker,
+            )
+
+    def on_cancel(self):
+        self._end_class_picker_edit_session()
         self.hide()
 
     def showEvent(self, event):
@@ -5558,8 +5685,9 @@ class ShortcutManager(QWidget):
         super().changeEvent(event)
 
     def closeEvent(self, event):
-        # Always hide on close (X button) — never destroy the widget.
-        # Real cleanup happens in _do_real_close() called only at app shutdown.
+        # Always hide on close (X button) — never destroy the widget.  Crucially,
+        # stop editing the shared runtime ClassPicker before hiding.
+        self._end_class_picker_edit_session()
         event.ignore()
         self.hide()
 
@@ -5627,8 +5755,34 @@ class ShortcutManager(QWidget):
                 needs_new = True
 
         if needs_new:
+            # Show a lightweight loading splash while the heavy constructor runs
+            from PySide6.QtWidgets import QLabel, QWidget, QApplication
+            from PySide6.QtGui import QFont
+            _splash = QWidget(None, Qt.SplashScreen | Qt.FramelessWindowHint)
+            _splash.setAttribute(Qt.WA_ShowWithoutActivating)
+            _splash.setFixedSize(260, 60)
+            _splash.setStyleSheet(
+                "background-color: #1e1e2e; border: 1px solid #444; border-radius: 8px;"
+            )
+            _lbl = QLabel("Loading shortcuts...", _splash)
+            _lbl.setAlignment(Qt.AlignCenter)
+            _lbl.setStyleSheet(
+                "color: #cccccc; font-size: 13px; background: transparent; border: none;"
+            )
+            _lbl.setGeometry(_splash.rect())
+            # Position near the Config button or center of screen
+            screen = QApplication.primaryScreen().geometry()
+            _splash.move(
+                screen.width() // 2 - 130,
+                screen.height() // 2 - 30
+            )
+            _splash.show()
+            QApplication.processEvents()  # force the splash to paint
+
             inst = ShortcutManager(app_window)
             ShortcutManager.instance = inst
+
+            _splash.close()
 
         # Restore from minimized/taskbar state if needed
         inst.setWindowFlag(Qt.WindowStaysOnTopHint, True)
@@ -5757,6 +5911,11 @@ class ShortcutManager(QWidget):
                 self._is_loading_shortcuts = False
 
             self.app_window.shortcuts = shortcuts
+            shortcut_filter = getattr(self.app_window, "short_cut_filter", None)
+            if shortcut_filter is not None and hasattr(
+                shortcut_filter, "rebuild_ctrl_alt_shortcuts"
+            ):
+                shortcut_filter.rebuild_ctrl_alt_shortcuts()
             print(f"✅ {len(shortcuts)} shortcuts loaded into app_window.shortcuts")
             print("   ⚠️  view_palettes / class_palette NOT touched — will apply on keypress only")
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import weakref
 
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer, Qt
 
 from gui.zoom_navigation import (
     FAST_WHEEL_ZOOM_FACTOR,
@@ -195,6 +195,11 @@ class SectionWheelZoomEventFilter(QObject):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.setInterval(150)
         self._settle_timer.timeout.connect(self._settle_full_detail)
+        # MicroStation-style dynamic pan for every cross/cut viewport. The
+        # first left tap starts a button-free pan and the second tap stops it.
+        self._tap_pan_active = False
+        self._tap_last_position = None
+        self._tap_swallow_release = False
 
     @property
     def vtk_widget(self):
@@ -419,8 +424,151 @@ class SectionWheelZoomEventFilter(QObject):
         except Exception:
             pass
 
+    def _tap_pan_configured(self) -> bool:
+        app = self._app_ref()
+        return app is not None and getattr(app, "panning_button", "scroll") == "tap"
+
+    def _left_click_owned_by_tool(self) -> bool:
+        """Keep navigation from stealing section/cut tool input."""
+        app = self._app_ref()
+        vtk_widget = self.vtk_widget
+        if app is None:
+            return True
+        if getattr(app, "cross_section_active", False):
+            return True
+        if getattr(app, "active_classify_tool", None) is not None:
+            return True
+        for name in (
+            "cross_section_measurement_tool",
+            "measurement_tool",
+            "identification_tool",
+            "point_sync_tool",
+            "snt_layer_pick_tool",
+        ):
+            tool = getattr(app, name, None)
+            if tool is not None and (
+                getattr(tool, "active", False)
+                or getattr(tool, "is_measuring", False)
+            ):
+                return True
+        cut = getattr(app, "cut_section_controller", None)
+        if cut is not None:
+            state = getattr(cut, "_state", 0)
+            if state in (1, 2):  # WAITING_CENTER / WAITING_DEPTH
+                owns = getattr(cut, "owns_cross_section_left_click", None)
+                if getattr(cut, "cut_vtk", None) is vtk_widget:
+                    return True
+                if callable(owns) and owns(vtk_widget):
+                    return True
+        return False
+
+    def _finish_tap_pan(self) -> None:
+        self._tap_pan_active = False
+        self._tap_last_position = None
+        self._tap_swallow_release = False
+
+    def _apply_tap_pan_move(self, position) -> bool:
+        components = self._live_components(require_visible=False)
+        if components is None or self._tap_last_position is None:
+            self._finish_tap_pan()
+            return False
+        vtk_widget, _qt_interactor, renderer, camera = components
+        try:
+            current = (float(position.x()), float(position.y()))
+            dx = current[0] - self._tap_last_position[0]
+            dy = current[1] - self._tap_last_position[1]
+            self._tap_last_position = current
+            if dx == 0.0 and dy == 0.0:
+                return True
+
+            render_window = vtk_widget.GetRenderWindow()
+            size = render_window.GetSize() if render_window is not None else (800, 600)
+            height = max(float(size[1]), 1.0)
+            if camera.GetParallelProjection():
+                scale = (2.0 * float(camera.GetParallelScale())) / height
+            else:
+                scale = float(camera.GetDistance()) / height
+
+            camera.OrthogonalizeViewUp()
+            up = [float(value) for value in camera.GetViewUp()]
+            direction = [float(value) for value in camera.GetDirectionOfProjection()]
+            right = [
+                direction[1] * up[2] - direction[2] * up[1],
+                direction[2] * up[0] - direction[0] * up[2],
+                direction[0] * up[1] - direction[1] * up[0],
+            ]
+            magnitude = math.sqrt(sum(value * value for value in right))
+            if magnitude <= 1.0e-12:
+                return False
+            right = [value / magnitude for value in right]
+            position_before = tuple(camera.GetPosition())
+            focal_before = tuple(camera.GetFocalPoint())
+            delta = [
+                -dx * scale * right[index] - dy * scale * up[index]
+                for index in range(3)
+            ]
+            camera.SetPosition(*[
+                float(position_before[index]) + delta[index]
+                for index in range(3)
+            ])
+            camera.SetFocalPoint(*[
+                float(focal_before[index]) + delta[index]
+                for index in range(3)
+            ])
+            if not self._render_timer.isActive():
+                self._render_timer.start()
+            return True
+        except Exception:
+            self._finish_tap_pan()
+            return False
+
     def eventFilter(self, obj, event):
-        if event.type() != QEvent.Wheel:
+        event_type = event.type()
+        if event_type != QEvent.Wheel:
+            if not self._is_viewport_event(obj):
+                return False
+            if self._tap_pan_active and self._left_click_owned_by_tool():
+                self._finish_tap_pan()
+                return False
+            if event_type == QEvent.KeyPress and self._tap_pan_active:
+                is_escape = event.key() == Qt.Key_Escape
+                self._finish_tap_pan()
+                if is_escape:
+                    event.accept()
+                    return True
+                return False
+            if event_type in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+                button = event.button()
+                if button == Qt.RightButton and self._tap_pan_active:
+                    self._finish_tap_pan()
+                    event.accept()
+                    return True
+                if (
+                    button == Qt.LeftButton
+                    and self._tap_pan_configured()
+                    and not (event.modifiers() & Qt.ShiftModifier)
+                    and not self._left_click_owned_by_tool()
+                ):
+                    if self._tap_pan_active:
+                        self._finish_tap_pan()
+                    else:
+                        position = event.position()
+                        self._tap_pan_active = True
+                        self._tap_last_position = (
+                            float(position.x()), float(position.y())
+                        )
+                    self._tap_swallow_release = True
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseMove and self._tap_pan_active:
+                if self._apply_tap_pan_move(event.position()):
+                    event.accept()
+                    return True
+            elif event_type == QEvent.MouseButtonRelease:
+                if event.button() == Qt.LeftButton and self._tap_swallow_release:
+                    self._tap_swallow_release = False
+                    event.accept()
+                    return True
             return False
         # This filter is also installed on QCoreApplication so wheel input is
         # still owned when an active left-button pan changes Qt's receiver or
@@ -465,6 +613,23 @@ class SectionWheelZoomEventFilter(QObject):
             display_position=display_position,
         ):
             return False
+
+        # Display Mode is deliberately never "always on top" (a click on the
+        # main/section window should naturally bring it forward), but this
+        # section/cut viewport is its own separate top-level window when
+        # undocked - scrolling in it (not just clicking) also activates that
+        # window, which silently buries Display Mode behind it. Re-raise
+        # only, never activateWindow(): this keeps Display Mode visually on
+        # top without stealing focus back from the view being scrolled, and
+        # a later click on this window still brings it forward exactly as
+        # before, so nothing about the existing click-to-front design changes.
+        try:
+            app = self._app_ref()
+            dlg = getattr(app, "display_mode_dialog", None) if app is not None else None
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+        except Exception:
+            pass
 
         try:
             event.accept()

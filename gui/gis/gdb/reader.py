@@ -383,6 +383,23 @@ def _linearized_geom(geom):
         return geom
 
 
+def _finite_xyz(point):
+    """Return a finite XYZ tuple or None; VTK must never receive NaN/Inf XY."""
+    import math
+    if point is None or len(point) < 2:
+        return None
+    try:
+        x, y = float(point[0]), float(point[1])
+        z = float(point[2]) if len(point) >= 3 else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    if not math.isfinite(z):
+        z = 0.0
+    return (x, y, z)
+
+
 def _point_list_from_geom(geom) -> list[tuple[float, float, float]]:
     """Read direct vertices from Point/LineString/LinearRing/Triangle-like geometry."""
     geom = _linearized_geom(geom)
@@ -399,10 +416,10 @@ def _point_list_from_geom(geom) -> list[tuple[float, float, float]]:
         raw = None
     if raw is not None:
         pts = []
-        for p in raw:
-            x, y = float(p[0]), float(p[1])
-            z = float(p[2]) if len(p) >= 3 else 0.0
-            pts.append((x, y, z if z == z else 0.0))
+        for point in raw:
+            clean = _finite_xyz(point)
+            if clean is not None:
+                pts.append(clean)
         return pts
 
     pts = []
@@ -418,7 +435,9 @@ def _point_list_from_geom(geom) -> list[tuple[float, float, float]]:
                 x, y, z = geom.GetX(i), geom.GetY(i), 0.0
             except Exception:
                 continue
-        pts.append((float(x), float(y), float(z) if z == z else 0.0))
+        clean = _finite_xyz((x, y, z))
+        if clean is not None:
+            pts.append(clean)
     return pts
 
 
@@ -551,42 +570,23 @@ def _iter_rings(geom) -> list:
 
 
 def _sanitize_ring_points(ring: list) -> list:
-    """Drop duplicate vertices and the repeated closing vertex from a ring."""
-    if not ring:
-        return []
-    try:
-        pts = [(float(pt[0]), float(pt[1]), float(pt[2]) if len(pt) >= 3 else 0.0) for pt in ring if pt is not None and len(pt) >= 2]
-        if not pts:
-            return []
-            
-        clean = []
-        for p in pts:
-            if not clean or abs(clean[-1][0] - p[0]) > 1e-9 or abs(clean[-1][1] - p[1]) > 1e-9:
-                clean.append(p)
-                
-        if len(clean) >= 2:
-            if abs(clean[0][0] - clean[-1][0]) <= 1e-9 and abs(clean[0][1] - clean[-1][1]) <= 1e-9:
-                clean.pop()
-        return clean
-    except Exception:
-        clean = []
-        for pt in ring or []:
-            if pt is None or len(pt) < 2:
+    """Drop non-finite and duplicate vertices plus the closing duplicate."""
+    clean = []
+    for raw_point in ring or []:
+        point = _finite_xyz(raw_point)
+        if point is None:
+            continue
+        if clean:
+            px, py, _pz = clean[-1]
+            if abs(px - point[0]) <= 1e-9 and abs(py - point[1]) <= 1e-9:
                 continue
-            x = float(pt[0])
-            y = float(pt[1])
-            z = float(pt[2]) if len(pt) >= 3 else 0.0
-            if clean:
-                px, py, _pz = clean[-1]
-                if abs(px - x) <= 1e-9 and abs(py - y) <= 1e-9:
-                    continue
-            clean.append((x, y, z))
-        if len(clean) >= 2:
-            x0, y0, _ = clean[0]
-            x1, y1, _ = clean[-1]
-            if abs(x0 - x1) <= 1e-9 and abs(y0 - y1) <= 1e-9:
-                clean.pop()
-        return clean
+        clean.append(point)
+    if len(clean) >= 2:
+        x0, y0, _ = clean[0]
+        x1, y1, _ = clean[-1]
+        if abs(x0 - x1) <= 1e-9 and abs(y0 - y1) <= 1e-9:
+            clean.pop()
+    return clean
 
 
 def _ring_signed_area_xy(ring: list) -> float:
@@ -740,6 +740,7 @@ def _build_point_polydata(geoms: list, scene_z: float) -> tuple:
     """
     import vtk
     pts = vtk.vtkPoints()
+    pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     for g in geoms:
         if g is None or g.IsEmpty():
             continue
@@ -765,6 +766,7 @@ def _build_line_polydata(geoms: list, scene_z: float) -> tuple:
     """Build a vtkPolyData containing one polyline per independent line part."""
     import vtk
     pts = vtk.vtkPoints()
+    pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     lines = vtk.vtkCellArray()
     for g in geoms:
         if g is None or g.IsEmpty():
@@ -797,6 +799,7 @@ def _triangulate_polygon_part(rings: list, flat_z: float, use_vertex_z: bool = F
     import vtk
 
     contour_pts = vtk.vtkPoints()
+    contour_pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     contour_lines = vtk.vtkCellArray()
     valid_rings = []
 
@@ -839,6 +842,7 @@ def _triangulate_polygon_part(rings: list, flat_z: float, use_vertex_z: bool = F
         return None
 
     pts = vtk.vtkPoints()
+    pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     polys = vtk.vtkCellArray()
     poly = vtk.vtkPolygon()
     poly.GetPointIds().SetNumberOfIds(len(valid_rings[0]))
@@ -876,6 +880,7 @@ def _triangulate_simple_polygons_batch(entries: list):
     import vtk
 
     pts = vtk.vtkPoints()
+    pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     polys = vtk.vtkCellArray()
     for ring, flat_z, use_vertex_z in entries:
         poly = vtk.vtkPolygon()
@@ -917,6 +922,7 @@ def _build_polygon_polydata(geoms: list, scene_z: float) -> tuple:
     import vtk
     fill_append = vtk.vtkAppendPolyData()
     outline_pts = vtk.vtkPoints()
+    outline_pts.SetDataType(vtk.VTK_DOUBLE)  # vtkPoints defaults to float32; UTM-scale coords need double
     outline_lines = vtk.vtkCellArray()
     fill_inputs = 0
     simple_batch = []   # (ring, flat_z, use_vertex_z) for no-hole parts
@@ -1107,13 +1113,16 @@ def _register_gdb_entry(app, gdb_path: str, layer_name: str, *,
                         color: str | None = None, sub_layer_info: dict | None = None,
                         placeholder: bool = False,
                         placeholder_reason: str | None = None,
-                        source_crs=None) -> dict | None:
+                        source_crs=None,
+                        feature_count: int | None = None) -> dict | None:
     try:
         from gui.gis.gis_layers import register_gis_layer
         display_name = f"{Path(gdb_path).stem} · {layer_name}"
         entry = register_gis_layer(
             app, display_name, gdb_path, kind, "gdb", actors or [],
             allow_empty=placeholder or not actors,
+            feature_count=feature_count,
+            source_layer=layer_name,
         )
     except Exception as exc:
         log.error("import_gdb_layer: registry failed: %s", exc)
@@ -1127,8 +1136,32 @@ def _register_gdb_entry(app, gdb_path: str, layer_name: str, *,
         entry["_placement"] = "gdb-native"
         entry["sub_layers"] = sub_layer_info or {}
         entry["placeholder"] = bool(placeholder)
+        if feature_count is not None:
+            try:
+                entry["feature_count"] = max(0, int(feature_count))
+            except Exception:
+                pass
         if placeholder_reason:
             entry["placeholder_reason"] = placeholder_reason
+        try:
+            from gui.gis.layer_model import GISLayerModel, attach_native_model
+            from gui.crs_manager import get_canvas_crs
+            source_wkt = source_crs.to_wkt() if source_crs is not None else None
+            project_crs = get_canvas_crs(app)
+            project_wkt = project_crs.to_wkt() if project_crs is not None else source_wkt
+            attach_native_model(entry, GISLayerModel(
+                path=str(gdb_path),
+                layer_name=str(layer_name),
+                driver="OpenFileGDB",
+                kind="table" if kind == "table" else "vector",
+                geometry_type=str(geom or ""),
+                feature_count=int(feature_count) if feature_count is not None else -1,
+                source_crs_wkt=source_wkt,
+                project_crs_wkt=project_wkt,
+                read_only=False,
+            ))
+        except Exception:
+            pass
         try:
             from gui.gis.gis_layers import get_layer_epsg
             entry["epsg"] = get_layer_epsg(gdb_path, layer_name)
@@ -1167,6 +1200,15 @@ def _register_gdb_entry(app, gdb_path: str, layer_name: str, *,
     return entry
 
 
+
+def _report_import_error(app, title: str, text: str) -> None:
+    try:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(app, title, text)
+    except Exception:
+        log.error("%s: %s", title, text)
+
+
 def import_gdb_layer(app, gdb_path: str, layer_name: str,
                      color: str | None = None,
                      max_features: int = 0) -> dict | None:
@@ -1189,6 +1231,18 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
         If > 0, stop after reading this many features (used for huge layers).
     """
     _t0 = time.perf_counter()
+
+    # Reuse the layer if this feature class is already on the map instead of
+    # reading every feature a second time and registering a duplicate layer.
+    try:
+        from gui.gis.gis_layers import find_loaded_layer, focus_loaded_layer
+        already = find_loaded_layer(app, gdb_path, layer_name)
+        if already is not None:
+            focus_loaded_layer(app, already)
+            return already
+    except Exception as exc:
+        log.warning("import_gdb_layer: duplicate check failed: %s", exc)
+
     ds = open_gdb_for_read(gdb_path)
     log.warning("import_gdb_layer[%s]: open dataset %.3fs", layer_name, time.perf_counter() - _t0)
     if ds is None:
@@ -1241,41 +1295,49 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
 
         canvas_crs = None
         ogr_ct = None
+        transform_required = False
+        unknown_source_in_project = False
         try:
-            from gui.crs_manager import (get_canvas_crs, ensure_canvas_crs,
-                                         log_dataset_crs)
-            # First trustworthy georeferenced dataset establishes the canvas CRS;
-            # later layers are reprojected INTO it (never replace it).
+            from gui.crs_manager import get_canvas_crs, ensure_canvas_crs
+
+            # First trustworthy georeferenced dataset establishes Project CRS.
             if src_crs is not None:
-                ensure_canvas_crs(app, src_crs, source="GDB feature class",
-                                  dataset=f"{os.path.basename(str(gdb_path))}:{layer_name}")
+                ensure_canvas_crs(
+                    app, src_crs, source="GDB feature class",
+                    dataset=f"{os.path.basename(str(gdb_path))}:{layer_name}",
+                )
             canvas_crs = get_canvas_crs(app)
+
+            # Delay the unknown-CRS decision until feature iteration proves
+            # that this item contains real geometry. Tables, empty feature
+            # classes and rows with null geometry do not need map placement.
+            unknown_source_in_project = canvas_crs is not None and src_srs is None
+
             if src_srs is not None and canvas_crs is not None:
                 try:
-                    # Compare CRS via pyproj equality, not raw authority codes.
-                    # Many real GDB deliveries use a COMPOUND CRS (e.g. "UTM
-                    # 43N + EGM2008 height") that has no single EPSG authority
-                    # code, so GetAuthorityCode() returns None for BOTH the
-                    # source and an identically-compound canvas CRS - comparing
-                    # "int(None or 0) != int(None or 0)" would then read as
-                    # "equal" by coincidence, or as "different" (forcing a
-                    # needless transform) the moment either side legitimately
-                    # differs. src_crs (pyproj, already resolved above with a
-                    # WKT fallback) gives a real equality check either way.
                     same_crs = src_crs is not None and src_crs.equals(canvas_crs)
-                    if not same_crs:
-                        tgt = osr.SpatialReference()
-                        tgt.ImportFromWkt(canvas_crs.to_wkt())
-                        tgt.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-                        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-                        ogr_ct = osr.CreateCoordinateTransformation(src_srs, tgt)
-                except Exception as e:
-                    log.warning("import_gdb_layer[%s]: CRS transform setup failed: %s",
-                                layer_name, e)
-                    ogr_ct = None
+                except Exception:
+                    same_crs = False
+                if not same_crs:
+                    transform_required = True
+                    tgt = osr.SpatialReference()
+                    rc = tgt.ImportFromWkt(canvas_crs.to_wkt())
+                    if rc not in (None, 0):
+                        raise RuntimeError("Could not construct the Project CRS spatial reference.")
+                    tgt.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                    src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                    ogr_ct = osr.CreateCoordinateTransformation(src_srs, tgt)
+                    if ogr_ct is None:
+                        raise RuntimeError("GDAL could not create the source -> Project CRS transformation.")
         except Exception as e:
-            log.warning("import_gdb_layer[%s]: crs_manager unavailable: %s",
-                        layer_name, e)
+            log.error("import_gdb_layer[%s]: CRS setup failed: %s", layer_name, e)
+            _report_import_error(
+                app,
+                "Coordinate Transformation Failed",
+                f"Could not safely place FileGDB layer '{layer_name}' in the Naksha Project CRS.\n\n"
+                f"{e}\n\nThe layer was NOT loaded.",
+            )
+            return None
 
         try:
             lyr.ResetReading()
@@ -1300,6 +1362,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 kind="table", geom="table", actors=[],
                 color=base_color, placeholder=True,
                 placeholder_reason="table",
+                feature_count=feature_count(lyr),
             )
 
         if kind == "unknown":
@@ -1312,6 +1375,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 kind="vector", geom="unknown", actors=[],
                 color=base_color, placeholder=True,
                 placeholder_reason=f"unsupported:{geom_label}",
+                feature_count=feature_count(lyr),
             )
 
         # Check for subtypes via GDBEngine
@@ -1351,6 +1415,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 "actors": [],
                 "color": sub_color,
                 "label": sub_label,
+                "feature_count": 0,
             }
 
         # Collect geometries in one pass (sparse iteration), grouped by subtype if available
@@ -1374,6 +1439,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                     f"Loading features from '{layer_name}'...", "Cancel", 0, total_features, app
                 )
                 progress.setWindowTitle("Import Layer")
+                progress.setAttribute(Qt.WA_DeleteOnClose, True)
                 progress.setWindowModality(Qt.ApplicationModal)
                 progress.setMinimumDuration(200)
                 progress.setValue(0)
@@ -1384,15 +1450,50 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
         lyr.ResetReading()
         feat = lyr.GetNextFeature()
         canceled = False
+        transform_error = None
+        subtype_feature_counts = {sub_code: 0 for sub_code in subtype_domain}
         while feat is not None:
             row_count += 1
-            if progress is not None and row_count % 1000 == 0:
-                progress.setValue(row_count)
-                QCoreApplication.processEvents()
-                if progress.wasCanceled():
-                    log.warning("import_gdb_layer[%s]: loading canceled by user", layer_name)
-                    canceled = True
-                    break
+            if progress is not None and row_count % 500 == 0:
+                try:
+                    from shiboken6 import isValid
+                    if not isValid(progress):
+                        progress = None
+                except Exception:
+                    pass
+            if progress is not None and row_count % 500 == 0:
+                try:
+                    progress.setValue(min(row_count, max(total_features, row_count)))
+                    QCoreApplication.processEvents()
+                    if progress.wasCanceled():
+                        log.warning("import_gdb_layer[%s]: loading canceled by user", layer_name)
+                        canceled = True
+                        break
+                except RuntimeError:
+                    # Dialog's native object was deleted (user closed it via
+                    # the title bar mid-import) between the isValid() check
+                    # above and this call - stop touching it, keep loading.
+                    progress = None
+
+            # Resolve subtype for every row, not only rows with geometry, so the
+            # Layers panel reports real GIS feature counts rather than VTK cells.
+            sub_code = None
+            if subtype_field:
+                try:
+                    val = feat.GetField(subtype_field)
+                    sub_code = str(val).strip() if val is not None else None
+                except Exception:
+                    sub_code = None
+                if sub_code and sub_code not in subtype_domain:
+                    try:
+                        int_code = str(int(float(sub_code)))
+                        if int_code in subtype_domain:
+                            sub_code = int_code
+                    except Exception:
+                        pass
+                if sub_code not in subtype_domain:
+                    sub_code = "default"
+                subtype_feature_counts[sub_code] = subtype_feature_counts.get(sub_code, 0) + 1
 
             try:
                 g = feat.GetGeometryRef()
@@ -1400,36 +1501,18 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 g = None
             if g is not None and not g.IsEmpty():
                 geom_count += 1
-                sub_code = None
-                if subtype_field:
-                    try:
-                        val = feat.GetField(subtype_field)
-                        sub_code = str(val).strip() if val is not None else None
-                    except Exception:
-                        pass
-
-                if sub_code and sub_code not in subtype_domain:
-                    # Normalize numeric subtype values to the schema's string keys.
-                    try:
-                        int_code = str(int(float(sub_code)))
-                        if int_code in subtype_domain:
-                            sub_code = int_code
-                    except Exception:
-                        pass
-
-                if subtype_field and sub_code not in subtype_domain:
-                    sub_code = "default"
-
                 if sub_code not in geoms_by_subtype:
                     geoms_by_subtype[sub_code] = []
                 _clone = g.Clone()   # Clone because feat is destroyed
-                # Reproject SOURCE CRS -> CANVAS CRS before the geometry ever
-                # reaches VTK. Source coordinates are never mutated on disk.
                 if ogr_ct is not None:
                     try:
-                        _clone.Transform(ogr_ct)
-                    except Exception:
-                        pass
+                        rc = _clone.Transform(ogr_ct)
+                        if rc not in (None, 0):
+                            raise RuntimeError(f"OGR Transform returned error code {rc}")
+                    except Exception as exc:
+                        transform_error = f"Feature FID {feat.GetFID()}: {exc}"
+                        feat = None
+                        break
                 geoms_by_subtype[sub_code].append(_clone)
             feat = lyr.GetNextFeature()
             if max_features:
@@ -1437,10 +1520,48 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 if total_collected >= max_features:
                     break
 
+        # Attach authoritative per-subtype feature counts.  These are OGR rows,
+        # not VTK cells/triangles.
+        for _code, _count in subtype_feature_counts.items():
+            _key = _code if _code is not None else "default"
+            if _key not in sub_layer_info:
+                sub_layer_info[_key] = {
+                    "actor": None, "actors": [], "color": color,
+                    "label": ("Unclassified" if _key == "default" and subtype_field else layer_name),
+                }
+            sub_layer_info[_key]["feature_count"] = int(_count)
+
         if progress is not None:
-            if not canceled:
-                progress.setValue(total_features)
-            progress.close()
+            try:
+                if not canceled:
+                    progress.setValue(total_features)
+                progress.close()
+            except RuntimeError:
+                pass
+
+        if canceled:
+            return None
+        if unknown_source_in_project and geom_count > 0:
+            geoms_by_subtype.clear()
+            _report_import_error(
+                app,
+                "Unknown Layer CRS",
+                f"The FileGDB layer '{layer_name}' contains geometry but has no declared "
+                "coordinate reference system, while the Naksha project already has a Project CRS.\n\n"
+                "Naksha will not place unknown raw coordinates into the Project CRS. "
+                "Define/repair the layer CRS first, then load it again.",
+            )
+            return None
+
+        if transform_error:
+            geoms_by_subtype.clear()
+            _report_import_error(
+                app,
+                "Coordinate Transformation Failed",
+                f"A feature in FileGDB layer '{layer_name}' could not be transformed into the Project CRS.\n\n"
+                f"{transform_error}\n\nThe layer was NOT loaded.",
+            )
+            return None
 
         log.warning(
             "import_gdb_layer[%s]: feature-collection loop %.3fs (rows=%d geoms=%d)",
@@ -1464,6 +1585,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 placeholder=True,
                 placeholder_reason=reason,
                 source_crs=src_crs,
+                feature_count=(total_features if total_features >= 0 else row_count),
             )
 
         # Build actors and polydata per subtype
@@ -1540,7 +1662,8 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 "actor": actor_bundle[0] if actor_bundle else None,
                 "actors": actor_bundle,
                 "color": sub_color,
-                "label": sub_label
+                "label": sub_label,
+                "feature_count": int(subtype_feature_counts.get(sub_code, len(sub_geoms))),
             }
 
         if not actors:
@@ -1555,6 +1678,7 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
                 placeholder=True,
                 placeholder_reason="no_renderable_actor",
                 source_crs=src_crs,
+                feature_count=(total_features if total_features >= 0 else row_count),
             )
 
         log.warning(
@@ -1572,7 +1696,11 @@ def import_gdb_layer(app, gdb_path: str, layer_name: str,
             kind="vector", geom=kind, actors=actors,
             color=color, sub_layer_info=sub_layer_info,
             source_crs=src_crs,
+            feature_count=(total_features if total_features >= 0 else row_count),
         )
+        if entry is not None:
+            entry["loaded_feature_count"] = int(row_count)
+            entry["rendered_geometry_feature_count"] = int(geom_count)
         try:
             from gui.crs_manager import log_dataset_crs, get_canvas_crs as _gcc
             _raw = lyr.GetExtent()  # xmin, xmax, ymin, ymax (OGR order)
@@ -1908,10 +2036,20 @@ def _get_overlay_renderer(app):
 
 
 def _render(app):
+    """Render through the shared GIS batch gate."""
     try:
-        app.vtk_widget.render()
+        from gui.gis.gis_layers import _render as render_gis
+        return render_gis(app)
     except Exception:
+        if getattr(app, "_gis_batch_update_depth", 0) > 0:
+            app._gis_batch_render_pending = True
+            return False
         try:
-            app.vtk_widget.GetRenderWindow().Render()
+            app.vtk_widget.render()
+            return True
         except Exception:
-            pass
+            try:
+                app.vtk_widget.GetRenderWindow().Render()
+                return True
+            except Exception:
+                return False

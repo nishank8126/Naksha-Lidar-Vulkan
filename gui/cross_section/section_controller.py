@@ -62,8 +62,8 @@ class _SectionPreviewOverlay(QWidget):
         self._style   = style
         if not self.isVisible():
             self.show()
-        self.raise_()
-        self.repaint()
+            self.raise_()
+        self.update()
 
     def set_line(self, p1: tuple, p2: tuple, color=(255, 0, 255), width: int = 2, style: str = 'solid'):
         self._sync_geometry()
@@ -73,8 +73,24 @@ class _SectionPreviewOverlay(QWidget):
         self._style   = style
         if not self.isVisible():
             self.show()
-        self.raise_()
-        self.repaint()
+            self.raise_()
+        self.update()
+
+    def set_preview(self, p1: tuple, p2: tuple, corners: list,
+                    color=(255, 0, 255), width: int = 2,
+                    style: str = 'solid'):
+        """Update the complete rectangle preview in one composited frame."""
+        self._sync_geometry()
+        self._line = (p1[0], p1[1], p2[0], p2[1])
+        self._corners = list(corners)
+        self._color = QColor(*color)
+        self._width = width
+        self._style = style
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+        # Coalesce high-frequency mouse events into the next Qt paint pass.
+        self.update()
 
 
     def clear(self):
@@ -83,7 +99,7 @@ class _SectionPreviewOverlay(QWidget):
         # Don't call hide() here - it causes flickering and "clashing" with the OS window manager
         # during rapid continuous actions. The empty paintEvent + repaint() is enough to make it
         # instantly invisible.
-        self.repaint()  # Force instant synchronous clear before heavy thread blocking
+        self.repaint()  # Clear before section computation blocks the UI thread
 
     # ------------------------------------------------------------------
     def paintEvent(self, event):
@@ -1406,14 +1422,9 @@ class SectionController:
             width   = int(getattr(self.app, 'cross_line_width', 2))
             style   = getattr(self.app, 'cross_line_style', 'solid')
 
-            # Sync centerline to P1-P2 so it stays visible inside the box
-            overlay.set_line(
+            overlay.set_preview(
                 self._vtk_display_to_qt(*p1_screen),
                 self._vtk_display_to_qt(*p2_screen),
-                color=color, width=width, style=style
-            )
-
-            overlay.set_rect(
                 [self._vtk_display_to_qt(*c1),
                  self._vtk_display_to_qt(*c2),
                  self._vtk_display_to_qt(*c3),
@@ -1865,17 +1876,16 @@ class SectionController:
                 # ── STEP 2: Exact geometry — only on the candidate subset (float64 centering) ──
                 # ✅ PERFORMANCE: Only perform float64 subtraction on the small candidate subset.
                 # ✅ PRECISION: Center in float64 BEFORE casting to float32 to fix the 'scattering'.
-                cand_xy  = xyz[candidate_idx, :2]
-                rel      = cand_xy - P1[:2]
-                
-                # Now safe to cast to float32 for high-speed dot products
-                rel_f32  = rel.astype(np.float32)
-                dir_f    = dir_vec.astype(np.float32)
-                perp_f   = perp.astype(np.float32)
-                
-                along_c  = rel_f32 @ dir_f
-                across_c = rel_f32 @ perp_f
-                del rel, rel_f32, cand_xy
+                # Keep the inclusion test in float64. Reducing these centred
+                # values and unit vectors to float32 can move points across the
+                # section boundary. Only the final display coordinates are cast
+                # to float32 below, preserving the existing rendering contract.
+                cand_xy = np.asarray(xyz[candidate_idx, :2], dtype=np.float64)
+                rel = cand_xy - np.asarray(P1[:2], dtype=np.float64)
+
+                along_c = rel @ dir_vec
+                across_c = rel @ perp
+                del rel, cand_xy
 
                 core_local = (
                     (along_c >= 0.0) & (along_c <= length) &

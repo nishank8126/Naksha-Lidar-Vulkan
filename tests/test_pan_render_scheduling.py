@@ -12,7 +12,12 @@ class _FakeManager:
         self._pan_frame_started = False
         self._pan_last_frame_monotonic = 0.0
         self._interaction_active = False
+        self._interaction_hidden_snt_text = []
+        self._snt_text_interaction_active = False
         self.force_render_count = 0
+
+    def _set_snt_text_interaction_visibility(self, hide):
+        return GPURenderManager._set_snt_text_interaction_visibility(self, hide)
 
     def force_render(self):
         self.force_render_count += 1
@@ -68,6 +73,63 @@ def test_large_pan_start_never_traverses_or_mutates_scene_mappers():
         manager,
         point_count=13_879_131,
     )
+
+
+class _FakeActor:
+    def __init__(self, *, label=False, visible=True):
+        self.is_grid_label = label
+        self.visible = visible
+        self.off_calls = 0
+        self.on_calls = 0
+
+    def GetVisibility(self):
+        return self.visible
+
+    def VisibilityOff(self):
+        self.visible = False
+        self.off_calls += 1
+
+    def VisibilityOn(self):
+        self.visible = True
+        self.on_calls += 1
+
+
+def test_pan_temporarily_hides_only_visible_snt_labels_and_restores_them():
+    visible_label = _FakeActor(label=True)
+    user_hidden_label = _FakeActor(label=True, visible=False)
+    linework = _FakeActor(label=False)
+    manager = _FakeManager()
+    manager.app.snt_actors = [{
+        "actors": [visible_label, user_hidden_label, linework, visible_label],
+    }]
+
+    assert GPURenderManager.begin_pan_interaction(manager, point_count=2_000_000)
+    assert not visible_label.visible
+    assert not user_hidden_label.visible
+    assert linework.visible
+    assert visible_label.off_calls == 1
+
+    assert GPURenderManager.finish_pan_interaction(manager)
+    assert visible_label.visible
+    assert not user_hidden_label.visible
+    assert linework.visible
+    assert visible_label.on_calls == 1
+
+
+def test_snt_label_suppression_is_idempotent_when_no_labels_are_visible():
+    hidden_label = _FakeActor(label=True, visible=False)
+    manager = _FakeManager()
+    manager.app.snt_actors = [{"actors": [hidden_label]}]
+
+    assert GPURenderManager._set_snt_text_interaction_visibility(manager, True) == 0
+    assert manager._snt_text_interaction_active
+    assert GPURenderManager._set_snt_text_interaction_visibility(manager, True) == 0
+    assert hidden_label.off_calls == 0
+
+    manager._interaction_active = False
+    assert GPURenderManager._set_snt_text_interaction_visibility(manager, False) == 0
+    assert not manager._snt_text_interaction_active
+    assert not hidden_label.visible
 
 
 class _FakeTimer:

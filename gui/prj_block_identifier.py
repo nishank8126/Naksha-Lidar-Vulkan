@@ -6445,6 +6445,26 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush
 from gui.popup_guard import InputPopupMixin
 
 
+def _lidar_block_stem(value):
+    """Return a block filename without only a terminal LAS/LAZ suffix.
+
+    ``os.path.splitext`` cannot be used for extensionless TerraScan block
+    labels such as ``S. PIETRO000025``: it interprets everything from the
+    embedded dot onward as an extension and returns just ``S``.
+    """
+    name = os.path.basename(str(value or '').strip())
+    lower_name = name.lower()
+    for suffix in ('.laz', '.las'):
+        if lower_name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def _lidar_block_key(value):
+    """Return a case/punctuation-insensitive key for a LAS/LAZ block."""
+    return ''.join(ch.lower() for ch in _lidar_block_stem(value) if ch.isalnum())
+
+
 def _point_in_polygon_xy(px, py, polygon_xy, eps: float = 1e-9):
     """Return True when a point lies inside or on the edge of a polygon."""
     pts = [(float(x), float(y)) for x, y in polygon_xy]
@@ -8271,7 +8291,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                     try:
                         for fp in prj_root.iterdir():
                             if fp.is_file() and fp.suffix.lower() in ('.laz', '.las'):
-                                prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                                prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
                     except OSError as exc:
                         print(f"  ⚠️ Could not scan PRJ directory directly: {exc}")
 
@@ -8281,7 +8301,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                         for fp in prj_root.rglob('*'):
                             if not fp.is_file() or fp.suffix.lower() not in ('.laz', '.las'):
                                 continue
-                            prj_lidar_index.setdefault(fp.stem.upper(), str(fp))
+                            prj_lidar_index.setdefault(_lidar_block_key(fp), str(fp))
                     except OSError as exc:
                         print(f"  ⚠️ Could not recursively scan PRJ directory: {exc}")
 
@@ -8306,8 +8326,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 block_label = data['label']
                 # Resolve strictly from the currently loaded PRJ's own
                 # directory tree.  This deliberately ignores loaded SNT folders.
-                block_stem = os.path.splitext(os.path.basename(block_label))[0].upper()
-                found_laz_path = prj_lidar_index.get(block_stem)
+                block_key = _lidar_block_key(block_label)
+                found_laz_path = prj_lidar_index.get(block_key)
 
                 # Column 0: Block Label  — store original prj_data index in UserRole
                 label_item = QTableWidgetItem(block_label)
@@ -8522,17 +8542,22 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             block_label = block_data['label']
             print(f"\n🔍 Searching for block: '{block_label}'")
 
-            # The loaded SNT polygon is authoritative for viewport location.
-            # It exists independently of whether a matching LAZ/LAS file is
-            # present or whether its text label received a rendered actor.
-            snt_polygon = self._find_loaded_snt_block_polygon(
-                block_label,
-                block_data.get('boundary_coords') or [],
-            )
+            # Use the block actor that is actually rendered in the viewport.
+            # The cached SNT/PRJ index is only a fallback: its polygon can be
+            # in a different revision/coordinate space from the visible actor.
+            rendered_block_actor = self._find_rendered_snt_block_actor(block_label)
+            snt_polygon = self._rendered_actor_polygon(rendered_block_actor)
+            if snt_polygon is None:
+                snt_polygon = self._find_loaded_snt_block_polygon(
+                    block_label,
+                    block_data.get('boundary_coords') or [],
+                )
             identify_data = dict(block_data)
             if snt_polygon is not None:
                 identify_data['boundary_coords'] = snt_polygon
                 identify_data['identify_source'] = 'SNT'
+                if rendered_block_actor is not None:
+                    identify_data['_rendered_boundary_actor'] = rendered_block_actor
                 print(
                     f"  ✅ MATCH (SNT polygon): '{block_label}' "
                     f"({len(snt_polygon)} vertices)"
@@ -8807,13 +8832,79 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                 "The selected block has no valid boundary coordinates in the PRJ file."
             )
 
+    def _find_rendered_snt_block_actor(self, block_label):
+        """Return the visible renderer-owned block actor for this label."""
+        wanted = _lidar_block_key(block_label)
+        if not wanted:
+            return None
+
+        vtk_widget = getattr(self.app, 'vtk_widget', None)
+        renderer = getattr(vtk_widget, 'renderer', None)
+        seen = set()
+        for collection_name in ('snt_actors', 'dxf_actors'):
+            for data_set in getattr(self.app, collection_name, []) or []:
+                for actor in data_set.get('actors', []) or []:
+                    actor_id = id(actor)
+                    if actor_id in seen:
+                        continue
+                    seen.add(actor_id)
+                    if not getattr(actor, 'is_block_polygon', False):
+                        continue
+                    if _lidar_block_key(getattr(actor, 'grid_name', '')) != wanted:
+                        continue
+                    try:
+                        if not actor.GetVisibility():
+                            continue
+                        if renderer is not None and not renderer.HasViewProp(actor):
+                            # Actor collections can retain replaced/removed SNT
+                            # actors. Never build a preview from stale geometry.
+                            continue
+                    except (AttributeError, TypeError):
+                        continue
+                    return actor
+        return None
+
+    @staticmethod
+    def _rendered_actor_polygon(actor):
+        """Return world XY points for navigation; rendering clones the actor."""
+        if actor is None:
+            return None
+
+        try:
+            mapper = actor.GetMapper()
+            mapper.Update()
+            poly_data = mapper.GetInput()
+            vtk_points = poly_data.GetPoints()
+            if vtk_points is None or vtk_points.GetNumberOfPoints() < 3:
+                return None
+
+            matrix = actor.GetMatrix()
+            polygon = []
+            for point_index in range(vtk_points.GetNumberOfPoints()):
+                x, y, z = vtk_points.GetPoint(point_index)
+                wx, wy, _wz, ww = matrix.MultiplyPoint((x, y, z, 1.0))
+                if ww and ww != 1.0:
+                    wx, wy = wx / ww, wy / ww
+                polygon.append((float(wx), float(wy)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        if polygon[0] == polygon[-1]:
+            polygon = polygon[:-1]
+        return polygon if len(polygon) >= 3 else None
+
+    def _find_rendered_snt_block_polygon(self, block_label):
+        """Compatibility wrapper returning the visible actor's world points."""
+        actor = PRJBlockIdentifierDialog._find_rendered_snt_block_actor(
+            self, block_label
+        )
+        return PRJBlockIdentifierDialog._rendered_actor_polygon(
+            actor
+        )
+
     def _find_loaded_snt_block_polygon(self, block_label, prj_boundary=None):
         """Return a loaded-SNT polygon by label, then by PRJ spatial overlap."""
-        def _key(value):
-            stem = os.path.splitext(os.path.basename(str(value or '').strip()))[0]
-            return ''.join(ch.lower() for ch in stem if ch.isalnum())
-
-        wanted = _key(block_label)
+        wanted = _lidar_block_key(block_label)
         if not wanted:
             return None
 
@@ -8821,7 +8912,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         for entry in entries:
             names = [entry.get('grid_name'), entry.get('block_file')]
             names.extend(entry.get('alt_names') or [])
-            if not any(_key(name) == wanted for name in names):
+            if not any(_lidar_block_key(name) == wanted for name in names):
                 continue
 
             points = entry.get('points_2d') or []
@@ -8909,6 +9000,35 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             for block in blocks:
                 coords = block.get("boundary_coords") or []
                 if len(coords) < 3:
+                    continue
+
+                rendered_actor = block.get('_rendered_boundary_actor')
+                if rendered_actor is not None:
+                    # Clone the exact visible SNT actor. Reconstructing a new
+                    # polyline from vtkPoints loses the mapper's cell topology
+                    # and can use a stale point order, producing the diverging
+                    # yellow segments visible only at deep zoom.
+                    boundary_actor = vtk.vtkActor()
+                    boundary_actor.ShallowCopy(rendered_actor)
+                    preview_property = vtk.vtkProperty()
+                    preview_property.DeepCopy(rendered_actor.GetProperty())
+                    preview_property.SetColor(1.0, 1.0, 0.0)
+                    preview_property.SetLineWidth(2.0)
+                    preview_property.SetOpacity(1.0)
+                    preview_property.SetLighting(False)
+                    boundary_actor.SetProperty(preview_property)
+                    boundary_actor.PickableOff()
+                    renderer.AddActor(boundary_actor)
+                    self._highlight_actors.append(boundary_actor)
+
+                    bounds = rendered_actor.GetBounds()
+                    if bounds is not None and len(bounds) >= 4:
+                        all_x.extend((float(bounds[0]), float(bounds[1])))
+                        all_y.extend((float(bounds[2]), float(bounds[3])))
+                    print(
+                        f"   Exact rendered SNT actor preview: "
+                        f"{block.get('label', '')}"
+                    )
                     continue
 
                 ring = [(float(x), float(y)) for x, y in coords]

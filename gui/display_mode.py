@@ -3,8 +3,12 @@ import sys as _sys
 import os as _os
 import copy as _copy
 
-from PySide6.QtGui import QColor, QFont, QIcon, QAction, QActionGroup
-from PySide6.QtCore import Qt, Signal, QSettings, QMutex, QMutexLocker, QEvent
+from PySide6.QtGui import (
+    QColor, QFont, QIcon, QAction, QActionGroup, QPainter, QPainterPath, QPen
+)
+from PySide6.QtCore import (
+    Qt, Signal, QSettings, QMutex, QMutexLocker, QEvent, QRectF
+)
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -153,7 +157,7 @@ def sync_palette_to_gpu_safe(app, slot, palette, reason=""):
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # restore_display_settings_for_file
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def restore_display_settings_for_file(app, filepath):
+def restore_display_settings_for_file(app, filepath, refresh=True):
     """
     Restore display settings for a file.
 
@@ -435,7 +439,9 @@ def restore_display_settings_for_file(app, filepath):
         else:
             print("   âš ï¸ No view_palettes[0] available - skipping weight sync")
 
-        if hasattr(app, 'data') and app.data is not None:
+        if not refresh:
+            print('   Classification refresh deferred to the load pipeline')
+        elif hasattr(app, 'data') and app.data is not None:
             print(f"\n   ðŸ”„ FORCING CLASSIFICATION REFRESH with restored weights...")
             try:
                 from gui.class_display import update_class_mode
@@ -1133,7 +1139,9 @@ class DisplayModeDialog(QDialog):
         self.lines_button.setToolTip("Choose flight lines shown in Line mode")
         controls_layout.addWidget(self.lines_button)
         self.lines_button.clicked.connect(self._open_lines_dialog)
-        self._rebuild_lines_menu()
+        # Never scan a potentially multi-million-entry source-ID array merely
+        # to construct Display Mode. Discovery runs when Lines is requested.
+        self._rebuild_lines_menu(allow_recovery=False)
 
         main_layout.addWidget(controls_card)
 
@@ -2019,6 +2027,8 @@ class DisplayModeDialog(QDialog):
             for row in range(self.table.rowCount()):
                 code        = int(self.table.item(row, 1).text())
                 desc        = self.table.item(row, 2).text()
+                draw_item   = self.table.item(row, 3)
+                draw        = draw_item.text() if draw_item else ""
                 lvl_item    = self.table.item(row, 4)
                 lvl         = lvl_item.text() if lvl_item else ""
                 color       = self.table.item(row, 5).background().color().getRgb()[:3]
@@ -2029,6 +2039,7 @@ class DisplayModeDialog(QDialog):
                 master_palette[code] = {
                     "show":        show,
                     "description": desc,
+                    "draw":        draw,
                     "lvl":         lvl,
                     "color":       color,
                     "weight":      weight
@@ -2082,6 +2093,7 @@ class DisplayModeDialog(QDialog):
                     self.view_palettes[view_idx][code] = {
                         "show":        show_to_use,
                         "description": str(info["description"]),
+                        "draw":        str(info.get("draw", "")),
                         "lvl":         str(info.get("lvl", "")),
                         "color":       color_to_use,
                         "weight":      weight_to_use
@@ -2157,7 +2169,9 @@ class DisplayModeDialog(QDialog):
     def on_add(self):
         dlg = EditClassDialog(parent=self)
         if dlg.exec() == QDialog.Accepted:
-            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color())
+            # EditClassDialog stores the selected QColor as an attribute.
+            # Calling it raises: TypeError: 'QColor' object is not callable.
+            self.add_class(dlg.code(), dlg.desc(), dlg.draw(), dlg.lvl(), dlg.color)
 
     def on_edit(self):
         row = self.table.currentRow()
@@ -2170,7 +2184,10 @@ class DisplayModeDialog(QDialog):
         color  = self.table.item(row, 5).background().color()
         weight = self.table.item(row, 6).text() if self.table.columnCount() > 6 else "2.0"
 
-        dlg = EditClassDialog(code, desc, color, self, draw, lvl, weight)
+        dlg = EditClassDialog(
+            code, desc, color, self, draw, lvl, weight,
+            target_slot=self.current_slot,
+        )
         if dlg.exec() == QDialog.Accepted:
             self.table.setItem(row, 1, QTableWidgetItem(str(dlg.code())))
             self.table.setItem(row, 2, QTableWidgetItem(dlg.desc()))
@@ -2194,15 +2211,20 @@ class DisplayModeDialog(QDialog):
         # Do not auto-check or modify checkboxes â€” user controls visibility for all modes.
         pass
 
-    def _rebuild_lines_menu(self):
+    def _rebuild_lines_menu(self, allow_recovery=True):
         """Refresh flight-line IDs/colors from the active point cloud."""
         if not hasattr(self, "lines_button"):
+            return
+        if not allow_recovery:
+            # Opening/synchronizing Display Mode must remain O(1) even when
+            # the loaded point-source array contains tens of millions of IDs.
+            self.lines_button.setEnabled(True)
             return
         app = self._get_app_window()
         source_ids = None
         if app is not None and isinstance(getattr(app, "data", None), dict):
             source_ids = app.data.get("point_source_id")
-            if source_ids is None:
+            if source_ids is None and allow_recovery:
                 source_ids = self._recover_flight_line_ids(app)
         slot = int(getattr(self, "current_slot", 0))
         by_slot = getattr(app, "flight_line_visibility_by_slot", None) if app else None
@@ -2278,17 +2300,215 @@ class DisplayModeDialog(QDialog):
             )
             return
 
-        popup = QDialog(self)
+        class LinesDialog(QDialog):
+            """Movable frameless selector with resize handles on every edge."""
+
+            RESIZE_MARGIN = 10
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setMouseTracking(True)
+                self._drag_offset = None
+                self._resize_edges_active = Qt.Edges()
+                self._resize_start_position = None
+                self._resize_start_geometry = None
+
+            def _resize_edges(self, position):
+                edges = Qt.Edges()
+                margin = self.RESIZE_MARGIN
+                if position.x() <= margin:
+                    edges |= Qt.LeftEdge
+                elif position.x() >= self.width() - margin:
+                    edges |= Qt.RightEdge
+                if position.y() <= margin:
+                    edges |= Qt.TopEdge
+                elif position.y() >= self.height() - margin:
+                    edges |= Qt.BottomEdge
+                return edges
+
+            def _update_resize_cursor(self, position):
+                edges = self._resize_edges(position)
+                if edges in (Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.BottomEdge):
+                    self.setCursor(Qt.SizeFDiagCursor)
+                elif edges in (Qt.RightEdge | Qt.TopEdge, Qt.LeftEdge | Qt.BottomEdge):
+                    self.setCursor(Qt.SizeBDiagCursor)
+                elif edges & (Qt.LeftEdge | Qt.RightEdge):
+                    self.setCursor(Qt.SizeHorCursor)
+                elif edges & (Qt.TopEdge | Qt.BottomEdge):
+                    self.setCursor(Qt.SizeVerCursor)
+                else:
+                    self.unsetCursor()
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.LeftButton:
+                    edges = self._resize_edges(event.position().toPoint())
+                    if edges:
+                        handle = self.windowHandle()
+                        if handle is not None and handle.startSystemResize(edges):
+                            event.accept()
+                            return
+                        # Some window managers do not implement native resize
+                        # for frameless windows, so retain a manual fallback.
+                        self._resize_edges_active = edges
+                        self._resize_start_position = event.globalPosition().toPoint()
+                        self._resize_start_geometry = self.geometry()
+                        event.accept()
+                        return
+                    self._drag_offset = event.globalPosition().toPoint() - self.pos()
+                    handle = self.windowHandle()
+                    if handle is not None and handle.startSystemMove():
+                        self._drag_offset = None
+                    event.accept()
+                    return
+                super().mousePressEvent(event)
+
+            def mouseMoveEvent(self, event):
+                if self._resize_edges_active and self._resize_start_geometry is not None:
+                    delta = (
+                        event.globalPosition().toPoint()
+                        - self._resize_start_position
+                    )
+                    geometry = self._resize_start_geometry
+                    left, top = geometry.left(), geometry.top()
+                    right, bottom = geometry.right(), geometry.bottom()
+                    minimum_width = self.minimumWidth()
+                    minimum_height = self.minimumHeight()
+                    edges = self._resize_edges_active
+                    if edges & Qt.LeftEdge:
+                        left = min(left + delta.x(), right - minimum_width + 1)
+                    if edges & Qt.RightEdge:
+                        right = max(right + delta.x(), left + minimum_width - 1)
+                    if edges & Qt.TopEdge:
+                        top = min(top + delta.y(), bottom - minimum_height + 1)
+                    if edges & Qt.BottomEdge:
+                        bottom = max(bottom + delta.y(), top + minimum_height - 1)
+                    self.setGeometry(left, top, right - left + 1, bottom - top + 1)
+                    event.accept()
+                    return
+                if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+                    self.move(event.globalPosition().toPoint() - self._drag_offset)
+                    event.accept()
+                    return
+                self._update_resize_cursor(event.position().toPoint())
+                super().mouseMoveEvent(event)
+
+            def mouseReleaseEvent(self, event):
+                self._drag_offset = None
+                self._resize_edges_active = Qt.Edges()
+                self._resize_start_position = None
+                self._resize_start_geometry = None
+                self._update_resize_cursor(event.position().toPoint())
+                super().mouseReleaseEvent(event)
+
+            def leaveEvent(self, event):
+                if not self._resize_edges_active:
+                    self.unsetCursor()
+                super().leaveEvent(event)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                buttons = getattr(self, "_responsive_buttons", ())
+                if not buttons:
+                    return
+                margins = self.layout().contentsMargins()
+                spacing = self._responsive_button_spacing
+                usable = (
+                    self.contentsRect().width()
+                    - margins.left() - margins.right()
+                    - spacing * (len(buttons) - 1)
+                )
+                equal_width = max(56, usable // len(buttons))
+                for button in buttons:
+                    button.setFixedWidth(equal_width)
+
+        class VisibilityCheckBox(QCheckBox):
+            """High-contrast visibility checkbox with an explicit check mark."""
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setFixedSize(22, 22)
+                self.setCursor(Qt.PointingHandCursor)
+
+            def paintEvent(self, event):
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                box = QRectF(2.0, 2.0, 18.0, 18.0)
+                if self.isChecked():
+                    painter.setPen(QPen(QColor("#69b8ff"), 1.5))
+                    painter.setBrush(QColor("#087ff5"))
+                    painter.drawRoundedRect(box, 4.0, 4.0)
+                    tick = QPainterPath()
+                    tick.moveTo(6.0, 11.0)
+                    tick.lineTo(9.5, 14.5)
+                    tick.lineTo(16.5, 7.0)
+                    painter.setPen(QPen(QColor("#ffffff"), 2.2, Qt.SolidLine,
+                                        Qt.RoundCap, Qt.RoundJoin))
+                    painter.drawPath(tick)
+                else:
+                    painter.setPen(QPen(QColor("#7b8793"), 1.5))
+                    painter.setBrush(QColor("#303840"))
+                    painter.drawRoundedRect(box, 4.0, 4.0)
+        popup = LinesDialog(self)
+        popup.setWindowFlag(Qt.FramelessWindowHint, True)
+        popup.setObjectName("flightLinesPopup")
         popup.setWindowTitle("Display Lines")
         popup.setModal(False)
         popup.setWindowModality(Qt.NonModal)
         popup.setAttribute(Qt.WA_DeleteOnClose, True)
-        popup.setMinimumWidth(285)
-        popup.setMaximumHeight(520)
-        popup.setStyleSheet(get_dialog_stylesheet())
+        # Keep this as an owned dialog so the application's existing window-
+        # state handler hides/restores it with NakshaAI. The size grip makes
+        # the frameless popup resizable without adding a native title bar.
+        popup.setSizeGripEnabled(True)
+        popup.setMinimumSize(344, 250)
+        popup.setStyleSheet("""
+            QDialog#flightLinesPopup {
+                background: #191c1f; border: 1px solid #30363c;
+                border-radius: 8px;
+            }
+            QTableWidget {
+                background: #141719; color: #ebebeb;
+                border: 1px solid #30363c; border-radius: 5px;
+                font-family: 'Segoe UI'; font-size: 14px;
+            }
+            QTableWidget::item { padding-left: 12px; }
+            QHeaderView { background: #202428; }
+            QHeaderView::section {
+                background: #202428; color: #ebebeb;
+                border: none; border-right: 1px solid #30363c;
+                border-bottom: 1px solid #30363c;
+                padding: 8px; font-family: 'Segoe UI'; font-size: 14px;
+            }
+            QCheckBox { background: transparent; }
+            QScrollBar:vertical {
+                background: #191c1f; width: 10px; margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #59636f; border-radius: 3px; min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QPushButton {
+                background: #252a30; color: #ebebeb;
+                border: 1px solid #363e47; border-radius: 6px;
+                padding: 0px; font-family: 'Segoe UI'; font-size: 14px;
+            }
+            QPushButton:hover { background: #303740; }
+            QPushButton:pressed { background: #1c2127; }
+            QPushButton:focus { border: 1px solid #8794a2; }
+            QPushButton#applyFlightLines {
+                background: #0067df; border-color: #2388ff; color: white;
+            }
+            QPushButton#applyFlightLines:hover { background: #0877ef; }
+            QPushButton#applyFlightLines:pressed { background: #0058c4; }
+            QPushButton#applyFlightLines:focus { border-color: #b6d8ff; }
+        """)
         root = QVBoxLayout(popup)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(9)
+        root.setContentsMargins(16, 20, 16, 16)
+        root.setSpacing(16)
 
         table = QTableWidget(len(line_ids), 2, popup)
         table.setHorizontalHeaderLabels(["Show", "Flight line / Color"])
@@ -2297,9 +2517,16 @@ class DisplayModeDialog(QDialog):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setFocusPolicy(Qt.NoFocus)
         table.setShowGrid(False)
-        table.verticalHeader().setDefaultSectionSize(34)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.verticalHeader().setDefaultSectionSize(40)
+        table.horizontalHeader().setFixedHeight(40)
+        table.horizontalHeader().setMinimumSectionSize(64)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        table.setColumnWidth(0, 80)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setMinimumHeight(40 + min(len(line_ids), 4) * 40 + 2)
 
         slot = int(getattr(self, "current_slot", 0))
         visibility = dict(
@@ -2312,7 +2539,7 @@ class DisplayModeDialog(QDialog):
             check_layout = QHBoxLayout(check_host)
             check_layout.setContentsMargins(0, 0, 0, 0)
             check_layout.setAlignment(Qt.AlignCenter)
-            check = QCheckBox()
+            check = VisibilityCheckBox()
             check.setChecked(bool(visibility.get(lid, True)))
             check_layout.addWidget(check)
             table.setCellWidget(row, 0, check_host)
@@ -2328,27 +2555,42 @@ class DisplayModeDialog(QDialog):
             table.setItem(row, 1, item)
         root.addWidget(table)
 
-        bulk = QHBoxLayout()
-        all_on = QPushButton("All on")
-        invert = QPushButton("Invert")
-        all_off = QPushButton("All off")
+        all_on = QPushButton("All on", popup)
+        invert = QPushButton("Invert", popup)
+        all_off = QPushButton("All off", popup)
         all_on.clicked.connect(lambda: [c.setChecked(True) for c in checks.values()])
         invert.clicked.connect(lambda: [c.setChecked(not c.isChecked()) for c in checks.values()])
         all_off.clicked.connect(lambda: [c.setChecked(False) for c in checks.values()])
-        bulk.addWidget(all_on)
-        bulk.addWidget(invert)
-        bulk.addWidget(all_off)
-        root.addLayout(bulk)
-
-        footer = QHBoxLayout()
-        footer.addStretch()
-        ok_btn = QPushButton("OK")
-        close_btn = QPushButton("Close")
+        ok_btn = QPushButton("OK", popup)
+        close_btn = QPushButton("Close", popup)
+        ok_btn.setObjectName("applyFlightLines")
         ok_btn.setDefault(True)
         close_btn.clicked.connect(popup.reject)
-        footer.addWidget(ok_btn)
-        footer.addWidget(close_btn)
-        root.addLayout(footer)
+        button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(8)
+        buttons = [all_on, invert, all_off, ok_btn, close_btn]
+        for button in buttons:
+            # The dialog resize handler recalculates one shared width so all
+            # five controls remain equal as the popup grows or shrinks.
+            button.setMinimumWidth(56)
+            button.setMinimumHeight(36)
+            button.setMaximumHeight(44)
+            button_layout.addWidget(button, 1)
+        popup._responsive_buttons = tuple(buttons)
+        popup._responsive_button_spacing = button_layout.spacing()
+        root.addLayout(button_layout)
+
+        # Choose a compact initial size from the current screen's available
+        # geometry. There is deliberately no fixed width or height: users can
+        # resize the popup and the table/button layouts consume the space.
+        available = self.screen().availableGeometry()
+        preferred_width = max(380, min(620, int(available.width() * 0.34)))
+        preferred_height = 20 + 40 + min(len(line_ids), 6) * 40 + 2 + 16 + 40 + 16
+        popup.resize(
+            min(preferred_width, max(344, available.width() - 32)),
+            min(preferred_height, max(250, available.height() - 32)),
+        )
 
         def apply_line_visibility():
             slot_visibility = {
@@ -2400,7 +2642,7 @@ class DisplayModeDialog(QDialog):
 
         # Applying is intentionally non-destructive to the popup lifecycle:
         # users can inspect the result, adjust lines, and apply again. Only
-        # Close (or the title-bar X) dismisses this selector.
+        # Close (or Escape) dismisses this selector.
         ok_btn.clicked.connect(apply_line_visibility)
         self._lines_popup = popup
 
@@ -2476,9 +2718,9 @@ class DisplayModeDialog(QDialog):
         if not app:
             return
 
-        # A new LAS/LAZ may have been loaded while this modeless dialog stayed
-        # open; refresh the available Point Source IDs on every explicit sync.
-        self._rebuild_lines_menu()
+        # Keep explicit Display Mode opens constant-time. Flight-line ID
+        # discovery remains deferred until Lines or Line mode is requested.
+        self._rebuild_lines_menu(allow_recovery=False)
 
         current_mode = getattr(app, "display_mode", "class")
         if not current_mode:
@@ -2697,25 +2939,50 @@ class DisplayModeDialog(QDialog):
         if self.current_slot == 0:
             app.class_palette = clone_palette(class_map)
 
-            # Keep every other already-seeded view slot's colors/weights/etc.
-            # in sync with this Main View edit. Only 'show' (visibility) is
-            # meant to differ per view — everything else is meant to be
-            # shared. Without this, a cross-section view whose slot palette
-            # was already seeded before this edit keeps showing the old
-            # color even after re-taking its section, because nothing ever
-            # pushed the new value into its (already-persisted) snapshot.
+            # Reconcile the PTC schema into every already-seeded view slot.
+            # Only ``show`` is per-view.  Class identity (code/name/draw/color/
+            # weight) is global.  The previous code only updated classes that
+            # already existed in a slot, so a class added to the PTC vanished
+            # from Cross/Cut palettes and later from shortcut rebases.
+            master_codes = set(class_map)
             for other_slot in range(1, 6):
                 for target_palettes in (self.view_palettes, app.view_palettes):
                     existing = target_palettes.get(other_slot)
                     if not existing:
-                        continue  # not seeded yet — will pick up fresh values when it is
+                        continue  # not seeded yet — fresh seeding will use Main schema
+
+                    # A deleted Main/PTC class must not survive in an old slot.
+                    for stale_code in set(existing) - master_codes:
+                        existing.pop(stale_code, None)
+
                     for code, entry in class_map.items():
-                        target_entry = existing.get(code)
-                        if target_entry is None:
-                            continue
-                        keep_show = target_entry.get('show', entry.get('show', True))
-                        target_entry.update(_copy.deepcopy(entry))
-                        target_entry['show'] = keep_show
+                        previous = existing.get(code)
+                        keep_show = (
+                            previous.get('show', entry.get('show', True))
+                            if isinstance(previous, dict)
+                            else entry.get('show', True)
+                        )
+                        # Per-view weight is presentation state, like visibility.
+                        # Main/PTC Apply owns class identity, but it must not
+                        # overwrite a weight already configured for Cross/Cut.
+                        keep_weight = (
+                            previous.get('weight', entry.get('weight', 1.0))
+                            if isinstance(previous, dict)
+                            else entry.get('weight', 1.0)
+                        )
+                        existing[code] = _copy.deepcopy(entry)
+                        existing[code]['show'] = bool(keep_show)
+                        existing[code]['weight'] = float(keep_weight)
+
+                # Keep the dialog's checkbox snapshot structurally aligned too.
+                if not hasattr(self, 'slot_shows') or self.slot_shows is None:
+                    self.slot_shows = {}
+                slot_show = self.slot_shows.setdefault(other_slot, {})
+                for stale_code in set(slot_show) - master_codes:
+                    slot_show.pop(stale_code, None)
+                live_slot = self.view_palettes.get(other_slot, {})
+                for code, entry in live_slot.items():
+                    slot_show[code] = bool(entry.get('show', True))
 
             # ============================================================
             # ACTIVE PTC FOR AI
@@ -3016,6 +3283,11 @@ class DisplayModeDialog(QDialog):
                                    if is_class_mode else 0),
             }
             self.applied.emit(payload)
+
+        # Main View owns the canonical classification schema. Notify any
+        # open picker after Add/Edit/Delete + Apply so its choices refresh.
+        if self.current_slot == 0:
+            self.classes_loaded.emit()
 
         if hasattr(app, 'statusBar'):
             view_names = ["Main View", "View 1", "View 2", "View 3", "View 4"]
@@ -3652,7 +3924,7 @@ class EditClassDialog(InputPopupMixin, QDialog):
     weight_applied = Signal(float)
 
     def __init__(self, code=0, desc="", color=QColor("white"), parent=None,
-                 draw="Not set", lvl="", weight=2.0):
+                 draw="Not set", lvl="", weight=2.0, target_slot=None):
         super().__init__(parent)
         self.setProperty("themeStyledDialog", True)
         self.setWindowTitle("Edit Class")
@@ -3661,6 +3933,15 @@ class EditClassDialog(InputPopupMixin, QDialog):
         self.default_weight  = float(weight)
         self.current_weight  = float(weight)
         self.parent_dialog   = parent
+        # Freeze the view slot this editor belongs to. The Display Mode target
+        # can change while this floating editor is open; a View-1 weight must
+        # never be applied to View 2 because current_slot changed meanwhile.
+        if target_slot is None and parent is not None:
+            target_slot = getattr(parent, 'current_slot', 0)
+        try:
+            self.target_slot = int(target_slot)
+        except Exception:
+            self.target_slot = 0
 
         layout = QVBoxLayout(self)
 
@@ -3734,8 +4015,12 @@ class EditClassDialog(InputPopupMixin, QDialog):
             # 3. Setup Context
             parent_table = self.parent_dialog.table
             code = int(self.code_edit.text())
-            current_slot = self.parent_dialog.current_slot
-            app = self.parent_dialog.parent()
+            current_slot = int(getattr(self, 'target_slot', self.parent_dialog.current_slot))
+            app = (
+                self.parent_dialog._get_app_window()
+                if hasattr(self.parent_dialog, '_get_app_window')
+                else self.parent_dialog.parent()
+            )
 
             # 4. Update UI Table
             for row in range(parent_table.rowCount()):

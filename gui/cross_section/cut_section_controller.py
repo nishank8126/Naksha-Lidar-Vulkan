@@ -1161,6 +1161,16 @@ class CutSectionController:
             # Detach observers
             self._detach_all_view_observers()
             
+            # ✅ Clean up resize refit timer and filter
+            try:
+                t = getattr(self, '_cut_refit_timer', None)
+                if t is not None:
+                    t.stop()
+                self._cut_refit_timer = None
+                self._cut_resize_filter = None
+            except Exception:
+                pass
+
             # ✅ Close dock AFTER widget cleanup
             if self.cut_dock is not None:
                 try:
@@ -2134,6 +2144,11 @@ class CutSectionController:
         
         self._set_camera_along_tangent(self.cut_vtk, self.cut_points, self.section_tangent)
 
+        # ✅ FIX: this fit runs right after the dock was shown/restored, which can
+        # still be one layout pass behind the real viewport size - re-fit once
+        # the layout has settled so a new cut always fits the whole section.
+        self._schedule_cut_view_fit_after_layout()
+
         # ------------------------------------------------------------
         # FAST PERSISTENT CUT-IN-CUT PATH
         # ------------------------------------------------------------
@@ -2283,35 +2298,11 @@ class CutSectionController:
         setattr(wrapper, "on_classify_done", on_classify_done_cut)
         self._restore_classification_tools()    
         
-        if not hasattr(self.app, 'original_undo_classification'):
-            self.app.original_undo_classification = self.app.undo_classification
-            self.app.original_redo_classification = self.app.redo_classification
-            
-            def undo_with_cut_refresh():
-                self.app.original_undo_classification()
-                if hasattr(self.app, 'cut_section_controller'):
-                    ctrl = self.app.cut_section_controller
-                    if ctrl.is_cut_view_active and ctrl.cut_points is not None:
-                        try:
-                            print("🔄 [UNDO] Refreshing cut section...")
-                            ctrl._refresh_cut_colors_fast()
-                        except Exception as e:
-                            print(f"⚠️ Cut undo refresh failed: {e}")
-            
-            def redo_with_cut_refresh():
-                self.app.original_redo_classification()
-                if hasattr(self.app, 'cut_section_controller'):
-                    ctrl = self.app.cut_section_controller
-                    if ctrl.is_cut_view_active and ctrl.cut_points is not None:
-                        try:
-                            print("🔄 [REDO] Refreshing cut section...")
-                            ctrl._refresh_cut_colors_fast()
-                        except Exception as e:
-                            print(f"⚠️ Cut redo refresh failed: {e}")
-            
-            self.app.undo_classification = undo_with_cut_refresh
-            self.app.redo_classification = redo_with_cut_refresh
-            print("✅ Cut section undo/redo hooks installed")
+        # Undo/redo is centralized in NakshaApp.  It already refreshes the Cut
+        # Section after classification history changes, so do not monkey-patch
+        # app.undo_classification/app.redo_classification here.  Keeping one
+        # owner also preserves their Boolean return contract for shortcut
+        # dispatch and avoids duplicate Cut refreshes.
         
         print("✅ ClassificationInteractor attached to dedicated cut widget!")
 
@@ -5243,10 +5234,26 @@ class CutSectionController:
             perp_extent = max(np.max(proj_perp) - np.min(proj_perp), 0.5)
         else:
             perp_extent = max(xmax - xmin, ymax - ymin, 0.5)
-        
-        scale = max(z_extent, perp_extent) * 0.6
+
+        # ✅ FIX: aspect-correct parallel scale.
+        # Screen-right is the in-plane perpendicular (= section length) while
+        # screen-up is Z (= elevation), so the two axes need different world
+        # spans.  The old `max(z_extent, perp_extent) * 0.6` ignored the
+        # viewport aspect: the visible world width is
+        # (2 * ParallelScale * aspect), so in a narrow/tall dock the along-
+        # section extent no longer fitted and a freshly created cut looked
+        # cropped/zoomed until the dock was resized (which re-ran this fit).
+        padding = 0.08
+        padded_perp = perp_extent * (1.0 + 2.0 * padding)
+        padded_z = z_extent * (1.0 + 2.0 * padding)
+        aspect = self._cut_view_aspect(vtk_widget)
+        scale = max((padded_perp / 2.0) / aspect, padded_z / 2.0)
         cam.SetParallelScale(scale)
         ren.ResetCameraClippingRange()
+        print(
+            f"   📷 Cut camera fit: len={perp_extent:.2f} z={z_extent:.2f} "
+            f"aspect={aspect:.2f} scale={scale:.3f}"
+        )
         
         if abs(self.cut_yaw_deg) > 1e-6:
             cam.Azimuth(self.cut_yaw_deg)
@@ -5293,6 +5300,95 @@ class CutSectionController:
             traceback.print_exc()
             return False
 
+    def _cut_view_aspect(self, vtk_widget=None):
+        """
+        Viewport aspect ratio (width / height) of the cut section widget.
+
+        Prefers the VTK render window size; falls back to the Qt widget size
+        (the render window can still report a stale size right after the dock
+        is created or re-laid out) and finally to a sane default.
+        """
+        target = vtk_widget if vtk_widget is not None else self.cut_vtk
+
+        win_w = win_h = 0
+        if target is not None:
+            try:
+                rw = target.GetRenderWindow()
+                if rw is not None:
+                    win_w, win_h = rw.GetSize()
+            except Exception:
+                win_w, win_h = 0, 0
+
+            if win_w < 10 or win_h < 10:
+                try:
+                    win_w, win_h = target.width(), target.height()
+                except Exception:
+                    win_w, win_h = 0, 0
+
+        if win_w < 10 or win_h < 10:
+            win_w, win_h = 900, 450
+
+        return max(float(win_w) / float(win_h), 0.05)
+
+    def _schedule_cut_view_fit_after_layout(self, delay_ms=150):
+        """
+        Re-run the cut camera fit once Qt has applied the final viewport size.
+
+        The first plot can run before the VTK render window reports its real
+        (often much narrower) size, so the aspect-correct fit is computed with
+        a stale aspect and the first view appears cropped.  This re-fits only
+        when the viewport aspect actually changed and the camera is still
+        untouched, so a user pan/zoom (or the resize-driven refit) is never
+        overridden.
+        """
+        if self.cut_vtk is None:
+            return
+
+        try:
+            cam = self.cut_vtk.renderer.GetActiveCamera()
+            state = (
+                tuple(cam.GetPosition()),
+                tuple(cam.GetFocalPoint()),
+                float(cam.GetParallelScale()),
+            )
+            aspect = self._cut_view_aspect(self.cut_vtk)
+        except Exception:
+            return
+
+        def _refit_if_layout_settled():
+            if self.cut_vtk is None or not getattr(self, "is_cut_view_active", False):
+                return
+            try:
+                cam_now = self.cut_vtk.renderer.GetActiveCamera()
+                state_now = (
+                    tuple(cam_now.GetPosition()),
+                    tuple(cam_now.GetFocalPoint()),
+                    float(cam_now.GetParallelScale()),
+                )
+                if state_now != state:
+                    return  # camera already moved (user interaction / refit)
+                if abs(self._cut_view_aspect(self.cut_vtk) - aspect) < 1e-3:
+                    return  # viewport unchanged - nothing to correct
+
+                if self.section_tangent is not None:
+                    self._set_camera_along_tangent(
+                        self.cut_vtk, self.cut_points, self.section_tangent
+                    )
+                else:
+                    ren = self.cut_vtk.renderer
+                    ren.ResetCamera()
+                    ren.GetActiveCamera().ParallelProjectionOn()
+                    ren.ResetCameraClippingRange()
+
+                _safe_vtk_render(self.cut_vtk)
+                print(
+                    "   📐 Cut view re-fitted after first layout "
+                    f"(aspect {aspect:.2f} → {self._cut_view_aspect(self.cut_vtk):.2f})"
+                )
+            except Exception:
+                pass
+
+        QTimer.singleShot(max(int(delay_ms), 0), _refit_if_layout_settled)
 
     def _get_cut_slot_palette(self, ensure_seed: bool = True):
         """
@@ -5554,7 +5650,114 @@ class CutSectionController:
         except Exception:
             pass
         self._cut_locate_rb_actor = None
+        
+    def restore_cut_locate_observers_for_cross_section(self) -> bool:
+        """
+        Restore MicroStation-style CrossSectionRect locate interaction on the
+        existing Cut View.
 
+        CutFromCut intentionally owns LeftButtonPressEvent/MouseMoveEvent while
+        nested placement is active. Its fast path can remove the normal locate
+        observers. When CrossSectionRect takes ownership again, recreate only
+        those two observers without rebuilding the cut dataset, actor, camera,
+        classification interactor, palette or index mapping.
+
+        Safe to call repeatedly.
+        """
+        try:
+            if self.cut_vtk is None:
+                return False
+
+            if not self._has_valid_cut_dock():
+                return False
+
+            # This helper is specifically for CrossSectionRect ownership.
+            if not getattr(self.app, "cross_section_active", False):
+                return False
+
+            iren = getattr(self.cut_vtk, "interactor", None)
+            if iren is None:
+                return False
+
+            # Cross-section locate is active again.
+            sc = getattr(self.app, "section_controller", None)
+            if sc is not None and hasattr(sc, "set_section_locate_enabled"):
+                sc.set_section_locate_enabled(
+                    True,
+                    clear_state=True,
+                )
+
+            # --------------------------------------------------------------
+            # Remove the OLD tracked IDs first.
+            #
+            # CutFromCut may already have removed these through
+            # RemoveObservers(...). In that case RemoveObserver(stale_id)
+            # is simply best-effort cleanup.
+            # --------------------------------------------------------------
+            old_left = getattr(
+                self,
+                "_cut_locate_observer_id",
+                None,
+            )
+
+            if old_left is not None:
+                try:
+                    iren.RemoveObserver(old_left)
+                except Exception:
+                    pass
+
+            self._cut_locate_observer_id = None
+
+            old_move = getattr(
+                self,
+                "_cut_locate_move_observer_id",
+                None,
+            )
+
+            if old_move is not None:
+                try:
+                    iren.RemoveObserver(old_move)
+                except Exception:
+                    pass
+
+            self._cut_locate_move_observer_id = None
+
+            # --------------------------------------------------------------
+            # Reattach exactly the existing proven callbacks.
+            # Do NOT create another coordinate conversion implementation.
+            # --------------------------------------------------------------
+            self._cut_locate_observer_id = iren.AddObserver(
+                "LeftButtonPressEvent",
+                self._on_cut_view_left_click_locate,
+                1.0,
+            )
+
+            self._cut_locate_move_observer_id = iren.AddObserver(
+                "MouseMoveEvent",
+                self._on_cut_view_mouse_move_locate,
+                1.0,
+            )
+
+            print(
+                "CUT_LOCATE_OBSERVERS "
+                "action=restored "
+                f"left={self._cut_locate_observer_id} "
+                f"move={self._cut_locate_move_observer_id} "
+                "reason=cross_section_activate"
+            )
+
+            return True
+
+        except (RuntimeError, ReferenceError):
+            return False
+
+        except Exception as e:
+            print(
+                "CUT_LOCATE_OBSERVERS "
+                f"action=restore_failed error={e}"
+            )
+            return False
+    
     def _on_cut_view_left_click_locate(self, obj, event):
         if not getattr(self.app, "cross_section_active", False):
             return
@@ -6250,6 +6453,42 @@ class CutSectionController:
             # ✅ SHOW DOCK
             self.cut_dock.show()
 
+            # ✅ Auto-refit camera when Cut Section dock is resized
+            from PySide6.QtCore import QTimer, QEvent
+            _cut_refit_timer = QTimer(self.app)
+            _cut_refit_timer.setSingleShot(True)
+            _cut_refit_timer.setInterval(200)  # debounce 200ms
+            def _do_cut_refit():
+                try:
+                    self.fit_cut_section_view()
+                except Exception:
+                    pass
+            _cut_refit_timer.timeout.connect(_do_cut_refit)
+            self._cut_refit_timer = _cut_refit_timer
+
+            _orig_cut_resize = self.cut_dock.resizeEvent
+            def _patched_cut_resize(event, _orig=_orig_cut_resize, _timer=_cut_refit_timer):
+                _orig(event)
+                try:
+                    _timer.start()
+                except Exception:
+                    pass
+            self.cut_dock.resizeEvent = _patched_cut_resize
+
+            # Also watch VTK interactor resize for layout-driven changes
+            from PySide6.QtCore import QObject as _QObject
+            class _CutVtkResizeFilter(_QObject):
+                def __init__(self, timer, parent=None):
+                    super().__init__(parent)
+                    self.timer = timer
+                def eventFilter(self, obj, event):
+                    if event.type() == QEvent.Resize:
+                        self.timer.start()
+                    return False
+            _cut_vtk_filter = _CutVtkResizeFilter(_cut_refit_timer, self.cut_vtk.interactor)
+            self.cut_vtk.interactor.installEventFilter(_cut_vtk_filter)
+            self._cut_resize_filter = _cut_vtk_filter
+
     def _plot_cut_to_dedicated_widget(self, points):
         """
         Plot cut section to the DEDICATED cut section widget.
@@ -6308,7 +6547,11 @@ class CutSectionController:
             ren.GetActiveCamera().ParallelProjectionOn()
             ren.ResetCameraClippingRange()
         _safe_vtk_render(self.cut_vtk)
-        
+
+        # ✅ FIX: the first plot can run before the render window knows its real
+        # (possibly narrow) size - re-fit once the layout has settled.
+        self._schedule_cut_view_fit_after_layout()
+
         print(f"✅ Cut plotted to dedicated widget: {points.shape[0]} pts")
 
 
