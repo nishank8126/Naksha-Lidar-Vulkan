@@ -628,6 +628,15 @@ class TempFenceTool:
     # ------------------------------------------------------------------
     # Actors
     # ------------------------------------------------------------------
+    @staticmethod
+    def _apply_fence_style(actor):
+        """Apply the user's colour/width from the Classify Tools window."""
+        try:
+            from gui.classify_settings_dialog import apply_classify_style_to_actor
+            apply_classify_style_to_actor(actor, "temp_fence")
+        except Exception:
+            pass
+
     def _make_line_actor(self, pts, color=(1.0, 1.0, 0.0), width=2.0):
         """Build a polyline + vertex-points actor from a list of (x, y, z).
 
@@ -753,6 +762,7 @@ class TempFenceTool:
             if not pts:
                 return
             self._preview_actor = self._make_line_actor(pts, color=(0.4, 0.9, 1.0), width=2.0)
+            self._apply_fence_style(self._preview_actor)
             self._add_actor(self._preview_actor)
             self._render()
         except Exception as e:
@@ -860,6 +870,7 @@ class TempFenceTool:
             self._teardown_previous()
 
             self._fence_actor = self._make_line_actor(outline, color=(1.0, 1.0, 0.0), width=2.5)
+            self._apply_fence_style(self._fence_actor)
             self._add_actor(self._fence_actor)
 
             self._fence = {

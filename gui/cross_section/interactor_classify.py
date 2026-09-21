@@ -12882,6 +12882,13 @@ class ClassificationInteractor:
         
         self.line_actor.VisibilityOn()
 
+        # Classify Tools window: user colour/width for the Above tool
+        # (every other tool keeps the default yellow / 2 px).
+        from gui.classify_settings_dialog import apply_classify_style_to_actor
+        apply_classify_style_to_actor(
+            self.line_actor, getattr(self.app, "active_classify_tool", None)
+        )
+
         # 3. Fast Coordinate Update
         u1, v1 = self._get_view_coordinates(P1)
         u2, v2 = self._get_view_coordinates(P2)
@@ -12926,6 +12933,9 @@ class ClassificationInteractor:
         # Ensure actor presence in the current renderer
         if not renderer.HasViewProp(self.dotted_actor):
             renderer.AddActor2D(self.dotted_actor)
+
+        from gui.classify_settings_dialog import apply_classify_style_to_actor
+        apply_classify_style_to_actor(self.dotted_actor, tool)
 
         # Update Display values
         self._coord_converter.SetValue(*P1)
@@ -13107,6 +13117,10 @@ class ClassificationInteractor:
             renderer.AddActor2D(self.rect_actor)
         
         self.rect_actor.VisibilityOn()
+        
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        
+        _acs(self.rect_actor, 'rectangle')
 
         u1, v1 = self._get_view_coordinates(P1)
         u2, v2 = self._get_view_coordinates(P2)
@@ -13324,6 +13338,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor):
             renderer.AddActor2D(self.freehand_actor)
         self.freehand_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor, 'freehand')
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_freehand_coord"):
@@ -13396,6 +13412,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.poly_actor):
             renderer.AddActor2D(self.poly_actor)
         self.poly_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.poly_actor, 'polygon')
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_poly_coord_conv"):
@@ -13551,6 +13569,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor):
             renderer.AddActor2D(self.brush_actor)
         self.brush_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor, 'brush')
 
         # ── FAST GEOMETRY UPDATE (display coords, no world conversion) ────────
         pts   = self._brush_pts
@@ -16776,6 +16796,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor):
             renderer.AddActor2D(self.freehand_actor)
         self.freehand_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor, 'freehand')
 
         if not hasattr(self, "_freehand_coord"):
             from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
@@ -17467,6 +17489,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor_main):
             renderer.AddActor2D(self.circle_actor_main)
         self.circle_actor_main.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor_main, 'circle')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         if not hasattr(self, "_circle_main_coord"):
@@ -17543,6 +17567,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor):
             renderer.AddActor2D(self.circle_actor)
         self.circle_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor, 'circle')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         if not hasattr(self, "_circle_coord"):
@@ -18916,6 +18942,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor):
             renderer.AddActor2D(self.brush_actor)
         self.brush_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._rect_cursor_pts
