@@ -1142,8 +1142,18 @@ class ElementSelectTool(QObject):
             elif self._copy_mode:
                 self.exit_copy_mode()
             else:
-                self._cancel_in_progress_pick()
-                self._status("Element Select: pick canceled")
+                # Fully deactivate the element select tool AND the select
+                # rectangle tool / pick-method dialog.  Plain self.deactivate()
+                # re-enables the digitizer, which re-arms the Identify-tab
+                # Select tool immediately.  Use the app-window teardown to
+                # prevent that re-arm.
+                try:
+                    self.app._deactivate_selection_tools("Escape")
+                    self.app._deactivate_identify_tab_tools()
+                except Exception:
+                    # Fallback: at least deactivate our own tool
+                    self.deactivate()
+                self._status("Element Select deactivated")
             return
 
         if ctrl and not shift and key in ("z", "Z"):

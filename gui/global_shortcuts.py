@@ -622,8 +622,31 @@ class GlobalShortcutFilter(QObject):
             # Display Mode dialog (incl. its Edit Class sub-dialog) owns the key
             # presses while open — description/code/level text entry must not
             # trigger alphabet tool shortcuts.
+            # HOWEVER: Esc while a tool is active must still deactivate the tool
+            # (draw, select, classify, measure, etc.) instead of closing the dialog.
             if self._is_display_mode_dialog_active():
-                return False
+                if event.key() == Qt.Key_Escape:
+                    # Check if any identify/select tool is active; if so,
+                    # deactivate it here (before VTK gets the event) and
+                    # consume Esc so the dialog does NOT close.
+                    _aw = self.app_window
+                    _sel_rect = getattr(_aw, 'select_rectangle_tool', None)
+                    _sel_active = _sel_rect is not None and getattr(_sel_rect, 'active', False)
+                    _dig = getattr(_aw, 'digitizer', None)
+                    _es = getattr(_dig, '_element_select_tool', None) if _dig else None
+                    _es_active = _es is not None and getattr(_es, '_active', False)
+                    if _sel_active or _es_active:
+                        try:
+                            _aw._deactivate_selection_tools("Escape")
+                            _aw._deactivate_identify_tab_tools()
+                        except Exception:
+                            pass
+                        print("🛑 ESC — tool deactivated (Display Mode open)")
+                        return True
+                    # No tool active — let Esc reach the dialog to close it
+                    return False
+                else:
+                    return False
 
             # Shortcut editor has priority over runtime tool shortcuts.
             if self._is_shortcut_editor_active():
@@ -704,13 +727,16 @@ class GlobalShortcutFilter(QObject):
                     bool(event.modifiers() & Qt.ControlModifier)
                     and event.key() in (Qt.Key_Z, Qt.Key_Y)
                 )
-                # A Display Mode combo box has no use for modified keys, so any
-                # Ctrl/Alt/Shift/Meta shortcut (Ctrl+Z/Y, Shift+F Fit View, ...)
-                # must still reach the global handlers. Plain letters stay with
-                # the combo (type-ahead).
-                display_combo_modified_key = focus_in_display_mode_combo and bool(
-                    event.modifiers()
-                    & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)
+                # A Display Mode combo box has no use for modified keys or Esc,
+                # so any Ctrl/Alt/Shift/Meta shortcut (Ctrl+Z/Y, Shift+F Fit View,
+                # ...) or Esc (tool deactivation) must still reach the global
+                # handlers. Plain letters stay with the combo (type-ahead).
+                display_combo_modified_key = focus_in_display_mode_combo and (
+                    bool(
+                        event.modifiers()
+                        & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)
+                    )
+                    or event.key() == Qt.Key_Escape
                 )
                 allow_classification_history_from_picker = (
                     is_history_key
@@ -798,12 +824,32 @@ class GlobalShortcutFilter(QObject):
                 cut_controller = getattr(
                     self.app_window, 'cut_section_controller', None
                 )
+                # 1. Nested cut-in-cut (cut_source == "cut")
                 cancel_nested_cut = getattr(
                     cut_controller, 'cancel_persistent_cut_in_cut', None
                 )
                 if callable(cancel_nested_cut) and cancel_nested_cut():
                     print("🛑 ESC - persistent Cut-in-Cut deactivated; left pan restored")
                     return True
+
+                # 2. Cross-section cut (cut_source == "cross") — when the user
+                #    initiated the cut from a cross-section view, cancel_persistent_cut_in_cut
+                #    returns False because it only handles _cut_source == "cut".  Use
+                #    deactivate_if_waiting which covers both sources.
+                if cut_controller is not None:
+                    _cut_state = getattr(cut_controller, '_state', 0)
+                    # CutSectionState.WAITING_CENTER=1, WAITING_DEPTH=2
+                    if _cut_state in (1, 2):
+                        try:
+                            deactivate_wait = getattr(
+                                cut_controller, 'deactivate_if_waiting', None
+                            )
+                            if callable(deactivate_wait):
+                                deactivate_wait()
+                                print("🛑 ESC - cut section placement deactivated")
+                                return True
+                        except Exception as e:
+                            print(f"⚠️ ESC cut section deactivation failed: {e}")
 
                 deactivate_identification = getattr(
                     self.app_window,
@@ -844,6 +890,69 @@ class GlobalShortcutFilter(QObject):
                     if getattr(self.app_window, 'active_classify_tool', None) == 'temp_fence':
                         self.app_window.active_classify_tool = None
                     print("🛑 ESC - temp fence tool deactivated")
+                    return True
+
+                # Deactivate draw (digitizer) tool on Escape — when focus is in a
+                # Display Mode combo the VTK interactor never sees the key, so we
+                # must handle it here.  Keeps drawings on screen (cancel the active
+                # sub-tool only, same as the VTK Esc path).
+                _digitizer = getattr(self.app_window, 'digitizer', None)
+                if _digitizer is not None and getattr(_digitizer, 'active_tool', None):
+                    try:
+                        if hasattr(_digitizer, '_deactivate_active_tool_keep_drawings'):
+                            _digitizer._deactivate_active_tool_keep_drawings()
+                        elif hasattr(_digitizer, 'deactivate_all'):
+                            _digitizer.deactivate_all()
+                    except Exception as e:
+                        print(f"⚠️ ESC draw tool deactivation failed: {e}")
+                    print("🛑 ESC - draw tool deactivated")
+                    return True
+
+                # Deactivate select rectangle tool (Block/Shape pick) on Escape
+                _sel_rect = getattr(self.app_window, 'select_rectangle_tool', None)
+                if _sel_rect is not None and getattr(_sel_rect, 'active', False):
+                    try:
+                        self.app_window._deactivate_selection_tools("Escape")
+                        self.app_window._deactivate_identify_tab_tools()
+                    except Exception as e:
+                        print(f"⚠️ ESC select rectangle tool deactivation failed: {e}")
+                    print("🛑 ESC - select rectangle tool deactivated")
+                    return True
+
+                # Deactivate element select (identify/pick) tool on Escape
+                _digitizer_for_es = getattr(self.app_window, 'digitizer', None)
+                _es_tool = getattr(_digitizer_for_es, '_element_select_tool', None) if _digitizer_for_es is not None else None
+                if _es_tool is not None and getattr(_es_tool, '_active', False):
+                    try:
+                        # Use _deactivate_selection_tools to fully teardown the
+                        # Select Rectangle tool, element select tool, and the
+                        # pick-method dialog — plain es.deactivate() re-enables
+                        # the digitizer which re-arms the Identify-tab select tool.
+                        self.app_window._deactivate_selection_tools("Escape")
+                        self.app_window._deactivate_identify_tab_tools()
+                    except Exception as e:
+                        print(f"⚠️ ESC element select tool deactivation failed: {e}")
+                    print("🛑 ESC - element select (identify) tool deactivated")
+                    return True
+
+                # Deactivate curve tool on Escape
+                _curve = getattr(self.app_window, 'curve_tool', None)
+                if _curve is not None and getattr(_curve, 'active', False):
+                    try:
+                        _curve.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC curve tool deactivation failed: {e}")
+                    print("🛑 ESC - curve tool deactivated")
+                    return True
+
+                # Deactivate measurement tool on Escape
+                _mt = getattr(self.app_window, 'measurement_tool', None)
+                if _mt is not None and getattr(_mt, 'active', False):
+                    try:
+                        _mt.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC measurement tool deactivation failed: {e}")
+                    print("🛑 ESC - measurement tool deactivated")
                     return True
 
                 cross_action = getattr(self.app_window, 'cross_action', None)

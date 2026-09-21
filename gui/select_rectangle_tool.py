@@ -54,6 +54,10 @@ class SelectRectangleTool:
         
         self.observer_ids = [press_id, move_id, right_id]
         
+        # Add KeyPressEvent for Esc handling
+        key_id = interactor.AddObserver("KeyPressEvent", self._on_key_press, 1.0)
+        self.observer_ids.append(key_id)
+        
         # ✅ NEW: Add camera observer to handle panning/zooming
         try:
             renderer = self.app.vtk_widget.renderer
@@ -70,6 +74,22 @@ class SelectRectangleTool:
         
         self.app.statusBar().showMessage("🟧 Draw rectangle: LEFT-CLICK & drag, RIGHT-CLICK to finish", 5000)
         
+    def _on_key_press(self, obj, evt):
+        """Handle key press events — Esc deactivates the tool."""
+        if not self.active:
+            return
+        try:
+            key = obj.GetKeySym() or ""
+        except Exception:
+            key = ""
+        if key in ("Escape", "escape"):
+            try:
+                self.app._deactivate_selection_tools("Escape")
+                self.app._deactivate_identify_tab_tools()
+            except Exception:
+                self.deactivate()
+            print("🛑 Esc pressed — Select Rectangle tool deactivated")
+
     def deactivate(self):
         """Deactivate the selection tool"""
         if not self.active:
