@@ -11613,6 +11613,85 @@ class ClassificationInteractor:
 
         return undo_mask
 
+    def cancel_pending_brush_stroke(self):
+        """Roll back the live brush stroke without adding an undo entry."""
+        if getattr(self.app, "active_classify_tool", None) != "brush":
+            return None
+
+        index_chunks = getattr(self, "_brush_indices_arrays", None) or []
+        old_class_chunks = getattr(self, "_brush_old_classes_arrays", None) or []
+        old_classes_dict = getattr(self, "_brush_old_classes", None) or {}
+        indices = old_cls = None
+
+        if index_chunks and len(index_chunks) == len(old_class_chunks):
+            indices = np.concatenate(index_chunks).astype(np.int64, copy=False)
+            old_cls = np.concatenate(old_class_chunks)
+            if indices.size:
+                # A point may be touched more than once during a stroke. The
+                # first saved value is its class before this gesture began.
+                _, first_idx = np.unique(indices, return_index=True)
+                indices = indices[first_idx]
+                old_cls = old_cls[first_idx]
+        elif old_classes_dict:
+            indices = np.array(sorted(old_classes_dict), dtype=np.int64)
+            old_cls = np.array(
+                [old_classes_dict[int(i)] for i in indices],
+                dtype=self.app.data["classification"].dtype,
+            )
+
+        changed_mask = None
+        if indices is not None and indices.size:
+            classes = self.app.data["classification"]
+            classes[indices] = old_cls
+            changed_mask = np.zeros(len(classes), dtype=bool)
+            changed_mask[indices] = True
+
+        # Invalidate queued worker results before clearing the transaction.
+        self._brush_current_to_class = None
+        self._brush_accumulated_mask = None
+        self._brush_old_classes = {}
+        self._brush_old_classes_arrays = []
+        self._brush_indices_arrays = []
+        self._brush_frame_chunks = []
+        self._brush_stroke_positions = []
+        self._last_brush_center = None
+        self._last_brush_center_uv = None
+        self._brush_needs_render = False
+        self._brush_visible_classes = None
+        self._brush_section_local_mask = None
+        self.app._suppress_section_refresh = False
+        self.is_dragging = False
+
+        try:
+            self._destroy_brush_paint_overlay()
+        except Exception:
+            pass
+        try:
+            self._clear_all_previews()
+        except Exception:
+            pass
+
+        if changed_mask is not None:
+            try:
+                from gui.unified_actor_manager import fast_undo_update
+                fast_undo_update(self.app, changed_mask=changed_mask)
+            except Exception as exc:
+                print(f"⚠️ Brush cancel refresh failed: {exc}")
+            try:
+                ctrl = getattr(self.app, "cut_section_controller", None)
+                if ctrl is not None and getattr(ctrl, "is_cut_view_active", False):
+                    ctrl._refresh_cut_colors_fast()
+            except Exception:
+                pass
+            try:
+                from gui.point_count_widget import refresh_point_statistics
+                refresh_point_statistics(self.app)
+            except Exception:
+                pass
+            print(f"🧹 Cancelled live brush stroke: restored {len(indices):,} points")
+
+        return changed_mask
+
     def finalize_pending_brush_for_history(self):
         """Commit an applied brush stroke before an immediate undo/redo request."""
         if getattr(self.app, "active_classify_tool", None) != "brush":
@@ -12882,6 +12961,13 @@ class ClassificationInteractor:
         
         self.line_actor.VisibilityOn()
 
+        # Classify Tools window: user colour/width for the Above tool
+        # (every other tool keeps the default yellow / 2 px).
+        from gui.classify_settings_dialog import apply_classify_style_to_actor
+        apply_classify_style_to_actor(
+            self.line_actor, getattr(self.app, "active_classify_tool", None)
+        )
+
         # 3. Fast Coordinate Update
         u1, v1 = self._get_view_coordinates(P1)
         u2, v2 = self._get_view_coordinates(P2)
@@ -12926,6 +13012,9 @@ class ClassificationInteractor:
         # Ensure actor presence in the current renderer
         if not renderer.HasViewProp(self.dotted_actor):
             renderer.AddActor2D(self.dotted_actor)
+
+        from gui.classify_settings_dialog import apply_classify_style_to_actor
+        apply_classify_style_to_actor(self.dotted_actor, tool)
 
         # Update Display values
         self._coord_converter.SetValue(*P1)
@@ -13107,6 +13196,10 @@ class ClassificationInteractor:
             renderer.AddActor2D(self.rect_actor)
         
         self.rect_actor.VisibilityOn()
+        
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        
+        _acs(self.rect_actor, 'rectangle')
 
         u1, v1 = self._get_view_coordinates(P1)
         u2, v2 = self._get_view_coordinates(P2)
@@ -13324,6 +13417,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor):
             renderer.AddActor2D(self.freehand_actor)
         self.freehand_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor, 'freehand')
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_freehand_coord"):
@@ -13396,6 +13491,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.poly_actor):
             renderer.AddActor2D(self.poly_actor)
         self.poly_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.poly_actor, 'polygon')
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_poly_coord_conv"):
@@ -13475,6 +13572,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.poly_actor_cut):
             renderer.AddActor2D(self.poly_actor_cut)
         self.poly_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.poly_actor_cut, 'polygon')
 
         pts = self._poly_cut_pts
         lines = self._poly_cut_lines
@@ -13551,6 +13650,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor):
             renderer.AddActor2D(self.brush_actor)
         self.brush_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor, 'brush')
 
         # ── FAST GEOMETRY UPDATE (display coords, no world conversion) ────────
         pts   = self._brush_pts
@@ -16776,6 +16877,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor):
             renderer.AddActor2D(self.freehand_actor)
         self.freehand_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor, 'freehand')
 
         if not hasattr(self, "_freehand_coord"):
             from vtkmodules.vtkRenderingCore import vtkCoordinate as _C
@@ -17467,6 +17570,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor_main):
             renderer.AddActor2D(self.circle_actor_main)
         self.circle_actor_main.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor_main, 'circle')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         if not hasattr(self, "_circle_main_coord"):
@@ -17543,6 +17648,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor):
             renderer.AddActor2D(self.circle_actor)
         self.circle_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor, 'circle')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         if not hasattr(self, "_circle_coord"):
@@ -17977,6 +18084,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.circle_actor_cut):
             renderer.AddActor2D(self.circle_actor_cut)
         self.circle_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.circle_actor_cut, 'circle')
 
         # ── FAST GEOMETRY UPDATE (world → display coords) ────────────────────
         if not hasattr(self, "_circle_cut_coord"):
@@ -18057,6 +18166,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.line_actor_cut):
             renderer.AddActor2D(self.line_actor_cut)
         self.line_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.line_actor_cut, getattr(self.app, "active_classify_tool", None))
 
         # ── FAST COORDINATE UPDATE ───────────────────────────────────────────
         if not hasattr(self, "_line_cut_coord"):
@@ -18171,6 +18282,8 @@ class ClassificationInteractor:
             pts.Modified()
             self._dotted_cut_poly.Modified()
             self.dotted_actor_cut.VisibilityOn()
+            from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+            _acs(self.dotted_actor_cut, getattr(self.app, "active_classify_tool", None))
         else:
             self.dotted_actor_cut.VisibilityOff()
         # Render batched by caller
@@ -18240,6 +18353,8 @@ class ClassificationInteractor:
         pts.Modified()
         self._dotted_cut_poly.Modified()
         self.dotted_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.dotted_actor_cut, getattr(self.app, "active_classify_tool", None))
 
     def _draw_rectangle_preview_cut(self, P1, P2):
         """✅ PERFORMANCE FIX: Rectangle preview for CUT SECTION. One-time VTK pipeline init."""
@@ -18279,6 +18394,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.rect_actor_cut):
             renderer.AddActor2D(self.rect_actor_cut)
         self.rect_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.rect_actor_cut, 'rectangle')
 
         # ── FAST COORDINATE UPDATE (world → display) ─────────────────────────
         if not hasattr(self, "_rect_cut_coord"):
@@ -18355,6 +18472,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.freehand_actor_cut):
             renderer.AddActor2D(self.freehand_actor_cut)
         self.freehand_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.freehand_actor_cut, 'freehand')
 
         # ── FAST GEOMETRY UPDATE (display coords — no world conversion) ──────
         pts   = self._freehand_cut_pts
@@ -18587,6 +18706,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor_cut):
             renderer.AddActor2D(self.brush_actor_cut)
         self.brush_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor_cut, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._brush_cut_pts
@@ -18675,6 +18796,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor_cut):
             renderer.AddActor2D(self.brush_actor_cut)
         self.brush_actor_cut.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor_cut, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._rect_cut_pts
@@ -18916,6 +19039,8 @@ class ClassificationInteractor:
         if not renderer.HasViewProp(self.brush_actor):
             renderer.AddActor2D(self.brush_actor)
         self.brush_actor.VisibilityOn()
+        from gui.classify_settings_dialog import apply_classify_style_to_actor as _acs
+        _acs(self.brush_actor, 'brush')
 
         # ── FAST GEOMETRY UPDATE ─────────────────────────────────────────────
         pts   = self._rect_cursor_pts

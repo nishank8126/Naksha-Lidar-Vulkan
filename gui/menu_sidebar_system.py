@@ -426,6 +426,10 @@ RIBBON_TOOLTIP_META = {
         "description": "Classify individual points directly.",
         "shortcut_tools": ("Point",),
     },
+    ("ClassifyRibbon", "Settings", "Settings"): {
+        "title": "Classify Settings",
+        "description": "Customise classify tool appearance (colour and width).",
+    },
     ("DisplayRibbon", "Config", "Display"): {
         "title": "Display Mode",
         "description": "Open the display mode dialog and manage saved display presets.",
@@ -1925,7 +1929,53 @@ class ClassifyRibbon(QWidget):
         points.add_button("Fence", "🔲", lambda: self._try_activate_tool("temp_fence"))
         layout.addWidget(points)
 
+        # Settings (same gear icon as Draw > Utilities > Settings, resolved by
+        # the shared "Settings" ribbon icon mapping).
+        settings = RibbonSection("Settings", self)
+        settings.add_button(
+            "Settings", "⚙️",
+            self._show_classify_settings,
+            toggleable=False
+        )
+        layout.addWidget(settings)
+
         layout.addStretch()
+
+    def _show_classify_settings(self):
+        """Open the Classify Tools window (per-tool colour / width)."""
+        try:
+            from .classify_settings_dialog import ClassifyToolSettingsDialog
+            main_window = self.window()
+            widget = self
+            while widget:
+                if hasattr(widget, 'digitizer'):
+                    main_window = widget
+                    break
+                widget = widget.parent()
+
+            dialog = getattr(main_window, "classify_settings_dialog", None)
+            already_open = dialog is not None and dialog.isVisible()
+
+            if dialog is None:
+                dialog = ClassifyToolSettingsDialog(main_window, parent=main_window)
+                main_window.classify_settings_dialog = dialog
+                dialog.destroyed.connect(
+                    lambda: setattr(main_window, "classify_settings_dialog", None)
+                )
+
+            dialog.show()
+            if dialog.isMinimized():
+                dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+
+            if already_open:
+                dialog.highlight_already_open()
+        except Exception as e:
+            print(f"⚠️ Failed to open Classify Tools: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 class DisplayRibbon(QWidget):
     """Ribbon for Display menu"""
