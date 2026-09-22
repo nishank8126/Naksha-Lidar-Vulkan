@@ -16524,12 +16524,13 @@ class NakshaApp(QMainWindow):
         from gui.dialogs.view_fields_table import ViewFieldsTableDialog
 
         if not getattr(self, "loaded_file", None):
-            QMessageBox.information(
-                self,
-                "View Fields",
-                "Load a point cloud file first to view its fields.",
-            )
-            return
+            if not self.data or "xyz" not in self.data:
+                QMessageBox.information(
+                    self,
+                    "View Fields",
+                    "Load a point cloud file first to view its fields.",
+                )
+                return
 
         if not self.data or "xyz" not in self.data:
             QMessageBox.information(
