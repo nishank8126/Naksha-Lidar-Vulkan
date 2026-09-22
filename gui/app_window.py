@@ -4763,10 +4763,17 @@ class NakshaApp(QMainWindow):
         self._view_selector_dialog.setStyleSheet(get_dialog_stylesheet())
        
         # ✅ ALWAYS SHOW AND BRING TO FRONT (even if already open!)
-        if getattr(self._view_selector_dialog, "_is_minimized_to_chip", False):
-            self._view_selector_dialog.restore_from_chip()
+        # Also un-minimize: the dialog may have been minimized natively
+        # (windowState == WindowMinimized), in which case _is_minimized_to_chip
+        # is False and a plain show() would leave it minimized.
+        _vs_dlg = self._view_selector_dialog
+        if (
+            getattr(_vs_dlg, "_is_minimized_to_chip", False)
+            or (_vs_dlg.windowState() & Qt.WindowMinimized)
+        ):
+            _vs_dlg.restore_from_chip()
         else:
-            self._view_selector_dialog.show()
+            _vs_dlg.show()
         self._view_selector_dialog.raise_()
         self._view_selector_dialog.activateWindow()  # ✅ Force focus
        

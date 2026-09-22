@@ -45,6 +45,26 @@ class AccuDrawDialog(QDialog):
 
         self._build_ui()
 
+    def keyPressEvent(self, event):
+        """
+        ESC must deactivate AccuDraw entirely (tool + palette).
+        QDialog's default behaviour only hides this window via reject(),
+        leaving the tool armed with its priority-100 observers.
+        """
+        if event.key() == Qt.Key_Escape:
+            tool = getattr(self, "tool", None)
+            if tool is not None and getattr(tool, "active", False):
+                try:
+                    if hasattr(tool, "finish_for_tool_switch"):
+                        tool.finish_for_tool_switch("ESC")
+                    else:
+                        tool.deactivate(cancel=True)
+                except Exception as e:
+                    print(f"⚠️ AccuDraw ESC deactivate failed: {e}")
+                # deactivate() hides this palette; do NOT call reject().
+                return
+        super().keyPressEvent(event)
+
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)

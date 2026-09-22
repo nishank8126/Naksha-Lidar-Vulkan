@@ -14483,7 +14483,33 @@ class DigitizeManager:
         ESC behavior: Exit/deactivate current tool.
         Cancel ONLY in-progress preview. KEEP all already drawn lines.
         """
-        
+
+        # ============================================================
+        # ✅ ESC must exit AccuDraw FIRST (mirrors deactivate_all):
+        # AccuDraw can stay active even when active_tool is None or
+        # points at another tool, and none of the tool-specific branches
+        # below know about it — so plain ESC used to fall through the
+        # generic 'else' and leave AccuDraw running (observers at
+        # priority 100 + its palette still up).
+        # ============================================================
+        accudraw_tool = getattr(self, "accudraw_tool", None)
+        if accudraw_tool is not None and getattr(accudraw_tool, "active", False):
+            try:
+                if hasattr(accudraw_tool, "finish_for_tool_switch"):
+                    accudraw_tool.finish_for_tool_switch("ESC")
+                else:
+                    has_unfinished = bool(
+                        getattr(accudraw_tool, "points", None)
+                        or getattr(accudraw_tool, "drawing", None) is not None
+                        or getattr(accudraw_tool, "preview_actor", None) is not None
+                    )
+                    accudraw_tool.deactivate(cancel=has_unfinished)
+                print("🛑 ESC - AccuDraw deactivated (draft cancelled, drawings kept)")
+                return True
+            except Exception as e:
+                print(f"⚠️ AccuDraw ESC deactivate failed: {e}")
+        # ============================================================
+
         # ============================================================
         # ✅ FIX: Clean up text tool state when deactivating via ESC
         # This must happen BEFORE tool checks below, while active_tool
@@ -14590,10 +14616,10 @@ class DigitizeManager:
                 except Exception: pass
             self._hatch_vertex_markers = []
             self.temp_points = []
+            # ESC also closes the mini "Hatch Area" window. Keep the dialog
+            # object (close() only hides it) so the next activation reuses it.
             if hasattr(self, '_hatch_dialog') and self._hatch_dialog:
-                try: self._hatch_dialog.set_status(
-                    "Click inside a shape to hatch it,\nor click empty space to define boundary points\n(right-click when ≥3 points to apply)."
-                )
+                try: self._hatch_dialog.close()
                 except Exception: pass
             # Remove "hatcharea" from cursor active-tools set (the generic end only removes "draw")
             if hasattr(self.app, 'set_cross_cursor_active'):

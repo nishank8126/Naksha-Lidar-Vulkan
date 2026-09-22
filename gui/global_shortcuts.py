@@ -645,6 +645,27 @@ class GlobalShortcutFilter(QObject):
                             pass
                         print("🛑 ESC — tool deactivated (Display Mode open)")
                         return True
+                    # Draw tools (Hatch Area, SmartLine, etc.) and AccuDraw —
+                    # run the same digitizer Esc path so the tool AND its mini
+                    # window (e.g. the Hatch Area / AccuDraw palette) are torn
+                    # down, then consume Esc so Display Mode stays open.
+                    _acc_draw = getattr(_dig, 'accudraw_tool', None) if _dig else None
+                    if (
+                        _dig is not None
+                        and (
+                            getattr(_dig, 'active_tool', None) not in (None, 'none')
+                            or (_acc_draw is not None and getattr(_acc_draw, 'active', False))
+                        )
+                    ):
+                        try:
+                            _draw_deactivated = False
+                            if hasattr(_dig, '_deactivate_active_tool_keep_drawings'):
+                                _draw_deactivated = bool(_dig._deactivate_active_tool_keep_drawings())
+                            if _draw_deactivated:
+                                print("🛑 ESC — draw tool deactivated (Display Mode open)")
+                                return True
+                        except Exception as e:
+                            print(f"⚠️ ESC draw tool deactivation failed: {e}")
                     # No tool active — let Esc reach the dialog to close it
                     return False
                 else:
@@ -899,7 +920,11 @@ class GlobalShortcutFilter(QObject):
                 # must handle it here.  Keeps drawings on screen (cancel the active
                 # sub-tool only, same as the VTK Esc path).
                 _digitizer = getattr(self.app_window, 'digitizer', None)
-                if _digitizer is not None and getattr(_digitizer, 'active_tool', None):
+                _accudraw = getattr(_digitizer, 'accudraw_tool', None) if _digitizer else None
+                if _digitizer is not None and (
+                    getattr(_digitizer, 'active_tool', None)
+                    or (_accudraw is not None and getattr(_accudraw, 'active', False))
+                ):
                     try:
                         if hasattr(_digitizer, '_deactivate_active_tool_keep_drawings'):
                             _digitizer._deactivate_active_tool_keep_drawings()
