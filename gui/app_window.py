@@ -4763,10 +4763,17 @@ class NakshaApp(QMainWindow):
         self._view_selector_dialog.setStyleSheet(get_dialog_stylesheet())
        
         # ✅ ALWAYS SHOW AND BRING TO FRONT (even if already open!)
-        if getattr(self._view_selector_dialog, "_is_minimized_to_chip", False):
-            self._view_selector_dialog.restore_from_chip()
+        # Also un-minimize: the dialog may have been minimized natively
+        # (windowState == WindowMinimized), in which case _is_minimized_to_chip
+        # is False and a plain show() would leave it minimized.
+        _vs_dlg = self._view_selector_dialog
+        if (
+            getattr(_vs_dlg, "_is_minimized_to_chip", False)
+            or (_vs_dlg.windowState() & Qt.WindowMinimized)
+        ):
+            _vs_dlg.restore_from_chip()
         else:
-            self._view_selector_dialog.show()
+            _vs_dlg.show()
         self._view_selector_dialog.raise_()
         self._view_selector_dialog.activateWindow()  # ✅ Force focus
        
@@ -7180,6 +7187,8 @@ class NakshaApp(QMainWindow):
                 "color_mode"  : 0,
                 "target_view" : 0,
             })
+            if isinstance(_batch_opts, dict) and _batch_opts.get("only_class"):
+                self._sync_display_dialog_visibility(palette_to_apply)
 
         # ── Drawings ───────────────────────────────────────────────────
         try:
@@ -7727,7 +7736,9 @@ class NakshaApp(QMainWindow):
                 "color_mode": 0,
                 "target_view": 0
             })
-       
+            if isinstance(import_options, dict) and import_options.get("only_class"):
+                self._sync_display_dialog_visibility(palette_to_apply)
+
         # Finalize
         update_progress(95, "Finalizing...")
        
@@ -7757,6 +7768,95 @@ class NakshaApp(QMainWindow):
         progress.finish_success(f"Loaded {n_points:,} points in {total_time:.1f}s")
  
  
+    def _apply_import_class_block(self, palette, slot=0):
+        """Force classes excluded at import ("only selected classes") off in
+        ``palette`` (in place) and return it. For cross/cut slots (1-5) each
+        entry actually flipped is remembered so _restore_import_class_block
+        can turn it back on when the dataset is cleared, leaving no stale
+        hidden classes behind for the next load."""
+        blocked = getattr(self, "_import_class_blocked", None)
+        if not blocked or not isinstance(palette, dict):
+            return palette
+        try:
+            slot_i = int(slot)
+        except Exception:
+            slot_i = 0
+        forced = None
+        if slot_i != 0:
+            forced = getattr(self, "_import_class_forced_off", None)
+            if forced is None:
+                forced = self._import_class_forced_off = set()
+        for code in blocked:
+            entry = palette.get(code)
+            if isinstance(entry, dict) and entry.get("show", True):
+                entry["show"] = False
+                if forced is not None:
+                    forced.add((slot_i, code))
+        return palette
+
+    def _restore_import_class_block(self):
+        """Undo the cross/cut-slot changes made by _apply_import_class_block
+        and the Display Mode dialog state set up by an only-class import."""
+        try:
+            dlg0 = getattr(self, "display_mode_dialog", None)
+            if dlg0 is not None and hasattr(dlg0, "restore_import_block_ui"):
+                dlg0.restore_import_block_ui()
+        except Exception:
+            pass
+        forced = getattr(self, "_import_class_forced_off", None)
+        self._import_class_forced_off = set()
+        if not forced:
+            return
+        try:
+            stores = []
+            vp = getattr(self, "view_palettes", None)
+            if isinstance(vp, dict):
+                stores.append(vp)
+            dlg = getattr(self, "display_mode_dialog", None)
+            dvp = getattr(dlg, "view_palettes", None) if dlg is not None else None
+            if isinstance(dvp, dict):
+                stores.append(dvp)
+            cut = getattr(self, "cut_section_controller", None)
+            cut_pal = getattr(cut, "cut_palette", None) if cut is not None else None
+            for slot_i, code in forced:
+                for store in stores:
+                    entry = (store.get(slot_i) or {}).get(code)
+                    if isinstance(entry, dict) and entry.get("show") is False:
+                        entry["show"] = True
+                if slot_i == 5 and isinstance(cut_pal, dict):
+                    entry = cut_pal.get(code)
+                    if isinstance(entry, dict) and entry.get("show") is False:
+                        entry["show"] = True
+            from gui.unified_actor_manager import invalidate_palette_cache
+            invalidate_palette_cache()
+        except Exception as e:
+            print(f"⚠️ Import class block restore skipped: {e}")
+
+    def _sync_display_dialog_visibility(self, palette):
+        """After an only-selected-classes load hides classes, keep the Display
+        Mode dialog's checkboxes in step so its Apply doesn't re-show them."""
+        try:
+            # Classes the user did not select at import stay off for this
+            # dataset (enforced in apply_class_map and Display Mode Apply);
+            # cleared again by release_data_arrays on the next clear/load.
+            self._import_class_blocked = {
+                int(c) for c, e in (palette or {}).items()
+                if isinstance(e, dict) and not e.get("show", True)
+            }
+        except Exception:
+            self._import_class_blocked = None
+        try:
+            from gui.unified_actor_manager import set_import_blocked_classes
+            set_import_blocked_classes(self._import_class_blocked)
+        except Exception:
+            pass
+        try:
+            dlg = getattr(self, "display_mode_dialog", None)
+            if dlg is not None and hasattr(dlg, "sync_slot_visibility_from_palette"):
+                dlg.sync_slot_visibility_from_palette(0, palette)
+        except Exception as e:
+            print(f"⚠️ Display dialog visibility sync skipped: {e}")
+
     def _get_palette_for_file(self, filename):
         """Helper to get appropriate palette for file"""
         import os
@@ -9351,6 +9451,10 @@ class NakshaApp(QMainWindow):
                     "lvl": str(info.get("lvl", "")),
                 }
 
+            # Classes excluded at import ("only selected classes") never turn on
+            # for the Main View, whatever palette is being applied.
+            self._apply_import_class_block(normalized_palette, target_view)
+
             self.view_palettes[target_view] = normalized_palette
 
             # ============================================================
@@ -9684,6 +9788,8 @@ class NakshaApp(QMainWindow):
                     print(f"{'='*60}\n")
                     return
             
+            self._apply_import_class_block(view_palette, target_slot)
+
             # Get visible classes from THIS VIEW's palette
             visible = [c for c, v in view_palette.items() if v.get("show", False)]
             
@@ -11742,6 +11848,15 @@ class NakshaApp(QMainWindow):
         return seeded
 
     def _get_cross_section_palette(self, slot_idx, allow_default_seed: bool = True, persist_seed: bool = False):
+        pal = self._get_cross_section_palette_raw(slot_idx, allow_default_seed, persist_seed)
+        try:
+            if int(slot_idx) != 0:
+                self._apply_import_class_block(pal, slot_idx)
+        except Exception:
+            pass
+        return pal
+
+    def _get_cross_section_palette_raw(self, slot_idx, allow_default_seed: bool = True, persist_seed: bool = False):
         """Get isolated palette for cross/cut slots without leaking slot-0 visibility."""
         try:
             slot_i = int(slot_idx)
@@ -17063,6 +17178,8 @@ class NakshaApp(QMainWindow):
                         "color_mode": 0,
                         "target_view": 0
                     })
+                    if isinstance(import_options, dict) and import_options.get("only_class"):
+                        self._sync_display_dialog_visibility(palette_to_apply)
                 else:
                     # Build palette from classification
                     try:

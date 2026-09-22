@@ -70,6 +70,23 @@ def _source_polydata(app, view_idx, mode, force_independent=False):
 
 
 def _section_palette_dict(app, view_idx):
+    """Section palette with classes excluded at import ("only selected
+    classes") forced hidden. Works on a copy, so stored palettes are never
+    modified; identical to the raw palette when nothing was excluded."""
+    palette = _section_palette_dict_raw(app, view_idx)
+    blocked = getattr(app, "_import_class_blocked", None)
+    if not blocked or not palette:
+        return palette
+    try:
+        return {
+            c: (dict(e, show=False) if isinstance(e, dict) and int(c) in blocked else e)
+            for c, e in palette.items()
+        }
+    except Exception:
+        return palette
+
+
+def _section_palette_dict_raw(app, view_idx):
     """Return the class-visibility/color palette for THIS section's own
     slot (view_idx+1 in Display Mode's per-slot view_palettes), falling
     back to the global class_palette. Main View's own visibility helpers
@@ -212,6 +229,26 @@ def _build_independent_shaded_mesh(app, view_idx):
         ci = int(c)
         if ci < mc:
             lut[ci] = e.get("color", (128, 128, 128))
+
+    # The cached triangulation above only knows which classes were visible
+    # when it was built. A point reclassified INTO a class excluded at import
+    # ("only selected classes") is still in it and would be recoloured with
+    # that class's colour, so drop every triangle touching such a point.
+    # Works on copies; the cache is never modified. No-op otherwise.
+    blocked = getattr(app, "_import_class_blocked", None)
+    if blocked:
+        blk = np.zeros(mc, dtype=bool)
+        for _c in blocked:
+            if 0 <= int(_c) < mc:
+                blk[int(_c)] = True
+        keep = ~blk[cm[faces]].any(axis=1)
+        if not keep.all():
+            if not keep.any():
+                return None
+            same_len = len(shade) == len(faces)
+            faces = faces[keep]
+            if same_len:
+                shade = shade[keep]
 
     face_class = cm[faces[:, 0]]
     base_color = lut[face_class]

@@ -3745,6 +3745,12 @@ class ViewShaderContext:
             self.color_lut[base + 1] = g / 255.0
             self.color_lut[base + 2] = b / 255.0
 
+        # Classes excluded at import ("only selected classes") stay invisible
+        # on the GPU for every view, whichever palette reached this point.
+        for idx in _IMPORT_BLOCKED_CLASSES:
+            if 0 <= idx < 256:
+                self.visibility_mask[idx] = 0.0
+
         self.border_ring = np.float32(min(1.0, max(0.0, border_percent / 100.0)))
         self._generation += 1
         self._vis_list_cache = None
@@ -3778,6 +3784,20 @@ class ViewShaderContext:
         return ctx
 
 
+_IMPORT_BLOCKED_CLASSES: frozenset = frozenset()
+
+
+def set_import_blocked_classes(codes) -> None:
+    """Classes an "only selected classes" import left out (empty = none).
+    Consulted by ViewShaderContext.load_from_palette; part of the palette
+    fingerprint so a change always forces the next reload."""
+    global _IMPORT_BLOCKED_CLASSES
+    try:
+        _IMPORT_BLOCKED_CLASSES = frozenset(int(c) for c in (codes or ()))
+    except Exception:
+        _IMPORT_BLOCKED_CLASSES = frozenset()
+
+
 def _palette_fingerprint_full(palette: dict, border_percent: float = 0.0) -> int:
     try:
         return hash((
@@ -3788,6 +3808,7 @@ def _palette_fingerprint_full(palette: dict, border_percent: float = 0.0) -> int
                 for k, v in sorted(palette.items())
             ),
             round(border_percent, 2),
+            _IMPORT_BLOCKED_CLASSES,
         ))
     except Exception:
         return id(palette) ^ int(border_percent * 100)
@@ -7751,6 +7772,18 @@ _palette_resolve_cache: dict = {}
 
 
 def _get_slot_palette(app, slot_idx: int) -> dict:
+    result = _get_slot_palette_raw(app, slot_idx)
+    try:
+        if int(slot_idx) != 0 and getattr(app, "_import_class_blocked", None):
+            enforce = getattr(app, "_apply_import_class_block", None)
+            if callable(enforce):
+                enforce(result, slot_idx)
+    except Exception:
+        pass
+    return result
+
+
+def _get_slot_palette_raw(app, slot_idx: int) -> dict:
     """
     Fingerprint-guarded palette resolver.
     Returns a cached resolved dict when master + overrides have not changed.

@@ -698,6 +698,16 @@ class SectionController:
                     print(f"⚠️ Right-click reactivate failed: {e}")
 
     def _get_view_palette(self, view_index):
+        palette = self._get_view_palette_raw(view_index)
+        try:
+            enforce = getattr(self.app, "_apply_import_class_block", None)
+            if callable(enforce):
+                enforce(palette, view_index + 1)
+        except Exception:
+            pass
+        return palette
+
+    def _get_view_palette_raw(self, view_index):
         """
         Get the palette for a specific view from DisplayModeDialog.
         Returns view-specific palette.
@@ -1719,7 +1729,14 @@ class SectionController:
             # Fallback to app palette if dialog not available
             if current_palette is None:
                 current_palette = self._get_view_palette(view_index)
-            
+            else:
+                try:
+                    _enforce = getattr(self.app, "_apply_import_class_block", None)
+                    if callable(_enforce):
+                        _enforce(current_palette, view_index + 1)
+                except Exception:
+                    pass
+
             if not current_palette:
                 # No palette = show all
                 print(f"   📊 No palette filter for View {view_index + 1} - using all points")

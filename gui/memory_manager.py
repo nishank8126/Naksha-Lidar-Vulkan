@@ -321,6 +321,18 @@ def release_data_arrays(app) -> None:
                 del value
         del data
     app.data = None
+    # An "only selected classes" import restriction belongs to the dataset
+    # that was loaded with it — never carry it into the next load. Cross/cut
+    # slot entries it forced off are turned back on first.
+    _restore = getattr(app, "_restore_import_class_block", None)
+    if callable(_restore):
+        _restore()
+    app._import_class_blocked = None
+    try:
+        from gui.unified_actor_manager import set_import_blocked_classes
+        set_import_blocked_classes(())
+    except Exception:
+        pass
 
     if hasattr(app, "spatial_index") and app.spatial_index is not None:
         try:

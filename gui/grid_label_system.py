@@ -9013,6 +9013,8 @@ class GridLabelManager:
                     "color_mode": 0,
                     "target_view": 0,
                 })
+                if _load_opts.get("only_class") and hasattr(self.app, "_sync_display_dialog_visibility"):
+                    self.app._sync_display_dialog_visibility(palette_to_apply)
             else:
                 # Fallback: build palette from classification
                 update_progress(85, "Building palette...", force=True)
