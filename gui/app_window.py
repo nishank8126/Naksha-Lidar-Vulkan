@@ -14578,7 +14578,7 @@ class NakshaApp(QMainWindow):
                     self.digitizer.vertex_move_constraint_mode = "free"
                     self.digitizer.vertex_move_constraint_label = "Free 360 Move"
 
-                    # Shift + Move Vertex opens controlled movement popup.
+                    # Shift + Move Vertex opens the floating measure popup.
                     normalized_tool = str(tool_name or "").lower().replace(" ", "").replace("_", "")
 
                     if normalized_tool == "movevertex":
@@ -14588,32 +14588,7 @@ class NakshaApp(QMainWindow):
                             shift_pressed = False
 
                         if shift_pressed:
-                            options = [
-                                "Free 360 Move",
-                                "Move Along Previous Edge Direction",
-                                "Move Along Next Edge Direction",
-                            ]
-
-                            choice, ok = QInputDialog.getItem(
-                                self,
-                                "Move Vertex Mode",
-                                "Choose how the selected vertex should move:",
-                                options,
-                                0,
-                                False,
-                            )
-
-                            if not ok:
-                                return
-
-                            mode_map = {
-                                "Free 360 Move": "free",
-                                "Move Along Previous Edge Direction": "previous",
-                                "Move Along Next Edge Direction": "next",
-                            }
-
-                            self.digitizer.vertex_move_constraint_mode = mode_map.get(choice, "free")
-                            self.digitizer.vertex_move_constraint_label = choice
+                            self._show_vertex_move_measure_popup()
 
                 self.digitizer.set_tool(tool_name)
 
@@ -14643,7 +14618,61 @@ class NakshaApp(QMainWindow):
             print("✅ Curve ribbon connected")
 
         self._sidebar_actions_connected = True
-                
+
+    # ── Vertex Move Measure Popup ────────────────────────────────
+
+    def _show_vertex_move_measure_popup(self):
+        """Show the floating vertex-move-measure popup near the cursor.
+
+        The popup provides:
+          - Three movement mode radio buttons (Free 360 / Previous Edge / Next Edge)
+          - Live distance readout updated during drag
+          - Unit selector (m / cm / km)
+
+        It stays visible until the vertex move is finalised or the tool is
+        deactivated, at which point ``digitize_tools`` calls
+        ``_dismiss_vertex_move_measure_popup()``.
+        """
+        from PySide6.QtGui import QCursor
+        from gui.digitize_tools import VertexMoveMeasurePopup
+
+        popup = getattr(self, "_vertex_move_measure_popup", None)
+        if popup is None:
+            popup = VertexMoveMeasurePopup(parent=self)
+            popup.set_on_mode_changed(self._on_vertex_move_mode_changed)
+            self._vertex_move_measure_popup = popup
+
+        # Default to the current constraint mode
+        popup.set_mode(
+            getattr(self.digitizer, "vertex_move_constraint_mode", "free")
+        )
+        popup.reset_distance()
+
+        # Position near the cursor, offset so it does not overlap the pointer.
+        cursor_pos = QCursor.pos()
+        popup.move(cursor_pos.x() + 20, cursor_pos.y() - popup.height() // 2)
+        popup.show()
+        popup.raise_()
+
+    def _on_vertex_move_mode_changed(self, new_mode: str):
+        """Callback from the popup when the user picks a different mode."""
+        if not hasattr(self, "digitizer"):
+            return
+        label_map = {
+            "free": "Free 360 Move",
+            "previous": "Edge Measure",
+            "next": "Edge Move",
+            "measure360": "Measure 360",
+        }
+        self.digitizer.vertex_move_constraint_mode = new_mode
+        self.digitizer.vertex_move_constraint_label = label_map.get(new_mode, "Free 360 Move")
+
+    def _dismiss_vertex_move_measure_popup(self):
+        """Hide the popup after the vertex move is finalised."""
+        popup = getattr(self, "_vertex_move_measure_popup", None)
+        if popup is not None:
+            popup.dismiss()
+
     def on_saturation_changed(self, value):
         """Handle saturation slider changes from View Ribbon."""
         # Convert percentage (0-200) to multiplier (0.0-2.0)

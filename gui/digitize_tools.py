@@ -9,7 +9,7 @@ try:
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                     QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                     QCheckBox, QPushButton, QGroupBox, QColorDialog,QRadioButton, QMenu,
-                                    QMessageBox)
+                                    QMessageBox, QWidget, QButtonGroup, QFrame)
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor, QCursor
 except ImportError:
@@ -17,7 +17,7 @@ except ImportError:
         from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                        QLineEdit, QSpinBox, QFontComboBox, QComboBox,
                                        QCheckBox, QPushButton, QGroupBox, QColorDialog, QMenu,
-                                       QMessageBox)
+                                       QMessageBox, QWidget, QButtonGroup, QFrame)
         from PyQt5.QtCore import Qt
         from PyQt5.QtGui import QColor, QCursor
     except ImportError:
@@ -15350,6 +15350,7 @@ class DigitizeManager:
         self.vertex_moving = False
         self.dragging_vertex = None
         self.left_down = False
+        self._dismiss_move_vertex_measure_popup()
 
     def _point_to_np3(self, point):
         """Convert any point-like value to xyz numpy array."""
@@ -15558,6 +15559,8 @@ class DigitizeManager:
             'constraint_mode': getattr(self, "vertex_move_constraint_mode", "free"),
         }
 
+        self._set_initial_edge_distance(nearest_drawing, vertex_idx)
+
         if hasattr(self, 'vertex_drag_marker') and self.vertex_drag_marker:
             self._remove_actor_from_overlay(self.vertex_drag_marker)
 
@@ -15624,6 +15627,9 @@ class DigitizeManager:
 
         new_pos = self._constrain_move_vertex_position(raw_pos, drawing, vertex_idx)
         coords[vertex_idx] = tuple(new_pos)
+
+        # ── Live distance update for the measure popup ──
+        self._update_move_vertex_measure_popup(new_pos)
 
         # Remove and recreate — SetPosition does not move vtkPoints geometry.
         if hasattr(self, 'vertex_drag_marker') and self.vertex_drag_marker:
@@ -15698,6 +15704,7 @@ class DigitizeManager:
         self._rebuild_drawing_actor(drawing)
         self._update_shared_vertices(old_pos, new_pos)
         self.moving_vertex_data = None
+        self._dismiss_move_vertex_measure_popup()
         self.app.vtk_widget.render()
 
     def _update_shared_vertices(self, old_pos, new_pos, tolerance=0.01):
@@ -15722,6 +15729,83 @@ class DigitizeManager:
         if updated > 0:
             print(f"🔗 Propagated vertex move to {updated} shared drawing(s)")
 
+    def _update_move_vertex_measure_popup(self, new_pos):
+        """Push live distance to the VertexMoveMeasurePopup (if visible)."""
+        popup = getattr(getattr(self, "app", None), "_vertex_move_measure_popup", None)
+        if popup is None or not popup.isVisible():
+            return
+        original = getattr(self, "moving_vertex_data", None)
+        if not original:
+            return
+        try:
+            mode = getattr(self, "vertex_move_constraint_mode", "free")
+            if mode in ("previous", "next", "measure360"):
+                drawing = original.get("drawing")
+                vertex_idx = original.get("vertex_index")
+                if isinstance(drawing, dict) and vertex_idx is not None:
+                    coords = drawing.get("coords")
+                    if coords and 0 <= vertex_idx < len(coords):
+                        measure_mode = "previous" if mode == "measure360" else mode
+                        neighbor_idx = self._move_vertex_neighbor_index(coords, vertex_idx, measure_mode)
+                        if neighbor_idx is not None and 0 <= neighbor_idx < len(coords):
+                            nb = coords[neighbor_idx]
+                            px, py = new_pos[0], new_pos[1]
+                            nx, ny = nb[0], nb[1]
+                            dx, dy = px - nx, py - ny
+                            popup.update_distance(math.sqrt(dx * dx + dy * dy))
+                            return
+            orig = original.get("original_pos")
+            if orig is None:
+                return
+            ox, oy = orig[0], orig[1]
+            nx, ny = new_pos[0], new_pos[1]
+            dx, dy = nx - ox, ny - oy
+            popup.update_distance(math.sqrt(dx * dx + dy * dy))
+        except Exception:
+            pass
+
+    def _dismiss_move_vertex_measure_popup(self):
+        """Hide the vertex-move-measure popup."""
+        popup = getattr(getattr(self, "app", None), "_vertex_move_measure_popup", None)
+        if popup is not None:
+            popup.dismiss()
+
+    def _set_initial_edge_distance(self, drawing, vertex_idx):
+        """Set the initial distance from the neighbor edge on the popup."""
+        popup = getattr(getattr(self, "app", None), "_vertex_move_measure_popup", None)
+        if popup is None or not popup.isVisible():
+            return
+        mode = getattr(self, "vertex_move_constraint_mode", "free")
+        if mode in ("previous", "next", "measure360"):
+            measure_mode = "previous" if mode == "measure360" else mode
+        else:
+            popup.set_initial_edge_distance(0.0)
+            popup.update_distance(0.0)
+            return
+        if not isinstance(drawing, dict) or not self._move_vertex_supports_edge_constraint(drawing):
+            popup.set_initial_edge_distance(0.0)
+            popup.update_distance(0.0)
+            return
+        coords = drawing.get("coords")
+        if not coords or vertex_idx < 0 or vertex_idx >= len(coords):
+            popup.set_initial_edge_distance(0.0)
+            popup.update_distance(0.0)
+            return
+        neighbor_idx = self._move_vertex_neighbor_index(coords, vertex_idx, measure_mode)
+        if neighbor_idx is None or neighbor_idx < 0 or neighbor_idx >= len(coords):
+            popup.set_initial_edge_distance(0.0)
+            popup.update_distance(0.0)
+            return
+        try:
+            v = coords[vertex_idx]
+            nb = coords[neighbor_idx]
+            dx, dy = v[0] - nb[0], v[1] - nb[1]
+            init_dist = math.sqrt(dx * dx + dy * dy)
+            popup.set_initial_edge_distance(init_dist)
+            popup.update_distance(init_dist)
+        except Exception:
+            popup.set_initial_edge_distance(0.0)
+            popup.update_distance(0.0)
 
     def _deactivate_move_vertex_mode(self):
         """Exit move vertex mode.
@@ -15729,6 +15813,7 @@ class DigitizeManager:
         self.vertex_moving = False
         self.moving_vertex_data = None
         self._middle_button_down = False
+        self._dismiss_move_vertex_measure_popup()
         
         if hasattr(self, 'vertex_hover_marker') and self.vertex_hover_marker:
             self._remove_actor_from_overlay(self.vertex_hover_marker)
@@ -15755,7 +15840,236 @@ class DigitizeManager:
         
         print("⚪ Move Vertex mode deactivated")
         self.app.vtk_widget.render()
-        
+
+
+class VertexMoveMeasurePopup(QWidget):
+    """Floating popup for constrained vertex move with live measurement."""
+
+    _UNIT_FACTORS = {"m": 1.0, "cm": 100.0, "km": 0.001}
+    _UNIT_LABELS = {"m": "m", "cm": "cm", "km": "km"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Move Vertex")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.X11BypassWindowManagerHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFixedWidth(320)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self._distance_m = 0.0
+        self._initial_edge_distance = 0.0
+        self._displayed_text = ""
+        self._unit = "m"
+        self._constraint_mode = "free"
+        self._on_mode_changed_callback = None
+        self._drag_pos = None
+
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        from PySide6.QtGui import QFont, QCursor
+        from PySide6.QtCore import QTimer
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+
+        title = QLabel("  Move Vertex  ")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(10)
+        title.setFont(title_font)
+        title.setStyleSheet("background-color: #4fc3f7; color: #000000; border-radius: 4px; padding: 4px;")
+        title.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
+        title.setMouseTracking(True)
+        root.addWidget(title)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #555;")
+        root.addWidget(sep)
+
+        mode_label = QLabel("Movement Mode:")
+        mode_label.setFont(QFont("", 9, QFont.Weight.Bold))
+        root.addWidget(mode_label)
+
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+
+        self._rb_free = QRadioButton("Free 360 Move")
+        self._rb_prev = QRadioButton("Edge Measure")
+        self._rb_next = QRadioButton("Edge Move")
+        self._rb_measure360 = QRadioButton("Measure 360")
+        self._rb_free.setChecked(True)
+
+        self._mode_group.addButton(self._rb_free, 0)
+        self._mode_group.addButton(self._rb_prev, 1)
+        self._mode_group.addButton(self._rb_next, 2)
+        self._mode_group.addButton(self._rb_measure360, 3)
+
+        root.addWidget(self._rb_free)
+        root.addWidget(self._rb_prev)
+        root.addWidget(self._rb_next)
+        root.addWidget(self._rb_measure360)
+
+        self._mode_group.idClicked.connect(self._on_mode_changed)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("color: #555;")
+        root.addWidget(sep2)
+
+        dist_row = QHBoxLayout()
+        dist_row.setSpacing(6)
+        dist_title = QLabel("Distance:")
+        dist_title.setFont(QFont("", 9, QFont.Weight.Bold))
+        dist_row.addWidget(dist_title)
+        self._dist_label = QLabel("0.000 m")
+        dist_font = QFont("Consolas", 13, QFont.Weight.Bold)
+        self._dist_label.setFont(dist_font)
+        self._dist_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._dist_label.setStyleSheet("color: #ffffff; background-color: #1a1a1a; border: 1px solid #4fc3f7; border-radius: 3px; padding: 2px 6px;")
+        dist_row.addWidget(self._dist_label, 1)
+        root.addLayout(dist_row)
+
+        unit_row = QHBoxLayout()
+        unit_row.setSpacing(6)
+        unit_title = QLabel("Unit:")
+        unit_title.setFont(QFont("", 9))
+        unit_row.addWidget(unit_title)
+        self._unit_combo = QComboBox()
+        self._unit_combo.addItem("Meters (m)", "m")
+        self._unit_combo.addItem("Centimeters (cm)", "cm")
+        self._unit_combo.addItem("Kilometers (km)", "km")
+        self._unit_combo.currentIndexChanged.connect(self._on_unit_changed)
+        unit_row.addWidget(self._unit_combo, 1)
+        root.addLayout(unit_row)
+
+        self._pending_distance = 0.0
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(40)
+        self._flush_timer.timeout.connect(self._flush_label)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QWidget { background-color: #2b2b2b; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; }
+            QRadioButton { color: #e0e0e0; spacing: 6px; }
+            QRadioButton::indicator { width: 14px; height: 14px; }
+            QRadioButton::indicator:unchecked { border: 2px solid #888; border-radius: 8px; background: #3b3b3b; }
+            QRadioButton::indicator:checked { border: 2px solid #4fc3f7; border-radius: 8px; background: #4fc3f7; }
+            QComboBox { background-color: #3b3b3b; color: #e0e0e0; border: 1px solid #555; border-radius: 4px; padding: 3px 8px; min-height: 22px; }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox QAbstractItemView { background-color: #3b3b3b; color: #e0e0e0; selection-background-color: #4fc3f7; }
+            QFrame { color: #555; }
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        event.accept()
+
+    def set_mode(self, mode):
+        self._constraint_mode = mode
+        if mode == "free":
+            self._rb_free.setChecked(True)
+        elif mode == "previous":
+            self._rb_prev.setChecked(True)
+        elif mode == "next":
+            self._rb_next.setChecked(True)
+        elif mode == "measure360":
+            self._rb_measure360.setChecked(True)
+
+    def get_mode(self):
+        return self._constraint_mode
+
+    def set_unit(self, unit):
+        if unit not in self._UNIT_FACTORS:
+            return
+        self._unit = unit
+        idx = self._unit_combo.findData(unit)
+        if idx >= 0:
+            self._unit_combo.blockSignals(True)
+            self._unit_combo.setCurrentIndex(idx)
+            self._unit_combo.blockSignals(False)
+        self._displayed_text = ""
+        self._flush_label()
+
+    def get_unit(self):
+        return self._unit
+
+    def set_on_mode_changed(self, callback):
+        self._on_mode_changed_callback = callback
+
+    def set_initial_edge_distance(self, dist_m):
+        self._initial_edge_distance = abs(dist_m)
+
+    def update_distance(self, distance_m):
+        self._pending_distance = abs(distance_m)
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def reset_distance(self):
+        self._pending_distance = 0.0
+        self._distance_m = 0.0
+        self._initial_edge_distance = 0.0
+        self._displayed_text = ""
+        self._dist_label.setText("0.000 m")
+
+    def _flush_label(self):
+        self._distance_m = self._pending_distance
+        factor = self._UNIT_FACTORS.get(self._unit, 1.0)
+        label = self._UNIT_LABELS.get(self._unit, "m")
+        converted = self._distance_m * factor
+        if self._unit == "km":
+            text = f"{converted:.4f} {label}"
+        elif self._unit == "cm":
+            text = f"{converted:.2f} {label}"
+        else:
+            text = f"{converted:.4f} {label}"
+        if text != self._displayed_text:
+            self._displayed_text = text
+            self._dist_label.setText(text)
+
+    def _on_mode_changed(self, idx):
+        mode_map = {0: "free", 1: "previous", 2: "next", 3: "measure360"}
+        self._constraint_mode = mode_map.get(idx, "free")
+        if self._on_mode_changed_callback:
+            try:
+                self._on_mode_changed_callback(self._constraint_mode)
+            except Exception:
+                pass
+
+    def _on_unit_changed(self, index):
+        unit = self._unit_combo.currentData()
+        if unit and unit != self._unit:
+            self._unit = unit
+            self._displayed_text = ""
+            self._flush_label()
+
+    def dismiss(self):
+        self._flush_timer.stop()
+        self.reset_distance()
+        self.hide()
+
+
 class LineEditDialog(QDialog):
     """Custom dialog for editing line properties (color and thickness)."""
     
