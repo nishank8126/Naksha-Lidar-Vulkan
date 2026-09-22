@@ -579,8 +579,10 @@ class SelectRectangleTool:
         
         self.preview_line_actor = vtk.vtkActor2D()
         self.preview_line_actor.SetMapper(mapper)
-        self.preview_line_actor.GetProperty().SetColor(1.0, 0.5, 0.0) # Orange
-        self.preview_line_actor.GetProperty().SetLineWidth(3)
+        from gui.identify_settings_dialog import apply_identify_style_to_actor
+        apply_identify_style_to_actor(
+            self.preview_line_actor, "select_rect", default_color=(1.0, 0.5, 0.0), default_width=3
+        )
         
         self.app.vtk_widget.renderer.AddActor2D(self.preview_line_actor)
         self.app.vtk_widget.render()
@@ -964,8 +966,10 @@ class SelectRectangleTool:
         
         self.rubber_band_actor = vtk.vtkActor2D()
         self.rubber_band_actor.SetMapper(mapper)
-        self.rubber_band_actor.GetProperty().SetColor(1.0, 0.5, 0.0)
-        self.rubber_band_actor.GetProperty().SetLineWidth(4)
+        from gui.identify_settings_dialog import apply_identify_style_to_actor
+        apply_identify_style_to_actor(
+            self.rubber_band_actor, "select_rect", default_color=(1.0, 0.5, 0.0), default_width=4
+        )
         self.rubber_band_actor.GetProperty().SetOpacity(0.8)
         
         self.app.vtk_widget.renderer.AddActor2D(self.rubber_band_actor)

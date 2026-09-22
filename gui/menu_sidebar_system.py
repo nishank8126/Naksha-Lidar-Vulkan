@@ -516,6 +516,10 @@ RIBBON_TOOLTIP_META = {
         "title": "Rectangle Selection",
         "description": "Select points and overlay entities inside a rectangle.",
     },
+    ("IdentificationRibbon", "Settings", "Settings"): {
+        "title": "Identify Settings",
+        "description": "Customise Zoom and Select rectangle colour and width.",
+    },
     ("BlockRibbon", "Block", "Create Block"): {
         "title": "Create Block",
         "description": "Open block creation settings.",
@@ -3819,7 +3823,16 @@ class IdentificationRibbon(QWidget):
         self.zoom_rect_btn = identify.add_button("Zoom", "⬚", self.toggle_zoom_rectangle, toggleable=True) 
         self.select_rect_btn = identify.add_button("Select", "☑️", self.toggle_select_rectangle, toggleable=True)  # ✅ NEW
         layout.addWidget(identify)
-            
+
+        # Settings (placeholder — same gear icon as Draw/Classify Settings).
+        settings = RibbonSection("Settings", self)
+        settings.add_button(
+            "Settings", "⚙️",
+            self._show_identify_settings,
+            toggleable=False
+        )
+        layout.addWidget(settings)
+
         # ℹ️ Info Display
         info = QWidget()
         info.setObjectName("ribbonSection")
@@ -3859,8 +3872,44 @@ class IdentificationRibbon(QWidget):
 
         info_outer_layout.addWidget(info_box)
         layout.addWidget(info)
+
         layout.addStretch()
         self._reset_status_label()
+
+    def _show_identify_settings(self):
+        """Open the Identify Tool Settings window (Zoom / Select colour & width)."""
+        try:
+            from .identify_settings_dialog import IdentifyToolSettingsDialog
+            main_window = self.window()
+            widget = self
+            while widget:
+                if hasattr(widget, 'digitizer'):
+                    main_window = widget
+                    break
+                widget = widget.parent()
+
+            dialog = getattr(main_window, "identify_settings_dialog", None)
+            already_open = dialog is not None and dialog.isVisible()
+
+            if dialog is None:
+                dialog = IdentifyToolSettingsDialog(main_window, parent=main_window)
+                main_window.identify_settings_dialog = dialog
+                dialog.destroyed.connect(
+                    lambda: setattr(main_window, "identify_settings_dialog", None)
+                )
+
+            dialog.show()
+            if dialog.isMinimized():
+                dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+
+            if already_open:
+                dialog.highlight_already_open()
+        except Exception as e:
+            print(f"⚠️ Failed to open Identify Tool Settings: {e}")
+            import traceback
+            traceback.print_exc()
         
         
     def toggle_select_rectangle(self):

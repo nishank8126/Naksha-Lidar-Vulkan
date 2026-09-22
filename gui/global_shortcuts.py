@@ -632,10 +632,12 @@ class GlobalShortcutFilter(QObject):
                     _aw = self.app_window
                     _sel_rect = getattr(_aw, 'select_rectangle_tool', None)
                     _sel_active = _sel_rect is not None and getattr(_sel_rect, 'active', False)
+                    _zoom_rect = getattr(_aw, 'zoom_rectangle_tool', None)
+                    _zoom_active = _zoom_rect is not None and getattr(_zoom_rect, 'active', False)
                     _dig = getattr(_aw, 'digitizer', None)
                     _es = getattr(_dig, '_element_select_tool', None) if _dig else None
                     _es_active = _es is not None and getattr(_es, '_active', False)
-                    if _sel_active or _es_active:
+                    if _sel_active or _zoom_active or _es_active:
                         try:
                             _aw._deactivate_selection_tools("Escape")
                             _aw._deactivate_identify_tab_tools()
@@ -906,6 +908,23 @@ class GlobalShortcutFilter(QObject):
                     except Exception as e:
                         print(f"⚠️ ESC draw tool deactivation failed: {e}")
                     print("🛑 ESC - draw tool deactivated")
+                    return True
+
+                # Deactivate zoom rectangle tool (Identify > Zoom) on Escape
+                _zoom_rect = getattr(self.app_window, 'zoom_rectangle_tool', None)
+                if _zoom_rect is not None and getattr(_zoom_rect, 'active', False):
+                    try:
+                        # Reset the ribbon button too, otherwise the Identify tab
+                        # re-arms the tool on the next cursor refresh.
+                        _ribbon_mgr = getattr(self.app_window, 'ribbon_manager', None)
+                        _identify_ribbon = getattr(_ribbon_mgr, 'ribbons', {}).get('identify') if _ribbon_mgr else None
+                        if _identify_ribbon is not None and hasattr(_identify_ribbon, '_deactivate_zoom_rectangle'):
+                            _identify_ribbon._deactivate_zoom_rectangle()
+                        else:
+                            _zoom_rect.deactivate()
+                    except Exception as e:
+                        print(f"⚠️ ESC zoom rectangle tool deactivation failed: {e}")
+                    print("🛑 ESC - zoom rectangle tool deactivated")
                     return True
 
                 # Deactivate select rectangle tool (Block/Shape pick) on Escape

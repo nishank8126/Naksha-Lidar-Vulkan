@@ -101,6 +101,13 @@ class ZoomRectangleTool(QObject):
                     self.on_middle_button_guard,
                     1.0
                 ),
+
+                # Esc deactivates the zoom rectangle tool.
+                self.interactor.AddObserver(
+                    "KeyPressEvent",
+                    self._on_key_press,
+                    1.0
+                ),
             ]
 
             print(f"✅ Zoom Rectangle Tool activated (State Clean, Observers: {self.observer_ids})")
@@ -296,6 +303,36 @@ class ZoomRectangleTool(QObject):
 
         self._finish_zoom_rectangle(self.end_pos, obj)
 
+    def _on_key_press(self, obj, event):
+        """Handle key press events — Esc deactivates the zoom tool."""
+        if not self.active:
+            return
+
+        try:
+            key = obj.GetKeySym() or ""
+        except Exception:
+            key = ""
+
+        if key not in ("Escape", "escape"):
+            return
+
+        # Cancel any in-progress drag without zooming.
+        self.is_dragging_zoom = False
+        self.start_pos = None
+        self.end_pos = None
+
+        try:
+            ribbon = self.app.ribbon_manager.ribbons.get("identify")
+            if ribbon and hasattr(ribbon, "_deactivate_zoom_rectangle"):
+                ribbon._deactivate_zoom_rectangle()
+            else:
+                self.deactivate()
+        except Exception:
+            self.deactivate()
+
+        self._safe_abort(obj)
+        print("🛑 Esc pressed — Zoom Rectangle tool deactivated")
+
     def on_right_button_down(self, obj, event):
         """Right click disables Zoom Rectangle tool."""
         if not self.active:
@@ -377,8 +414,10 @@ class ZoomRectangleTool(QObject):
 
         self.rubber_band_actor = vtk.vtkActor()
         self.rubber_band_actor.SetMapper(mapper)
-        self.rubber_band_actor.GetProperty().SetColor(0.0, 0.5, 1.0)
-        self.rubber_band_actor.GetProperty().SetLineWidth(2)
+        from gui.identify_settings_dialog import apply_identify_style_to_actor
+        apply_identify_style_to_actor(
+            self.rubber_band_actor, "zoom_rect", default_color=(0.0, 0.5, 1.0), default_width=2
+        )
         self.rubber_band_actor.GetProperty().SetOpacity(0.8)
 
         renderer = self.app.vtk_widget.renderer
