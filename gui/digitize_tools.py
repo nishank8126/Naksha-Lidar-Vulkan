@@ -981,7 +981,7 @@ class DigitizeManager:
         print("✅ Text overlay renderer created (layer 3, isolated depth)")
 
         # ── Draw tool style settings (per-tool color/width/style) ─────────────────
-        from gui.draw_settings_dialog import load_draw_settings, DEFAULT_DRAW_STYLES
+        from gui.draw_settings_dialog import load_draw_settings, DEFAULT_DRAW_STYLES, FILLABLE_TOOLS
         self.default_draw_tool_styles = {k: dict(v) for k, v in DEFAULT_DRAW_STYLES.items()}
         try:
             loaded_styles = load_draw_settings()
@@ -12899,6 +12899,135 @@ class DigitizeManager:
             import traceback
             traceback.print_exc()
     
+    # ---- Update existing drawings to match current tool settings ----
+
+    def update_all_drawings_style(self):
+        """Reflect current draw-tool settings in all already-finalized drawings.
+
+        When the user changes line width / style / colour in Draw Tool Settings
+        and clicks Apply, this method updates every finalized drawing's stored
+        ``original_width`` / ``original_style`` / ``original_color`` to match
+        the current per-tool style, then rebuilds each actor so the canvas
+        immediately reflects the new appearance.
+        """
+        if not hasattr(self, "drawings") or not self.drawings:
+            return
+
+        styles = getattr(self, "draw_tool_styles", {}) or {}
+        changed = False
+        for drawing in list(self.drawings):
+            try:
+                self._apply_current_style_to_drawing(drawing, styles)
+                changed = True
+            except Exception as e:
+                print(f"⚠️ Style update skipped for a drawing: {e}")
+
+        if changed:
+            try:
+                self.app.vtk_widget.render()
+            except Exception:
+                pass
+
+    def _apply_current_style_to_drawing(self, drawing, styles):
+        """Update one drawing's stored style fields to current settings and rebuild."""
+        dtype = drawing.get("type")
+        source = drawing.get("source")
+        is_curve = source == "curve_tool"
+
+        if is_curve:
+            # Curve drawings follow curve_tool.curve_style, not draw_tool_styles.
+            curve_tool = getattr(getattr(self, "app", None), "curve_tool", None)
+            cs = None
+            if curve_tool is not None and hasattr(curve_tool, "curve_style"):
+                cs = curve_tool.curve_style or None
+            if cs is None:
+                return
+            new_color = cs.get("color", drawing.get("original_color", (0, 1, 0)))
+            new_width = cs.get("width", drawing.get("original_width", 2))
+            new_style = self._normalize_line_style(
+                cs.get("style", drawing.get("original_style", "solid"))
+            )
+            color_changed = drawing.get("original_color") != new_color
+            width_changed = drawing.get("original_width") != new_width
+            style_changed = drawing.get("original_style") != new_style
+            if not (color_changed or width_changed or style_changed):
+                return
+            drawing["original_color"] = new_color
+            drawing["original_width"] = new_width
+            drawing["original_style"] = new_style
+            self._rebuild_drawing_actor(drawing)
+            return
+
+        # Map drawing types to draw_tool_styles keys. Some drawing types use a
+        # different key than the style dict (e.g. "line_segment" drawings are
+        # styled via the "line" entry in draw_tool_styles).
+        _TYPE_TO_STYLE_KEY = {
+            "line_segment": "line",
+            "smartline": "smartline",
+            "centerline": "centerline",
+            "polyline": "polyline",
+            "freehand": "freehand",
+            "rectangle": "rectangle",
+            "polygon": "polygon",
+            "circle": "circle",
+            "hatcharea": "hatcharea",
+            "curve": "curve",
+            "text": "text",
+            "arrow": "arrow",
+            "cloud": "cloud",
+            "cloud_segment": "cloud_segment",
+        }
+        style_key = _TYPE_TO_STYLE_KEY.get(dtype, dtype)
+
+        # --- Resolve the tool style that should apply to this drawing. -------
+        # draw_tool_styles is keyed by tool name (e.g. "line", "polyline",
+        # "rectangle"); drawing dicts store their geometry type under "type"
+        # (e.g. "line_segment", "polyline", "rectangle").  The mapping above
+        # handles the well-known pairs; anything not in the map falls back to
+        # the raw dtype.  If neither key exists in styles there is genuinely
+        # no configured style for this drawing type, so skip it silently.
+        style_lookup_key = styles.get(style_key)
+        if style_lookup_key is None and dtype in styles:
+            style_lookup_key = styles[dtype]
+        tool_style = style_lookup_key or {}
+
+        # If the resolved style dict is empty AND the raw dtype is also missing
+        # from styles, there is nothing to apply at all.
+        if not tool_style and style_key not in styles and dtype not in styles:
+            return
+
+        new_color = tool_style.get("color", drawing.get("original_color", (1, 0, 0)))
+        new_width = tool_style.get("width", drawing.get("original_width", 2))
+        new_style = self._normalize_line_style(
+            tool_style.get("style", drawing.get("original_style", "solid"))
+        )
+
+        color_changed = drawing.get("original_color") != new_color
+        width_changed = drawing.get("original_width") != new_width
+        style_changed = drawing.get("original_style") != new_style
+
+        if dtype in FILLABLE_TOOLS:
+            fill_enabled = tool_style.get(
+                "fill_enabled", drawing.get("original_fill_color") is not None
+            )
+            if fill_enabled and drawing.get("original_fill_color") is None:
+                drawing["original_fill_color"] = tool_style.get("fill_color", new_color)
+                drawing["original_fill_opacity"] = tool_style.get("fill_opacity", 0.3)
+                color_changed = True
+            elif not fill_enabled and drawing.get("original_fill_color") is not None:
+                drawing.pop("original_fill_color", None)
+                drawing.pop("original_fill_opacity", None)
+                drawing.pop("fill_actor", None)
+                color_changed = True
+
+        if not (color_changed or width_changed or style_changed):
+            return
+
+        drawing["original_color"] = new_color
+        drawing["original_width"] = new_width
+        drawing["original_style"] = new_style
+        self._rebuild_drawing_actor(drawing)
+
     def _on_vertex_move_hover(self, obj, evt):
         """Show cyan marker when hovering over a vertex."""
         if self.dragging_vertex:

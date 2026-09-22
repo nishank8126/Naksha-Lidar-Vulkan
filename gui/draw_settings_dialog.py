@@ -468,19 +468,21 @@ class DrawToolSettingsDialog(QDialog):
     def _commit_current_to_working(self):
         """Write current UI values into the working dict for the active tool."""
         vtk_c = qcolor_to_vtk(self.current_color)
+        base = {
+            "color": vtk_c,
+            "width": self.current_width,
+            "style": self.current_style,
+        }
         if self.selected_tool_key == "__global__":
             for key in TOOL_ORDER:
-                self._working_styles[key] = {
-                    'color': vtk_c,
-                    'width': self.current_width,
-                    'style': self.current_style,
-                }
+                prev = dict(self._working_styles.get(key, {}))
+                # Keep any fill / extra keys that the dialog doesn't expose.
+                prev.update(base)
+                self._working_styles[key] = prev
         else:
-            self._working_styles[self.selected_tool_key] = {
-                'color': vtk_c,
-                'width': self.current_width,
-                'style': self.current_style,
-            }
+            prev = dict(self._working_styles.get(self.selected_tool_key, {}))
+            prev.update(base)
+            self._working_styles[self.selected_tool_key] = prev
 
     def _apply_settings(self):
         """Apply settings to the digitizer/curve_tool and persist."""
@@ -505,6 +507,31 @@ class DrawToolSettingsDialog(QDialog):
             # Persist to QSettings
             save_curve_settings(self._working_styles['curve'])
             print(f"✅ Curve settings saved: color={self.current_color.name()}, width={self.current_width}px")
+
+            # Also push the (updated) curve style into the digitizer's
+            # draw_tool_styles so that update_all_drawings_style() can pick it
+            # up for drawings whose "source" is "curve_tool".
+            digitizer = None
+            if hasattr(self.app, 'digitizer'):
+                digitizer = self.app.digitizer
+            else:
+                widget = self.parent()
+                while widget:
+                    if hasattr(widget, 'digitizer'):
+                        digitizer = widget.digitizer
+                        self.app = widget
+                        break
+                    widget = widget.parent()
+            if digitizer is not None and hasattr(digitizer, 'draw_tool_styles'):
+                working = dict(self._working_styles)
+                working.setdefault('curve', dict(self._working_styles.get('curve', {})))
+                digitizer.draw_tool_styles = working
+                try:
+                    if hasattr(digitizer, 'update_all_drawings_style'):
+                        digitizer.update_all_drawings_style()
+                        print(f"✅ Updated existing curve drawings to new curve style")
+                except Exception as e:
+                    print(f"⚠️ Curve style update failed: {e}")
 
             try:
                 if hasattr(self.app, 'statusBar'):
@@ -535,10 +562,13 @@ class DrawToolSettingsDialog(QDialog):
             digitizer.draw_tool_styles = draw_styles
             print(f"✅ Pushed styles to digitizer.draw_tool_styles")
             try:
+                if hasattr(digitizer, "update_all_drawings_style"):
+                    digitizer.update_all_drawings_style()
+                    print(f"✅ Updated {len(getattr(digitizer, 'drawings', []))} existing drawings to new styles")
                 if hasattr(digitizer, "_deferred_preview_update"):
                     digitizer._deferred_preview_update()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Style update failed: {e}")
         else:
             print(f"⚠️ Could not find digitizer! app={type(self.app).__name__}, has_digitizer={hasattr(self.app, 'digitizer')}")
 
