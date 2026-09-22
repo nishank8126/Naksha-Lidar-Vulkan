@@ -1128,6 +1128,7 @@ class DisplayModeDialog(QDialog):
         )
         controls_layout.addWidget(self.shading_quality)
         self.color_mode.currentIndexChanged.connect(self._sync_color_mode_state)
+        self.color_mode.currentIndexChanged.connect(self._restore_class_mode_visibility)
 
         # MicroStation-style persistent flight-line selector.  A QMenu closes
         # after every click, so this button opens a proper dialog instead.
@@ -1716,6 +1717,192 @@ class DisplayModeDialog(QDialog):
     def _save_slot_checkboxes(self, slot_idx: int) -> None:
         self._save_slot_state(slot_idx)
 
+    def sync_slot_visibility_from_palette(self, slot_idx: int, palette: dict) -> None:
+        """Mirror a palette's ``show`` flags into this dialog's checkbox state.
+
+        Used after an "only selected classes" load hides classes in the app
+        palette, so a later Display Mode Apply (which reads the checkboxes)
+        doesn't silently re-enable them. Visibility only: weights, colours,
+        PTC/schema and border state are not touched, and per-checkbox signals
+        are blocked so nothing is applied or written back while syncing.
+        """
+        if not isinstance(palette, dict):
+            return
+        shows = {}
+        for raw_code, info in palette.items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                shows[int(raw_code)] = bool(info.get('show', True))
+            except (TypeError, ValueError):
+                continue
+        if not shows:
+            return
+
+        if not isinstance(getattr(self, 'slot_shows', None), dict):
+            self.slot_shows = {}
+        _slot_store = self.slot_shows.setdefault(slot_idx, {})
+        if slot_idx == 0:
+            # Remember every checkbox this sync turns off so
+            # restore_import_block_ui() can put it back afterwards.
+            _tracked = getattr(self, "_import_unticked_slot0", None)
+            if _tracked is None:
+                _tracked = self._import_unticked_slot0 = set()
+            for _c, _v in shows.items():
+                if not _v and _slot_store.get(_c, True):
+                    _tracked.add(_c)
+        _slot_store.update(shows)
+
+        if slot_idx == 0:
+            # Remember the Main View's By-Classification visibility so it can
+            # be put back after a detour through another mode (see
+            # _restore_class_mode_visibility). Only ever set by an
+            # "only selected classes" load, so ordinary sessions never use it.
+            self._class_mode_vis_slot0 = dict(shows)
+
+        if self.current_slot != slot_idx:
+            return
+        for row in range(self.table.rowCount()):
+            try:
+                code_item = self.table.item(row, 1)
+                chk = self.table.cellWidget(row, 0)
+                if not code_item or chk is None:
+                    continue
+                code = int(code_item.text())
+                if code not in shows or chk.isChecked() == shows[code]:
+                    continue
+                if slot_idx == 0 and not shows[code]:
+                    self._import_unticked_slot0.add(code)
+                chk.blockSignals(True)
+                try:
+                    chk.setChecked(shows[code])
+                finally:
+                    chk.blockSignals(False)
+            except Exception:
+                continue
+
+    def _untick_import_blocked(self, slot_idx: int) -> None:
+        """Cross-section / cut slots: show classes excluded at import as
+        unticked, like the Main View. Every box turned off is remembered per
+        slot so restore_import_block_ui can put it back when the dataset is
+        cleared. Signals are blocked; nothing is applied here."""
+        if slot_idx == 0:
+            return
+        try:
+            blocked = getattr(self._get_app_window(), "_import_class_blocked", None)
+            if not blocked:
+                return
+            tracked = getattr(self, "_import_unticked_other", None)
+            if tracked is None:
+                tracked = self._import_unticked_other = set()
+            for row in range(self.table.rowCount()):
+                code_item = self.table.item(row, 1)
+                chk = self.table.cellWidget(row, 0)
+                if not code_item or chk is None:
+                    continue
+                code = int(code_item.text())
+                if code in blocked and chk.isChecked():
+                    tracked.add((slot_idx, code))
+                    # A later Apply stores this unticked state in the slot's
+                    # palette; record it so it is turned back on with the rest.
+                    app = self._get_app_window()
+                    forced = getattr(app, "_import_class_forced_off", None)
+                    if not isinstance(forced, set):
+                        forced = set()
+                        try:
+                            app._import_class_forced_off = forced
+                        except Exception:
+                            forced = None
+                    if forced is not None:
+                        forced.add((slot_idx, code))
+                    chk.blockSignals(True)
+                    try:
+                        chk.setChecked(False)
+                    finally:
+                        chk.blockSignals(False)
+        except Exception:
+            pass
+
+    def restore_import_block_ui(self) -> None:
+        """Undo what an "only selected classes" import did to this dialog
+        (called when that dataset is cleared): forget the class-mode memory
+        and re-tick the Main View boxes it turned off, so a later normal load
+        sees the same dialog state as before."""
+        try:
+            self._class_mode_vis_slot0 = None
+            # Cross-section / cut slots: re-tick what _untick_import_blocked /
+            # Apply turned off.
+            others = getattr(self, "_import_unticked_other", None)
+            self._import_unticked_other = set()
+            if others:
+                _ss = getattr(self, "slot_shows", None)
+                for slot_i, code in others:
+                    if isinstance(_ss, dict) and code in (_ss.get(slot_i) or {}):
+                        _ss[slot_i][code] = True
+                if self.current_slot != 0:
+                    _cur = {c for s, c in others if s == self.current_slot}
+                    for row in range(self.table.rowCount()):
+                        code_item = self.table.item(row, 1)
+                        chk = self.table.cellWidget(row, 0)
+                        if (code_item and chk is not None
+                                and int(code_item.text()) in _cur and not chk.isChecked()):
+                            chk.blockSignals(True)
+                            try:
+                                chk.setChecked(True)
+                            finally:
+                                chk.blockSignals(False)
+            codes = getattr(self, "_import_unticked_slot0", None)
+            self._import_unticked_slot0 = set()
+            if not codes:
+                return
+            slot0 = getattr(self, "slot_shows", {}).get(0) if isinstance(getattr(self, "slot_shows", None), dict) else None
+            if isinstance(slot0, dict):
+                for c in codes:
+                    if c in slot0:
+                        slot0[c] = True
+            if self.current_slot == 0:
+                for row in range(self.table.rowCount()):
+                    code_item = self.table.item(row, 1)
+                    chk = self.table.cellWidget(row, 0)
+                    if not code_item or chk is None:
+                        continue
+                    if int(code_item.text()) in codes and not chk.isChecked():
+                        chk.blockSignals(True)
+                        try:
+                            chk.setChecked(True)
+                        finally:
+                            chk.blockSignals(False)
+        except Exception:
+            pass
+
+    def _restore_class_mode_visibility(self, idx: int) -> None:
+        """Main View only, and only after an "only selected classes" load:
+        when the user switches the mode combo back to By Classification,
+        re-tick the classes that were visible in class mode (load-time
+        selection, or the last class-mode Apply). This undoes the Select All
+        that is typically used for Depth/Intensity/etc. Checkbox toggles go
+        through the normal handler, so no GPU/render work happens until Apply,
+        and Select All clicked afterwards in class mode is still honoured.
+        """
+        try:
+            if idx != 0 or self.current_slot != 0:
+                return
+            snap = getattr(self, "_class_mode_vis_slot0", None)
+            if not snap:
+                return
+            blocked = getattr(self._get_app_window(), "_import_class_blocked", None) or ()
+            for row in range(self.table.rowCount()):
+                code_item = self.table.item(row, 1)
+                chk = self.table.cellWidget(row, 0)
+                if not code_item or chk is None:
+                    continue
+                code = int(code_item.text())
+                want = False if code in blocked else snap.get(code)
+                if want is not None and chk.isChecked() != want:
+                    chk.setChecked(want)
+        except Exception:
+            pass
+
     def _on_weight_cell_changed(self, item: "QTableWidgetItem") -> None:
         if item.column() != 6:
             return
@@ -1750,6 +1937,7 @@ class DisplayModeDialog(QDialog):
 
         self.current_slot = idx
         self._load_slot_state(idx)                 # 1 pass: checks + weights, signals blocked
+        self._untick_import_blocked(idx)           # no-op unless an only-class import is active
         self.update_border_display()
         self.load_view_border(idx)
         self._load_border_mode(idx)
@@ -2018,6 +2206,10 @@ class DisplayModeDialog(QDialog):
                             if r + g + b < 30:
                                 self._set_color_cell(row, QColor(200, 200, 200))
                         break
+
+            # A new PTC replaces the class table: drop any class-mode
+            # visibility memory from an earlier "only selected classes" load.
+            self._class_mode_vis_slot0 = None
 
             print(f"\n{'=' * 60}")
             print(f"ðŸ”„ REBUILDING ALL VIEW PALETTES AFTER PTC LOAD")
@@ -2698,9 +2890,19 @@ class DisplayModeDialog(QDialog):
             return None
 
     def on_select_all(self):
+        # All views: classes excluded by an "only selected classes" import
+        # are skipped (see on_apply); everything else is ticked as before.
+        app = self._get_app_window()
+        blocked = getattr(app, "_import_class_blocked", None) or ()
         for row in range(self.table.rowCount()):
             chk = self.table.cellWidget(row, 0)
             if chk:
+                if blocked:
+                    try:
+                        if int(self.table.item(row, 1).text()) in blocked:
+                            continue
+                    except Exception:
+                        pass
                 chk.setChecked(True)
 
     def on_clear_all(self):
@@ -2761,6 +2963,7 @@ class DisplayModeDialog(QDialog):
         self.view_palettes = {i: {} for i in range(6)}
         self.slot_shows = {i: {} for i in range(6)}
         self.current_ptc_path = None
+        self._class_mode_vis_slot0 = None
         print("   âœ… DisplayModeDialog state reset")
 
     def _on_checkbox_toggled_fast(self, row: int, state: int) -> None:
@@ -2900,9 +3103,50 @@ class DisplayModeDialog(QDialog):
             except Exception:
                 continue
 
+        # Keep the class-mode visibility memory (only present after an
+        # "only selected classes" load) in step with what the user applies.
+        if (
+            self.current_slot == 0
+            and is_class_mode
+            and getattr(self, "_class_mode_vis_slot0", None)
+        ):
+            self._class_mode_vis_slot0 = {
+                _c: bool(_v.get("show", True)) for _c, _v in class_map.items()
+            }
+
         app = self._get_app_window()
         if not app:
             return
+
+        # Classes left out at import ("only selected classes") stay off for
+        # this dataset on the Main View, even after Select All. Reflect that
+        # in both the applied map and the checkboxes.
+        _blocked = getattr(app, "_import_class_blocked", None)
+        if self.current_slot == 0 and _blocked:
+            for _code in _blocked:
+                if _code in class_map:
+                    class_map[_code]["show"] = False
+            for _row in range(self.table.rowCount()):
+                try:
+                    _item = self.table.item(_row, 1)
+                    _chk = self.table.cellWidget(_row, 0)
+                    if _item and _chk is not None and int(_item.text()) in _blocked and _chk.isChecked():
+                        _chk.setChecked(False)
+                        _tr = getattr(self, "_import_unticked_slot0", None)
+                        if _tr is None:
+                            _tr = self._import_unticked_slot0 = set()
+                        _tr.add(int(_item.text()))
+                except Exception:
+                    continue
+        elif _blocked:
+            # Cross-section / cut slots: this class_map is passed straight to
+            # the section/cut renderers (never through apply_class_map), so
+            # filter it here and untick the blocked boxes. Everything flipped is
+            # recorded and turned back on when the dataset is cleared.
+            _enforce = getattr(app, "_apply_import_class_block", None)
+            if callable(_enforce):
+                _enforce(class_map, self.current_slot)
+            self._untick_import_blocked(self.current_slot)
 
         quality_mode = str(self.shading_quality.currentData() or "normal").lower()
         if self.current_slot == 0 and idx in (1, 6) and quality_mode == "slow":

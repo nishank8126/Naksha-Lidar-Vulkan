@@ -5391,6 +5391,16 @@ class CutSectionController:
         QTimer.singleShot(max(int(delay_ms), 0), _refit_if_layout_settled)
 
     def _get_cut_slot_palette(self, ensure_seed: bool = True):
+        palette = self._get_cut_slot_palette_raw(ensure_seed)
+        try:
+            enforce = getattr(self.app, "_apply_import_class_block", None)
+            if callable(enforce):
+                enforce(palette, 5)
+        except Exception:
+            pass
+        return palette
+
+    def _get_cut_slot_palette_raw(self, ensure_seed: bool = True):
         """
         Resolve cut-section palette (slot 5) without leaking slot-0 visibility.
         Priority:
