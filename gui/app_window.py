@@ -267,6 +267,17 @@ class MainWheelZoomEventFilter(QObject):
                 )
             except Exception:
                 is_plain_escape = False
+            if is_plain_escape:
+                # Escape deactivates a configured Left / Tap-Tap pan the same
+                # way it deactivates any tool: closes an open tap session AND
+                # suspends further left/tap panning until the Pan shortcut
+                # (or an app restart) re-arms it. Scroll/middle pan is the
+                # main pan and is never affected. Must run before the tap-
+                # session / identification branches below so the suspension
+                # happens even when they consume this key press.
+                susp = getattr(app, "_suspend_pan_nav_for_escape", None)
+                if callable(susp):
+                    susp()
             if self._tap_session:
                 # An open tap-pan session is ended by any key press - Esc
                 # above all - so the user always has a reliable escape hatch.
@@ -1144,6 +1155,11 @@ class NakshaApp(QMainWindow):
         # Escape/tool exit must never arm left-click pan. Only the configured
         # Pan tool shortcut changes this state.
         self._left_pan_shortcut_active = False
+        # Escape suspends a configured Left / Tap-Tap pan like a tool
+        # (scroll/middle-click pan is the main pan and is never touched).
+        # Holds the suspended value ("left"/"tap") while off; None = not off.
+        # Re-armed by the Pan tool shortcut, an explicit settings save, or restart.
+        self._pan_nav_suspended_button = None
 
         # ── Smooth (eased) mouse-wheel zoom state ──────────────────────────
         # Each wheel notch nudges a *target* zoom multiplier; a short-lived
@@ -17870,6 +17886,38 @@ class NakshaApp(QMainWindow):
 
         print(f"Stale VTK interaction state {state} stopped before mouse move")
         return True
+
+    def _suspend_pan_nav_for_escape(self):
+        """Escape turns a configured Left / Tap-Tap pan off like a tool.
+
+        Scroll (middle-button) pan is the main pan and is never touched.
+        Idempotent: repeated Escape presses are no-ops while already off.
+        Re-armed by the Pan tool shortcut, an explicit Global Settings save,
+        or an app restart (QSettings still holds the configured value).
+        """
+        if getattr(self, "_pan_nav_suspended_button", None) is not None:
+            return
+        pb = getattr(self, "panning_button", "scroll")
+        if pb not in ("left", "tap"):
+            return
+        self._pan_nav_suspended_button = pb
+        self.panning_button = "scroll"
+        print(f"🛑 Left/Tap-Tap pan deactivated (Escape) - was '{pb}'; press Pan shortcut to re-arm")
+        try:
+            self.statusBar().showMessage(
+                "Pan deactivated (Escape) - press Pan shortcut to re-arm", 4000
+            )
+        except Exception:
+            pass
+
+    def _restore_pan_nav(self):
+        """Re-arm a Left / Tap-Tap pan suspended by Escape (Pan shortcut / settings save)."""
+        saved = getattr(self, "_pan_nav_suspended_button", None)
+        if saved is None:
+            return
+        self._pan_nav_suspended_button = None
+        self.panning_button = saved
+        print(f"✅ Left/Tap-Tap pan re-armed ({saved})")
 
     def _handle_fast_main_pan_press(self, position, canvas_width, canvas_height):
         """Start one Qt-owned main-view pan before VTK sees the press."""

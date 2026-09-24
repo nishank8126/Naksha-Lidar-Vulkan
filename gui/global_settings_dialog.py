@@ -1726,6 +1726,10 @@ class GlobalSettingsDialog(QDialog):
         panning_button = self.panning_button_combo.currentData() or "scroll"
         self.settings.setValue("panning_button", panning_button)
         self.app.panning_button = panning_button
+        # An explicit settings save re-arms Left/Tap-Tap pan if a previous
+        # Escape had suspended it (the combo is the user's chosen mode).
+        if hasattr(self.app, "_pan_nav_suspended_button"):
+            self.app._pan_nav_suspended_button = None
 
     def _save_update_settings(self):
         self.update_manager.set_preferences(
