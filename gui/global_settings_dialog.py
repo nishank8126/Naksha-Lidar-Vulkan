@@ -4,6 +4,7 @@ from PySide6.QtCore import QSettings, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -41,6 +43,7 @@ from gui.draw_settings_dialog import (
     vtk_color_to_qcolor,
 )
 from gui.shortcut_manager import ShortcutManager, TOOLS, SIMPLE_SHORTCUT_TOOLS
+from gui.update_manager import APP_VERSION, UpdateInfo, UpdateManager, UpdateWorker
 
 
 SHORTCUT_MODIFIERS = [
@@ -142,6 +145,11 @@ class GlobalSettingsDialog(QDialog):
         super().__init__(parent or app)
         self.app = app
         self.settings = QSettings("NakshaAI", "LidarApp")
+        self.update_manager = UpdateManager(self.settings)
+        self._update_worker = None
+        self._available_update = None
+        self._downloaded_update = None
+        self._pending_auto_download = False
 
         self._draw_styles = {}
         self._selected_draw_tool = TOOL_ORDER[0]
@@ -253,6 +261,10 @@ class GlobalSettingsDialog(QDialog):
                 border:none; font-weight:bold;
             }}
             QPushButton#primaryBtn:hover {{ background:{self.c_accent}; }}
+            QPushButton#primaryBtn:disabled {{
+                background:{self.c_bg_alt}; color:{self.c_text_muted};
+                border:1px solid {self.c_border};
+            }}
             QPushButton#secondaryBtn {{
                 background:{self.c_bg_alt}; color:{self.c_text};
             }}
@@ -318,6 +330,7 @@ class GlobalSettingsDialog(QDialog):
             ("Cross Section", "✂"),
             ("Draw",          "✏"),
             ("Navigation",    "⊙"),
+            ("Updates",       "UP"),
         ]:
             item = QListWidgetItem(f"  {icon}  {label}")
             item.setSizeHint(QSize(160, 32))
@@ -337,6 +350,7 @@ class GlobalSettingsDialog(QDialog):
         self.category_stack.addWidget(self._build_cross_section_page())
         self.category_stack.addWidget(self._build_draw_page())
         self.category_stack.addWidget(self._build_navigation_page())
+        self.category_stack.addWidget(self._build_updates_page())
         right_layout.addWidget(self.category_stack, 1)
 
         # Footer separator + bar
@@ -829,10 +843,116 @@ class GlobalSettingsDialog(QDialog):
         layout.addStretch()
         return page
 
+    def _build_updates_page(self):
+        """Build the presentation-only shell for the future updater."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        device_group = QGroupBox("This Device")
+        device_form = QFormLayout(device_group)
+        device_form.setHorizontalSpacing(12)
+        device_form.setVerticalSpacing(8)
+
+        self.update_system_number = QLabel("Not registered")
+        self.update_device_id = QLabel("Not available")
+        self.update_device_status = QLabel("Update service not configured")
+        self.update_device_status.setObjectName("dialogCaption")
+
+        device_form.addRow("System number:", self.update_system_number)
+        device_form.addRow("Device ID:", self.update_device_id)
+        device_form.addRow("Status:", self.update_device_status)
+
+        preferences_group = QGroupBox("Update Preferences")
+        preferences_layout = QVBoxLayout(preferences_group)
+        preferences_layout.setSpacing(8)
+
+        self.auto_check_updates_cb = QCheckBox("Automatically check for updates")
+        self.auto_download_updates_cb = QCheckBox(
+            "Automatically download available updates"
+        )
+        preferences_layout.addWidget(self.auto_check_updates_cb)
+        preferences_layout.addWidget(self.auto_download_updates_cb)
+
+        channel_row = QHBoxLayout()
+        channel_row.addWidget(QLabel("Update channel:"))
+        self.update_channel_combo = QComboBox()
+        self.update_channel_combo.addItem("Stable", "stable")
+        self.update_channel_combo.addItem("Testing", "testing")
+        self.update_channel_combo.setMinimumWidth(180)
+        channel_row.addWidget(self.update_channel_combo)
+        channel_row.addStretch()
+        preferences_layout.addLayout(channel_row)
+
+        update_group = QGroupBox("Software Update")
+        update_layout = QVBoxLayout(update_group)
+        update_layout.setSpacing(9)
+
+        version_form = QFormLayout()
+        version_form.setHorizontalSpacing(12)
+        version_form.setVerticalSpacing(7)
+        self.current_version_label = QLabel("Version information unavailable")
+        self.available_version_label = QLabel("Not available")
+        self.last_checked_label = QLabel("Never")
+        version_form.addRow("Current version:", self.current_version_label)
+        version_form.addRow("Available version:", self.available_version_label)
+        version_form.addRow("Last checked:", self.last_checked_label)
+        update_layout.addLayout(version_form)
+
+        self.update_status_label = QLabel(
+            "Automatic updates are not configured yet. No update actions are active."
+        )
+        self.update_status_label.setObjectName("dialogCaption")
+        self.update_status_label.setWordWrap(True)
+        update_layout.addWidget(self.update_status_label)
+
+        self.update_progress = QProgressBar()
+        self.update_progress.setRange(0, 100)
+        self.update_progress.setValue(0)
+        self.update_progress.setTextVisible(True)
+        self.update_progress.setFormat("No download in progress")
+        update_layout.addWidget(self.update_progress)
+
+        release_notes_title = QLabel("Release notes")
+        release_notes_title.setStyleSheet("font-weight:bold;")
+        update_layout.addWidget(release_notes_title)
+
+        self.update_release_notes = QLabel(
+            "Release details will appear here when an update is available for this system."
+        )
+        self.update_release_notes.setObjectName("dialogCaption")
+        self.update_release_notes.setWordWrap(True)
+        self.update_release_notes.setMinimumHeight(36)
+        update_layout.addWidget(self.update_release_notes)
+
+        actions = QHBoxLayout()
+        self.check_updates_btn = QPushButton("Check for Updates")
+        self.download_update_btn = QPushButton("Download Update")
+        self.install_restart_btn = QPushButton("Install and Restart")
+        self.install_restart_btn.setObjectName("primaryBtn")
+        for button in (self.download_update_btn, self.install_restart_btn):
+            button.setEnabled(False)
+            actions.addWidget(button)
+        self.check_updates_btn.clicked.connect(self._check_for_updates)
+        self.download_update_btn.clicked.connect(self._download_update)
+        self.install_restart_btn.clicked.connect(self._install_update)
+        actions.insertWidget(0, self.check_updates_btn)
+        actions.addStretch()
+        update_layout.addLayout(actions)
+
+        layout.addWidget(device_group)
+        layout.addWidget(preferences_group)
+        layout.addWidget(update_group)
+        layout.addStretch()
+        return page
+
     def _on_category_changed(self, index):
         self.category_stack.setCurrentIndex(max(0, index))
         if index == 1:
             self._ensure_shortcuts_loaded()
+        elif index == 5:
+            self._refresh_update_page()
 
     def _ensure_shortcuts_loaded(self):
         if self._shortcuts_needs_reload:
@@ -857,6 +977,9 @@ class GlobalSettingsDialog(QDialog):
         self.draw_fill_opacity_slider.valueChanged.connect(lambda _: self._mark_dirty(3))
         self.zoom_behavior_combo.currentIndexChanged.connect(lambda _: self._mark_dirty(4))
         self.panning_button_combo.currentIndexChanged.connect(lambda _: self._mark_dirty(4))
+        self.auto_check_updates_cb.toggled.connect(lambda _: self._mark_dirty(5))
+        self.auto_download_updates_cb.toggled.connect(lambda _: self._mark_dirty(5))
+        self.update_channel_combo.currentIndexChanged.connect(lambda _: self._mark_dirty(5))
 
     def _load_values(self):
         self._loading = True
@@ -866,6 +989,7 @@ class GlobalSettingsDialog(QDialog):
             self._load_cross_section_settings()
             self._load_draw_settings_page()
             self._load_navigation_settings()
+            self._load_update_settings()
         finally:
             self._loading = False
         # If shortcuts tab is already active, load now so it isn't blank
@@ -967,6 +1091,136 @@ class GlobalSettingsDialog(QDialog):
             index = 0
         self.panning_button_combo.setCurrentIndex(index)
         self._update_navigation_summary()
+
+    def _load_update_settings(self):
+        auto_check = self.settings.value("updates/auto_check", True, type=bool)
+        auto_download = self.settings.value(
+            "updates/auto_download", False, type=bool
+        )
+        self.auto_check_updates_cb.setChecked(auto_check)
+        self.auto_download_updates_cb.setChecked(auto_download)
+        channel_index = self.update_channel_combo.findData(self.update_manager.channel)
+        self.update_channel_combo.setCurrentIndex(max(0, channel_index))
+        self._refresh_update_page()
+
+    def _refresh_update_page(self):
+        self.current_version_label.setText(APP_VERSION)
+        self.update_device_id.setText(self.update_manager.device_id)
+        self.update_system_number.setText(
+            self.update_manager.system_number or "Not assigned"
+        )
+        configured = self.update_manager.configured
+        self.update_device_status.setText(
+            "Ready" if configured else "Update service credentials not configured"
+        )
+        self.check_updates_btn.setEnabled(configured and not self._worker_running())
+        self.check_updates_btn.setToolTip(
+            "" if configured else "Configure the update URL and per-device token."
+        )
+
+    def _worker_running(self):
+        return self._update_worker is not None and self._update_worker.isRunning()
+
+    def _start_update_worker(self, operation, info=None):
+        if self._worker_running():
+            return
+        self._update_worker = UpdateWorker(
+            self.update_manager, operation, info, self
+        )
+        self._update_worker.failed.connect(self._update_operation_failed)
+        self._update_worker.finished.connect(self._update_worker_finished)
+        if operation == "check":
+            self._update_worker.succeeded.connect(self._update_check_finished)
+            self.update_status_label.setText("Checking for updates...")
+        else:
+            self._update_worker.succeeded.connect(self._update_download_finished)
+            self._update_worker.progress_changed.connect(
+                self._update_download_progress
+            )
+            self.update_progress.setValue(0)
+            self.update_progress.setFormat("Downloading: %p%")
+            self.update_status_label.setText("Downloading and verifying update...")
+        self.check_updates_btn.setEnabled(False)
+        self.download_update_btn.setEnabled(False)
+        self._update_worker.start()
+
+    def _check_for_updates(self):
+        self._start_update_worker("check")
+
+    def _update_check_finished(self, info):
+        from datetime import datetime
+
+        self.last_checked_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.settings.setValue("updates/last_checked", self.last_checked_label.text())
+        if info is None:
+            self._available_update = None
+            self.available_version_label.setText("Up to date")
+            self.update_release_notes.setText("No newer update is assigned to this system.")
+            self.update_status_label.setText("This application is up to date.")
+            return
+        self._available_update = info
+        self.available_version_label.setText(info.version)
+        self.update_release_notes.setText(info.release_notes)
+        self.update_status_label.setText(
+            f"Version {info.version} is available for this system."
+        )
+        self.download_update_btn.setEnabled(True)
+        if self.auto_download_updates_cb.isChecked():
+            self._pending_auto_download = True
+
+    def _download_update(self):
+        if self._available_update is not None:
+            self._start_update_worker("download", self._available_update)
+
+    def _update_download_progress(self, value):
+        self.update_progress.setValue(value)
+
+    def _update_download_finished(self, installer):
+        self._downloaded_update = installer
+        self.update_progress.setValue(100)
+        self.update_progress.setFormat("Download verified and ready")
+        self.update_status_label.setText(
+            "The signed update is ready to install. Save your work before continuing."
+        )
+        self.install_restart_btn.setEnabled(True)
+
+    def _update_operation_failed(self, message):
+        self.update_status_label.setText(message)
+        self.update_progress.setFormat("Update operation failed")
+        QMessageBox.warning(self, "Update Failed", message)
+
+    def _update_worker_finished(self):
+        worker = self._update_worker
+        self._update_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._refresh_update_page()
+        self.download_update_btn.setEnabled(self._available_update is not None)
+        self.install_restart_btn.setEnabled(self._downloaded_update is not None)
+        if self._pending_auto_download and self._available_update is not None:
+            self._pending_auto_download = False
+            self._download_update()
+
+    def _install_update(self):
+        if self._downloaded_update is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Install Update",
+            "Save your open work now. The application will close and Windows "
+            "will request permission to install the verified update. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            if self.app is not None and not self.app.close():
+                return
+            self.update_manager.launch_installer(self._downloaded_update)
+            QApplication.quit()
+        except Exception as exc:
+            QMessageBox.warning(self, "Installation Failed", str(exc))
 
     def _add_empty_shortcut_row(self):
         entry = {
@@ -1473,6 +1727,13 @@ class GlobalSettingsDialog(QDialog):
         self.settings.setValue("panning_button", panning_button)
         self.app.panning_button = panning_button
 
+    def _save_update_settings(self):
+        self.update_manager.set_preferences(
+            self.auto_check_updates_cb.isChecked(),
+            self.auto_download_updates_cb.isChecked(),
+            self.update_channel_combo.currentData() or "stable",
+        )
+
     def save_all_settings(self):
         try:
             if not self._dirty_categories:
@@ -1490,6 +1751,8 @@ class GlobalSettingsDialog(QDialog):
                 self._save_navigation_settings()
             if 1 in self._dirty_categories:
                 self._save_shortcuts_settings()
+            if 5 in self._dirty_categories:
+                self._save_update_settings()
 
             self.settings.sync()
             self._dirty_categories.clear()

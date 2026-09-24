@@ -101,6 +101,7 @@ Filename: "{sys}\ie4uinit.exe"; Parameters: "-show"; Flags: runhidden waituntilt
 
 ; ── Launch app after install ──────────────────────────────────────
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent; Check: RestartAfterUpdate
 
 [UninstallRun]
 ; ── Remove .snt file association on uninstall ─────────────────────
@@ -114,4 +115,9 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "--unregister-snt"; Flags: runhid
 function VCRedistFileExists(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{tmp}\VC_redist.x64.exe'));
+end;
+
+function RestartAfterUpdate(): Boolean;
+begin
+  Result := CmdLineParamExists('/RESTARTAFTERUPDATE');
 end;

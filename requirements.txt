@@ -88,7 +88,7 @@ git add -A
 git diff --cached --stat
 git diff --cached
 <<<<<<< HEAD
-git commit -m "class picker issues fixed"
+git commit -m "Brush working speed improved in the main view "
 git push origin ortho-pyramid-tif-loading
 =======
 git commit -m "75 pt preserves the imported size. Values below 75 pt continue shrinking linearly.Values above 75 pt grow with stronger world-space scaling.Repeated edits use an immutable baseline, preventing accumulated scaling errors.Works for both vtkFollower and vtkTextActor3D labelsUses the current class set.Backfills missing Lvl, description, draw, and color.Checks the live Display Mode table and all per-view palettes.Preserves shortcut-specific visibility and weight settings.Falls back to description or class code when no meaningful level exists."
@@ -98,3 +98,12 @@ git push origin software-enhancement-20260910
 
 # git pull --rebase origin MAIN
 # git push origin MAIN
+
+#git status
+# git fetch origin --prune
+
+# # Create a remote backup of the current MAIN branch
+# git push origin origin/MAIN:refs/heads/backup-MAIN-before-ortho-replace
+
+# # Completely replace MAIN with the source branch
+# git push --force-with-lease origin origin/ortho-pyramid-tif-loading:refs/heads/MAIN
