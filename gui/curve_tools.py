@@ -370,11 +370,13 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
             if (event.type() == QEvent.MouseButtonPress 
                     and event.button() == Qt.RightButton):
                 
-                grid_name = self._check_grid_label_at_click(event)
+                grid_name, label_actor = self._check_grid_label_at_click(event)
                 if grid_name:
                     print(f"   🏷️ Grid label found: '{grid_name}' → showing menu")
                     if hasattr(self.app, 'grid_label_manager'):
-                        self.app.grid_label_manager.show_grid_label_menu(grid_name)
+                        self.app.grid_label_manager.show_grid_label_menu(
+                            grid_name, actor=label_actor
+                        )
                     return True   # ← BLOCK digitizer from seeing this click
                 
                 # No grid label → let VTK / digitizer handle normally
@@ -1614,7 +1616,10 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
     def _check_grid_label_at_click(self, event):
         """
         Check if a grid label exists at the click position.
-        Returns grid_name string if found, None otherwise.
+        Returns (grid_name, actor) — (None, None) if not found. The actor is
+        passed through to show_grid_label_menu so the menu never has to
+        re-look it up from the actor stores (that re-lookup was the reason
+        the Edit Label Text / Set Font Size items sometimes went missing).
         
         Uses multiple picker strategies to handle VTK's Python wrapper
         mismatch (where GetActor() returns a different wrapper that lost
@@ -1637,7 +1642,7 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
                 if hasattr(prop, 'is_grid_label') and prop.is_grid_label:
                     grid_name = getattr(prop, 'grid_name', '')
                     if grid_name:
-                        return grid_name
+                        return grid_name, prop
 
             # ── Method 2: PropPicker + match against known actors ──────
             prop_picker = vtk.vtkPropPicker()
@@ -1645,18 +1650,18 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
             picked = prop_picker.GetActor()
 
             if picked is None:
-                return None
+                return None, None
 
             # Direct attribute check
             if hasattr(picked, 'is_grid_label') and picked.is_grid_label:
-                return getattr(picked, 'grid_name', '')
+                return getattr(picked, 'grid_name', ''), picked
 
             # ── Method 3: Match by position/bounds with all known labels ─
             try:
                 picked_pos = picked.GetPosition()
                 picked_bounds = picked.GetBounds()
             except Exception:
-                return None
+                return None, None
 
             for store_name in ('snt_actors', 'dxf_actors'):
                 for data in getattr(self.app, store_name, []):
@@ -1668,14 +1673,14 @@ class CurveTool(QObject):  # ✅ INHERIT FROM QObject
                                     and actor.GetBounds() == picked_bounds):
                                 gn = getattr(actor, 'grid_name', '')
                                 if gn:
-                                    return gn
+                                    return gn, actor
                         except Exception:
                             pass
 
         except Exception as exc:
             print(f"   ⚠️ Grid label check failed: {exc}")
 
-        return None
+        return None, None
 
     def _select_curve(self, curve_data):
         """Highlight selected curve"""

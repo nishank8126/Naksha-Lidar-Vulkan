@@ -7592,6 +7592,63 @@ class GridLabelManager:
             menu.addAction(clear_action)
             menu.addAction(fence_action)
 
+            # ── Label edit items must also be reachable from INSIDE the block ──
+            # Block labels can be a few pixels tall; the user right-clicks the
+            # block area (not the glyphs) to reach Edit Label Text / Set Font
+            # Size and enlarge them. Resolve the label actor from the block's
+            # own name, its alternate names, or the authoritative file name.
+            from PySide6.QtCore import QTimer as _QTimer
+            _label_candidates = [grid_name]
+            for _c in merged_alt:
+                if _c and _c not in _label_candidates:
+                    _label_candidates.append(_c)
+            if file_path:
+                try:
+                    _fname = Path(file_path).name
+                    if _fname not in _label_candidates:
+                        _label_candidates.append(_fname)
+                except Exception:
+                    pass
+
+            edit_actor = None
+            for _cand in _label_candidates:
+                if not _cand:
+                    continue
+                edit_actor = self._find_grid_label_actor(_cand)
+                if edit_actor is not None:
+                    break
+            if edit_actor is None:
+                print(
+                    f"[block-click] no label actor matched candidates "
+                    f"{_label_candidates} — Edit Label Text disabled"
+                )
+
+            menu.addSeparator()
+            edit_label_action = QAction("✏️ Edit Label Text", self.app)
+            edit_label_action.setEnabled(edit_actor is not None)
+            # Defer the modal dialog by one event-loop tick so the VTK
+            # render-window mouse grab from this right-click releases first
+            # (same pattern as show_grid_label_menu).
+            edit_label_action.triggered.connect(
+                lambda _=False, a=edit_actor: _QTimer.singleShot(
+                    10, lambda a=a: self._edit_grid_label(a)
+                )
+            )
+            menu.addAction(edit_label_action)
+
+            bulk_font_action = QAction("🔠 Set Font Size — All Block Labels", self.app)
+            bulk_font_action.triggered.connect(
+                lambda _=False: _QTimer.singleShot(10, self.edit_all_grid_labels_font_size)
+            )
+            menu.addAction(bulk_font_action)
+
+            if getattr(self, '_label_edit_undo_stack', None):
+                undo_label_action = QAction("↶ Undo Last Label Edit", self.app)
+                undo_label_action.triggered.connect(
+                    lambda _=False: _QTimer.singleShot(10, self._undo_last_label_edit)
+                )
+                menu.addAction(undo_label_action)
+
             self._consume_vtk_event(obj)
             print(
                 f"[block-click] showing block context menu for "
@@ -9872,22 +9929,47 @@ class GridLabelManager:
         if not grid_name:
             return None
         try:
+            # Per-entry guards: one stale/bad store entry (non-dict, deleted
+            # VTK wrapper, ...) must never abort the whole scan — the old
+            # single try/except around the entire loop silently returned None
+            # and made the Edit Label Text / Set Font Size menu items vanish.
             for store_name in ('snt_actors', 'dxf_actors'):
-                for data in getattr(self.app, store_name, []) or []:
-                    for actor in data.get('actors', []) or []:
-                        if not (hasattr(actor, 'is_grid_label') and actor.is_grid_label):
+                try:
+                    entries = getattr(self.app, store_name, []) or []
+                except Exception:
+                    continue
+                for data in entries:
+                    try:
+                        actors = data.get('actors', []) if isinstance(data, dict) else []
+                    except Exception:
+                        continue
+                    for actor in actors or []:
+                        try:
+                            if not (hasattr(actor, 'is_grid_label') and actor.is_grid_label):
+                                continue
+                            if getattr(actor, 'grid_name', None) == grid_name:
+                                return actor
+                        except Exception:
                             continue
-                        if getattr(actor, 'grid_name', None) == grid_name:
-                            return actor
         except Exception as e:
             print(f"⚠️ Could not resolve grid label actor for '{grid_name}': {e}")
+        try:
+            _n_snt = sum(len((d or {}).get('actors', [])) for d in (getattr(self.app, 'snt_actors', []) or []) if isinstance(d, dict))
+            _n_dxf = sum(len((d or {}).get('actors', [])) for d in (getattr(self.app, 'dxf_actors', []) or []) if isinstance(d, dict))
+            print(f"⚠️ Grid label actor '{grid_name}' not found in stores (snt actors={_n_snt}, dxf actors={_n_dxf})")
+        except Exception:
+            pass
         return None
 
-    def show_grid_label_menu(self, grid_name, snt_filename=None):
+    def show_grid_label_menu(self, grid_name, snt_filename=None, actor=None):
         """
         Show context menu for a grid label.
         Called by CurveTool.eventFilter when it detects a right-click on a grid label.
         Extracted from on_right_click() so it can be called externally.
+
+        `actor` is the label actor the click detection already picked. Passing
+        it in guarantees the Edit Label Text / Set Font Size items always have
+        a target and skips the O(N) store re-lookup entirely.
         """
         from PySide6.QtWidgets import QMenu, QMessageBox
         from PySide6.QtGui import QAction, QCursor
@@ -9964,39 +10046,55 @@ class GridLabelManager:
         menu.addAction(buffer_action)
         menu.addAction(clear_action)
         menu.addAction(fence_action)
+        menu.addSeparator()
 
-        edit_actor = self._find_grid_label_actor(grid_name)
-        if edit_actor is not None:
-            from PySide6.QtCore import QTimer
-            edit_label_action = QAction("✏️ Edit Label Text", self.app)
-            # Defer the dialog by one event-loop tick (mirrors
-            # digitize_tools._show_text_context_menu's _deferred_menu/QTimer
-            # pattern). Opening a modal QDialog synchronously inside this
-            # menu-action's triggered slot — itself already nested inside
-            # the CurveTool eventFilter's synchronous mouse-press handling —
-            # leaves VTK's render-window mouse grab from the original click
-            # unreleased, so the dialog paints but never receives mouse
-            # input. A short QTimer defer lets that grab release first.
-            edit_label_action.triggered.connect(
-                lambda _=False, a=edit_actor: QTimer.singleShot(
-                    10, lambda a=a: self._edit_grid_label(a)
-                )
+        from PySide6.QtCore import QTimer
+
+        # ── The Edit Label Text / Set Font Size items must ALWAYS appear. ──
+        # Prefer the actor the click detection already picked (passed in as
+        # `actor`): that removes the O(N) store re-lookup from the happy path
+        # entirely. _find_grid_label_actor is only a fallback now (and it
+        # prints a diagnostic if it also fails).
+        edit_actor = actor
+        if not (edit_actor is not None and getattr(edit_actor, 'is_grid_label', False)):
+            edit_actor = self._find_grid_label_actor(grid_name)
+        if edit_actor is None:
+            print(f"   ⚠️ Grid label '{grid_name}' not resolved from click or stores")
+
+        edit_label_action = QAction("✏️ Edit Label Text", self.app)
+        # Visible always; only disabled in the (practically impossible) case
+        # where neither the click nor the stores yielded an actor.
+        edit_label_action.setEnabled(edit_actor is not None)
+        # Defer the dialog by one event-loop tick (mirrors
+        # digitize_tools._show_text_context_menu's _deferred_menu/QTimer
+        # pattern). Opening a modal QDialog synchronously inside this
+        # menu-action's triggered slot — itself already nested inside
+        # the CurveTool eventFilter's synchronous mouse-press handling —
+        # leaves VTK's render-window mouse grab from the original click
+        # unreleased, so the dialog paints but never receives mouse
+        # input. A short QTimer defer lets that grab release first.
+        edit_label_action.triggered.connect(
+            lambda _=False, a=edit_actor, gn=grid_name: QTimer.singleShot(
+                10,
+                lambda a=a, gn=gn: self._edit_grid_label(
+                    a if a is not None else self._find_grid_label_actor(gn)
+                ),
             )
-            menu.addSeparator()
-            menu.addAction(edit_label_action)
+        )
+        menu.addAction(edit_label_action)
 
-            bulk_font_action = QAction("🔠 Set Font Size — All Block Labels", self.app)
-            bulk_font_action.triggered.connect(
-                lambda _=False: QTimer.singleShot(10, self.edit_all_grid_labels_font_size)
+        bulk_font_action = QAction("🔠 Set Font Size — All Block Labels", self.app)
+        bulk_font_action.triggered.connect(
+            lambda _=False: QTimer.singleShot(10, self.edit_all_grid_labels_font_size)
+        )
+        menu.addAction(bulk_font_action)
+
+        if getattr(self, '_label_edit_undo_stack', None):
+            undo_label_action = QAction("↶ Undo Last Label Edit", self.app)
+            undo_label_action.triggered.connect(
+                lambda _=False: QTimer.singleShot(10, self._undo_last_label_edit)
             )
-            menu.addAction(bulk_font_action)
-
-            if getattr(self, '_label_edit_undo_stack', None):
-                undo_label_action = QAction("↶ Undo Last Label Edit", self.app)
-                undo_label_action.triggered.connect(
-                    lambda _=False: QTimer.singleShot(10, self._undo_last_label_edit)
-                )
-                menu.addAction(undo_label_action)
+            menu.addAction(undo_label_action)
 
         menu.exec(QCursor.pos())
 
