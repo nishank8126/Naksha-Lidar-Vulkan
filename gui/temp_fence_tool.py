@@ -985,6 +985,17 @@ class TempFenceTool:
                 return
 
             self._inject_fence(dlg, fence)
+            # ✅ Reset _conversion_completed so the Keep/Delete popup only
+            # fires after a NEW conversion, not from a stale flag left over
+            # from a previous run of the same (reused) dialog.
+            try:
+                if hasattr(dlg, "_conversion_completed"):
+                    dlg._conversion_completed = False
+                fs = getattr(dlg, "_fence_sel", None)
+                if fs is not None and hasattr(fs, "_conversion_completed"):
+                    fs._conversion_completed = False
+            except Exception:
+                pass
             self._watch_completion(dlg)
 
             self._close_popup()
