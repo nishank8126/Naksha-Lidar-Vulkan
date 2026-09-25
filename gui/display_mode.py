@@ -2822,12 +2822,24 @@ class DisplayModeDialog(QDialog):
                     from gui.unified_actor_manager import build_section_unified_actor
                     view_idx = slot - 1
                     if view_idx in (getattr(app, "section_vtks", {}) or {}):
+                        mode_idx = int(
+                            (getattr(self, "view_color_modes", {}) or {}).get(slot, 0)
+                            or 0
+                        )
+                        section_mode = {
+                            2: "depth",
+                            3: "intensity",
+                            4: "rgb",
+                            5: "elevation",
+                            7: "line",
+                        }.get(mode_idx, "class")
                         build_section_unified_actor(
                             app,
                             view_idx,
                             border_percent=float(
                                 getattr(app, "view_borders", {}).get(slot, 0.0)
                             ),
+                            color_mode=section_mode,
                         )
             except Exception as exc:
                 print(f"⚠️ Flight-line filter refresh failed: {exc}")
