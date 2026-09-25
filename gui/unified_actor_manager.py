@@ -6610,6 +6610,7 @@ def build_section_unified_actor(
     palette: Optional[dict] = None,
     border_percent: float = 0.0,
     point_size: float = _BASE_POINT_SIZE,
+    color_mode: str = "class",
     **kwargs
 ) -> Optional[object]:
     t0 = time.perf_counter()
@@ -6767,8 +6768,14 @@ def build_section_unified_actor(
     setattr(app, f"_section_{view_idx}_global_indices", all_global_indices)
     palette = palette or _get_slot_palette(app, slot_idx)
 
+    color_mode = str(color_mode or "class").lower()
+    non_class_mode = color_mode in ("rgb", "intensity", "elevation", "depth", "line")
+
     if hasattr(app, 'view_borders') and slot_idx in app.view_borders:
         border_percent = float(app.view_borders[slot_idx])
+    if non_class_mode:
+        # Classification borders do not apply to non-class presentations.
+        border_percent = 0.0
 
     actor_name = f"_section_{view_idx}_unified"
     interaction_actor_name = f"_section_{view_idx}_interaction_lod"
@@ -6805,15 +6812,15 @@ def build_section_unified_actor(
             return None
         _wire_actor_metadata(actor, mesh, vtk_ca, _vtk_rgb, _vtk_cls, class_vtk, bf_vtk, combined_global_mask, actual_pt_size)
 
-        # A freshly built section unified actor is CLASS-colored by definition.
-        # Stamp the live mode immediately so classification refresh does not
-        # inherit a stale Depth/RGB/Intensity/Elevation/Line mode from the
-        # previous actor/widget state.  _slot_uses_class_rgb() intentionally
-        # trusts this live metadata before dialog state.
-        actor._naksha_color_mode = "class"
-        vtk_widget._naksha_color_mode = "class"
+        # Stamp the presentation mode represented by this rebuilt actor.
+        actor._naksha_color_mode = color_mode
+        vtk_widget._naksha_color_mode = color_mode
 
         actor._naksha_global_indices = all_global_indices
+        if non_class_mode:
+            _rewrite_section_rgb_for_mode(
+                app, actor, color_mode, vtk_widget
+            )
         vtk_widget._naksha_full_detail_actor = actor
         try:
             from PySide6.QtCore import QTimer
@@ -6844,12 +6851,15 @@ def build_section_unified_actor(
         return None
     _wire_actor_metadata(lod_actor, lod_mesh, lod_vtk_ca, lod_vtk_rgb, lod_vtk_cls, lod_class_vtk, lod_bf_vtk, combined_global_mask, actual_pt_size)
 
-    # The first-frame LOD actor also starts as CLASS-colored.  Do not let the
-    # section widget keep the mode of the actor that this rebuild replaced.
-    lod_actor._naksha_color_mode = "class"
-    vtk_widget._naksha_color_mode = "class"
+    # Keep the first-frame LOD actor in the requested presentation mode.
+    lod_actor._naksha_color_mode = color_mode
+    vtk_widget._naksha_color_mode = color_mode
 
     lod_actor._naksha_global_indices = all_global_indices[lod_sel]
+    if non_class_mode:
+        _rewrite_section_rgb_for_mode(
+            app, lod_actor, color_mode, vtk_widget
+        )
     lod_actor._naksha_lod_source_indices = lod_sel
     vtk_widget._naksha_section_render_mode = "unified_lod"
     vtk_widget.camera_position = cam_pos
@@ -6903,12 +6913,20 @@ def build_section_unified_actor(
                         return
                     _wire_actor_metadata(full_actor, full_mesh, full_vtk_ca, full_vtk_rgb, full_vtk_cls, full_class_vtk, full_bf_vtk, combined_global_mask, actual_pt_size)
 
-                    # Preserve the same CLASS live-mode invariant when the
-                    # background full-resolution actor replaces the LOD actor.
-                    full_actor._naksha_color_mode = "class"
-                    vtk_widget._naksha_color_mode = "class"
-
+                    # Preserve the latest live mode in the full-resolution swap.
+                    swap_color_mode = str(
+                        getattr(vtk_widget, "_naksha_color_mode", color_mode)
+                        or color_mode
+                    ).lower()
                     full_actor._naksha_global_indices = all_global_indices
+                    if swap_color_mode in (
+                        "rgb", "intensity", "elevation", "depth", "line"
+                    ):
+                        _rewrite_section_rgb_for_mode(
+                            app, full_actor, swap_color_mode, vtk_widget
+                        )
+                    full_actor._naksha_color_mode = swap_color_mode
+                    vtk_widget._naksha_color_mode = swap_color_mode
                     if interaction_actor_name in vtk_widget.actors:
                         vtk_widget._naksha_full_detail_actor = full_actor
                         vtk_widget._naksha_interaction_actor = lod_actor
