@@ -210,6 +210,12 @@ class GlobalShortcutFilter(QObject):
         """Publish the latched left-pan tool state used by every viewport."""
         active = bool(active)
         self.app_window._left_pan_shortcut_active = active
+        if active:
+            # Arming the Pan tool also re-arms a Left / Tap-Tap pan that a
+            # previous Escape suspended (tool-like off/on behaviour).
+            restore = getattr(self.app_window, "_restore_pan_nav", None)
+            if callable(restore):
+                restore()
         if not active:
             release = getattr(self.app_window, "_handle_fast_main_pan_release", None)
             if callable(release) and getattr(self.app_window, "_qt_main_pan_active", False):
@@ -598,6 +604,14 @@ class GlobalShortcutFilter(QObject):
                 self.app_window, "_left_pan_shortcut_active", False
             ):
                 self._set_pan_shortcut_active(False)
+
+            # Escape also deactivates a configured Left / Tap-Tap pan like a
+            # tool (scroll/middle pan is unaffected). Idempotent; the main-
+            # view Qt filter may already have done it for the same key press.
+            if event.key() == Qt.Key_Escape and event.modifiers() == Qt.NoModifier:
+                susp = getattr(self.app_window, "_suspend_pan_nav_for_escape", None)
+                if callable(susp):
+                    susp()
 
             # Build a readable label for the pressed key (e.g. "Ctrl+Shift+F1") so
             # status-bar feedback can show the exact key the user pressed.

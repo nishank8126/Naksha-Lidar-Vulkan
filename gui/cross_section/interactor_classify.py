@@ -14401,6 +14401,40 @@ class ClassificationInteractor:
                                 self._brush_last_render_time = now
                                 self._brush_needs_render = False
 
+                        # Sparse/reduced-density areas can legitimately produce
+                        # no new points for several consecutive mouse moves. The
+                        # cursor actor was updated above, but the main-view brush
+                        # deliberately skips its normal preview render and relied
+                        # on the paint flush to render it. With no fresh hits that
+                        # flush never runs, which made the cursor appear to stick.
+                        # Keep the existing paint/render path unchanged and issue
+                        # only a throttled cursor-only render while there is no
+                        # classification work to display.
+                        if frame_fresh is None or len(frame_fresh) == 0:
+                            cursor_now = time.time()
+                            if (cursor_now - getattr(
+                                    self, '_brush_last_render_time', 0.0
+                            )) > 0.033:
+                                # Match the point-hit path above: bypass the
+                                # general render coalescer so empty-space cursor
+                                # frames cannot be dropped as redundant.
+                                _mgr = getattr(
+                                    self.app, 'gpu_render_manager', None
+                                )
+                                _orig = getattr(
+                                    _mgr, '_original_render', None
+                                ) if _mgr else None
+                                if _orig is not None:
+                                    try:
+                                        _orig()
+                                    except Exception:
+                                        pass
+                                else:
+                                    self._safe_render_pyvista(
+                                        self.app.vtk_widget
+                                    )
+                                self._brush_last_render_time = cursor_now
+
                         self._last_brush_center = center
                         self._brush_stroke_positions.append(center)
 

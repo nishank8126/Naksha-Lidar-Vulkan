@@ -269,6 +269,64 @@ if __name__ == "__main__":
         win = NakshaApp()
         win.show()
 
+        # Start the device-targeted updater after the heavy GUI startup has
+        # settled. Checks repeat every six hours and never block the UI.
+        def _start_automatic_update_check():
+            from datetime import datetime
+            from PySide6.QtCore import QSettings
+            from gui.update_manager import UpdateManager, UpdateWorker
+
+            settings = QSettings("NakshaAI", "LidarApp")
+            if not settings.value("updates/auto_check", True, type=bool):
+                return
+            manager = getattr(win, "_automatic_update_manager", None)
+            if manager is None:
+                manager = UpdateManager(settings)
+                win._automatic_update_manager = manager
+            if not manager.configured:
+                return
+            running = getattr(win, "_automatic_update_worker", None)
+            if running is not None and running.isRunning():
+                return
+
+            worker = UpdateWorker(manager, "check", parent=win)
+            win._automatic_update_worker = worker
+
+            def _check_finished(info):
+                settings.setValue(
+                    "updates/last_checked", datetime.now().strftime("%Y-%m-%d %H:%M")
+                )
+                settings.sync()
+                if info is None or getattr(win, "_shutdown_in_progress", False):
+                    return
+                win.open_global_settings()
+                dialog = getattr(win, "_global_settings_dialog", None)
+                if dialog is None:
+                    return
+                dialog.category_list.setCurrentRow(5)
+                dialog._update_check_finished(info)
+                if dialog.auto_download_updates_cb.isChecked():
+                    dialog._pending_auto_download = False
+                    dialog._download_update()
+
+            def _check_failed(message):
+                write_startup_log(f"Automatic update check skipped: {message}")
+
+            def _check_cleanup():
+                win._automatic_update_worker = None
+                worker.deleteLater()
+
+            worker.succeeded.connect(_check_finished)
+            worker.failed.connect(_check_failed)
+            worker.finished.connect(_check_cleanup)
+            worker.start()
+
+        win._automatic_update_timer = QTimer(win)
+        win._automatic_update_timer.setInterval(6 * 60 * 60 * 1000)
+        win._automatic_update_timer.timeout.connect(_start_automatic_update_check)
+        win._automatic_update_timer.start()
+        QTimer.singleShot(15_000, _start_automatic_update_check)
+
         # Handle .snt file passed via Windows double-click / shell open
         # Use app.arguments() as backup — Qt may strip sys.argv entries
         _argv = sys.argv[1:]

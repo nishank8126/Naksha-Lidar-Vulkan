@@ -1707,9 +1707,13 @@ class ClassifyRibbon(QWidget):
     # ------------------------------------------------------------------
     def _try_activate_tool(self, tool_name: str):
         """
-        Emit classify_tool_selected only when the active display mode is
-        'class' or 'shaded_class'.  For Depth / RGB / Intensity / Elevation
-        views show a friendly info popup instead.
+        Emit classify_tool_selected for the requested tool.
+
+        Classification edits are valid in every display mode (Class,
+        Shaded, Depth, RGB, Intensity, Elevation) -- only the on-screen
+        class-color feedback differs by mode. Main View's display mode is
+        therefore left exactly as the user set it; no auto-switch to Class
+        mode happens here.
         """
         # Walk up the widget tree to find the main app that owns display_mode
         app = None
@@ -1719,49 +1723,6 @@ class ClassifyRibbon(QWidget):
                 app = widget
                 break
             widget = widget.parent()
-
-        current_mode = getattr(app, "display_mode", "class") if app else "class"
-
-        if current_mode in self._RESTRICTED_MODES:
-            mode_label = {
-                "depth": "Depth",
-                "rgb": "RGB",
-                "intensity": "Intensity",
-                "elevation": "Elevation",
-            }.get(current_mode, current_mode.capitalize())
-            print(
-                f"🔁 Classification tool '{tool_name}' requested in {mode_label} mode "
-                f"— switching Main View to Class mode first"
-            )
-            try:
-                if app is not None:
-                    # Classification edits are valid in all modes, but class-color
-                    # feedback is only visible in Class/Shading. Force Class mode
-                    # so user immediately sees updated classification in Main View.
-                    if hasattr(app, "_shading_visibility_override"):
-                        del app._shading_visibility_override
-                    if hasattr(app, "set_display_mode"):
-                        app.set_display_mode("class")
-                    else:
-                        app.display_mode = "class"
-                        from gui.pointcloud_display import update_pointcloud
-                        update_pointcloud(app, "class")
-                    QApplication.processEvents()
-                    try:
-                        if hasattr(app, "vtk_widget") and hasattr(app.vtk_widget, "render"):
-                            app.vtk_widget.render()
-                        elif hasattr(app, "vtk_widget") and hasattr(app.vtk_widget, "GetRenderWindow"):
-                            app.vtk_widget.GetRenderWindow().Render()
-                    except Exception as _render_err:
-                        print(f"⚠️ Explicit render after class-mode switch failed: {_render_err}")
-                    if hasattr(app, "statusBar"):
-                        app.statusBar().showMessage(
-                            f"Switched Main View from {mode_label} to Class mode for classification",
-                            3000
-                        )
-            except Exception as _mode_switch_err:
-                print(f"⚠️ Auto-switch to Class mode failed: {_mode_switch_err}")
-
 
         if tool_name == "brush" and app is not None:
             modifiers = QApplication.keyboardModifiers()
