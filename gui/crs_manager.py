@@ -615,15 +615,15 @@ def notify_plugins_crs_changed(app):
 
 
 # --------------------------------------------------------------------------
-# CRS resolution: .prj (OGC WKT or TerraScan)
+# CRS resolution: .prj (OGC WKT or Nakshatech)
 # --------------------------------------------------------------------------
 def resolve_prj_crs(prj_path):
     """Return (crs, source_label) from a .prj file, or (None, None).
 
     Handles:
       * OGC WKT (PROJCS/GEOGCS/...)            -> parsed as WKT
-      * TerraScan project ([TerraScan project] -> ProjectionSystem=<EPSG>)
-    A TerraScan *block* file (Block <name> + coords) is geometry, not CRS, and
+      * Nakshatech project ([Nakshatech project] -> ProjectionSystem=<EPSG>)
+    A Nakshatech *block* file (Block <name> + coords) is geometry, not CRS, and
     yields None.
     """
     try:
@@ -635,16 +635,16 @@ def resolve_prj_crs(prj_path):
         if not head:
             return None, None
         upper = head.upper()
-        if head[:32].lstrip().upper().startswith("[TERRASCAN"):
+        if head[:32].lstrip().upper().startswith("[NAKSHATECH"):
             with open(prj_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
             m = re.search(r"ProjectionSystem\s*=\s*(\d+)", text, re.IGNORECASE)
             if m:
                 epsg = int(m.group(1))
                 if epsg > 0:
-                    return CRS.from_epsg(epsg), f"TerraScan PRJ ProjectionSystem={epsg}"
+                    return CRS.from_epsg(epsg), f"Nakshatech PRJ ProjectionSystem={epsg}"
             return None, None
-        # Reject quickly (e.g. TerraScan block files starting with "Block ...")
+        # Reject quickly (e.g. Nakshatech block files starting with "Block ...")
         # unless the content really is a WKT1 or WKT2 CRS definition.
         if not _looks_like_wkt(upper):
             return None, None
@@ -969,8 +969,8 @@ def resolve_point_cloud_crs(path):
     return None, None
 
 
-def _terrascan_block_laz(prj_path):
-    """Return existing .laz/.las paths referenced by a TerraScan block list."""
+def _nakshatech_block_laz(prj_path):
+    """Return existing .laz/.las paths referenced by a Nakshatech block list."""
     out = []
     try:
         from pathlib import Path
@@ -1003,8 +1003,8 @@ def resolve_snt_crs(snt_path):
     Chain:
       1. companion DGNv8 embedded SpatialRef WKT
       2. adjacent OGC WKT .prj
-      3. adjacent TerraScan .prj -> ProjectionSystem=<EPSG>
-      4. LAZ/LAS listed in the SNT's TerraScan block list -> their VLR CRS
+      3. adjacent Nakshatech .prj -> ProjectionSystem=<EPSG>
+      4. LAZ/LAS listed in the SNT's Nakshatech block list -> their VLR CRS
       5. a single differently-named .prj in the same folder (delivery convention)
     """
     try:
@@ -1015,7 +1015,7 @@ def resolve_snt_crs(snt_path):
 
         # DGN-embedded CRS is checked first: it comes straight from the source
         # drawing's own SpatialRef, which is more authoritative than a sidecar
-        # .prj (TerraScan project files in particular are tile-index files
+        # .prj (Nakshatech project files in particular are tile-index files
         # that only sometimes carry a ProjectionSystem= code, and adjacent
         # OGC .prj files can be stale copies from an unrelated delivery step).
         crs, label = _resolve_adjacent_dgn_crs(p)
@@ -1055,12 +1055,12 @@ def resolve_snt_crs(snt_path):
             if crs is not None:
                 return crs, label
 
-        terrascans = exact + [prj for prj in matching if prj not in exact]
-        if not terrascans and len(siblings) == 1:
-            terrascans = list(siblings)
+        nakshatechs = exact + [prj for prj in matching if prj not in exact]
+        if not nakshatechs and len(siblings) == 1:
+            nakshatechs = list(siblings)
         laz_resolutions = []
-        for prj in terrascans:
-            for laz in _terrascan_block_laz(prj):
+        for prj in nakshatechs:
+            for laz in _nakshatech_block_laz(prj):
                 crs, label = resolve_laz_crs(laz)
                 if crs is not None:
                     laz_resolutions.append(

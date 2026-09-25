@@ -51,7 +51,7 @@ class MeasurementTool:
         self._line_actor_polydata = {}
         # ✅ Overlay renderer for always-on-top measurement lines
         self._overlay_renderer = getattr(digitizer, "overlay_renderer", None)
-        # ⚡ Throttle + reuse state for fast mouse-move preview (Microstation-style)
+        # ⚡ Throttle + reuse state for fast mouse-move preview (Nakshatech-style)
         self._render_timer = None
         self._last_z = 0.0
         self._last_preview_time = 0.0          # epoch time of last preview render
@@ -1182,8 +1182,8 @@ class MeasurementTool:
 
         return candidates
 
-    def _parse_terrascan_prj_blocks(self, prj_path):
-        """Parse TerraScan PRJ block boundaries into searchable polygons."""
+    def _parse_nakshatech_prj_blocks(self, prj_path):
+        """Parse Nakshatech PRJ block boundaries into searchable polygons."""
         blocks = []
         try:
             lines = Path(prj_path).read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1402,7 +1402,7 @@ class MeasurementTool:
         for prj_path in self._iter_block_project_files():
             cache_key = str(prj_path)
             if cache_key not in self._block_boundary_cache:
-                self._block_boundary_cache[cache_key] = self._parse_terrascan_prj_blocks(prj_path)
+                self._block_boundary_cache[cache_key] = self._parse_nakshatech_prj_blocks(prj_path)
             blocks.extend(self._block_boundary_cache.get(cache_key, []))
 
         blocks.extend(self._parse_attached_snt_blocks())

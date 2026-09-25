@@ -5,7 +5,7 @@
 # level, matching QGIS's dynamic-refresh behaviour. But without a pyramid
 # (overview levels) already baked into the file, every one of those reads -
 # at ANY zoom, including zoomed far out - has to decimate the full-resolution
-# base raster on the fly. That's the same cost MicroStation/QGIS/ArcGIS avoid
+# base raster on the fly. That's the same cost Nakshatech/QGIS/ArcGIS avoid
 # by relying on pre-built overviews: GDAL picks the closest matching pyramid
 # level transparently for a decimated read, with no code-level change needed
 # on the reading side.

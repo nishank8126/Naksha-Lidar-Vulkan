@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QSettings
 
 class DepthSettingsDialog(QDialog):
     """
-    Customize depth display settings (like MicroStation Display Depth).
+    Customize depth display settings (like Nakshatech Display Depth).
     
     Controls:
     - Depth range (near/far percentiles)
@@ -65,7 +65,7 @@ class DepthSettingsDialog(QDialog):
         
         subtitle = QLabel(
             "Customize how depth (distance from camera) is displayed.<br>"
-            "<i>Similar to MicroStation Display Depth controls</i>"
+            "<i>Similar to Nakshatech Display Depth controls</i>"
         )
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: gray; font-size: 10pt;")
@@ -280,7 +280,7 @@ class DepthSettingsDialog(QDialog):
         self.gamma_label.setText(f"{self.gamma:.2f}")
     
     def _preset_default(self):
-        """Reset to MicroStation-like defaults."""
+        """Reset to Nakshatech-like defaults."""
         self.clip_low_spin.setValue(1.0)
         self.clip_high_spin.setValue(99.0)
         self.scheme_combo.setCurrentIndex(0)  # Grayscale

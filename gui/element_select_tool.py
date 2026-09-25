@@ -1,5 +1,5 @@
 """
-ElementSelectTool — MicroStation-style element selection on top of
+ElementSelectTool — Nakshatech-style element selection on top of
 DigitizeManager + SelectionManager.
 
 Pick methods:
@@ -38,7 +38,7 @@ class PickMethod:
 class EncloseMode:
     """How Block/Shape decide whether a drawing is 'picked'.
 
-    OVERLAP — any vertex inside the fence picks the element (MicroStation default,
+    OVERLAP — any vertex inside the fence picks the element (Nakshatech default,
               most forgiving — what users intuitively expect).
     INSIDE  — every vertex must be inside the fence (strict containment).
     """
@@ -47,7 +47,7 @@ class EncloseMode:
 
 
 class ElementSelectTool(QObject):
-    """MicroStation-style element selection layer."""
+    """Nakshatech-style element selection layer."""
 
     HOVER_COLOR = (1.0, 0.85, 0.2)   # warm yellow preview
     HOVER_WIDTH_BOOST = 1.5
@@ -63,7 +63,7 @@ class ElementSelectTool(QObject):
 
         self._active = False
         self._method = PickMethod.INDIVIDUAL
-        self._enclose_mode = EncloseMode.OVERLAP  # MicroStation default
+        self._enclose_mode = EncloseMode.OVERLAP  # Nakshatech default
         self._observer_ids = []
         self._key_press_observer_id = None
         self._char_observer_id = None
@@ -1087,7 +1087,7 @@ class ElementSelectTool(QObject):
                 pass
             return True
 
-        # BLOCK — right-click finalizes the drag (MicroStation behavior).
+        # BLOCK — right-click finalizes the drag (Nakshatech behavior).
         if self._method == PickMethod.BLOCK and self._dragging_block:
             x, y = self.interactor.GetEventPosition()
             self._dragging_block = False
@@ -1182,7 +1182,7 @@ class ElementSelectTool(QObject):
             return
 
         if key in ("Delete", "delete", "BackSpace"):
-            # Refuses classified by default — matches MicroStation Delete behavior.
+            # Refuses classified by default — matches Nakshatech Delete behavior.
             try:
                 self.digitizer.delete_selection(include_classified=False)
             except Exception as e:
@@ -1239,7 +1239,7 @@ class ElementSelectTool(QObject):
             self._set_selected_measurement_refs([picked_measurement])
         if drawing is None:
             # Click on empty space:
-            # - NEW mode  -> clear selection (MicroStation behavior)
+            # - NEW mode  -> clear selection (Nakshatech behavior)
             # - other     -> no-op
             mode = self._current_mode()
             if mode == SelectionMode.NEW:

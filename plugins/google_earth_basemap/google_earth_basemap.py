@@ -1942,7 +1942,7 @@ class GoogleEarthBasemapPlugin(QObject):
 
     def _discover_crs_from_app_files(self):
         """Find a CRS by scanning the app for any loaded .snt/.dgn/.laz/.las/.ply
-        file path and reading the adjacent OGC WKT .prj (NOT TerraScan block .prj).
+        file path and reading the adjacent OGC WKT .prj (NOT Nakshatech block .prj).
 
         Sources, in priority order:
           1. app.loaded_file / last_save_path / current_file / project_file
@@ -2058,11 +2058,11 @@ class GoogleEarthBasemapPlugin(QObject):
     def _read_adjacent_wkt_prj(self, file_path):
         """Read the .prj next to file_path. Supports:
           - OGC WKT (starts with PROJCS/GEOGCS/GEOCCS/...).
-          - TerraScan project file (starts with ``[TerraScan project]``)
-            with a ``ProjectionSystem=<EPSG>`` line — the TerraScan EPSG code
+          - Nakshatech project file (starts with ``[Nakshatech project]``)
+            with a ``ProjectionSystem=<EPSG>`` line — the Nakshatech EPSG code
             for the LiDAR project / SNT blocks.
         Falls back to scanning the same folder for a uniquely-named
-        differently-stemmed ``.prj`` (TerraScan delivery convention).
+        differently-stemmed ``.prj`` (Nakshatech delivery convention).
         Returns CRS or None.
         """
         try:
@@ -2088,7 +2088,7 @@ class GoogleEarthBasemapPlugin(QObject):
             return None
 
     def _try_read_prj(self, prj):
-        """Parse a single .prj file: WKT or TerraScan ProjectionSystem."""
+        """Parse a single .prj file: WKT or Nakshatech ProjectionSystem."""
         try:
             from pathlib import Path
             prj = Path(str(prj))
@@ -2097,7 +2097,7 @@ class GoogleEarthBasemapPlugin(QObject):
             if not head:
                 return None
             upper = head.upper()
-            if head[:32].lstrip().upper().startswith("[TERRASCAN"):
+            if head[:32].lstrip().upper().startswith("[NAKSHATECH"):
                 import re as _re
                 with open(prj, "r", encoding="utf-8", errors="ignore") as f:
                     text = f.read()
@@ -2190,7 +2190,7 @@ class GoogleEarthBasemapPlugin(QObject):
         return None
 
     def _snt_referenced_laz_paths(self, snt_path):
-        """If a TerraScan ``.prj`` exists for snt_path (same-stem or a unique
+        """If a Nakshatech ``.prj`` exists for snt_path (same-stem or a unique
         differently-named one in the folder), return the ``.laz`` / ``.las``
         file paths referenced by its ``Block <name>`` lines (only those that
         actually exist on disk). Used to recover the CRS when the SNT itself
@@ -2217,7 +2217,7 @@ class GoogleEarthBasemapPlugin(QObject):
                         head = f.read(2048).lstrip()
                 except Exception:
                     continue
-                if not head[:32].lstrip().upper().startswith("[TERRASCAN"):
+                if not head[:32].lstrip().upper().startswith("[NAKSHATECH"):
                     continue
                 try:
                     with open(prj, "r", encoding="utf-8", errors="ignore") as f:
@@ -2248,7 +2248,7 @@ class GoogleEarthBasemapPlugin(QObject):
             return []
 
     def _resolve_crs_for_path(self, path):
-        """Return CRS for *path* or None. Tries WKT/TerraScan .prj, then
+        """Return CRS for *path* or None. Tries WKT/Nakshatech .prj, then
         direct LAZ VLRs, then SNT -> referenced-LAZ chain."""
         try:
             from pathlib import Path

@@ -597,7 +597,7 @@ class BlockSplitSaveDialog(QDialog):
 
         block_size = int(round(distance)) if distance > 0 else 0
         lines = [
-            "[TerraScan project]",
+            "[Nakshatech project]",
             "Scanner=AirborneLidar",
             f"Storage={self.output_ext.lstrip('.').upper()}1.2",
             "StoreTime=1",

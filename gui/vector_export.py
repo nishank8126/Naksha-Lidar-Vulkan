@@ -894,7 +894,7 @@ def _drawing_to_shapefile_feature(drawing: dict):
 def _geometry_to_linestring(geom, shape_type: str):
     """
     Convert ANY Shapely geometry to a LineString for single-file SHP export.
-    This is the MicroStation "linework" approach — everything is represented as
+    This is the Nakshatech "linework" approach — everything is represented as
     line work in the output Shapefile so all shapes go into one file.
 
     Conversion rules:
@@ -945,7 +945,7 @@ def export_drawings_to_shapefile(app, output_path: str) -> bool:
     """
     Export ALL drawings to a SINGLE Shapefile (.shp).
 
-    Uses the MicroStation "linework" approach: every geometry type
+    Uses the Nakshatech "linework" approach: every geometry type
     (point, line, polyline, polygon, rectangle, circle, text) is converted
     to a LineString so that all features share one common geometry type and
     can be stored in a single .shp file without any splitting.

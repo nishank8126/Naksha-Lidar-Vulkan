@@ -17,7 +17,7 @@ class CrossSectionInteractor(vtk.vtkInteractorStyleTrackballCamera):
         self._observer_ids = []
         self._cleaned_up = False
 
-        # state machine — pure 3-click "data point" placement (MicroStation-
+        # state machine — pure 3-click "data point" placement (Nakshatech-
         # style: click 1 = P1, click 2 = P2, click 3 = width + finalize).
         # No drag gesture: distinguishing a deliberate tap from a drag by
         # release timing/pixel-distance proved unreliable (a slightly slower

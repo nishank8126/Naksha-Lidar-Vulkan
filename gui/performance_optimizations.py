@@ -112,7 +112,7 @@ class SpatialIndex:
 def fast_update_colors_optimized(app, changed_mask=None):
     """
     Ultra-fast color update without rebuilding geometry.
-    Only updates the color array in VTK (MicroStation-style).
+    Only updates the color array in VTK (Nakshatech-style).
     """
     import numpy as np
     import pyvista as pv

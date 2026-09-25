@@ -1,5 +1,5 @@
 """
-SelectionModeDialog — MicroStation-style PowerSelector panel.
+SelectionModeDialog — Nakshatech-style PowerSelector panel.
 
 UI rewrite: no fixed size, full-text buttons, and auto-positioned to
 the top-right of the parent window so it doesn't block the canvas.

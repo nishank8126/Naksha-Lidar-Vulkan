@@ -138,7 +138,7 @@ def _alias_score(field_text: str, alias: str) -> int:
 def _entry_score(info: Mapping[str, Any], semantic: str) -> int:
     aliases = _ALIASES.get(semantic, ())
     best = 0
-    # lvl is frequently the real semantic label in TerraScan PTC files, while
+    # lvl is frequently the real semantic label in Nakshatech PTC files, while
     # description can be blank or project-specific.  Score both independently.
     for field_name in ("lvl", "description", "name", "label"):
         field = info.get(field_name, "")
@@ -249,7 +249,7 @@ def resolve_semantic_mapping(
                 mapping[semantic] = value
                 matched[semantic] = f"fallback: power_mapping[{internal}]={value}"
 
-    # A large number of TerraScan PTCs use class 0 as Unclassified but leave
+    # A large number of Nakshatech PTCs use class 0 as Unclassified but leave
     # the text field blank.  Falling back to 0 is safe only when code 0 is
     # actually present in the active PTC and is not already assigned to another
     # known semantic.
@@ -267,7 +267,7 @@ def resolve_semantic_mapping(
 
 
 def _parse_ptc_palette(path_value: Any) -> Dict[int, Dict[str, Any]]:
-    """Read the active TerraScan-style PTC without depending on GUI state.
+    """Read the active Nakshatech-style PTC without depending on GUI state.
 
     Display/session restores can preserve color/show/weight while accidentally
     dropping ``description``/``lvl``.  The .ptc file is the authoritative

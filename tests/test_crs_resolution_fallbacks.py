@@ -87,7 +87,7 @@ def test_snt_uses_companion_dgn_embedded_spatial_ref(monkeypatch, tmp_path):
     snt.write_bytes(b"")
     (tmp_path / "survey.dgn").write_bytes(b"placeholder")
     (tmp_path / "survey.prj").write_text(
-        "[TerraScan project]\nBlock tile.laz\n0 0\n1 0\n1 1\n0 0\n",
+        "[Nakshatech project]\nBlock tile.laz\n0 0\n1 0\n1 1\n0 0\n",
         encoding="utf-8",
     )
     _mock_dgn_spatial_refs(monkeypatch, CRS.from_epsg(2957))

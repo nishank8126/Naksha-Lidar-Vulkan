@@ -195,7 +195,7 @@ class SectionWheelZoomEventFilter(QObject):
         self._settle_timer.setSingleShot(True)
         self._settle_timer.setInterval(150)
         self._settle_timer.timeout.connect(self._settle_full_detail)
-        # MicroStation-style dynamic pan for every cross/cut viewport. The
+        # Nakshatech-style dynamic pan for every cross/cut viewport. The
         # first left tap starts a button-free pan and the second tap stops it.
         self._tap_pan_active = False
         self._tap_last_position = None

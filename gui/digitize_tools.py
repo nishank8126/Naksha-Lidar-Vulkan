@@ -823,7 +823,7 @@ class DigitizeManager:
         self._temp_vertex_stack = []
         self._temp_redo_stack = []
 
-        # MicroStation-style selection set (Phase 1 — beside legacy selected_drawing)
+        # Nakshatech-style selection set (Phase 1 — beside legacy selected_drawing)
         self._selection_manager = None
         self._element_select_tool = None
         self._corner_rotate_selection_restore = None
@@ -2572,7 +2572,7 @@ class DigitizeManager:
 
 
     # ------------------------------------------------------------------
-    # MicroStation-style selection set (lazy — created on first access)
+    # Nakshatech-style selection set (lazy — created on first access)
     # ------------------------------------------------------------------
     @property
     def selection_manager(self):
@@ -4430,7 +4430,7 @@ class DigitizeManager:
         elif self.active_tool and self.snap_enabled:
             pos = self._snap_point(pos)
 
-        # ✅ FIX: Plan View Z-Consistency (MicroStation style)
+        # ✅ FIX: Plan View Z-Consistency (Nakshatech style)
         # If we are in 2D Plan View and already have a starting point or are dragging a vertex,
         # force the Z-coordinate to be consistent. This prevents "jagged" figures in 3D.
         if not getattr(self.app, 'is_3d_mode', False):
@@ -4476,7 +4476,7 @@ class DigitizeManager:
         Convert a fixed screen-pixel snap radius into world-space units
         at the current camera zoom level.  This makes snap feel identical
         regardless of how far in or out the user is zoomed — exactly like
-        MicroStation's AccuSnap.
+        Nakshatech's AccuSnap.
         """
         try:
             camera = self.renderer.GetActiveCamera()
@@ -4504,7 +4504,7 @@ class DigitizeManager:
         Nearby Snap mode also snaps to the nearest point on completed drawing
         segments, so a new vertex can land directly on an existing figure edge.
         The tolerance is converted to world units per frame so it stays constant
-        at every zoom level — identical to MicroStation AccuSnap behaviour.
+        at every zoom level — identical to Nakshatech AccuSnap behaviour.
         """
         world_tol = self._screen_to_world_tolerance(screen_tol_px)
 
@@ -7540,7 +7540,7 @@ class DigitizeManager:
             if hasattr(self, '_refresh_segment_markers'):
                 self._refresh_segment_markers()
 
-            # Keep MicroStation-style selection set in sync (Phase 1)
+            # Keep Nakshatech-style selection set in sync (Phase 1)
             if self._selection_manager is not None:
                 try:
                     self._selection_manager.notify_drawing_removed(drawing)
@@ -8504,7 +8504,7 @@ class DigitizeManager:
         self.app.vtk_widget.render()
         # Undo/redo may have replaced some drawing dicts with fresh objects
         # (added/changed) and dropped others (removed) — refresh the
-        # MicroStation-style selection set so it only tracks ids still live.
+        # Nakshatech-style selection set so it only tracks ids still live.
         self._notify_selection_drawings_changed()
         
         # ✅ Sync and clear By Class fence dialogs on undo/redo to prevent stale reference leaks
@@ -11900,7 +11900,7 @@ class DigitizeManager:
 
 
     # ==================================================================
-    # MicroStation-style delete operations (Phase 3)
+    # Nakshatech-style delete operations (Phase 3)
     # ==================================================================
     def delete_selection(self, include_classified=False):
         """Delete every drawing currently in the SelectionManager.
@@ -12358,7 +12358,7 @@ class DigitizeManager:
         return len(targets)
 
     def activate_element_select_tool(self, method="individual", delete_on_click=False):
-        """Bring the MicroStation-style element selection tool online.
+        """Bring the Nakshatech-style element selection tool online.
 
         method: 'individual' | 'block' | 'shape' | 'cline'
         delete_on_click=True turns it into 'Delete Element' mode.

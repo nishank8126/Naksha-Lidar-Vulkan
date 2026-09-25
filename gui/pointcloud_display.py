@@ -235,9 +235,9 @@ class ColorUpdateWorker(QObject):
 import numpy as np
 
 
-def _microstation_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero=False, return_clip=False):
+def _nakshatech_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero=False, return_clip=False):
     """
-    Robust auto-normalization similar to MicroStation display stretching.
+    Robust auto-normalization similar to Nakshatech display stretching.
     """
     arr = np.asarray(values, dtype=np.float64)
 
@@ -284,7 +284,7 @@ def _microstation_auto_normalize(values, low_pct=1.0, high_pct=99.0, ignore_zero
     return norm
 
 
-def _microstation_rainbow_5color(norm):
+def _nakshatech_rainbow_5color(norm):
     """
     Blue -> Cyan -> Green -> Yellow -> Red
     """
@@ -326,7 +326,7 @@ def _camera_forward_vector(cam):
         return np.array([0.0, 0.0, -1.0], dtype=np.float64)
     return v / n
 
-def _microstation_view_depth_values(points, cam):
+def _nakshatech_view_depth_values(points, cam):
     """
     Depth along the camera viewing direction.
     This matches display/eye-space depth much better than Euclidean distance.
@@ -336,7 +336,7 @@ def _microstation_view_depth_values(points, cam):
     fwd = _camera_forward_vector(cam)
     return np.dot(pts - pos, fwd)
 
-def _microstation_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0, 
+def _nakshatech_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0, 
                                         color_scheme="grayscale", gamma=1.0, 
                                         return_debug=False):
     """
@@ -351,8 +351,8 @@ def _microstation_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0,
         gamma: Contrast adjustment (0.5=dark, 1.0=normal, 2.0=bright)
         return_debug: Return debug info
     """
-    depth_vals = _microstation_view_depth_values(points, cam)
-    norm, lo, hi = _microstation_auto_normalize(
+    depth_vals = _nakshatech_view_depth_values(points, cam)
+    norm, lo, hi = _nakshatech_auto_normalize(
         depth_vals,
         low_pct=low_pct,
         high_pct=high_pct,
@@ -370,7 +370,7 @@ def _microstation_depth_rgb_from_camera(points, cam, low_pct=1.0, high_pct=99.0,
         rgb = np.stack([gray, gray, gray], axis=1)
     
     elif color_scheme == "rainbow":
-        rgb = _microstation_rainbow_5color(norm)
+        rgb = _nakshatech_rainbow_5color(norm)
     
     elif color_scheme == "heatmap":
         # Dark blue → Purple → Red → Yellow
@@ -408,7 +408,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
 
     ramp = sorted(color_ramp, key=lambda x: x[0])
     if len(ramp) < 2:
-        return _microstation_rainbow_5color(norm)
+        return _nakshatech_rainbow_5color(norm)
 
     for i, val in enumerate(norm):
         if val <= ramp[0][0]:
@@ -435,7 +435,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
     return colors
 
 
-def _microstation_intensity_rgb(
+def _nakshatech_intensity_rgb(
     intensity,
     low_pct=0.5,
     high_pct=99.8,
@@ -443,7 +443,7 @@ def _microstation_intensity_rgb(
     return_debug=False,
 ):
     """
-    MicroStation-like intensity display:
+    Nakshatech-like intensity display:
     - ignore zero / invalid intensity
     - robust histogram stretch
     - perceptual darkening of mid-tones
@@ -488,7 +488,7 @@ def _microstation_intensity_rgb(
     norm = (arr - lo) / (hi - lo)
     norm = np.clip(norm, 0.0, 1.0)
 
-    # Darken the mid-tones to match MicroStation look
+    # Darken the mid-tones to match Nakshatech look
     norm = np.power(norm, gamma)
 
     gray = (norm * 255.0).astype(np.uint8)
@@ -499,7 +499,7 @@ def _microstation_intensity_rgb(
     return rgb
 
 
-def _microstation_rgb_enhancement(
+def _nakshatech_rgb_enhancement(
     rgb_norm,
     auto_stretch=True,
     gamma=1.1,
@@ -508,7 +508,7 @@ def _microstation_rgb_enhancement(
     return_debug=False
 ):
     """
-    MicroStation-style RGB enhancement for natural photo-realistic display.
+    Nakshatech-style RGB enhancement for natural photo-realistic display.
     
     Args:
         rgb_norm: RGB values in 0.0-1.0 range (N x 3 array)
@@ -532,7 +532,7 @@ def _microstation_rgb_enhancement(
         return result
     
     # ══════════════════════════════════════════════════════════════
-    # STEP 1: Per-Channel Histogram Stretching (like MicroStation)
+    # STEP 1: Per-Channel Histogram Stretching (like Nakshatech)
     # ══════════════════════════════════════════════════════════════
     if auto_stretch:
         stretched = np.zeros_like(rgb)
@@ -575,7 +575,7 @@ def _microstation_rgb_enhancement(
     # ══════════════════════════════════════════════════════════════
     # STEP 2: Gamma Correction (Perceptual Brightness)
     # ══════════════════════════════════════════════════════════════
-    # MicroStation typically uses gamma 1.0-1.2 for natural look
+    # Nakshatech typically uses gamma 1.0-1.2 for natural look
     # Lower gamma = brighter midtones (good for dark LiDAR scans)
     if gamma != 1.0:
         rgb = np.power(rgb, 1.0 / gamma)
@@ -583,7 +583,7 @@ def _microstation_rgb_enhancement(
     # ══════════════════════════════════════════════════════════════
     # STEP 3: Black Point Lift (Prevent Muddy Shadows)
     # ══════════════════════════════════════════════════════════════
-    # Add slight lift to very dark values (like MicroStation's "shadow detail")
+    # Add slight lift to very dark values (like Nakshatech's "shadow detail")
     black_lift = 0.02  # 2% lift for darkest values
     rgb = rgb * (1.0 - black_lift) + black_lift
     rgb = np.clip(rgb, 0.0, 1.0)
@@ -605,21 +605,21 @@ def _microstation_rgb_enhancement(
     return rgb_u8
 
 
-def _microstation_elevation_rgb(z_values, color_ramp=None, low_pct=1.0, high_pct=99.0, return_debug=False):
-    norm, lo, hi = _microstation_auto_normalize(z_values, low_pct, high_pct, return_clip=True)
+def _nakshatech_elevation_rgb(z_values, color_ramp=None, low_pct=1.0, high_pct=99.0, return_debug=False):
+    norm, lo, hi = _nakshatech_auto_normalize(z_values, low_pct, high_pct, return_clip=True)
 
     if color_ramp and len(color_ramp) >= 2:
         rgb = _apply_custom_color_ramp(norm, color_ramp)
     else:
-        rgb = _microstation_rainbow_5color(norm)
+        rgb = _nakshatech_rainbow_5color(norm)
 
     if return_debug:
         return rgb, lo, hi
     return rgb
 
 
-def _microstation_depth_rgb_from_distance(distances, low_pct=1.0, high_pct=99.0, return_debug=False):
-    norm, lo, hi = _microstation_auto_normalize(distances, low_pct, high_pct, return_clip=True)
+def _nakshatech_depth_rgb_from_distance(distances, low_pct=1.0, high_pct=99.0, return_debug=False):
+    norm, lo, hi = _nakshatech_auto_normalize(distances, low_pct, high_pct, return_clip=True)
     gray = ((1.0 - norm) * 255.0).astype(np.uint8)
     rgb = np.stack([gray, gray, gray], axis=1)
     if return_debug:
@@ -664,7 +664,7 @@ def _normalize_rgb_to_uint8(rgb):
 def compute_colors(app, mask=None, section_points=None):
     """
     Compute per-point colors for non-shaded modes.
-    Main logic aligned with MicroStation-like display stretch.
+    Main logic aligned with Nakshatech-like display stretch.
     """
     mode = app.display_mode
     xyz = app.data["xyz"]
@@ -683,7 +683,7 @@ def compute_colors(app, mask=None, section_points=None):
     # INTENSITY
     elif mode == "intensity" and app.data.get("intensity") is not None:
         intens = app.data["intensity"][mask].astype(np.float64)
-        colors = _microstation_intensity_rgb(
+        colors = _nakshatech_intensity_rgb(
             intens,
             low_pct=getattr(app, "intensity_clip_low", 0.5),
             high_pct=getattr(app, "intensity_clip_high", 99.8),
@@ -700,7 +700,7 @@ def compute_colors(app, mask=None, section_points=None):
         else:
             z = pts[:, 2]
 
-        colors = _microstation_elevation_rgb(
+        colors = _nakshatech_elevation_rgb(
             z,
             color_ramp=getattr(app, "elevation_color_ramp", None),
             low_pct=getattr(app, "elevation_clip_low", 1.0),
@@ -712,7 +712,7 @@ def compute_colors(app, mask=None, section_points=None):
         try:
             if section_points is not None and hasattr(app, "sec_vtk") and app.sec_vtk is not None:
                 cam = app.sec_vtk.renderer.GetActiveCamera()
-                colors = _microstation_depth_rgb_from_camera(
+                colors = _nakshatech_depth_rgb_from_camera(
                     section_points,
                     cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
@@ -722,7 +722,7 @@ def compute_colors(app, mask=None, section_points=None):
                 )
             else:
                 cam = app.vtk_widget.renderer.GetActiveCamera()
-                colors = _microstation_depth_rgb_from_camera(
+                colors = _nakshatech_depth_rgb_from_camera(
                     pts,
                     cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
@@ -760,9 +760,9 @@ def compute_colors(app, mask=None, section_points=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# HELPER: MicroStation 5-Color Rainbow (EXACT)
+# HELPER: Nakshatech 5-Color Rainbow (EXACT)
 # ═══════════════════════════════════════════════════════════════════════════
-def _microstation_rainbow_5color(norm):
+def _nakshatech_rainbow_5color(norm):
     """
     Fast vectorized Blue -> Cyan -> Green -> Yellow -> Red
     """
@@ -827,7 +827,7 @@ def _apply_custom_color_ramp(norm, color_ramp):
 
     ramp = sorted(color_ramp, key=lambda x: x[0])
     if len(ramp) < 2:
-        return _microstation_rainbow_5color(norm)
+        return _nakshatech_rainbow_5color(norm)
 
     pos = np.array([float(p) for p, _ in ramp], dtype=np.float32)
     cols = np.array([c for _, c in ramp], dtype=np.float32)

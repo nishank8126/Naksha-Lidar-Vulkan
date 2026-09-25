@@ -604,7 +604,7 @@ def _compute_shading_geometry_backend(
         lod_factor = 1.0
 
         if quality_mode == "slow":
-            # MicroStation-style Slow: retain every eligible finite point.
+            # Nakshatech-style Slow: retain every eligible finite point.
             # The confirmation and memory warning live in Display Mode before
             # this deliberately expensive background operation starts.
             unique_local = np.arange(n_pts, dtype=np.int64)
@@ -1067,7 +1067,7 @@ if HAS_NUMBA:
 
     @njit(parallel=True, fastmath=True)
     def _compute_shading_fast(normals, z_values, lx, ly, lz, ambient, z_lo, z_range):
-        """Standard MicroStation/ArcGIS hillshade: N.L dot product only."""
+        """Standard Nakshatech/ArcGIS hillshade: N.L dot product only."""
         n = normals.shape[0]
         shade = np.empty(n, dtype=np.float32)
         for i in prange(n):
@@ -1389,7 +1389,7 @@ def _recompute_vertex_normals_partial(cache, patch_face_start_idx):
 
 
 def _compute_shading(normals, azimuth, angle, ambient, z_values=None):
-    """Standard MicroStation/ArcGIS hillshade algorithm.
+    """Standard Nakshatech/ArcGIS hillshade algorithm.
     
     Uses the standard formula:
       Hillshade = cos(zenith)*cos(slope) + sin(zenith)*sin(slope)*cos(azimuth_math - aspect)
@@ -1426,7 +1426,7 @@ def _remove_shaded_edge_overlay(app):
 
 
 def _remove_shading_class_detail_overlays(app, remove_static=True, remove_live=True):
-    """Remove only the MicroStation-fidelity class-detail point layers."""
+    """Remove only the Nakshatech-fidelity class-detail point layers."""
     plotter = getattr(app, 'vtk_widget', None)
     if plotter is not None:
         if remove_static:
@@ -1452,8 +1452,8 @@ def _shading_class_detail_enabled(app, cache) -> bool:
     return False
 
 
-def _microstation_color_blend_enabled(app, cache) -> bool:
-    """Enable TerraScan/MicroStation-style class-color interpolation safely.
+def _nakshatech_color_blend_enabled(app, cache) -> bool:
+    """Enable Nakshatech/Nakshatech-style class-color interpolation safely.
 
     Geometry density remains controlled exclusively by the selected shading
     quality (Fast / Normal / Slow).  For every MULTI-CLASS quality, presentation
@@ -1466,7 +1466,7 @@ def _microstation_color_blend_enabled(app, cache) -> bool:
     untouched.  The environment switch is an emergency rollback without a code
     change.
     """
-    flag = os.environ.get('NAKSHA_SHADING_MICROSTATION_BLEND', '1').strip().lower()
+    flag = os.environ.get('NAKSHA_SHADING_NAKSHATECH_BLEND', '1').strip().lower()
     if flag in ('0', 'false', 'off', 'no'):
         return False
     return int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
@@ -1486,7 +1486,7 @@ def _crisp_multiclass_facets_enabled(app, cache) -> bool:
     if flag in ('0', 'false', 'off', 'no'):
         return False
     return bool(
-        _microstation_color_blend_enabled(app, cache)
+        _nakshatech_color_blend_enabled(app, cache)
         and int(getattr(cache, 'n_visible_classes', 0) or 0) > 1
     )
 
@@ -2069,7 +2069,7 @@ def _build_sharp_multiclass_tip_actor(app, cache, *, name, xyz, faces,
         setattr(actor, '_is_shading_mesh', True)
         setattr(actor, '_is_shading_sharp_tip', True)
         actor.PickableOff()
-        _configure_microstation_color_blend_lighting(app, actor)
+        _configure_nakshatech_color_blend_lighting(app, actor)
         mapper = actor.GetMapper()
         if mapper is not None:
             mapper.StaticOn()
@@ -2159,7 +2159,7 @@ def _build_static_multiclass_blend_overlays(app, cache, vertex_classes,
             setattr(actor, '_is_shading_mesh', True)
             setattr(actor, '_is_shading_static_blend', True)
             actor.PickableOff()
-            _configure_microstation_color_blend_lighting(app, actor)
+            _configure_nakshatech_color_blend_lighting(app, actor)
             mapper = actor.GetMapper()
             if mapper is not None:
                 mapper.StaticOn()
@@ -2369,7 +2369,7 @@ def _build_crisp_live_mixed_overlay(app, cache, classes_raw, visible_classes,
         setattr(actor, '_is_shading_mesh', True)
         setattr(actor, '_is_shading_color_overlay', True)
         actor.PickableOff()
-        _configure_microstation_color_blend_lighting(app, actor)
+        _configure_nakshatech_color_blend_lighting(app, actor)
         mapper = actor.GetMapper()
         if mapper is not None:
             mapper.StaticOn()
@@ -2443,7 +2443,7 @@ def _rebuild_crisp_live_edit_overlays(app, cache, classes_raw,
     )
     return pure_count, mixed_count, pure_vertices + mixed_vertices
 
-def _configure_microstation_color_blend_lighting(app, actor=None):
+def _configure_nakshatech_color_blend_lighting(app, actor=None):
     """Flat faceted lighting with Sharpness independent of brightness.
 
     Multi-class Shaded Classification controls now mean:
@@ -2521,8 +2521,8 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
     key_intensity = float(np.clip(key_intensity, 0.0, 2.0))
     fill_intensity = float(np.clip(fill_intensity, 0.0, 1.0))
 
-    key_light = getattr(app, '_shading_microstation_key_light', None)
-    fill_light = getattr(app, '_shading_microstation_fill_light', None)
+    key_light = getattr(app, '_shading_nakshatech_key_light', None)
+    fill_light = getattr(app, '_shading_nakshatech_fill_light', None)
     lights_live = False
     if key_light is not None and fill_light is not None:
         try:
@@ -2541,10 +2541,10 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
             pass
         key_light = vtk.vtkLight(); key_light.SetLightTypeToSceneLight()
         key_light.SetPositional(False); key_light.SetColor(1.0, 1.0, 1.0)
-        renderer.AddLight(key_light); app._shading_microstation_key_light = key_light
+        renderer.AddLight(key_light); app._shading_nakshatech_key_light = key_light
         fill_light = vtk.vtkLight(); fill_light.SetLightTypeToSceneLight()
         fill_light.SetPositional(False); fill_light.SetColor(1.0, 1.0, 1.0)
-        renderer.AddLight(fill_light); app._shading_microstation_fill_light = fill_light
+        renderer.AddLight(fill_light); app._shading_nakshatech_fill_light = fill_light
 
     # The 0..90 legacy range keeps the configured elevation. Overdrive lowers
     # the incidence angle so 90..200 has a strong, visible facet response.
@@ -2597,8 +2597,8 @@ def _configure_microstation_color_blend_lighting(app, actor=None):
         round(ambient,4), round(effective_ambient,4),
         round(key_intensity,4), round(fill_intensity,4),
     )
-    if getattr(app, '_shading_microstation_light_signature', None) != signature:
-        app._shading_microstation_light_signature = signature
+    if getattr(app, '_shading_nakshatech_light_signature', None) != signature:
+        app._shading_nakshatech_light_signature = signature
         print(
             'SHADING_SHARPNESS_CONTROL '
             f'azimuth={azimuth:.2f} sharpness={sharpness_angle:.2f} '
@@ -2995,7 +2995,7 @@ def detach_shading_before_non_shading_mode(app):
     app._shaded_mesh_edge_polydata = None
     _set_rendered_cache_key(app, cache_key=None)
 
-def _setup_microstation_lighting(renderer, azimuth=45., angle=45.):
+def _setup_nakshatech_lighting(renderer, azimuth=45., angle=45.):
     renderer.RemoveAllLights()
     zenith_rad = np.radians(90.0 - angle)
     az_math_rad = np.radians(360.0 - azimuth + 90.0)
@@ -3897,7 +3897,7 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
     is_sc = (nv == 1)
     print(f"\n{'='*60}")
     quality_mode = normalize_shading_quality(getattr(app, "shading_quality", "normal"))
-    print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (MicroStation mode, {quality_mode})")
+    print(f"🔺 {'SINGLE-CLASS' if is_sc else 'MULTI-CLASS'} SHADING (Nakshatech mode, {quality_mode})")
     print(f"{'='*60}")
     t_total = time.time()
 
@@ -4448,11 +4448,11 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
         ci = int(c)
         if ci < mc and ci in vc: lut[ci] = e.get("color", (128,128,128))
     amb = getattr(app, 'shade_ambient', 0.25)
-    # Every multi-class quality uses the same MicroStation/TerraScan presentation:
+    # Every multi-class quality uses the same Nakshatech/Nakshatech presentation:
     # class RGB lives on each representative vertex and is barycentrically blended
     # by the GPU while the triangle normal remains flat/faceted.  Fast / Normal /
     # Slow still differ ONLY in geometry density; single-class behaviour is intact.
-    blend_class_colors = _microstation_color_blend_enabled(app, cache)
+    blend_class_colors = _nakshatech_color_blend_enabled(app, cache)
     crisp_hybrid = bool(blend_class_colors and _crisp_multiclass_facets_enabled(app, cache))
     mixed_faces = np.empty(0, dtype=np.int64)
     mixed_count = 0
@@ -4485,7 +4485,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     checkpoint("class_map_lut_setup")
 
     if crisp_hybrid:
-        # Crisp MicroStation-style presentation:
+        # Crisp Nakshatech-style presentation:
         #   1) every TIN face is a solid cell-shaded triangle (no sub-pixel
         #      point-colour lighting chatter on the broad/low ground surface),
         #   2) only mixed DISPLAY-colour faces receive the barycentric blend
@@ -4554,7 +4554,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     elif blend_class_colors:
         # IMPORTANT: do not bake one class into the whole triangle.  Each mesh
         # vertex keeps its own canonical class RGB.  OpenGL then performs the
-        # barycentric color interpolation visible in MicroStation/TerraScan,
+        # barycentric color interpolation visible in Nakshatech/Nakshatech,
         # while VTK flat lighting uses the triangle slope for brightness.
         vertex_colors = _shading_palette_rgb(app, cm, vc)
 
@@ -4567,7 +4567,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
                     numpy_support.vtk_to_numpy(vtk_colors)[:] = vertex_colors
                     vtk_colors.Modified(); em.GetPointData().Modified(); em.Modified()
                     ea.GetMapper().Modified()
-                    _configure_microstation_color_blend_lighting(app, ea)
+                    _configure_nakshatech_color_blend_lighting(app, ea)
                     _set_rendered_cache_key(app, cache)
                     for actor in _attachment_overlay_actors(app):
                         vis = bool(actor.GetVisibility())
@@ -4787,7 +4787,7 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
             p2.SetAmbient(1.0); p2.SetDiffuse(0.0); p2.SetSpecular(0.0)
             p2.EdgeVisibilityOff(); p2.SetOpacity(1.0)
         elif blend_class_colors:
-            _configure_microstation_color_blend_lighting(app, app._shaded_mesh_actor)
+            _configure_nakshatech_color_blend_lighting(app, app._shaded_mesh_actor)
         else:
             if not smooth_all_classes:
                 p2.SetInterpolationToFlat()
@@ -5401,7 +5401,7 @@ def refresh_shaded_after_visibility_change(app, cgi, vcs):
         clear_shading_cache("patch failed"); update_shaded_class(app, force_rebuild=True)
 
 def _compute_face_shade_global_z(xyz_unique, faces, azimuth, angle, ambient, face_normals=None):
-    """Compute face shading using standard MicroStation hillshade with GLOBAL z-range."""
+    """Compute face shading using standard Nakshatech hillshade with GLOBAL z-range."""
     if xyz_unique is None or faces is None or len(faces) == 0:
         return np.array([], dtype=np.float32)
     if face_normals is None or len(face_normals) != len(faces):
@@ -6040,7 +6040,7 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
         _remove_multiclass_color_overlay(app, cache=cache, clear_dirty=True)
         return True
 
-    if _microstation_color_blend_enabled(app, cache):
+    if _nakshatech_color_blend_enabled(app, cache):
         point_colors = mesh.GetPointData().GetScalars()
         if point_colors is None or point_colors.GetNumberOfTuples() != len(cache.unique_indices):
             return False
@@ -6053,7 +6053,7 @@ def _bake_multiclass_color_overlay_into_base(app, cache, visible_classes=None):
         actor = getattr(app, '_shaded_mesh_actor', None)
         if actor is not None and actor.GetMapper() is not None:
             actor.GetMapper().Modified()
-            _configure_microstation_color_blend_lighting(app, actor)
+            _configure_nakshatech_color_blend_lighting(app, actor)
         print(
             'SHADING_MULTI_BLEND_BAKE '
             f'faces={len(dirty_faces)} vertices={len(dirty_vertices)} '
@@ -6124,7 +6124,7 @@ def _fast_multiclass_color_overlay(
     ):
         return False
 
-    blend_mode = _microstation_color_blend_enabled(app, cache)
+    blend_mode = _nakshatech_color_blend_enabled(app, cache)
     if not blend_mode and cache.shade is None:
         return False
 
@@ -6274,7 +6274,7 @@ def _fast_multiclass_color_overlay(
         actor.PickableOff()
         prop = actor.GetProperty()
         if blend_mode:
-            _configure_microstation_color_blend_lighting(app, actor)
+            _configure_nakshatech_color_blend_lighting(app, actor)
         else:
             prop.SetLighting(False)
             prop.SetInterpolationToFlat()
@@ -6381,7 +6381,7 @@ def _update_colors_gpu_fast(
         # normally takes the tiny blend-overlay path above; this branch is the
         # safe direct fallback and also handles full palette recolors.
         if (
-            _microstation_color_blend_enabled(app, cache)
+            _nakshatech_color_blend_enabled(app, cache)
             and not bool(getattr(app, '_shading_crisp_hybrid_active', False))
             and cls_raw is not None
             and cache.unique_indices is not None
@@ -6414,7 +6414,7 @@ def _update_colors_gpu_fast(
                     mapper = actor.GetMapper()
                     if mapper is not None:
                         mapper.Modified()
-                    _configure_microstation_color_blend_lighting(app, actor)
+                    _configure_nakshatech_color_blend_lighting(app, actor)
 
                 total_ms = (time.perf_counter() - t0) * 1000.0
                 print(
@@ -6775,7 +6775,7 @@ def _rebuild_single_class_for_undo(app, sci, changed_mask):
 
     fn = _compute_face_normals(cache.xyz_unique, npf)
 
-    # Standard MicroStation hillshade for new patch faces
+    # Standard Nakshatech hillshade for new patch faces
     N = fn.astype(np.float64)
     zenith_rad = np.radians(90.0 - an_)
     az_math_rad = np.radians(360.0 - az_ + 90.0)
@@ -8449,7 +8449,7 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
     app.last_shade_azimuth = azimuth
     app.shade_ambient = ambient
 
-    if _microstation_color_blend_enabled(app, cache):
+    if _nakshatech_color_blend_enabled(app, cache):
         sharpness_angle = _shading_sharpness_angle(app, angle)
         _, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
         light_elevation = _shading_effective_light_elevation(
@@ -8500,7 +8500,7 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
         )
 
         if crisp_hybrid:
-            # CRITICAL: never call _configure_microstation_color_blend_lighting
+            # CRITICAL: never call _configure_nakshatech_color_blend_lighting
             # on the crisp base.  The initial renderer deliberately keeps that
             # actor unlit because its shade is already baked into CELL RGB.
             # Turning VTK lighting back on is what creates the dark dotted/
@@ -8530,7 +8530,7 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
             _enforce_crisp_base_actor_state(app)
             cache.last_crisp_sharpness = sharpness_angle
         else:
-            _configure_microstation_color_blend_lighting(
+            _configure_nakshatech_color_blend_lighting(
                 app, getattr(app, '_shaded_mesh_actor', None)
             )
 
@@ -8539,11 +8539,11 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
             app, '_shading_multiclass_color_overlay_actor', None
         )
         if overlay_actor is not None:
-            _configure_microstation_color_blend_lighting(app, overlay_actor)
+            _configure_nakshatech_color_blend_lighting(app, overlay_actor)
         for entry in (getattr(app, '_shading_static_blend_overlays', None) or []):
             overlay = entry.get('actor') if isinstance(entry, dict) else None
             if overlay is not None:
-                _configure_microstation_color_blend_lighting(app, overlay)
+                _configure_nakshatech_color_blend_lighting(app, overlay)
 
         # Classification/undo/redo may have a tiny presentation mask above the
         # immutable base. Rebuild ONLY that dirty mask when lighting controls

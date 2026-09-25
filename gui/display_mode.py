@@ -1130,7 +1130,7 @@ class DisplayModeDialog(QDialog):
         self.color_mode.currentIndexChanged.connect(self._sync_color_mode_state)
         self.color_mode.currentIndexChanged.connect(self._restore_class_mode_visibility)
 
-        # MicroStation-style persistent flight-line selector.  A QMenu closes
+        # Nakshatech-style persistent flight-line selector.  A QMenu closes
         # after every click, so this button opens a proper dialog instead.
         self.lines_button = QToolButton()
         self.lines_button.setObjectName("displayLinesButton")

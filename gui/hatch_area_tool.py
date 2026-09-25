@@ -1,5 +1,5 @@
 # gui/hatch_area_tool.py
-# Hatch Area tool — MicroStation-style parallel-line hatch fill for closed boundaries.
+# Hatch Area tool — Nakshatech-style parallel-line hatch fill for closed boundaries.
 
 import os
 import numpy as np
@@ -299,7 +299,7 @@ def generate_hatch_lines(boundary_pts, spacing, angle_deg):
 
 class HatchAreaDialog(QDialog):
     """
-    Floating Hatch Area dialog — MicroStation-style.
+    Floating Hatch Area dialog — Nakshatech-style.
     Uses the app's theme manager for automatic dark/light theme adaptation.
     """
 

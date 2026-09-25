@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QColorDialog
 
 class CurveTool(QObject):  # ✅ INHERIT FROM QObject
     """
-    MicroStation-style Curve Point Tool
+    Nakshatech-style Curve Point Tool
     
     Workflow:
     1. Click "Curve Point" button → Tool activates

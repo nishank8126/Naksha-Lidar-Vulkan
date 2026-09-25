@@ -1,4 +1,4 @@
-"""Out-of-core TerraScan/Naksha ground-classification comparison.
+"""Out-of-core Nakshatech/Naksha ground-classification comparison.
 
 The module deliberately does not import any Qt or application state.  It can be
 used by tests, a command-line audit, or a future GUI wrapper without loading the
@@ -775,7 +775,7 @@ def _compare_identity_sorted(
                 np.flatnonzero(~_same_identity(original, reference))[0]
             )
             raise PointSetMismatchError(
-                "TerraScan reference does not contain the same quantized "
+                "Nakshatech reference does not contain the same quantized "
                 f"point identity near sorted record {start + local:,}."
             )
         if not np.all(_same_identity(original, candidate)):
@@ -839,7 +839,7 @@ def compare_las_files(
     chunk_size: int = 1_000_000,
     temp_directory: str | Path | None = None,
 ) -> dict:
-    """Compare original, TerraScan-reference and Naksha-candidate LAS/LAZ files."""
+    """Compare original, Nakshatech-reference and Naksha-candidate LAS/LAZ files."""
     paths = tuple(
         Path(path) for path in (
             original_path, reference_path, candidate_path
@@ -1131,7 +1131,7 @@ def write_markdown_report(path: str | Path, report: dict) -> None:
             "## Files",
             "",
             f"- Original: `{report['inputs']['original']['path']}`",
-            f"- TerraScan reference: `{report['inputs']['reference']['path']}`",
+            f"- Nakshatech reference: `{report['inputs']['reference']['path']}`",
             f"- Naksha candidate: `{report['inputs']['candidate']['path']}`",
             "",
             "See `parity_metrics.json` for complete machine-readable metrics "
@@ -1190,7 +1190,7 @@ def write_heatmap(
         linewidths=0,
     )
     axes.set_aspect("equal", adjustable="datalim")
-    axes.set_title("TerraScan vs Naksha Ground Disagreement")
+    axes.set_title("Nakshatech vs Naksha Ground Disagreement")
     axes.set_xlabel("Easting / X")
     axes.set_ylabel("Northing / Y")
     colorbar = figure.colorbar(scatter, ax=axes)

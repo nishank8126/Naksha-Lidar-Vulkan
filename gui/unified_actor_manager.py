@@ -4139,8 +4139,8 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
 
     try:
         from gui.pointcloud_display import (
-            _normalize_rgb_to_uint8, _microstation_intensity_rgb,
-            _microstation_elevation_rgb, _microstation_depth_rgb_from_camera,
+            _normalize_rgb_to_uint8, _nakshatech_intensity_rgb,
+            _nakshatech_elevation_rgb, _nakshatech_depth_rgb_from_camera,
         )
     except Exception:
         return False
@@ -4159,7 +4159,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             raw = data.get("intensity")
             if raw is not None:
                 intens = raw[global_indices].astype(np.float64)
-                colors = _microstation_intensity_rgb(
+                colors = _nakshatech_intensity_rgb(
                     intens,
                     low_pct=getattr(app, "intensity_clip_low", 0.5),
                     high_pct=getattr(app, "intensity_clip_high", 99.8),
@@ -4169,7 +4169,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             xyz = data.get("xyz")
             if xyz is not None:
                 z = xyz[global_indices, 2]
-                colors = _microstation_elevation_rgb(
+                colors = _nakshatech_elevation_rgb(
                     z,
                     color_ramp=getattr(app, "elevation_color_ramp", None),
                     low_pct=getattr(app, "elevation_clip_low", 1.0),
@@ -4180,7 +4180,7 @@ def _rewrite_section_rgb_for_mode(app, actor, mode: str, vtk_widget=None) -> boo
             cam = vtk_widget.renderer.GetActiveCamera() if vtk_widget is not None else None
             if xyz is not None and cam is not None:
                 pts = xyz[global_indices]
-                colors = _microstation_depth_rgb_from_camera(
+                colors = _nakshatech_depth_rgb_from_camera(
                     pts, cam,
                     low_pct=getattr(app, "depth_clip_low", 1.0),
                     high_pct=getattr(app, "depth_clip_high", 99.0),
@@ -5721,7 +5721,7 @@ def build_unified_actor(
     # and its local index is global_idx // step.
     app._main_lod_step = step
 
-    # "All off" is a valid MicroStation-style state. Keep overlays/camera but
+    # "All off" is a valid Nakshatech-style state. Keep overlays/camera but
     # remove the point-cloud actor instead of running min/max on empty arrays.
     if len(vis_xyz) == 0:
         app._main_global_indices = np.empty(0, dtype=np.int64)

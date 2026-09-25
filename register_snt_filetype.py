@@ -2,7 +2,7 @@
 Register .snt file type association in Windows.
 
 This script sets up the Windows registry so that .snt files display
-the custom snt_file.ico icon in Explorer — similar to how MicroStation
+the custom snt_file.ico icon in Explorer — similar to how Nakshatech
 registers .dgn files.
 
 Usage:

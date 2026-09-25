@@ -27,7 +27,7 @@ from gui.AI.common.ptc_mapping import (
 )
 
 # ═══════════════════════════════════════════════════════════════
-# TerraScan MAC PARSER
+# Nakshatech MAC PARSER
 # ═══════════════════════════════════════════════════════════════
 
 def _split_mac_args(args_str: str) -> list:
@@ -46,7 +46,7 @@ def _split_mac_args(args_str: str) -> list:
 
 def parse_mac_file(path: str) -> dict:
     """
-    Parse TerraScan .mac → extract pipeline-relevant params.
+    Parse Nakshatech .mac → extract pipeline-relevant params.
     Returns dict with keys matching advanced_config.
     Only successfully parsed keys are included.
     """
@@ -56,8 +56,8 @@ def parse_mac_file(path: str) -> dict:
         raise FileNotFoundError(f"MAC file not found: {path}")
     with open(path, encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
-    if '[TerraScan macro]' not in ''.join(lines):
-        raise ValueError("Not a valid TerraScan .mac file.")
+    if '[Nakshatech macro]' not in ''.join(lines):
+        raise ValueError("Not a valid Nakshatech .mac file.")
 
     for raw in lines:
         line = raw.strip()
@@ -2637,8 +2637,8 @@ class ClassMappingDialog(QDialog):
 
     def _load_mac_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load TerraScan Macro", "",
-            "TerraScan Macro (*.mac);;All Files (*)"
+            self, "Load Nakshatech Macro", "",
+            "Nakshatech Macro (*.mac);;All Files (*)"
         )
         if not path:
             return

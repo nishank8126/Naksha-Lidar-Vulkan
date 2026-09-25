@@ -16,7 +16,7 @@ def heights_above_reference_tin(reference_xyz, query_xyz, max_triangle,
 
     A query is valid only when it lies inside a triangle whose three XY edge
     lengths do not exceed ``max_triangle``. Z is evaluated on the triangle
-    plane by barycentric interpolation. This matches TerraScan's documented
+    plane by barycentric interpolation. This matches Nakshatech's documented
     By height from ground surface/Max triangle semantics.
     """
     reference_xyz = np.asarray(reference_xyz)

@@ -1,7 +1,7 @@
 
 """
 Grid Tool for Point Cloud Viewer
-Similar to MicroStation's grid functionality
+Similar to Nakshatech's grid functionality
 ✅ Draw rectangle to define area
 ✅ Configure grid: rows × columns OR spacing in meters
 ✅ Creates matrix of grid lines
@@ -214,7 +214,7 @@ class GridConfigDialog(QDialog):
 class GridTool:
     """
     Tool for creating grids in a rectangular area
-    Similar to MicroStation's grid functionality
+    Similar to Nakshatech's grid functionality
     ✅ FIXED: Left-click to start, right-click to finish
     """
     

@@ -2594,7 +2594,7 @@ class _ClassificationWorker(QThread):
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 1 — CLASSIFY LOW POINTS
-# TerraScan-compatible: local minima among source points in a 2D radius
+# Nakshatech-compatible: local minima among source points in a 2D radius
 # ═══════════════════════════════════════════════════════════════════════
 
 def classify_low_points(xyz, classification, from_classes, to_class,
@@ -2606,7 +2606,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
     """
     Classify source points/groups that form the lowest local elevation tier.
 
-    This follows TerraScan's documented Low Points conditions:
+    This follows Nakshatech's documented Low Points conditions:
     source classes, maximum group count, minimum vertical separation, a 2D
     search radius, and an optional fence.  ``ground_classes`` remains in the
     signature only for backward call compatibility and is intentionally
@@ -2903,7 +2903,7 @@ def classify_low_points(xyz, classification, from_classes, to_class,
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 2 — CLASSIFY ISOLATED POINTS
-# TerraScan-compatible: 3D sphere, self-excluded, From and In may differ
+# Nakshatech-compatible: 3D sphere, self-excluded, From and In may differ
 # ═══════════════════════════════════════════════════════════════════════
 def classify_isolated_points(xyz, classification, from_classes, to_class,
                              in_classes, if_fewer_than=1, within=5.0,
@@ -2918,7 +2918,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
 
     ``iterative``, ``max_iterations``, ``height_from_ground`` and
     ``ground_classes`` remain accepted for API compatibility but are not part
-    of TerraScan's Isolated Points routine and therefore do not alter this
+    of Nakshatech's Isolated Points routine and therefore do not alter this
     single-pass classification.
     """
     xyz = np.asarray(xyz)
@@ -3110,7 +3110,7 @@ def classify_isolated_points(xyz, classification, from_classes, to_class,
             np.isfinite(distances), axis=1
         ).astype(np.intp, copy=False)
         # If the candidate itself belongs to In class, it occupies one slot
-        # but TerraScan's condition counts only other points.
+        # but Nakshatech's condition counts only other points.
         counts -= in_mask[current].astype(np.intp)
         # Counts are intentionally capped at the decision threshold; values
         # above it are equivalent for the isolated/not-isolated decision.
@@ -3613,7 +3613,7 @@ def classify_ground_ptd(xyz, classification, from_classes, to_class,
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 4 — CLASSIFY SURFACE POINTS
-# TerraScan equivalent: locally smooth planar or rounded surfaces
+# Nakshatech equivalent: locally smooth planar or rounded surfaces
 # ═══════════════════════════════════════════════════════════════════════
 def classify_surface_points(
         xyz, classification, from_classes, to_class,
@@ -3622,7 +3622,7 @@ def classify_surface_points(
     """
     Classify points that belong to a locally smooth 3D surface.
 
-    TerraScan exposes only the surface tolerance for this routine.  The local
+    Nakshatech exposes only the surface tolerance for this routine.  The local
     neighborhood is therefore deliberately an implementation detail.  A
     robust PCA tangent plane is fitted to nearby source points in full XYZ so
     horizontal ground, sloped roofs, rounded surfaces, and vertical walls are
@@ -3836,7 +3836,7 @@ def classify_surface_points(
 
 # ═══════════════════════════════════════════════════════════════════════
 # ALGORITHM 5 — CLASSIFY BELOW SURFACE
-# TerraScan equivalent: elevation tolerance + limit × standard deviation
+# Nakshatech equivalent: elevation tolerance + limit × standard deviation
 # ═══════════════════════════════════════════════════════════════════════
 def classify_below_surface(xyz, classification, from_classes, to_class,
                            surface_type="planar", limit=4.0,
@@ -5413,7 +5413,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._persist_spin(self.mt_spin, "more_than", 0.50)
         self.mt_spin.setToolTip(
             "Minimum vertical gap between the low point/group and every "
-            "higher surrounding source point. TerraScan normally uses "
+            "higher surrounding source point. Nakshatech normally uses "
             "0.3–1.0 m."
         )
         mr = QHBoxLayout()
@@ -5428,7 +5428,7 @@ class ClassifyLowPointsDialog(_BaseClassifyDialog):
         self._persist_spin(self.within_spin, "within", 5.00)
         self.within_spin.setToolTip(
             "Horizontal (2D) radius used to find surrounding From-class "
-            "points. TerraScan normally uses 2–8 m."
+            "points. Nakshatech normally uses 2–8 m."
         )
         wr = QHBoxLayout()
         wr.addWidget(self.within_spin)
@@ -5902,14 +5902,14 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
 
         _separator(strategy)
         self.dist_rating_chk = QCheckBox(
-            "Use TerraScan distance attribute (not loaded)"
+            "Use Nakshatech distance attribute (not loaded)"
         )
         self._persist_checkbox(self.dist_rating_chk, "use_distance_as_rating", False)
         self.dist_rating_chk.setToolTip(
-            "TerraScan's option requires a stored vegetation-index, echo-"
+            "Nakshatech's option requires a stored vegetation-index, echo-"
             "length, or deviation-distance attribute. Naksha currently loads "
             "only XYZ and Classification, so enabling a look-alike formula "
-            "would not provide MicroStation parity."
+            "would not provide Nakshatech parity."
         )
         self.dist_rating_chk.setChecked(False)
         self.dist_rating_chk.setEnabled(False)
@@ -5964,7 +5964,7 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
             "After geometric classification, this deterministic spatial sample "
             "moves the selected percentage of newly accepted points to Class 0. "
             "Initial seeds and existing ground stay protected. Disable it for "
-            "strict TerraScan parity."
+            "strict Nakshatech parity."
         )
         self.class0_holdout_chk.setToolTip(density_explanation)
         self.class0_holdout_spin.setToolTip(density_explanation)
@@ -6091,7 +6091,7 @@ class ClassifyGroundDialog(_BaseClassifyDialog):
 # DIALOG 4 — CLASSIFY SURFACE POINTS
 # ═══════════════════════════════════════════════════════════════════════
 class ClassifySurfacePointsDialog(_BaseClassifyDialog):
-    """TerraScan-style Surface Points tool with its published controls."""
+    """Nakshatech-style Surface Points tool with its published controls."""
     _persist_prefix = "surface_points"
     _keep_visible_during_run = True
     _preserve_fence_on_restore = True
@@ -6161,7 +6161,7 @@ class ClassifySurfacePointsDialog(_BaseClassifyDialog):
         explanation.setWordWrap(True)
         explanation.setStyleSheet(_note_text_style())
         explanation.setToolTip(
-            "MicroStation/TerraScan Surface Points uses From class, To class, "
+            "Nakshatech/Nakshatech Surface Points uses From class, To class, "
             "Tolerance, and Inside fence only. The local neighborhood is "
             "selected automatically."
         )
@@ -6291,7 +6291,7 @@ class ClassifyBelowSurfaceDialog(_BaseClassifyDialog):
         info = QLabel(
             "ℹ️ Fits local surface through K neighbors.\n"
             "   Flags points below surface by > limit × standard deviation.\n"
-            "   MicroStation equivalent: post-ground cleanup.")
+            "   Nakshatech equivalent: post-ground cleanup.")
         info.setStyleSheet(_note_text_style())
         info.setWordWrap(True)
         ol.addWidget(info)

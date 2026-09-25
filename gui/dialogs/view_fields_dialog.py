@@ -1,5 +1,5 @@
 """View Fields dialog — lists point-cloud attribute fields available in the
-currently loaded LAS/LAZ file (MicroStation-style "View Fields" panel).
+currently loaded LAS/LAZ file (Nakshatech-style "View Fields" panel).
 
 Only the header is reopened (no point data is read), so this stays cheap
 even on very large files.

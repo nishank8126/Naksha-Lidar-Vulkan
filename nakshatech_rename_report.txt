@@ -1,0 +1,183 @@
+================================================================================
+NAKSHATECH RENAME REPORT
+Replacement of "microstation" / "bentley" / "terrascan" -> "nakshatech"
+(case preserved: microstation->nakshatech, MicroStation->Nakshatech, MICROSTATION->NAKSHATECH)
+================================================================================
+
+SUMMARY
+-------
+Files changed          : 51 source files (git-tracked) + 1 untracked doc
+Total occurrences fixed : 397  (375 in source .py files + 22 in README.md)
+Verification            : full repo scan confirms zero remaining occurrences
+                          outside inert build/cache artifacts
+                          (__pycache__/*.pyc, .pytest_cache, dist/, venv/)
+
+================================================================================
+PER-FILE OCCURRENCE COUNTS (comments, strings, docstrings, identifiers)
+================================================================================
+
+File                                                                  Count
+--------------------------------------------------------------------  -----
+core/ground_parity.py                                                     5
+gui/AI/common/ptc_semantics.py                                            3
+gui/accudraw_tool.py                                                      1
+gui/ai_dialog.py                                                          6
+gui/app_window.py                                                        36
+gui/block_creation_settings_dialog.py                                     1
+gui/class_display.py                                                      3
+gui/cross_section/cut_section_controller.py                               8
+gui/cross_section/interactor_classify.py                                 36
+gui/cross_section/interactor_slice.py                                     1
+gui/cross_section/section_controller.py                                   7
+gui/cross_section/section_zoom.py                                         1
+gui/crs_manager.py                                                       17
+gui/curve_ribbon.py                                                       1
+gui/curve_tools.py                                                        1
+gui/data_loader.py                                                        3
+gui/depth_settings_dialog.py                                              3
+gui/dialogs/load_pointcloud_dialog.py                                     1
+gui/dialogs/view_fields_dialog.py                                         1
+gui/dialogs/view_fields_table.py                                          4
+gui/digitize_tools.py                                                     9
+gui/display_mode.py                                                       1
+gui/display_mode.py.before_display_persistence_20260831-182657.bak        1
+gui/dxf_attachment.py                                                     1
+gui/element_select_tool.py                                                7
+gui/elevation_settings_dialog.py                                          4
+gui/gis/raster_overviews.py                                               1
+gui/global_settings_dialog.py                                             5
+gui/grid_tool.py                                                          2
+gui/hatch_area_tool.py                                                    2
+gui/height_reference_surface.py                                           1
+gui/intensity_settings_dialog.py                                          3
+gui/lidar_classification_tools.py                                        18
+gui/measurement_tools.py                                                  4
+gui/menu_sidebar_system.py                                                2
+gui/performance_optimizations.py                                          1
+gui/pointcloud_display.py                                                30
+gui/prj_block_identifier.py                                              41
+gui/rgb_settings_dialog.py                                                1
+gui/save_pointcloud.py                                                   11
+gui/selection_manager.py                                                  2
+gui/selection_popup.py                                                    1
+gui/shading_display.py                                                   42
+gui/snt_attachment.py                                                    14
+gui/unified_actor_manager.py                                              7
+gui/vector_export.py                                                      2
+plugins/google_earth_basemap/google_earth_basemap.py                     10
+post_install.py                                                           1
+register_snt_filetype.py                                                  1
+tests/test_crs_architecture.py                                            8
+tests/test_crs_resolution_fallbacks.py                                    1
+tests/test_lidar_classification_tools.py                                  2
+plugins/google_earth_basemap/README.md                                   22
+
+================================================================================
+FUNCTION / METHOD NAMES RENAMED (all call sites updated to match)
+================================================================================
+
+Old name                                        New name
+-----------------------------------------------  -----------------------------------------------
+_terrascan_block_laz                              _nakshatech_block_laz
+  Defined  : gui/crs_manager.py:972
+  Called   : gui/crs_manager.py:1063
+
+_load_terrascan_prj (method)                      _load_nakshatech_prj
+  Defined  : gui/app_window.py:7415
+  Called   : gui/app_window.py:6686
+
+_parse_terrascan_prj_blocks (method)              _parse_nakshatech_prj_blocks
+  Defined  : gui/measurement_tools.py:1185
+  Called   : gui/measurement_tools.py:1405
+
+_microstation_auto_normalize                      _nakshatech_auto_normalize
+  Defined  : gui/pointcloud_display.py:238
+  Called   : gui/pointcloud_display.py:355, 609, 622
+
+_microstation_rainbow_5color                      _nakshatech_rainbow_5color
+  Defined  : gui/pointcloud_display.py:287, 765 (defined twice in file)
+  Called   : gui/pointcloud_display.py:373, 411, 614, 830
+
+_microstation_view_depth_values                   _nakshatech_view_depth_values
+  Defined  : gui/pointcloud_display.py:329
+  Called   : gui/pointcloud_display.py:354
+
+_microstation_depth_rgb_from_camera               _nakshatech_depth_rgb_from_camera
+  Defined  : gui/pointcloud_display.py:339
+  Called   : gui/pointcloud_display.py:715, 725
+             gui/app_window.py:8841, 8846
+             gui/unified_actor_manager.py:4143, 4183
+
+_microstation_intensity_rgb                       _nakshatech_intensity_rgb
+  Defined  : gui/pointcloud_display.py:438
+  Called   : gui/pointcloud_display.py:686
+             gui/app_window.py:8739, 8745
+             gui/unified_actor_manager.py:4142, 4162
+
+_microstation_rgb_enhancement                     _nakshatech_rgb_enhancement
+  Defined  : gui/pointcloud_display.py:502
+  Called   : (defined only, no callers found)
+
+_microstation_elevation_rgb                       _nakshatech_elevation_rgb
+  Defined  : gui/pointcloud_display.py:608
+  Called   : gui/pointcloud_display.py:703
+             gui/app_window.py:8771, 8815
+             gui/unified_actor_manager.py:4143, 4172
+
+_microstation_depth_rgb_from_distance             _nakshatech_depth_rgb_from_distance
+  Defined  : gui/pointcloud_display.py:621
+  Called   : (defined only, no callers found)
+
+_microstation_color_blend_enabled                 _nakshatech_color_blend_enabled
+  Defined  : gui/shading_display.py:1455
+  Called   : gui/shading_display.py:1489, 4455, 6043, 6127, 6384, 8452
+
+_configure_microstation_color_blend_lighting      _configure_nakshatech_color_blend_lighting
+  Defined  : gui/shading_display.py:2446
+  Called   : gui/shading_display.py:2072, 2162, 2372, 4570, 4790, 6056, 6277, 6417, 8533, 8542, 8546
+
+_setup_microstation_lighting                      _setup_nakshatech_lighting
+  Defined  : gui/shading_display.py:2998
+  Called   : (defined only, no callers found)
+
+_shading_microstation_key_light (attribute)       _shading_nakshatech_key_light
+_shading_microstation_fill_light (attribute)      _shading_nakshatech_fill_light
+_shading_microstation_light_signature (attribute) _shading_nakshatech_light_signature
+  Used     : gui/shading_display.py:2524-2601
+
+test_low_and_isolated_dialogs_expose_only_terrascan_conditions
+  ->  test_low_and_isolated_dialogs_expose_only_nakshatech_conditions
+  Defined  : tests/test_lidar_classification_tools.py:945 (pytest test function)
+
+test_surface_dialog_exposes_microstation_surface_controls
+  ->  test_surface_dialog_exposes_nakshatech_surface_controls
+  Defined  : tests/test_lidar_classification_tools.py:981 (pytest test function)
+
+--------------------------------------------------------------------------------
+NOTE - pre-existing issue, NOT caused by this rename:
+gui/app_window.py:7420-7421 imports "_parse_nakshatech_prj" from gui/data_loader.py,
+but no such function exists in that file under either the old name
+(_parse_terrascan_prj) or the new one. This import was already broken before
+the rename; the rename simply kept the (already-broken) reference consistent
+with its old name's replacement. Flagging for separate follow-up.
+--------------------------------------------------------------------------------
+
+================================================================================
+NON-RENAME FIX APPLIED IN PASSING
+================================================================================
+gui/global_settings_dialog.py - the method "_open_feedback_email" was missing
+its 4-space class indentation (pre-existing bug in your own uncommitted edit,
+unrelated to the rename), which made the entire file fail to parse
+(SyntaxError: unindent does not match any outer indentation level).
+Fixed the indentation so the file compiles again.
+
+================================================================================
+VERIFICATION PERFORMED
+================================================================================
+1. ast.parse / py_compile on every modified .py file            -> all clean
+2. Full-repo case-insensitive grep for microstation|bentley|terrascan
+   (excluding .pyc / .pytest_cache / dist / venv)                -> zero hits
+3. Launched main.py end-to-end                                   -> app started
+   cleanly, all tools and the "Google Earth Basemap" plugin loaded with no
+   errors or tracebacks
+================================================================================

@@ -1,4 +1,4 @@
-"""MicroStation-style "View Fields" table — a full spreadsheet of point data.
+"""Nakshatech-style "View Fields" table — a full spreadsheet of point data.
 
 Shows every loaded point as a row and every attribute as a column, with
 virtual (lazy) rendering so millions of points stay responsive.  The dialog is
@@ -159,7 +159,7 @@ def _points_in_polygon(points, polygon_coords):
 #
 # A GPS Week Time value such as 307789 is NOT a date in January 1980.  Without
 # a trustworthy GPS week number, converting it from the GPS epoch invents a
-# calendar date.  TerraScan/MicroStation correctly shows '-' in this case.
+# calendar date.  Nakshatech/Nakshatech correctly shows '-' in this case.
 _GPS_EPOCH = datetime.datetime(1980, 1, 6)
 _GPS_WEEK_SECONDS = 7.0 * 24.0 * 60.0 * 60.0
 
@@ -601,7 +601,7 @@ class _ExtraFieldLoader(QThread):
 
 
 class ViewFieldsTableDialog(QDialog):
-    """MicroStation-style point data table window."""
+    """Nakshatech-style point data table window."""
 
     EXTRA_FIELD_LIMIT = 25_000_000
 

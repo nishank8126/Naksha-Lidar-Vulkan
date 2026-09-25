@@ -144,20 +144,20 @@ def test2_snt_laz():
     if os.path.exists(prj):
         with open(prj, "r", encoding="utf-8", errors="ignore") as f:
             head = f.read(64).lstrip()
-        is_terrascan = head.upper().startswith("[TERRASCAN")
-        check("adjacent .prj is a TerraScan project file (block list, not CRS WKT)",
-              is_terrascan, head.splitlines()[0] if head else "")
-        if is_terrascan:
+        is_nakshatech = head.upper().startswith("[NAKSHATECH")
+        check("adjacent .prj is a Nakshatech project file (block list, not CRS WKT)",
+              is_nakshatech, head.splitlines()[0] if head else "")
+        if is_nakshatech:
             with open(prj, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
             import re as _re
             has_epsg_line = bool(_re.search(r"ProjectionSystem\s*=\s*\d+", text, _re.IGNORECASE))
-            check("TerraScan .prj has NO ProjectionSystem=<EPSG> line (verified by reading the real file)",
+            check("Nakshatech .prj has NO ProjectionSystem=<EPSG> line (verified by reading the real file)",
                   not has_epsg_line)
 
     cs, csrc = cm.resolve_snt_crs(snt)
     print(f"  SNT CRS: {cs} via {csrc}")
-    check("FUNIVIA SNT CRS unresolved (verified: TerraScan .prj has no "
+    check("FUNIVIA SNT CRS unresolved (verified: Nakshatech .prj has no "
           "ProjectionSystem=, referenced LAZ carry no CRS VLR - see below)",
           cs is None, f"got {cs}")
 
@@ -192,7 +192,7 @@ def test2_snt_laz():
             span_y = max(ally) - min(ally)
             for name, (x0, y0, x1, y1) in boxes.items():
                 print(f"    {name}: X[{x0:.1f},{x1:.1f}] Y[{y0:.1f},{y1:.1f}]")
-            # A single TerraScan block project's tiles should span at most a
+            # A single Nakshatech block project's tiles should span at most a
             # few km, never hundreds/thousands of km (that would mean a tile
             # from a different project got mixed in).
             check("FUNIVIA tiles form one contiguous project area (<10 km span)",

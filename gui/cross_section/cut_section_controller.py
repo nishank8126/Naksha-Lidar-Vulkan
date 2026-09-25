@@ -494,7 +494,7 @@ class CutSectionController:
         self._cut_source_dialog = None
         self._cut_source_dialog_open = False
 
-        # ✅ ADD: MicroStation-style rotation tracking
+        # ✅ ADD: Nakshatech-style rotation tracking
         self.original_section_tangent = None  # Store initial cross-section line direction
         self.accumulated_rotation = 0  # Track total rotation (0°, 90°, 180°, 270°)
         self._depth_adjustment_started = False
@@ -2327,7 +2327,7 @@ class CutSectionController:
             print(f"   ⚠️ Point sync re-attach to Cut View failed: {_point_sync_reattach_err}")
 
         # Same nuclear-cleanup problem, same fix, for the Cut View's own
-        # MicroStation-style locate observer (click in Cut View while the
+        # Nakshatech-style locate observer (click in Cut View while the
         # cross-section tool is active -> pan Main View there). This runs
         # on every finalize, including the very first one (where
         # _ensure_cut_section_dock already added the observer once) -- so
@@ -4416,7 +4416,7 @@ class CutSectionController:
             # Fallback: use large default
             zmin, zmax = center[2] - 100.0, center[2] + 100.0
         else:
-            # ✅ MICROSTATION APPROACH: Use camera view bounds
+            # ✅ NAKSHATECH APPROACH: Use camera view bounds
             try:
                 ren = vtk_widget.renderer
                 cam = ren.GetActiveCamera()
@@ -4545,7 +4545,7 @@ class CutSectionController:
     #             mapper.SetInputData(poly)
     #             actor.SetMapper(mapper)
                 
-    #             # ✅ MICROSTATION STYLE: Yellow, thin lines
+    #             # ✅ NAKSHATECH STYLE: Yellow, thin lines
     #             actor.GetProperty().SetColor(1.0, 1.0, 0.0)  # Yellow
     #             actor.GetProperty().SetLineWidth(1)  # ✅ THIN
     #             actor.GetProperty().SetOpacity(0.8)
@@ -5512,7 +5512,7 @@ class CutSectionController:
         return self.cut_points, self._cut_index_map
 
     def _do_cut_section_locate(self, vtk_interactor, display_x, display_y):
-        """MicroStation-style locate for the Cut View, mirroring
+        """Nakshatech-style locate for the Cut View, mirroring
         SectionController._do_section_locate for cross-section views 1-4:
         click inside the Cut View while the cross-section tool is active ->
         pan Main View's camera to that world XY.
@@ -5663,7 +5663,7 @@ class CutSectionController:
         
     def restore_cut_locate_observers_for_cross_section(self) -> bool:
         """
-        Restore MicroStation-style CrossSectionRect locate interaction on the
+        Restore Nakshatech-style CrossSectionRect locate interaction on the
         existing Cut View.
 
         CutFromCut intentionally owns LeftButtonPressEvent/MouseMoveEvent while
@@ -5785,7 +5785,7 @@ class CutSectionController:
         self._draw_cut_locate_rubber_band(x, y)
 
     def onclassificationchanged(self, changedoriginalindices=None):
-        """🚀 MICROSTATION-STYLE REFRESH: Signal handler for classification changes."""
+        """🚀 NAKSHATECH-STYLE REFRESH: Signal handler for classification changes."""
         if self._is_refreshing or not self.is_cut_view_active or self.cut_vtk is None:
             return
         self._is_refreshing = True
@@ -6263,7 +6263,7 @@ class CutSectionController:
                 self._on_cut_view_right_click_reactivate,
                 1.0,
             )
-            # MicroStation-style locate (same feature as cross-section views
+            # Nakshatech-style locate (same feature as cross-section views
             # 1-4): click inside the Cut View while the cross-section tool
             # is active -> pan Main View to that location. Priority 1.0
             # matches SectionController's own left-click locate observer.

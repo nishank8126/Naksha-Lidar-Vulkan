@@ -2998,7 +2998,7 @@ class DrawRibbon(QWidget):
 
 
     def _handle_select_drawing_click(self):
-        """Open the MicroStation-style Element Selection panel.
+        """Open the Nakshatech-style Element Selection panel.
 
         Stands down any conflicting tools (draw, curve, measurement) first,
         then shows the SelectionModeDialog which activates ElementSelectTool.
@@ -12762,7 +12762,7 @@ class InsideFenceDialog(QDialog):
         """
 class SyncViewsDialog(QDialog):
     """
-    Synchronize Views dialog like MicroStation.
+    Synchronize Views dialog like Nakshatech.
     Rows:
       View N: [No synch | Match]  [View 1..View 5]
     """

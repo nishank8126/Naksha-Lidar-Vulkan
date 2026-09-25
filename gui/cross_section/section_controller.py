@@ -351,7 +351,7 @@ class SectionController:
             print("📏 Measurement tool active - cross-section blocked")
             return
 
-        # MicroStation-style locate: click in section view while cross-section
+        # Nakshatech-style locate: click in section view while cross-section
         # tool is active → pan main view to that world XY and start rubber-band.
         if (
             getattr(self.app, 'cross_section_active', False)
@@ -361,7 +361,7 @@ class SectionController:
             self._do_section_locate(obj, x, y)
             return
         
-    # ── MicroStation-style section locate ───────────────────────────────────
+    # ── Nakshatech-style section locate ───────────────────────────────────
 
     def _do_section_locate(self, vtk_interactor, display_x, display_y):
         """
@@ -1383,7 +1383,7 @@ class SectionController:
     
 
     def draw_rubber_rectangle(self, P1, P2, half_width):
-        """✅ MICROSTATION METHOD: 2D overlay actor - always perfect rectangle"""
+        """✅ NAKSHATECH METHOD: 2D overlay actor - always perfect rectangle"""
        
         # ============================================================
         # ✅ USE 2D OVERLAY ACTOR (screen space, not world space)
@@ -1790,7 +1790,7 @@ class SectionController:
 
     def finalize_section(self, P1, P2):
                 """
-                ✅ MICROSTATION METHOD:
+                ✅ NAKSHATECH METHOD:
                 - Width = ONLY what user dragged (half_width)
                 - Buffer extends LENGTH (along the line) only
                 ✅ FIXED:
@@ -2777,7 +2777,7 @@ class SectionController:
         """
         ✅ UNIFIED ACTOR: Refresh cross-section view via fast_cross_section_update.
         Writes directly into _naksha_rgb_ptr — no per-class actor create/destroy.
-        MicroStation equivalent: invalidate element display → single GPU redraw.
+        Nakshatech equivalent: invalidate element display → single GPU redraw.
         """
         if self.active_view is None:
             print("⚠️ No active view to refresh")
@@ -3059,7 +3059,7 @@ class SectionController:
         self.buffer_spin.setRange(0, 50)   # allow 0–50 m
         self.buffer_spin.setValue(getattr(self.app, "section_buffer", 2))
         self.buffer_spin.setSuffix(" m")
-        # ✅ Add tooltip explaining MicroStation behavior
+        # ✅ Add tooltip explaining Nakshatech behavior
         self.buffer_spin.setToolTip(
             "Extends section LENGTH (along the line) for context.\n"
             "Does NOT affect cross-section width.\n\n"
@@ -3129,7 +3129,7 @@ class SectionController:
             print("⚠️ No points to plot in cut section")
             return
 
-        print("🔄 Rendering CUT section with TerraScan classification colors...")
+        print("🔄 Rendering CUT section with Nakshatech classification colors...")
 
         # --- Save state ---
         self.app.section_cut_points = cut_points

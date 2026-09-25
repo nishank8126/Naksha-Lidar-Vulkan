@@ -143,7 +143,7 @@ def _border_ring_fraction(border_percent: float) -> float:
     Convert border_percent (0..100) to ring thickness fraction used in the
     GLSL shader uniform ``border_ring_val``.
  
-    MicroStation uses SQUARE point sprites where the outer fraction of each
+    Nakshatech uses SQUARE point sprites where the outer fraction of each
     sprite is painted in the border colour.  This function maps the user-facing
     percentage (0 = no border, 100 = half the sprite is border) to the shader
     value in a linear, intuitive way.
@@ -155,7 +155,7 @@ def _border_ring_fraction(border_percent: float) -> float:
     Examples (consistent with unified_actor_manager.py):
       0%  → 0.000  (no border — round circle mode)
       10% → 0.100  (thin border ring)
-      25% → 0.250  (MicroStation-style medium border)
+      25% → 0.250  (Nakshatech-style medium border)
       40% → 0.400  (thick, very visible)
       50% → 0.500  (half the sprite is border — maximum useful value)
      100% → 0.500  (clamped)
@@ -168,7 +168,7 @@ def _border_ring_fraction(border_percent: float) -> float:
  
 def apply_border_shader_ring(actor, border_percent: float, border_rgb=(0.0, 0.0, 0.0)) -> bool:
     """
-    Apply a MicroStation-style ADAPTIVE border to a per-class actor.
+    Apply a Nakshatech-style ADAPTIVE border to a per-class actor.
  
     Mirrors the behaviour of unified_actor_manager._attach_view_shader_context v10:
  

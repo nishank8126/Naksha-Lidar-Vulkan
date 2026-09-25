@@ -254,7 +254,7 @@ class RGBSettingsDialog(QDialog):
         self._load_current_values()
     
     def _reset_to_default(self):
-        """Reset to MicroStation-like defaults"""
+        """Reset to Nakshatech-like defaults"""
         self._apply_preset(True, 1.1, 2.0, 98.0)
     
     def get_settings(self):

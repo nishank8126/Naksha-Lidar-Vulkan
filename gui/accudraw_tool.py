@@ -1,5 +1,5 @@
 # gui/accudraw_tool.py
-# Naksha AccuDraw — separate MicroStation-style XYZ + Angle precision polyline tool.
+# Naksha AccuDraw — separate Nakshatech-style XYZ + Angle precision polyline tool.
 #
 # Behavior:
 #   - Separate tool only: active_tool = "accudraw"

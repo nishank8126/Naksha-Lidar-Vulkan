@@ -318,6 +318,8 @@ class GlobalSettingsDialog(QDialog):
             ("Cross Section", "✂"),
             ("Draw",          "✏"),
             ("Navigation",    "⊙"),
+            ("Feedback",      "📧"),
+            ("Report Issue",  "📝"),
         ]:
             item = QListWidgetItem(f"  {icon}  {label}")
             item.setSizeHint(QSize(160, 32))
@@ -789,13 +791,13 @@ class GlobalSettingsDialog(QDialog):
         self.zoom_behavior_combo = QComboBox()
         self.zoom_behavior_combo.addItem("Zoom to Center", "center")
         self.zoom_behavior_combo.addItem("Zoom to Cursor", "cursor")
-        self.zoom_behavior_combo.addItem("Zoom to Picked Point (MicroStation-like)", "picked_point")
+        self.zoom_behavior_combo.addItem("Zoom to Picked Point (Nakshatech-like)", "picked_point")
         self.zoom_behavior_combo.currentIndexChanged.connect(self._update_navigation_summary)
         form.addRow("Mouse wheel zoom:", self.zoom_behavior_combo)
 
         note = QLabel(
             "Center keeps the current behavior. Cursor follows the live mouse position. "
-            "Picked Point behaves closer to MicroStation zoom-and-recenter: click a model point first, then wheel zoom keeps bringing that point to the view center."
+            "Picked Point behaves closer to Nakshatech zoom-and-recenter: click a model point first, then wheel zoom keeps bringing that point to the view center."
         )
         note.setObjectName("dialogCaption")
         note.setWordWrap(True)
@@ -811,8 +813,8 @@ class GlobalSettingsDialog(QDialog):
 
         note_pan = QLabel(
             "Scroll Button uses the scroll wheel press for panning. "
-            "Left Mouse Button pans by left-dragging (MicroStation Pan-tool style). "
-            "Tap-Tap Pan pans like MicroStation's dynamic pan: tap once to start "
+            "Left Mouse Button pans by left-dragging (Nakshatech Pan-tool style). "
+            "Tap-Tap Pan pans like Nakshatech's dynamic pan: tap once to start "
             "panning, move the mouse without holding any button, and tap again to stop. "
             "Pan stays disabled while another tool owns the left click."
         )
@@ -833,6 +835,41 @@ class GlobalSettingsDialog(QDialog):
         self.category_stack.setCurrentIndex(max(0, index))
         if index == 1:
             self._ensure_shortcuts_loaded()
+        elif index == 5:
+            self._open_feedback_email()
+        elif index == 6:
+            self._open_issue_report()
+
+    def _open_feedback_email(self):
+        import webbrowser
+        import subprocess
+        import os
+        
+        # Try to open Chrome specifically first
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Users\%USERNAME%\AppData\Local\Google\Chrome\Application\chrome.exe",
+        ]
+        
+        chrome_found = False
+        for path in chrome_paths:
+            expanded = os.path.expandvars(path)
+            if os.path.exists(expanded):
+                try:
+                    subprocess.Popen([expanded, f"https://mail.google.com/mail/?view=cm&fs=1&to=chirag.kj@nakshatech.com&subject=NakshaAI%20Feedback&body="])
+                    chrome_found = True
+                    break
+                except Exception:
+                    pass
+        
+        if not chrome_found:
+            # Fall back to default browser
+            webbrowser.open("https://mail.google.com/mail/?view=cm&fs=1&to=chirag.kj@nakshatech.com&subject=NakshaAI%20Feedback&body=")
+
+    def _open_issue_report(self):
+        """Open Google Forms for bug/glitch/issue reporting."""
+        webbrowser.open("https://forms.gle/YOUR_FORM_LINK_HERE")
 
     def _ensure_shortcuts_loaded(self):
         if self._shortcuts_needs_reload:
@@ -1344,7 +1381,7 @@ class GlobalSettingsDialog(QDialog):
         if panning == "left":
             panning_text = "Left-drag pans in the main view (when no tool owns left click); middle-click drag also pans."
         elif panning == "tap":
-            panning_text = "Tap once to start panning, move to pan without holding, tap again to stop (MicroStation dynamic pan)."
+            panning_text = "Tap once to start panning, move to pan without holding, tap again to stop (Nakshatech dynamic pan)."
         else:
             panning_text = "Scroll Button (Middle Click) is used for panning."
 

@@ -15,16 +15,16 @@ from PySide6.QtCore import Qt
 class ElevationSettingsDialog(QDialog):
     """
     Dialog for customizing elevation color gradient.
-    Default: MicroStation 5-color rainbow (Blue→Cyan→Green→Yellow→Red)
+    Default: Nakshatech 5-color rainbow (Blue→Cyan→Green→Yellow→Red)
     """
     
-    def __init__(self, parent=None, app=None, ramp_attr="elevation_color_ramp", title="Elevation", subtitle="Customize how elevation (Z-height) is colored.", default_label="Default: MicroStation Rainbow (Blue→Cyan→Green→Yellow→Red)"):
+    def __init__(self, parent=None, app=None, ramp_attr="elevation_color_ramp", title="Elevation", subtitle="Customize how elevation (Z-height) is colored.", default_label="Default: Nakshatech Rainbow (Blue→Cyan→Green→Yellow→Red)"):
         super().__init__(parent)
         self.setWindowTitle(f"{title} Color Gradient Settings")
         self.resize(550, 650)
         self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
         
-        # Default MicroStation 5-color ramp
+        # Default Nakshatech 5-color ramp
         self.color_stops = [
             (0.00, (0, 0, 255)),      # Blue
             (0.25, (0, 255, 255)),    # Cyan
@@ -217,7 +217,7 @@ class ElevationSettingsDialog(QDialog):
         self._update_preview()
     
     def _preset_rainbow(self):
-        """MicroStation default rainbow (5 colors)."""
+        """Nakshatech default rainbow (5 colors)."""
         self.color_stops = [
             (0.00, (0, 0, 255)),      # Blue
             (0.25, (0, 255, 255)),    # Cyan

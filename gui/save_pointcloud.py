@@ -1264,20 +1264,20 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         return False
 
     # ✅ LAS 1.2: 5-bit classification (0-31). For codes > 31, use user_data
-    # field (MicroStation/TerraScan approach) — never remap or truncate.
+    # field (Nakshatech/Nakshatech approach) — never remap or truncate.
     classes_u8 = np.asarray(classes).astype(np.uint8, copy=False)
     max_cls = int(classes_u8.max()) if classes_u8.size else 0
 
     pack_class_into_flags = False
     if max_cls > 31 and las_version == "1.2":
-        # MicroStation/TerraScan compatible: pack the full code straight into
+        # Nakshatech/Nakshatech compatible: pack the full code straight into
         # the raw classification byte using the synthetic/key_point/withheld
         # flag bits. The on-disk byte then EQUALS the real code (0-255).
         pack_class_into_flags = True
         print(f"\n{'='*60}")
         print(f"📌 LAS 1.2 with extended classes (max={max_cls})")
         print(f"   Packing full code into classification byte via flag bits")
-        print(f"   (MicroStation/TerraScan compatible)")
+        print(f"   (Nakshatech/Nakshatech compatible)")
         print(f"{'='*60}\n")
 
     xyz_to_write, save_crs_wkt, save_crs_epsg = _coordinates_for_las_output(app, data, xyz)
@@ -1368,9 +1368,9 @@ def save_pointcloud(app, path=None, file_format=None, las_version=None, show_dia
         las.classification = np.clip(classes_u8, 0, 255).astype(np.uint8, copy=False)
     elif pack_class_into_flags:
         # LAS 1.2 with codes > 31: write the raw classification byte exactly
-        # the way TerraScan/MicroStation does. laspy exposes the byte as four
+        # the way Nakshatech/Nakshatech does. laspy exposes the byte as four
         # bit-packed sub-fields on point formats 0-5, so the on-disk byte ends
-        # up bit-for-bit equal to the real code (0-255). MicroStation reads the
+        # up bit-for-bit equal to the real code (0-255). Nakshatech reads the
         # whole byte and shows the correct value — no VLR, no user_data needed.
         las.classification = (classes_u8 & 0x1F).astype(np.uint8, copy=False)
         las.synthetic = ((classes_u8 >> 5) & 1).astype(bool)
@@ -1570,7 +1570,7 @@ def save_pointcloud_quick(app, path):
             las.classification = np.clip(classes_u8, 0, 255).astype(np.uint8, copy=False)
         elif use_user_data_for_class:
             # LAS 1.2 with codes > 31: pack full code into the raw classification
-            # byte via flag bits (TerraScan/MicroStation compatible). On-disk byte
+            # byte via flag bits (Nakshatech/Nakshatech compatible). On-disk byte
             # == real code (0-255). No VLR / user_data needed.
             las.classification = (classes_u8 & 0x1F).astype(np.uint8, copy=False)
             las.synthetic = ((classes_u8 >> 5) & 1).astype(bool)

@@ -143,11 +143,11 @@ class MainWheelZoomEventFilter(QObject):
         # release instead of leaking an unmatched release into VTK.
         self._owns_main_pan = False
         self._owned_main_pan_button = None
-        # MicroStation-style "tap-tap" (dynamic) pan state: one tap starts
+        # Nakshatech-style "tap-tap" (dynamic) pan state: one tap starts
         # panning, the view follows the cursor without holding any button,
         # and a second tap / Esc / right-click ends it. The toggle flips on
-        # PRESS, unconditionally - matching MicroStation's own toggle-pan,
-        # confirmed against Bentley's docs (state flips on the button-down
+        # PRESS, unconditionally - matching Nakshatech's own toggle-pan,
+        # confirmed against Nakshatech's docs (state flips on the button-down
         # itself, no distance/timing check). No press-position or arm-time
         # tracking is needed for that model.
         self._tap_session = False
@@ -375,11 +375,11 @@ class MainWheelZoomEventFilter(QObject):
                                 self._finish_tap_session(app)
                             return False
                         if self._tap_session:
-                            # Second tap immediately ends the MicroStation-
+                            # Second tap immediately ends the Nakshatech-
                             # style pan. No distance/timing check: real
-                            # MicroStation flips its toggle-pan state on
+                            # Nakshatech flips its toggle-pan state on
                             # every button-down, unconditionally (confirmed
-                            # against Bentley's own docs) - trying to infer
+                            # against Nakshatech's own docs) - trying to infer
                             # "was that really a deliberate second tap" from
                             # movement or timing was the source of every
                             # tap-tap bug this session chased (DblClick
@@ -429,7 +429,7 @@ class MainWheelZoomEventFilter(QObject):
                     if pan_button is None:
                         return False
                     if self._tap_session:
-                        # MicroStation dynamic pan: no button needs to stay
+                        # Nakshatech dynamic pan: no button needs to stay
                         # held - the view keeps following the cursor until the
                         # second tap / Esc / right-click / key ends the
                         # session. Tap-Tap arms this at press time (see the
@@ -1353,7 +1353,7 @@ class NakshaApp(QMainWindow):
         self.current_saturation = 1.0   # 100% = normal
         self.current_sharpness = 1.0  # Amplifier removed — always 1.0 (no scaling)
 
-        # ── MicroStation-style display stretch defaults ─────────────────
+        # ── Nakshatech-style display stretch defaults ─────────────────
         self.current_saturation = 1.0
         self.current_sharpness = 1.0
 
@@ -2279,7 +2279,7 @@ class NakshaApp(QMainWindow):
         return False
 
     # ------------------------------------------------------------------
-    # VTK-native crosshair (vtkActor2D in display coords — like MicroStation)
+    # VTK-native crosshair (vtkActor2D in display coords — like Nakshatech)
     # ------------------------------------------------------------------
 
     def _install_canvas_axis_render_observer(self):
@@ -5213,7 +5213,7 @@ class NakshaApp(QMainWindow):
                 tag = interactor.AddObserver("RightButtonPressEvent", _make_handler(app_ref), 1.0)
                 self._section_right_click_observers[view_index] = tag
 
-                # Left-click observer: MicroStation locate when cross-section tool active
+                # Left-click observer: Nakshatech locate when cross-section tool active
                 def _make_left_handler(app, vidx):
                     def _left_handler(obj, event):
                         if not getattr(app, 'cross_section_active', False):
@@ -6682,8 +6682,8 @@ class NakshaApp(QMainWindow):
                 self._load_single_ptc(fname)
                 return
             if fname.lower().endswith(".prj"):
-                print("📋 Loading TerraScan PRJ…")
-                self._load_terrascan_prj(fname)
+                print("📋 Loading Nakshatech PRJ…")
+                self._load_nakshatech_prj(fname)
                 return
 
         # ── STEP 4: Clear current project ─────────────────────────────
@@ -7412,13 +7412,13 @@ class NakshaApp(QMainWindow):
         return prompt_lidar_import_options(first_lidar, parent=self)
  
  
-    def _load_terrascan_prj(self, filename):
-        """Load TerraScan PRJ project"""
+    def _load_nakshatech_prj(self, filename):
+        """Load Nakshatech PRJ project"""
         from gui.progress_dialog import LoadingProgressDialog
         from PySide6.QtCore import QCoreApplication
 
-        from .data_loader import _parse_terrascan_prj
-        laz_files = _parse_terrascan_prj(filename)
+        from .data_loader import _parse_nakshatech_prj
+        laz_files = _parse_nakshatech_prj(filename)
 
         import_options = self._prompt_lidar_import_options_for_files(laz_files)
         if import_options is None:
@@ -7428,7 +7428,7 @@ class NakshaApp(QMainWindow):
         progress.set_filename(filename)
         progress.show()
 
-        progress.set_progress(20, "Parsing TerraScan project...")
+        progress.set_progress(20, "Parsing Nakshatech project...")
         QCoreApplication.processEvents()
 
         total_files = len(laz_files)
@@ -7469,16 +7469,16 @@ class NakshaApp(QMainWindow):
 
                     _dst_crs = get_canvas_crs(self)
                     if _dst_crs is None and _src_crs is not None:
-                        set_canvas_crs(self, _src_crs, source="TerraScan tile CRS", dataset=laz, force=True)
+                        set_canvas_crs(self, _src_crs, source="Nakshatech tile CRS", dataset=laz, force=True)
                         _dst_crs = get_canvas_crs(self) or _src_crs
                     if _src_crs is not None and _dst_crs is not None and not _src_crs.equals(_dst_crs):
                         laz_data["xyz"], _rep = transform_points(
                             laz_data["xyz"], _src_crs, _dst_crs,
                             copy=False, chunk_size=1_000_000,
                         )
-                        print(f"TerraScan tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
+                        print(f"Nakshatech tile reprojected: {crs_identifier(_src_crs)} -> {crs_identifier(_dst_crs)}")
                 except Exception as _crs_exc:
-                    print(f"TerraScan tile CRS warning ({laz}): {_crs_exc}")
+                    print(f"Nakshatech tile CRS warning ({laz}): {_crs_exc}")
 
                 layer = {
                     "type": "laz_tile",
@@ -7517,7 +7517,7 @@ class NakshaApp(QMainWindow):
                 self.crs = _pc
                 print(f"Project CRS: {_pc.name}")
         except Exception as e:
-            print(f"Could not report TerraScan project CRS: {e}")
+            print(f"Could not report Nakshatech project CRS: {e}")
        
         from .display_mode import restore_display_settings_for_file
         restore_display_settings_for_file(self, filename)
@@ -7891,9 +7891,9 @@ class NakshaApp(QMainWindow):
 
         # PTC must not be auto-loaded here. It is global state managed
         # exclusively by the Display Mode dialog. If no palette is in memory
-        # the renderer falls back to TerraScan defaults until the user loads
+        # the renderer falls back to Nakshatech defaults until the user loads
         # a PTC manually.
-        print("📋 No active PTC in memory — using TerraScan defaults")
+        print("📋 No active PTC in memory — using Nakshatech defaults")
         from gui.class_display import build_class_palette
         data = getattr(self, 'data', None)
         classification = data.get('classification') if isinstance(data, dict) else None
@@ -7935,7 +7935,7 @@ class NakshaApp(QMainWindow):
            
         #     return class_map
        
-        # print("📋 Using TerraScan defaults")
+        # print("📋 Using Nakshatech defaults")
         # return None
     # ============================================================
     # SIMPLER VERSION - Just add progress to existing code
@@ -8184,7 +8184,7 @@ class NakshaApp(QMainWindow):
         return palette
 
     def _load_ptc_file(self, path):
-            """Parse TerraScan-style .ptc file and return a class_map dict."""
+            """Parse Nakshatech-style .ptc file and return a class_map dict."""
             try:
                 with open(path, "r") as f:
                     lines = [ln.strip() for ln in f if ln.strip()]
@@ -8439,7 +8439,7 @@ class NakshaApp(QMainWindow):
 
     def set_display_mode(self, mode):
         """
-        MicroStation-style display mode switch.
+        Nakshatech-style display mode switch.
         ALL modes write directly into the unified actor's RGB buffer.
         Zero actor rebuild. DXF/SNT grids always preserved.
         """
@@ -8648,7 +8648,7 @@ class NakshaApp(QMainWindow):
 
         # ═══════════════════════════════════════════════════════════════
         # ALL OTHER MODES: Write colors into unified actor RGB buffer
-        # Zero rebuild. MicroStation instant switch.
+        # Zero rebuild. Nakshatech instant switch.
         # ═══════════════════════════════════════════════════════════════
 
         # Remove Surface mesh if switching away from Surface mode.
@@ -8736,13 +8736,13 @@ class NakshaApp(QMainWindow):
             print(f"  ✅ RGB mode: direct color copy")
 
         elif mode == "intensity":
-            from gui.pointcloud_display import _microstation_intensity_rgb
+            from gui.pointcloud_display import _nakshatech_intensity_rgb
 
             intensity = self.data.get("intensity")
             if intensity is not None:
                 vis_int = intensity[gi] if gi is not None else intensity
 
-                colors_u8, clip_lo, clip_hi = _microstation_intensity_rgb(
+                colors_u8, clip_lo, clip_hi = _nakshatech_intensity_rgb(
                     vis_int,
                     low_pct=getattr(self, "intensity_clip_low", 0.5),
                     high_pct=getattr(self, "intensity_clip_high", 99.8),
@@ -8768,7 +8768,7 @@ class NakshaApp(QMainWindow):
             self.vtk_widget.render()
 
         elif mode == "elevation":
-            from gui.pointcloud_display import _microstation_elevation_rgb
+            from gui.pointcloud_display import _nakshatech_elevation_rgb
             import time as _time
 
             t_elev0 = _time.perf_counter()
@@ -8812,7 +8812,7 @@ class NakshaApp(QMainWindow):
                 colors_u8 = self._elevation_cache_colors
                 print("  ⚡ Elevation cache hit")
             else:
-                colors_u8, clip_lo, clip_hi = _microstation_elevation_rgb(
+                colors_u8, clip_lo, clip_hi = _nakshatech_elevation_rgb(
                     vis_z,
                     color_ramp=getattr(self, "elevation_color_ramp", None),
                     low_pct=getattr(self, "elevation_clip_low", 1.0),
@@ -8838,12 +8838,12 @@ class NakshaApp(QMainWindow):
 
         elif mode == "depth":
             # ✅ FIX: Read custom depth settings from app attributes
-            from gui.pointcloud_display import _microstation_depth_rgb_from_camera
+            from gui.pointcloud_display import _nakshatech_depth_rgb_from_camera
             
             # Use camera-based depth (true depth from camera perspective)
             camera = self.vtk_widget.renderer.GetActiveCamera()
             
-            colors_u8 = _microstation_depth_rgb_from_camera(
+            colors_u8 = _nakshatech_depth_rgb_from_camera(
                 vis_xyz,
                 camera,
                 low_pct=getattr(self, "depth_clip_low", 1.0),
@@ -11383,7 +11383,7 @@ class NakshaApp(QMainWindow):
                 pass
 
     def redo_classification(self):
-        """🚀 MICROSTATION REDO: Instant GPU Forward-Patch"""
+        """🚀 NAKSHATECH REDO: Instant GPU Forward-Patch"""
         if not self.redo_stack: return
         step = self.redo_stack.pop()
         mask = step.get('mask')
@@ -12208,7 +12208,7 @@ class NakshaApp(QMainWindow):
     
     def refresh_after_classification(self, to_class, changed_mask=None): ################
         """
-        ⚡ MICROSTATION STYLE REFRESH
+        ⚡ NAKSHATECH STYLE REFRESH
         This replaces the slow rebuild logic during active classification.
         """
         if changed_mask is None:
@@ -16634,7 +16634,7 @@ class NakshaApp(QMainWindow):
             print("✅ Display Mode dialog FORCED visible")
 
     def open_fields_panel(self):
-        """Open the MicroStation-style point data table for the loaded cloud."""
+        """Open the Nakshatech-style point data table for the loaded cloud."""
         from PySide6.QtWidgets import QMessageBox
         from gui.dialogs.view_fields_table import ViewFieldsTableDialog
 

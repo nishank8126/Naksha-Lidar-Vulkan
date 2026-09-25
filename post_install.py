@@ -2,7 +2,7 @@
 Post-installation script for Naksha.
 
 Registers .snt file type association so .snt files show the Naksha icon
-in Windows Explorer (similar to how .dgn shows MicroStation icon).
+in Windows Explorer (similar to how .dgn shows Nakshatech icon).
 
 This script is called:
   1. Automatically by the Inno Setup installer (if used)

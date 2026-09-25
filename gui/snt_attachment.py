@@ -262,7 +262,7 @@
 # def _snt_polygon_interior_point(polygon: list) -> Tuple[float, float]:
 #     """Return a point that is reliably inside the polygon, even for thin diagonal strips.
 
-#     TerraScan block polygons are often long narrow strip shapes (flight-line corridors).
+#     Nakshatech block polygons are often long narrow strip shapes (flight-line corridors).
 #     Their arithmetic centroid frequently falls *outside* the boundary, which causes
 #     both PRJ-stage-1 (SNT centroid vs PRJ poly) and PRJ-stage-2 (PRJ centroid vs SNT
 #     poly) to fail, leaving the polygon matched only by the text-label fallback.
@@ -509,7 +509,7 @@
 
 # def _normalise_snt_level_name(layer_name: str) -> str:
 #     """
-#     Normalize a MicroStation/SNT level name without regex.
+#     Normalize a Nakshatech/SNT level name without regex.
 
 #     Examples:
 #         " New   Level "   -> "NEW LEVEL"
@@ -522,7 +522,7 @@
 
 # def _is_default_placeholder_block_level(layer_name: str) -> bool:
 #     """
-#     Return True only for the known MicroStation placeholder levels.
+#     Return True only for the known Nakshatech placeholder levels.
 
 #     This must remain separate from _is_block_boundary_layer_name().
 #     Globally treating every 'New Level' entity as a block boundary would
@@ -837,7 +837,7 @@
 #     # Real named block boundaries.
 #     explicit_block_polys: list = []
 
-#     # Possible real boundaries stored on MicroStation's default level.
+#     # Possible real boundaries stored on Nakshatech's default level.
 #     placeholder_polys: list = []
 
 #     # Small index tiles. These are used only when no real blocks exist.
@@ -2233,7 +2233,7 @@
 
 #     ``entities`` contains logical drawable SNT records and remains authoritative
 #     for rendering and the file-wide entity badge. CONNECT bridge SNTs also carry
-#     ``source_layer_counts``: MicroStation's physical per-level counts, including
+#     ``source_layer_counts``: Nakshatech's physical per-level counts, including
 #     stored complex components. Those declared counts are authoritative for the
 #     Level Manager. A drawable baseline captured at load time lets subsequent
 #     in-memory add/delete/move operations appear as deltas over the declaration.
@@ -2262,7 +2262,7 @@
 #             ordered_names.append(lname)
 
 #     # Keep entities/layers created by the application visible even though they
-#     # naturally have no MicroStation declaration.
+#     # naturally have no Nakshatech declaration.
 #     for lname in actual_counts:
 #         if lname not in stats:
 #             stats[lname] = {"count": 0, "color": _DEFAULT_COLOR}
@@ -12692,7 +12692,7 @@
 #         is_snt_binary = entity.get("snt_binary", False)
 
 #         if is_snt_binary:
-#             # CONNECT-native SNT stores the real MicroStation text height in
+#             # CONNECT-native SNT stores the real Nakshatech text height in
 #             # world units.  Do not normalise it: doing so reduced labels such
 #             # as NST/UMA from hundreds of metres to 2.5m while enlarging 0.1m
 #             # plan-title text to 1m.  That made every text entity visually
@@ -13277,7 +13277,7 @@ def _snt_polygon_centroid_2d(polygon: list) -> Tuple[float, float]:
 def _snt_polygon_interior_point(polygon: list) -> Tuple[float, float]:
     """Return a point that is reliably inside the polygon, even for thin diagonal strips.
 
-    TerraScan block polygons are often long narrow strip shapes (flight-line corridors).
+    Nakshatech block polygons are often long narrow strip shapes (flight-line corridors).
     Their arithmetic centroid frequently falls *outside* the boundary, which causes
     both PRJ-stage-1 (SNT centroid vs PRJ poly) and PRJ-stage-2 (PRJ centroid vs SNT
     poly) to fail, leaving the polygon matched only by the text-label fallback.
@@ -13652,7 +13652,7 @@ _DEFAULT_PLACEHOLDER_BLOCK_LEVELS = frozenset({
 
 def _normalise_snt_level_name(layer_name: str) -> str:
     """
-    Normalize a MicroStation/SNT level name without regex.
+    Normalize a Nakshatech/SNT level name without regex.
 
     Examples:
         " New   Level "   -> "NEW LEVEL"
@@ -13665,7 +13665,7 @@ def _normalise_snt_level_name(layer_name: str) -> str:
 
 def _is_default_placeholder_block_level(layer_name: str) -> bool:
     """
-    Return True only for the known MicroStation placeholder levels.
+    Return True only for the known Nakshatech placeholder levels.
 
     This must remain separate from _is_block_boundary_layer_name().
     Globally treating every 'New Level' entity as a block boundary would
@@ -14167,7 +14167,7 @@ def build_snt_block_polygons(
     # Real named block boundaries.
     explicit_block_polys: list = []
 
-    # Possible real boundaries stored on MicroStation's default level.
+    # Possible real boundaries stored on Nakshatech's default level.
     placeholder_polys: list = []
 
     # Small index tiles. These are used only when no real blocks exist.
@@ -15777,7 +15777,7 @@ def _snt_layer_stats_from_parsed(parsed) -> List[Tuple[str, int, Tuple[int, int,
 
     ``entities`` contains logical drawable SNT records and remains authoritative
     for rendering and the file-wide entity badge. CONNECT bridge SNTs also carry
-    ``source_layer_counts``: MicroStation's physical per-level counts, including
+    ``source_layer_counts``: Nakshatech's physical per-level counts, including
     stored complex components. Those declared counts are authoritative for the
     Level Manager. A drawable baseline captured at load time lets subsequent
     in-memory add/delete/move operations appear as deltas over the declaration.
@@ -15806,7 +15806,7 @@ def _snt_layer_stats_from_parsed(parsed) -> List[Tuple[str, int, Tuple[int, int,
             ordered_names.append(lname)
 
     # Keep entities/layers created by the application visible even though they
-    # naturally have no MicroStation declaration.
+    # naturally have no Nakshatech declaration.
     for lname in actual_counts:
         if lname not in stats:
             stats[lname] = {"count": 0, "color": _DEFAULT_COLOR}
@@ -26464,7 +26464,7 @@ class MultiSNTAttachmentDialog(MinimizableDialogMixin, QDialog):
         is_snt_binary = entity.get("snt_binary", False)
 
         if is_snt_binary:
-            # CONNECT-native SNT stores the real MicroStation text height in
+            # CONNECT-native SNT stores the real Nakshatech text height in
             # world units.  Do not normalise it: doing so reduced labels such
             # as NST/UMA from hundreds of metres to 2.5m while enlarging 0.1m
             # plan-title text to 1m.  That made every text entity visually

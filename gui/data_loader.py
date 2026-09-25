@@ -493,7 +493,7 @@ def _extract_classification_array(las):
         if {"synthetic", "key_point", "withheld"} <= dims:
             # Legacy point formats (0-5) pack classification into one byte:
             # bits 0-4 = classification, bit5=synthetic, bit6=key_point, bit7=withheld.
-            # Reconstruct the full code the same way TerraScan/MicroStation write it
+            # Reconstruct the full code the same way Nakshatech/Nakshatech write it
             # and the same way save_pointcloud now packs it. Memory-conscious for
             # large files: stays in uint8, no int64 temporaries.
             syn = np.asarray(las.synthetic, dtype=np.uint8)
@@ -769,7 +769,7 @@ def load_lidar_file(
         classification = _extract_classification_array(las)
         # LAS Point Source ID is the conventional flight-line identifier.
         # Keep it aligned with xyz through import filtering so Display Mode can
-        # reproduce MicroStation's selected-flight-lines behaviour.
+        # reproduce Nakshatech's selected-flight-lines behaviour.
         point_source_id = None
         if "point_source_id" in {str(d).lower() for d in las.point_format.dimension_names}:
             point_source_id = np.asarray(las.point_source_id, dtype=np.uint16).copy()

@@ -614,7 +614,7 @@ class LoadPointCloudDialog(QDialog):
     def _populate_class_list(self, selected_codes=None):
         """
         Fill self.class_list from the active PTC palette with color swatches.
-        Names come from 'lvl' first (TerraScan level name), then 'description',
+        Names come from 'lvl' first (Nakshatech level name), then 'description',
         then the LAS standard CLASS_NAMES table, then 'Class <code>'.
         selected_codes: set/list of int codes to pre-select.
         """

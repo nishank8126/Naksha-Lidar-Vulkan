@@ -22,11 +22,11 @@
 
 # _INTERACTOR_DEBUG = True
 
-# # MicroStation-style tap-vs-drag for above/below/parallel-line tools: a brief
+# # Nakshatech-style tap-vs-drag for above/below/parallel-line tools: a brief
 # # settle window right after press during which mouse movement is never
 # # counted toward drag detection (a real fast tap's hand jitter happens almost
 # # entirely within this window), plus the distance threshold (top of
-# # MicroStation's own stated 4-6px range) that decides drag once past it.
+# # Nakshatech's own stated 4-6px range) that decides drag once past it.
 # # Shared by _on_mouse_move_with_preview (accumulation) and on_left_release
 # # (the tap-vs-drag decision) so both stay in sync.
 # _LINE_TAP_GRACE_SEC = 0.12
@@ -317,7 +317,7 @@
 #         if event is not None:
 #             et = event.type()
 #             if et in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
-#                 # ✅ MicroStation tap-tap tools (above/below/parallel line) are two
+#                 # ✅ Nakshatech tap-tap tools (above/below/parallel line) are two
 #                 # deliberate clicks placed fast — well inside the OS double-click
 #                 # window. Swallowing that here as a "double click" would eat the
 #                 # second tap entirely (and block clicks for 500ms after), making
@@ -2238,7 +2238,7 @@
 
 #     def _navigate_main_to_section_click(self, display_x, display_y):
 #         """
-#         MicroStation-style locate: click in section view while cross-section tool is
+#         Nakshatech-style locate: click in section view while cross-section tool is
 #         active → pan main view to the corresponding world XY AND start a rubber-band
 #         preview line from that locked point.
 
@@ -3682,7 +3682,7 @@
 #             # ══════════════════════════════════════════════════════════════════
 #             # LINE TAP-VS-DRAG: track the MAXIMUM distance moved from the press
 #             # point while the button is held — not just the final displacement
-#             # at release. MicroStation's own state machine commits to DRAGGING
+#             # at release. Nakshatech's own state machine commits to DRAGGING
 #             # the instant the threshold is crossed and stays committed even if
 #             # the cursor drifts back near the origin before release; checking
 #             # only net (press→release) displacement would wrongly reclassify
@@ -3693,7 +3693,7 @@
 #             # Movement during the initial grace window (_LINE_TAP_GRACE_SEC,
 #             # matching on_left_release) is never accumulated at all — a real
 #             # fast tap's natural hand jitter happens almost entirely within
-#             # this window, and MicroStation itself does not start counting
+#             # this window, and Nakshatech itself does not start counting
 #             # distance toward drag detection until this brief settle period
 #             # has passed.
 #             # ══════════════════════════════════════════════════════════════════
@@ -3919,7 +3919,7 @@
 #                 if self.is_dragging:
 #                     if self._is_main_view():
 #                         # ═══════════════════════════════════════════════════════
-#                         # MICROSTATION PRODUCTION BRUSH
+#                         # NAKSHATECH PRODUCTION BRUSH
 #                         # Phase 1 (every mouse move): spatial lookup → CPU classify → accumulate
 #                         # Phase 2 (30fps tick only): single GPU injection + render
 #                         # Zero allocation per stamp. All numpy, no Python loops.
@@ -4608,7 +4608,7 @@
 #             self.app.active_classify_target = "section"
 
 #         # When cross-section tool is active, a click in the section view navigates
-#         # the main view to the corresponding world XY (MicroStation-style locate).
+#         # the main view to the corresponding world XY (Nakshatech-style locate).
 #         if not self._is_main_view() and not is_cut_interaction:
 #             if getattr(self.app, 'cross_section_active', False) and tool is None:
 #                 sx, sy = self.interactor.GetEventPosition()
@@ -4737,7 +4737,7 @@
 #         self._last_render_time     = 0.0
 #         self._last_mouse_move_time = 0.0
 
-#         # ✅ MicroStation tap-tap AND drag, combined: whether this gesture
+#         # ✅ Nakshatech tap-tap AND drag, combined: whether this gesture
 #         # becomes a tap (arm click_to_finalize, wait for the confirming
 #         # second tap) or a drag (classify immediately on release using
 #         # press→release as the line) is now decided in on_left_release by
@@ -4982,13 +4982,13 @@
 #                 not getattr(self, 'is_dragging', False)):
 #             return
 
-#         # ✅ LINE TAP-VS-DRAG (MicroStation-style, combined): a first release
+#         # ✅ LINE TAP-VS-DRAG (Nakshatech-style, combined): a first release
 #         # for above/below/parallel-line hasn't been classified as tap or drag
 #         # yet at this point (is_dragging=True from press, click_to_finalize
 #         # still False). Decide now using the MAXIMUM distance moved from the
 #         # press point at any point during the gesture (tracked continuously
 #         # in _on_mouse_move_with_preview) — not just the net press→release
-#         # displacement. MicroStation's engine commits to DRAGGING the instant
+#         # displacement. Nakshatech's engine commits to DRAGGING the instant
 #         # the threshold is crossed and stays committed even if the cursor
 #         # drifts back near the origin before release; using only the final
 #         # displacement would wrongly reclassify a "dragged out and back"
@@ -5001,7 +5001,7 @@
 #         #     Branch D drag-classify path below (untouched code that already
 #         #     handles above_line/below_line/parallel_line correctly using
 #         #     self.P1 as the press point and P2 resolved just below), so it
-#         #     classifies immediately on release, MicroStation-style.
+#         #     classifies immediately on release, Nakshatech-style.
 #         # A release that lands inside the initial settle window
 #         # (_LINE_TAP_GRACE_SEC) is always a tap — a real fast click's own
 #         # press→release displacement can otherwise exceed the pixel
@@ -5030,7 +5030,7 @@
 #             # else: genuine drag — continue past this block into the normal
 #             # release-classify path further down, unchanged.
 
-#         # ✅ MicroStation tap-tap only: if a stray release arrives while
+#         # ✅ Nakshatech tap-tap only: if a stray release arrives while
 #         # click_to_finalize is still armed (waiting on the confirming second
 #         # tap), it must never run the drag-classify path — it would
 #         # double-classify or misfire.
@@ -5040,7 +5040,7 @@
 
 #         # 3. Debounce (20ms) — guards against accidental double-fires from a
 #         # single physical click, but lets a fast user fire 30+ classifications
-#         # per second (Microstation cadence). Raised back to 100ms = silently
+#         # per second (Nakshatech cadence). Raised back to 100ms = silently
 #         # dropped clicks during streaks.
 #         current_time = time.time()
 #         if hasattr(self, '_last_release_time'):
@@ -5104,7 +5104,7 @@
 #                 if hasattr(self, '_brush_accumulated_mask') and np.any(self._brush_accumulated_mask):
 #                     start = time.time()
 
-#                     # ✅ MICROSTATION: Classification was already applied during drag.
+#                     # ✅ NAKSHATECH: Classification was already applied during drag.
 #                     # Only push the undo entry here (no re-classification needed).
 #                     # ✅ Lightning-fast array-based merge for undo
 #                     if hasattr(self, '_brush_indices_arrays') and self._brush_indices_arrays:
@@ -6970,7 +6970,7 @@
 #         self.app._last_from_classes = list(getattr(self.app, "from_classes", []) or [])
 
 #         # ─────────────────────────────────────────────────────────────
-#         # ⚡ MICROSTATION-STYLE INSTANT GPU INJECTION (replaces heavy optimizer)
+#         # ⚡ NAKSHATECH-STYLE INSTANT GPU INJECTION (replaces heavy optimizer)
 #         # ─────────────────────────────────────────────────────────────
 #         try:
 #             from gui.unified_actor_manager import fast_partial_classify_update, fast_partial_cross_section_update
@@ -9176,7 +9176,7 @@
         
 #     def _get_points_in_radius_fast(self, center_x, center_y, radius):
 #         """
-#         ✅ MICROSTATION O(1) GRID LOOKUP: Get points within radius.
+#         ✅ NAKSHATECH O(1) GRID LOOKUP: Get points within radius.
 #         Uses sort-order slicing — zero Python loops for candidate collection.
 #         Typical: 0.1-0.5ms per stamp (vs 10-50ms for full scan).
 #         """
@@ -9405,7 +9405,7 @@
 
 #     def on_right_press(self, obj, evt):
 #         """Right-click handler for cross-section views."""
-#         # ✅ MicroStation "Reset Button" behavior: a right-click at any point
+#         # ✅ Nakshatech "Reset Button" behavior: a right-click at any point
 #         # during an in-progress above/below/parallel-line gesture (awaiting
 #         # the confirming second tap, or mid-drag) must immediately cancel it
 #         # and revert to IDLE — never let it silently finalize against a
@@ -10093,11 +10093,11 @@ import pyvista as pv
 
 _INTERACTOR_DEBUG = True
 
-# MicroStation-style tap-vs-drag for above/below/parallel-line tools: a brief
+# Nakshatech-style tap-vs-drag for above/below/parallel-line tools: a brief
 # settle window right after press during which mouse movement is never
 # counted toward drag detection (a real fast tap's hand jitter happens almost
 # entirely within this window), plus the distance threshold (top of
-# MicroStation's own stated 4-6px range) that decides drag once past it.
+# Nakshatech's own stated 4-6px range) that decides drag once past it.
 # Shared by _on_mouse_move_with_preview (accumulation) and on_left_release
 # (the tap-vs-drag decision) so both stay in sync.
 _LINE_TAP_GRACE_SEC = 0.12
@@ -10388,7 +10388,7 @@ class ClassificationDoubleClickFilter(QObject):
         if event is not None:
             et = event.type()
             if et in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick):
-                # ✅ MicroStation tap-tap tools (above/below/parallel line) are two
+                # ✅ Nakshatech tap-tap tools (above/below/parallel line) are two
                 # deliberate clicks placed fast — well inside the OS double-click
                 # window. Swallowing that here as a "double click" would eat the
                 # second tap entirely (and block clicks for 500ms after), making
@@ -12430,7 +12430,7 @@ class ClassificationInteractor:
 
     def _navigate_main_to_section_click(self, display_x, display_y):
         """
-        MicroStation-style locate: click in section view while cross-section tool is
+        Nakshatech-style locate: click in section view while cross-section tool is
         active → pan main view to the corresponding world XY AND start a rubber-band
         preview line from that locked point.
 
@@ -13896,7 +13896,7 @@ class ClassificationInteractor:
             # ══════════════════════════════════════════════════════════════════
             # LINE TAP-VS-DRAG: track the MAXIMUM distance moved from the press
             # point while the button is held — not just the final displacement
-            # at release. MicroStation's own state machine commits to DRAGGING
+            # at release. Nakshatech's own state machine commits to DRAGGING
             # the instant the threshold is crossed and stays committed even if
             # the cursor drifts back near the origin before release; checking
             # only net (press→release) displacement would wrongly reclassify
@@ -13907,7 +13907,7 @@ class ClassificationInteractor:
             # Movement during the initial grace window (_LINE_TAP_GRACE_SEC,
             # matching on_left_release) is never accumulated at all — a real
             # fast tap's natural hand jitter happens almost entirely within
-            # this window, and MicroStation itself does not start counting
+            # this window, and Nakshatech itself does not start counting
             # distance toward drag detection until this brief settle period
             # has passed.
             # ══════════════════════════════════════════════════════════════════
@@ -14133,7 +14133,7 @@ class ClassificationInteractor:
                 if self.is_dragging:
                     if self._is_main_view():
                         # ═══════════════════════════════════════════════════════
-                        # MICROSTATION PRODUCTION BRUSH
+                        # NAKSHATECH PRODUCTION BRUSH
                         # Phase 1 (every mouse move): spatial lookup → CPU classify → accumulate
                         # Phase 2 (30fps tick only): single GPU injection + render
                         # Zero allocation per stamp. All numpy, no Python loops.
@@ -14842,7 +14842,7 @@ class ClassificationInteractor:
             self.app.active_classify_target = "section"
 
         # When cross-section tool is active, a click in the section view navigates
-        # the main view to the corresponding world XY (MicroStation-style locate).
+        # the main view to the corresponding world XY (Nakshatech-style locate).
         if not self._is_main_view() and not is_cut_interaction:
             if getattr(self.app, 'cross_section_active', False) and tool is None:
                 sx, sy = self.interactor.GetEventPosition()
@@ -14971,7 +14971,7 @@ class ClassificationInteractor:
         self._last_render_time     = 0.0
         self._last_mouse_move_time = 0.0
 
-        # ✅ MicroStation tap-tap AND drag, combined: whether this gesture
+        # ✅ Nakshatech tap-tap AND drag, combined: whether this gesture
         # becomes a tap (arm click_to_finalize, wait for the confirming
         # second tap) or a drag (classify immediately on release using
         # press→release as the line) is now decided in on_left_release by
@@ -15216,13 +15216,13 @@ class ClassificationInteractor:
                 not getattr(self, 'is_dragging', False)):
             return
 
-        # ✅ LINE TAP-VS-DRAG (MicroStation-style, combined): a first release
+        # ✅ LINE TAP-VS-DRAG (Nakshatech-style, combined): a first release
         # for above/below/parallel-line hasn't been classified as tap or drag
         # yet at this point (is_dragging=True from press, click_to_finalize
         # still False). Decide now using the MAXIMUM distance moved from the
         # press point at any point during the gesture (tracked continuously
         # in _on_mouse_move_with_preview) — not just the net press→release
-        # displacement. MicroStation's engine commits to DRAGGING the instant
+        # displacement. Nakshatech's engine commits to DRAGGING the instant
         # the threshold is crossed and stays committed even if the cursor
         # drifts back near the origin before release; using only the final
         # displacement would wrongly reclassify a "dragged out and back"
@@ -15235,7 +15235,7 @@ class ClassificationInteractor:
         #     Branch D drag-classify path below (untouched code that already
         #     handles above_line/below_line/parallel_line correctly using
         #     self.P1 as the press point and P2 resolved just below), so it
-        #     classifies immediately on release, MicroStation-style.
+        #     classifies immediately on release, Nakshatech-style.
         # A release that lands inside the initial settle window
         # (_LINE_TAP_GRACE_SEC) is always a tap — a real fast click's own
         # press→release displacement can otherwise exceed the pixel
@@ -15264,7 +15264,7 @@ class ClassificationInteractor:
             # else: genuine drag — continue past this block into the normal
             # release-classify path further down, unchanged.
 
-        # ✅ MicroStation tap-tap only: if a stray release arrives while
+        # ✅ Nakshatech tap-tap only: if a stray release arrives while
         # click_to_finalize is still armed (waiting on the confirming second
         # tap), it must never run the drag-classify path — it would
         # double-classify or misfire.
@@ -15274,7 +15274,7 @@ class ClassificationInteractor:
 
         # 3. Debounce (20ms) — guards against accidental double-fires from a
         # single physical click, but lets a fast user fire 30+ classifications
-        # per second (Microstation cadence). Raised back to 100ms = silently
+        # per second (Nakshatech cadence). Raised back to 100ms = silently
         # dropped clicks during streaks.
         current_time = time.time()
         if hasattr(self, '_last_release_time'):
@@ -15338,7 +15338,7 @@ class ClassificationInteractor:
                 if hasattr(self, '_brush_accumulated_mask') and np.any(self._brush_accumulated_mask):
                     start = time.time()
 
-                    # ✅ MICROSTATION: Classification was already applied during drag.
+                    # ✅ NAKSHATECH: Classification was already applied during drag.
                     # Only push the undo entry here (no re-classification needed).
                     # ✅ Lightning-fast array-based merge for undo
                     if hasattr(self, '_brush_indices_arrays') and self._brush_indices_arrays:
@@ -17206,7 +17206,7 @@ class ClassificationInteractor:
         self.app._last_from_classes = list(getattr(self.app, "from_classes", []) or [])
 
         # ─────────────────────────────────────────────────────────────
-        # ⚡ MICROSTATION-STYLE INSTANT GPU INJECTION (replaces heavy optimizer)
+        # ⚡ NAKSHATECH-STYLE INSTANT GPU INJECTION (replaces heavy optimizer)
         # ─────────────────────────────────────────────────────────────
         try:
             from gui.unified_actor_manager import fast_partial_classify_update, fast_partial_cross_section_update
@@ -19434,7 +19434,7 @@ class ClassificationInteractor:
         
     def _get_points_in_radius_fast(self, center_x, center_y, radius):
         """
-        ✅ MICROSTATION O(1) GRID LOOKUP: Get points within radius.
+        ✅ NAKSHATECH O(1) GRID LOOKUP: Get points within radius.
         Uses sort-order slicing — zero Python loops for candidate collection.
         Typical: 0.1-0.5ms per stamp (vs 10-50ms for full scan).
         """
@@ -19663,7 +19663,7 @@ class ClassificationInteractor:
 
     def on_right_press(self, obj, evt):
         """Right-click handler for cross-section views."""
-        # ✅ MicroStation "Reset Button" behavior: a right-click at any point
+        # ✅ Nakshatech "Reset Button" behavior: a right-click at any point
         # during an in-progress above/below/parallel-line gesture (awaiting
         # the confirming second tap, or mid-drag) must immediately cancel it
         # and revert to IDLE — never let it silently finalize against a

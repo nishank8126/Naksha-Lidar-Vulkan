@@ -88,7 +88,7 @@ class IntensitySettingsDialog(QDialog):
         # Description
         gamma_desc = QLabel(
             "• <b>Lower</b> (0.5-1.0): Brighter display, shows weak returns<br>"
-            "• <b>Default</b> (1.65): MicroStation-like balanced display<br>"
+            "• <b>Default</b> (1.65): Nakshatech-like balanced display<br>"
             "• <b>Higher</b> (2.0-3.0): Darker display, emphasizes strong returns"
         )
         gamma_desc.setWordWrap(True)
@@ -228,12 +228,12 @@ class IntensitySettingsDialog(QDialog):
         self._load_current_values()
     
     def _reset_to_default(self):
-        """Reset to MicroStation-like defaults"""
+        """Reset to Nakshatech-like defaults"""
         self._apply_preset(1.65, 0.5, 99.8)
         QMessageBox.information(
             self, 
             "Reset Complete", 
-            "Settings reset to default MicroStation-like values."
+            "Settings reset to default Nakshatech-like values."
         )
     
     def get_settings(self):

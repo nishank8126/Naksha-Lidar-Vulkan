@@ -1,5 +1,5 @@
 """
-SelectionManager — MicroStation-style centralized selection set.
+SelectionManager — Nakshatech-style centralized selection set.
 
 Single source of truth for "which digitized elements are currently selected".
 Sits beside DigitizeManager.drawings without modifying it; mutation hooks
@@ -12,7 +12,7 @@ Design notes:
 - All highlight/unhighlight goes through DigitizeManager's existing
   _highlight_line / _unhighlight_line so visuals stay consistent with the
   legacy single-click path.
-- Operates in four modes mirroring MicroStation: NEW, ADD, SUBTRACT, INVERT.
+- Operates in four modes mirroring Nakshatech: NEW, ADD, SUBTRACT, INVERT.
 - Polygon-closing expansion: when selected line segments form part of a
   closed polygon, the remaining boundary segments are automatically included
   in the selection (GIS digitizing behavior).

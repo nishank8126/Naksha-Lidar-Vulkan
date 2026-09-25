@@ -217,7 +217,7 @@
 # class AddBlocksByBoundariesDialog(InputPopupMixin, QDialog):
 #     """Naming dialog shown after drawing one or more boundary rectangles.
 
-#     Mirrors MicroStation's "Add Blocks by Boundaries" dialog: a file prefix,
+#     Mirrors Nakshatech's "Add Blocks by Boundaries" dialog: a file prefix,
 #     a numbering mode, and a starting number.  Block names are built as
 #     f"{prefix}{number:06d}" — the same zero-padded style already used by
 #     the existing PRJ blocks in this app.
@@ -364,7 +364,7 @@
 
 
 # class ProjectInformationDialog(InputPopupMixin, QDialog):
-#     """MicroStation-style Project Information dialog.
+#     """Nakshatech-style Project Information dialog.
 
 #     Used for both 'New project' (defaults) and 'Edit project information'
 #     (pre-populated from existing PRJ header).  On OK, returns a fields dict
@@ -834,7 +834,7 @@
 #     @staticmethod
 #     def fields_to_header_text(fields: dict) -> str:
 #         """Serialise fields dict → PRJ header text (before any Block sections)."""
-#         # Field order matches MicroStation's layout for readability
+#         # Field order matches Nakshatech's layout for readability
 #         ordered_keys = [
 #             "Description", "CloudType", "FirstPointId", "Storage",
 #             "RequireFileLocking", "Projection", "DataIn", "Directory",
@@ -847,13 +847,13 @@
 #             "AttrEchoLen", "AttrEchoNorm", "AttrEchoPos", "AttrRefl",
 #             "AttrDev", "AttrReli",
 #         ]
-#         lines = ["[TerraScan project]"]
+#         lines = ["[Nakshatech project]"]
 #         written = set()
 #         for key in ordered_keys:
 #             if key in fields:
 #                 lines.append(f"{key}={fields[key]}")
 #                 written.add(key)
-#         # Preserve any unknown keys from original (e.g. added by TerraScan itself)
+#         # Preserve any unknown keys from original (e.g. added by Nakshatech itself)
 #         for key, val in fields.items():
 #             if key not in written:
 #                 lines.append(f"{key}={val}")
@@ -1054,7 +1054,7 @@
 #         layout.setContentsMargins(10, 8, 16, 16)
 #         layout.setSpacing(10)
 
-#         # ── Menu bar — mirrors MicroStation's "Project:" window (File / Block) ──
+#         # ── Menu bar — mirrors Nakshatech's "Project:" window (File / Block) ──
 #         from PySide6.QtWidgets import QMenuBar
 #         self.menu_bar = QMenuBar(self)
 #         self.menu_bar.setNativeMenuBar(False)
@@ -1315,8 +1315,8 @@
 
 #     # ── Lock / Release lock ──────────────────────────────────────────────────
 #     # Lock state is session-only (not written to the .prj file) — the exact
-#     # TerraScan format for a lock flag is unverified, and inventing one risks
-#     # breaking compatibility if the file is later opened in real MicroStation.
+#     # Nakshatech format for a lock flag is unverified, and inventing one risks
+#     # breaking compatibility if the file is later opened in real Nakshatech.
 #     # It still fully blocks Delete / Rename / Edit Definition in this app.
 
 #     def _resolve_selected_prj_indices(self):
@@ -1714,7 +1714,7 @@
 #             self.parse_prj_file(file_path)
             
 #     def parse_prj_file(self, file_path):
-#         """Parse TerraScan PRJ file and populate table"""
+#         """Parse Nakshatech PRJ file and populate table"""
 #         try:
 #             # ✅ Store the PRJ file path (prevents deletion)
 #             self.current_prj_path = file_path
@@ -1773,7 +1773,7 @@
 #                             j += 1
 #                             continue
                         
-#                         # ✅ Skip TerraScan metadata lines (GroupFirst=, GroupCount=, etc.)
+#                         # ✅ Skip Nakshatech metadata lines (GroupFirst=, GroupCount=, etc.)
 #                         if '=' in coord_line:
 #                             print(f"    ⏭️ Metadata: '{coord_line}', skipping")
 #                             j += 1
@@ -2795,7 +2795,7 @@
 #     # ── Table right-click context menu ───────────────────────────────────────
 
 #     def _on_table_context_menu(self, pos):
-#         """Right-click context menu on the block table (MicroStation-style).
+#         """Right-click context menu on the block table (Nakshatech-style).
 
 #         Shows block-management actions for the currently selected row(s).
 #         Only available when at least one row is selected.
@@ -2836,7 +2836,7 @@
 #     def add_block_definition(self):
 #         """Add new block definition(s) to the loaded PRJ from LAZ/LAS file(s).
 
-#         Matches MicroStation's "Add using files..." — multiple files can be
+#         Matches Nakshatech's "Add using files..." — multiple files can be
 #         selected at once.  Each file's header is read to get the XY bounding
 #         box automatically (no points are loaded).  The bounding rectangle of
 #         each file becomes its block polygon.  All blocks are written in a
@@ -3382,7 +3382,7 @@
 #         ]
 #         for x, y in polygon_coords:
 #             lines.append(f" {x:.4f} {y:.4f}")
-#         lines.append("")  # trailing blank line required by TerraScan parser
+#         lines.append("")  # trailing blank line required by Nakshatech parser
 #         return "\n".join(lines) + "\n"
 
 #     @staticmethod
@@ -3745,7 +3745,7 @@
 #         the output.  Skipping stops as soon as the next 'Block ' header is
 #         reached, at which point the new block is evaluated independently.
 
-#         The file header ([TerraScan project] and all key=value settings) is
+#         The file header ([Nakshatech project] and all key=value settings) is
 #         never touched.
 
 #         Args:
@@ -3864,7 +3864,7 @@
 #             self._fence_highlight_actors = []
 
 #     def _highlight_fence_selected_blocks(self, labels_upper: Set[str]):
-#         """Draw bright boundary-polygon outlines for selected blocks (MicroStation-style).
+#         """Draw bright boundary-polygon outlines for selected blocks (Nakshatech-style).
 
 #         Uses the boundary_coords already stored in prj_data — no DXF/SNT actor
 #         lookup required.  Each selected block gets a cyan polyline at z=1 so it
@@ -3913,7 +3913,7 @@
 
 #                 actor = vtk.vtkActor()
 #                 actor.SetMapper(mapper)
-#                 actor.GetProperty().SetColor(0.0, 1.0, 1.0)   # cyan — MicroStation selection colour
+#                 actor.GetProperty().SetColor(0.0, 1.0, 1.0)   # cyan — Nakshatech selection colour
 #                 actor.GetProperty().SetLineWidth(3.0)
 #                 actor.GetProperty().SetOpacity(1.0)
 #                 try:
@@ -4130,7 +4130,7 @@
 #         if first_idx is not None:
 #             self.table.scrollTo(first_idx)
 
-#         # Highlight block boundary polygons in the viewport (MicroStation-style)
+#         # Highlight block boundary polygons in the viewport (Nakshatech-style)
 #         self._highlight_fence_selected_blocks(matched)
 
 #         n = len(matched)
@@ -4677,7 +4677,7 @@
 
 #     def _detect_prefix_and_next_number(self):
 #         """Inspect existing PRJ block labels to suggest a prefix + next number,
-#         matching MicroStation's auto-suggest in 'Add by boundaries' — e.g. if
+#         matching Nakshatech's auto-suggest in 'Add by boundaries' — e.g. if
 #         'drjh RADAR +000009/10/11' already exist, suggests prefix
 #         'drjh RADAR +' and first number 12.
 
@@ -5168,7 +5168,7 @@
 
 #     def _new_project(self):
 #         """'New project...' — Project Information dialog first, then save location."""
-#         # 1. Show Project Information dialog with all defaults — matches MicroStation
+#         # 1. Show Project Information dialog with all defaults — matches Nakshatech
 #         #    workflow where the form appears immediately on "New project".
 #         info_dlg = ProjectInformationDialog(fields=None, parent=self)
 #         info_dlg.setWindowTitle("Project Information — New Project")
@@ -6448,7 +6448,7 @@ from gui.popup_guard import InputPopupMixin
 def _lidar_block_stem(value):
     """Return a block filename without only a terminal LAS/LAZ suffix.
 
-    ``os.path.splitext`` cannot be used for extensionless TerraScan block
+    ``os.path.splitext`` cannot be used for extensionless Nakshatech block
     labels such as ``S. PIETRO000025``: it interprets everything from the
     embedded dot onward as an extension and returns just ``S``.
     """
@@ -6661,7 +6661,7 @@ class _MinimizedPRJChip(QWidget):
 class AddBlocksByBoundariesDialog(InputPopupMixin, QDialog):
     """Naming dialog shown after drawing one or more boundary rectangles.
 
-    Mirrors MicroStation's "Add Blocks by Boundaries" dialog: a file prefix,
+    Mirrors Nakshatech's "Add Blocks by Boundaries" dialog: a file prefix,
     a numbering mode, and a starting number.  Block names are built as
     f"{prefix}{number:06d}" — the same zero-padded style already used by
     the existing PRJ blocks in this app.
@@ -6808,7 +6808,7 @@ class _AttributesToStoreDialog(InputPopupMixin, QDialog):
 
 
 class ProjectInformationDialog(InputPopupMixin, QDialog):
-    """MicroStation-style Project Information dialog.
+    """Nakshatech-style Project Information dialog.
 
     Used for both 'New project' (defaults) and 'Edit project information'
     (pre-populated from existing PRJ header).  On OK, returns a fields dict
@@ -7278,7 +7278,7 @@ class ProjectInformationDialog(InputPopupMixin, QDialog):
     @staticmethod
     def fields_to_header_text(fields: dict) -> str:
         """Serialise fields dict → PRJ header text (before any Block sections)."""
-        # Field order matches MicroStation's layout for readability
+        # Field order matches Nakshatech's layout for readability
         ordered_keys = [
             "Description", "CloudType", "FirstPointId", "Storage",
             "RequireFileLocking", "Projection", "DataIn", "Directory",
@@ -7291,13 +7291,13 @@ class ProjectInformationDialog(InputPopupMixin, QDialog):
             "AttrEchoLen", "AttrEchoNorm", "AttrEchoPos", "AttrRefl",
             "AttrDev", "AttrReli",
         ]
-        lines = ["[TerraScan project]"]
+        lines = ["[Nakshatech project]"]
         written = set()
         for key in ordered_keys:
             if key in fields:
                 lines.append(f"{key}={fields[key]}")
                 written.add(key)
-        # Preserve any unknown keys from original (e.g. added by TerraScan itself)
+        # Preserve any unknown keys from original (e.g. added by Nakshatech itself)
         for key, val in fields.items():
             if key not in written:
                 lines.append(f"{key}={val}")
@@ -7498,7 +7498,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         layout.setContentsMargins(10, 8, 16, 16)
         layout.setSpacing(10)
 
-        # ── Menu bar — mirrors MicroStation's "Project:" window (File / Block) ──
+        # ── Menu bar — mirrors Nakshatech's "Project:" window (File / Block) ──
         from PySide6.QtWidgets import QMenuBar
         self.menu_bar = QMenuBar(self)
         self.menu_bar.setNativeMenuBar(False)
@@ -7759,8 +7759,8 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     # ── Lock / Release lock ──────────────────────────────────────────────────
     # Lock state is session-only (not written to the .prj file) — the exact
-    # TerraScan format for a lock flag is unverified, and inventing one risks
-    # breaking compatibility if the file is later opened in real MicroStation.
+    # Nakshatech format for a lock flag is unverified, and inventing one risks
+    # breaking compatibility if the file is later opened in real Nakshatech.
     # It still fully blocks Delete / Rename / Edit Definition in this app.
 
     def _resolve_selected_prj_indices(self):
@@ -8158,7 +8158,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             self.parse_prj_file(file_path)
             
     def parse_prj_file(self, file_path):
-        """Parse TerraScan PRJ file and populate table"""
+        """Parse Nakshatech PRJ file and populate table"""
         try:
             # ✅ Store the PRJ file path (prevents deletion)
             self.current_prj_path = file_path
@@ -8217,7 +8217,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
                             j += 1
                             continue
                         
-                        # ✅ Skip TerraScan metadata lines (GroupFirst=, GroupCount=, etc.)
+                        # ✅ Skip Nakshatech metadata lines (GroupFirst=, GroupCount=, etc.)
                         if '=' in coord_line:
                             print(f"    ⏭️ Metadata: '{coord_line}', skipping")
                             j += 1
@@ -8679,7 +8679,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         # The DXF/SNT actor position reflects where the grid label is
         # ACTUALLY rendered in the viewport.  PRJ boundary_coords are in
         # the PRJ's real-world projection which can differ from the DGN
-        # coordinate space used by the renderer (e.g. MicroStation UORs).
+        # coordinate space used by the renderer (e.g. Nakshatech UORs).
         # When an actor match exists we must navigate to its viewport
         # position — not to the raw PRJ coordinate — and translate the
         # PRJ boundary polygon so it frames the label the user can see.
@@ -9448,7 +9448,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
     # ── Table right-click context menu ───────────────────────────────────────
 
     def _on_table_context_menu(self, pos):
-        """Right-click context menu on the block table (MicroStation-style).
+        """Right-click context menu on the block table (Nakshatech-style).
 
         Shows block-management actions for the currently selected row(s).
         Only available when at least one row is selected.
@@ -9489,7 +9489,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
     def add_block_definition(self):
         """Add new block definition(s) to the loaded PRJ from LAZ/LAS file(s).
 
-        Matches MicroStation's "Add using files..." — multiple files can be
+        Matches Nakshatech's "Add using files..." — multiple files can be
         selected at once.  Each file's header is read to get the XY bounding
         box automatically (no points are loaded).  The bounding rectangle of
         each file becomes its block polygon.  All blocks are written in a
@@ -10035,7 +10035,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         ]
         for x, y in polygon_coords:
             lines.append(f" {x:.4f} {y:.4f}")
-        lines.append("")  # trailing blank line required by TerraScan parser
+        lines.append("")  # trailing blank line required by Nakshatech parser
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -10112,7 +10112,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         position and the PRJ centroid.  Returns a list of (dx, dy) pairs.
         A consistent non-zero offset means the DGN/SNT coordinate system
         differs from the PRJ projection — common when a DGN stores
-        MicroStation UOR values rather than real-world projected metres.
+        Nakshatech UOR values rather than real-world projected metres.
         """
         offsets = []
         try:
@@ -10456,7 +10456,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         the output.  Skipping stops as soon as the next 'Block ' header is
         reached, at which point the new block is evaluated independently.
 
-        The file header ([TerraScan project] and all key=value settings) is
+        The file header ([Nakshatech project] and all key=value settings) is
         never touched.
 
         Args:
@@ -10575,7 +10575,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
             self._fence_highlight_actors = []
 
     def _highlight_fence_selected_blocks(self, labels_upper: Set[str]):
-        """Draw bright boundary-polygon outlines for selected blocks (MicroStation-style).
+        """Draw bright boundary-polygon outlines for selected blocks (Nakshatech-style).
 
         Uses the boundary_coords already stored in prj_data — no DXF/SNT actor
         lookup required.  Each selected block gets a cyan polyline at z=1 so it
@@ -10624,7 +10624,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
-                actor.GetProperty().SetColor(0.0, 1.0, 1.0)   # cyan — MicroStation selection colour
+                actor.GetProperty().SetColor(0.0, 1.0, 1.0)   # cyan — Nakshatech selection colour
                 actor.GetProperty().SetLineWidth(3.0)
                 actor.GetProperty().SetOpacity(1.0)
                 try:
@@ -10841,7 +10841,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
         if first_idx is not None:
             self.table.scrollTo(first_idx)
 
-        # Highlight block boundary polygons in the viewport (MicroStation-style)
+        # Highlight block boundary polygons in the viewport (Nakshatech-style)
         self._highlight_fence_selected_blocks(matched)
 
         n = len(matched)
@@ -11388,7 +11388,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     def _detect_prefix_and_next_number(self):
         """Inspect existing PRJ block labels to suggest a prefix + next number,
-        matching MicroStation's auto-suggest in 'Add by boundaries' — e.g. if
+        matching Nakshatech's auto-suggest in 'Add by boundaries' — e.g. if
         'drjh RADAR +000009/10/11' already exist, suggests prefix
         'drjh RADAR +' and first number 12.
 
@@ -11879,7 +11879,7 @@ class PRJBlockIdentifierDialog(MinimizableDialogMixin, QDialog):
 
     def _new_project(self):
         """'New project...' — Project Information dialog first, then save location."""
-        # 1. Show Project Information dialog with all defaults — matches MicroStation
+        # 1. Show Project Information dialog with all defaults — matches Nakshatech
         #    workflow where the form appears immediately on "New project".
         info_dlg = ProjectInformationDialog(fields=None, parent=self)
         info_dlg.setWindowTitle("Project Information — New Project")

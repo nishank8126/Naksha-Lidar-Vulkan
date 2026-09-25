@@ -942,7 +942,7 @@ def test_below_surface_dialog_uses_project_defaults_and_tool_fence_picker():
     dialog.close()
 
 
-def test_low_and_isolated_dialogs_expose_only_terrascan_conditions():
+def test_low_and_isolated_dialogs_expose_only_nakshatech_conditions():
     qt_app, _, low, isolated = _noise_dialogs()
     low.show()
     isolated.show()
@@ -978,7 +978,7 @@ def test_low_and_isolated_dialogs_expose_only_terrascan_conditions():
     isolated.close()
 
 
-def test_surface_dialog_exposes_microstation_surface_controls():
+def test_surface_dialog_exposes_nakshatech_surface_controls():
     qt_app, _, dialog = _surface_dialog()
     dialog.show()
     qt_app.processEvents()
