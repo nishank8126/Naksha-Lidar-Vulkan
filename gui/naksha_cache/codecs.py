@@ -141,7 +141,7 @@ def compress(data: bytes, codec: int, level: int = 1) -> bytes:
     if codec == CODEC_ZSTD:
         lib = zstd_lib()
         if lib is None:
-            return bytes(data)
+            raise RuntimeError("zstd unavailable; cannot label raw bytes ZSTD")
         bound = lib.ZSTD_compressBound(len(data))
         dst = ctypes.create_string_buffer(bound)
         n = lib.ZSTD_compress(dst, bound, data, len(data), int(level))
@@ -152,7 +152,7 @@ def compress(data: bytes, codec: int, level: int = 1) -> bytes:
     if codec == CODEC_LZ4:
         lib = lz4_lib()
         if lib is None:
-            return bytes(data)
+            raise RuntimeError("lz4 unavailable; cannot label raw bytes LZ4")
         bound = lib.LZ4_compressBound(len(data))
         src = ctypes.create_string_buffer(bytes(data), len(data))
         dst = ctypes.create_string_buffer(bound)

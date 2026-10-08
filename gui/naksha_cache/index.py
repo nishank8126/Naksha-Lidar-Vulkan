@@ -182,11 +182,13 @@ class IndexReader:
     a million attribute lookups.
     """
 
-    def __init__(self, idx_path: str):
+    def __init__(self, idx_path: str, *, base_offset: int = 0):
         self.path = idx_path
+        self.base_offset = int(base_offset)
         if not os.path.isfile(idx_path):
             raise FileNotFoundError(idx_path)
         self.fh = open(idx_path, "rb")
+        self.fh.seek(self.base_offset)
         # magic (16) + version (4) are the same in every header layout, so the
         # version is read FIRST and decides which layout the rest is.
         prefix = self.fh.read(20)
@@ -205,7 +207,7 @@ class IndexReader:
         self._hdr_dtype = (IDX_HEADER if version >= 3 else
                            (IDX_HEADER_V2 if version == 2 else IDX_HEADER_V1))
         self._src_dtype = SOURCE_ENTRY if version >= 2 else SOURCE_ENTRY_V1
-        self.fh.seek(0)
+        self.fh.seek(self.base_offset)
         raw = self.fh.read(self._hdr_dtype.itemsize)
         if len(raw) < self._hdr_dtype.itemsize:
             raise ValueError(f"{idx_path}: truncated index header")
@@ -267,7 +269,7 @@ class IndexReader:
         n_src = int(hdr["source_count"])
         n_node = int(hdr["node_count"])
         n_blk = int(hdr["block_count"])
-        base = self._hdr_dtype.itemsize
+        base = self.base_offset + self._hdr_dtype.itemsize
         self._map_sources(base, n_src)
         base += n_src * self._src_dtype.itemsize
         self._map_nodes(base, n_node)
@@ -295,7 +297,7 @@ class IndexReader:
         self._stats = None
         if self.version >= 2 and int(self.header["stats_bytes"]) > 0:
             from .global_stats import GlobalStats
-            self.fh.seek(int(self.header["stats_offset"]))
+            self.fh.seek(self.base_offset + int(self.header["stats_offset"]))
             blob = self.fh.read(int(self.header["stats_bytes"]))
             self._stats = GlobalStats.from_bytes(blob)
         return self._stats
@@ -363,7 +365,7 @@ class IndexReader:
                 f"{self.build_state} | pc={self.point_cache_name}")
 
     def close(self):
-        for a in ("sources", "nodes", "blocks"):
+        for a in ("sources", "nodes", "blocks", "microcells"):
             m = getattr(self, a, None)
             if isinstance(m, np.memmap):
                 m._mmap.close() if hasattr(m, "_mmap") else None

@@ -32,12 +32,42 @@ class NakshaPointCacheReader:
     def __init__(self, project_file: str, verify_crc: bool = False,
                  load_edits: bool = True):
         from .index import project_paths
-        idx_path, pc_path, edit_path, _ = project_paths(project_file)
-        if not os.path.isfile(idx_path):
-            raise FileNotFoundError(f"{idx_path}: no index; cache not built")
-        self.index = IndexReader(idx_path)
-        from .index import resolve_point_cache
-        pc_path = resolve_point_cache(idx_path, self.index.point_cache_name, pc_path)
+        from .derived_container import DerivedContainer, project_container_path
+        idx_path, pc_path, edit_path, _ = project_paths(str(project_file))
+        container_path = project_container_path(project_file)
+        self.container = None
+        self._point_base = 0
+        if container_path.is_file():
+            candidate = DerivedContainer(container_path)
+            sections = candidate.directory["sections"]
+            if sections.get("BASE_POINTS", {}).get("version") == 2:
+                self.container = candidate
+                idx_path = pc_path = str(container_path)
+                # Metadata is bounded independently of payload size and must
+                # be checked before trusting mmap table counts and offsets.
+                import hashlib
+                index_item = sections["BASE_INDEX"]["blocks"]["base"]
+                with open(container_path, "rb") as metadata:
+                    metadata.seek(int(index_item["offset"]))
+                    remaining = int(index_item["size"])
+                    digest = hashlib.sha256()
+                    while remaining:
+                        chunk = metadata.read(min(remaining, 4 << 20))
+                        if not chunk:
+                            raise ValueError("truncated embedded index")
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                if digest.hexdigest() != index_item["checksum"]:
+                    raise ValueError("embedded index checksum mismatch")
+                self._point_base = int(sections["BASE_POINTS"]["blocks"]["base"]["offset"])
+                self.index = IndexReader(idx_path, base_offset=int(
+                    sections["BASE_INDEX"]["blocks"]["base"]["offset"]))
+        if self.container is None:
+            if not os.path.isfile(idx_path):
+                raise FileNotFoundError(f"{idx_path}: no index; cache not built")
+            self.index = IndexReader(idx_path)
+            from .index import resolve_point_cache
+            pc_path = resolve_point_cache(idx_path, self.index.point_cache_name, pc_path)
         if not os.path.isfile(pc_path):
             self.index.close()
             raise FileNotFoundError(f"{pc_path}: no point cache")
@@ -54,7 +84,7 @@ class NakshaPointCacheReader:
         # A lock is the minimum correct fix: it keeps seek+read atomic. It is
         # per-reader, and the reads are large sequential reads, so the cost is
         # one memcpy of contention rather than a second disk pass.
-        self._io_lock = threading.Lock()
+        self._io_lock = threading.RLock()
         self.verify_crc = verify_crc
         self.edits = EditFile(edit_path).load() if load_edits else None
         self.stats = {"blocks_read": 0, "bytes_read": 0, "corrupt": 0,
@@ -67,6 +97,26 @@ class NakshaPointCacheReader:
         # rebuilt the directory changes, so entries simply stop matching and
         # verification resumes - no separate generation counter is needed.
         self._verified = {}
+
+    def _read_block(self, entry, only_attrs=None, verify_crc=False):
+        with self._io_lock:
+            result = self._read_block_unlocked(entry, only_attrs, verify_crc)
+            self.stats["blocks_read"] += 1
+            self.stats["bytes_read"] += result[2]
+            return result
+
+    def _read_block_unlocked(self, entry, only_attrs=None, verify_crc=False):
+        if self.container is None:
+            return read_block_once(self.fh, entry, only_attrs=only_attrs,
+                                   verify_crc=verify_crc)
+        from .container_base import read_stream_block
+        size = int(self.container.directory["sections"]["BASE_POINTS"]["blocks"]["base"]["size"])
+        if int(entry["file_offset"]) + int(entry["stored_bytes"]) > size:
+            raise ValueError("point block outside BASE_DATA")
+        absolute = entry.copy()
+        absolute["file_offset"] = int(entry["file_offset"]) + self._point_base
+        return read_stream_block(self.fh, absolute, only_attrs=only_attrs,
+                                 stats=self.stats)
 
     def close(self):
         try:
@@ -98,14 +148,13 @@ class NakshaPointCacheReader:
                                        else verify_crc)
         try:
             with self._io_lock:
-                hdr, streams, nbytes, _raw = read_block_once(
-                    self.fh, entry, only_attrs=only_attrs, verify_crc=do_crc)
+                hdr, streams, nbytes, _raw = self._read_block(
+                    entry, only_attrs=only_attrs, verify_crc=do_crc)
             self._verified[key] = True
             self.stats["crc_skipped" if already else "crc_verified"] += 1
         except ValueError as exc:
             self.stats["corrupt"] += 1
             raise CorruptBlock(str(exc)) from exc
-        self.stats["bytes_read"] += nbytes
 
         xyz_local = streams.get(ATTR_XYZ)
         # BUG FIXED: this used to return None whenever ATTR_XYZ was absent, with
@@ -168,8 +217,7 @@ class NakshaPointCacheReader:
         if bid < 0:
             return None
         entry = self.index.blocks[int(bid)]
-        hdr, streams, nbytes, _raw = read_block_once(self.fh, entry)
-        self.stats["blocks_read"] += 1
+        hdr, streams, nbytes, _raw = self._read_block(entry)
         world = decode_world_f32(hdr, streams[ATTR_XYZ])
         return {"xyz": world,
                 "classification": streams.get(ATTR_CLASSIFICATION),
@@ -222,8 +270,8 @@ class NakshaPointCacheReader:
         if only_attrs is None:
             only_attrs = (ATTR_XYZ, ATTR_CLASSIFICATION, ATTR_INTENSITY,
                           ATTR_RGB)
-        hdr, streams, nbytes, raw = read_block_once(
-            self.fh, entry, only_attrs=only_attrs, verify_crc=False)
+        hdr, streams, nbytes, raw = self._read_block(
+            entry, only_attrs=only_attrs, verify_crc=False)
         out = {}
         for attr, arr in streams.items():
             out[attr] = arr[start:start + count]

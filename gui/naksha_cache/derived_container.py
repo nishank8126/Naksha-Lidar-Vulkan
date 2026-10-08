@@ -96,6 +96,8 @@ class DerivedContainer:
         raise ValueError("no valid committed .naksha directory")
 
     def read_block(self, section, key):
+        if section == "BASE_POINTS" and self.directory["sections"][section]["version"] == 2:
+            raise ValueError("BASE_DATA must be read through the random-access point-stream reader")
         item = self.directory["sections"][section]["blocks"][str(key)]
         with self.path.open("rb") as handle:
             handle.seek(item["offset"])
@@ -105,6 +107,13 @@ class DerivedContainer:
         codec = item.get("codec", "NONE")
         if codec == "ZLIB1":
             data = zlib.decompress(data)
+        elif codec in ("ZSTD", "LZ4"):
+            from .codecs import decompress
+            from .format import CODEC_ZSTD, CODEC_LZ4
+            data = decompress(data, int(item["uncompressed_size"]),
+                              CODEC_ZSTD if codec == "ZSTD" else CODEC_LZ4)
+        elif codec != "NONE":
+            raise ValueError("unsupported derived stream codec")
         if len(data) != item.get("uncompressed_size", len(data)):
             raise ValueError("derived block decoded size mismatch")
         return data, item
@@ -177,12 +186,12 @@ class DerivedContainer:
             with self.path.open("r+b") as handle:
                 handle.seek(0, 2)
                 for key, data, attributes in blocks:
-                    stored = zlib.compress(data, 1)
-                    codec = "ZLIB1"
-                    if len(stored) >= len(data):
-                        stored, codec = data, "NONE"
+                    from .codecs import compress
+                    from .format import CODEC_ZSTD
+                    stored = compress(data, CODEC_ZSTD, level=1)
+                    codec = "ZSTD"
                     item = dict(attributes, offset=handle.tell(), size=len(stored),
-                                uncompressed_size=len(data), codec=codec,
+                                uncompressed_size=len(data), codec=codec, codec_level=1,
                                 checksum=hashlib.sha256(stored).hexdigest())
                     handle.write(stored)
                     old["blocks"][str(key)] = item

@@ -56,7 +56,7 @@ IDLE_REFINE_MS = 900.0                       # Part 14
 # 300 ms is shorter than a single deliberate gesture step on a real mouse, so
 # ordinary interaction was misclassified as idle. 900 ms covers a gap between
 # gesture steps and still restores full detail promptly once input stops.
-MOVING_TARGET_POINTS_PER_PIXEL = 0.35   # Part 1: 0.25-0.50 band
+MOVING_TARGET_POINTS_PER_PIXEL = 0.40   # Measured 27M edge-footprint floor; still within the 0.25-0.50 motion band.
 IDLE_TARGET_POINTS_PER_PIXEL = 1.0     # Part 1: 0.75-1.00 band
 TARGET_MIN_POINTS_PER_PIXEL = 0.5
 COVERAGE_TO_RELEASE_OVERVIEW = 0.90          # Part 13
@@ -212,6 +212,14 @@ def open_normal_cache(dataset: str, *, verify_source: bool = True,
     t0 = time.perf_counter()
     from .normals import NormalCacheReader, sidecar_path
     path = sidecar_path(dataset)
+    from .derived_container import project_container_path, DerivedContainer
+    container_path = project_container_path(dataset)
+    container_normals = False
+    if container_path.is_file():
+        container = DerivedContainer(container_path)
+        if container.directory["sections"].get("BASE_POINTS", {}).get("version") == 2:
+            path = container_path
+            container_normals = True
     rep = NormalCacheReport(path=str(path))
     if not path.is_file():
         rep.status = "MISS"
@@ -221,9 +229,13 @@ def open_normal_cache(dataset: str, *, verify_source: bool = True,
         return None, rep
     reader = None
     try:
-        reader = NormalCacheReader(
-            dataset, verify_source=verify_source,
-            expected_layout_fingerprint=expected_layout_fingerprint)
+        if container_normals:
+            from .container_normals import ContainerNormalReader
+            reader = ContainerNormalReader(dataset, expected_layout_fingerprint)
+        else:
+            reader = NormalCacheReader(
+                dataset, verify_source=verify_source,
+                expected_layout_fingerprint=expected_layout_fingerprint)
     except FileNotFoundError:
         rep.status = "MISS"
         rep.reason = "sidecar vanished between stat and open"

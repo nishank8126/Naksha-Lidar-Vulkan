@@ -24,7 +24,7 @@ from .format import ATTR_XYZ, ATTR_SOURCE_ID, ATTR_CLASSIFICATION
 from .reader import NakshaPointCacheReader
 from .surface_cache import SurfaceBlockTriangulator, SurfaceBudgetExceeded
 
-ALGORITHM_VERSION = 4
+ALGORITHM_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,7 @@ def triangulate_identity_block(core, contexts, max_edge, max_vertices=160000):
         faces = _filter_long_edges(faces, positions[:, :2], max_edge)
         owned = np.isin(ids[faces].min(axis=1), core["source_id"])
         faces = faces[owned].copy()
+        faces = filter_unsupported_faces(positions, faces)
         cross = np.cross(positions[faces[:, 1]] - positions[faces[:, 0]],
                          positions[faces[:, 2]] - positions[faces[:, 0]])
         valid = cross[:, 2] != 0
@@ -101,6 +102,40 @@ def triangulate_identity_block(core, contexts, max_edge, max_vertices=160000):
     used, inverse = np.unique(faces.reshape(-1), return_inverse=True)
     return {"refs": references[used], "ids": ids[used],
             "faces": inverse.reshape(-1, 3).astype(np.uint32), "xyz": positions[used]}
+
+
+def filter_unsupported_faces(positions, faces):
+    """Keep triangles supported by actual points, never just a node AABB.
+
+    Ordinary local triangles take the cheap path. For long span triangles,
+    probe centroid and edge midpoints against the occupied point footprint.
+    Local vertex spacing allows naturally sparse surveys without bridging
+    voids between dense banks. Source filenames have no role in this test.
+    """
+    if not len(faces):
+        return faces
+    from scipy.spatial import cKDTree
+    xy = np.asarray(positions[:, :2], np.float64)
+    tree = cKDTree(xy)
+    nearest = tree.query(xy, k=2)[0][:, 1]
+    keep = np.ones(len(faces), dtype=bool)
+    for start in range(0, len(faces), 4096):
+        selected = faces[start:start+4096]
+        triangle = xy[selected]
+        edge = np.stack((triangle[:, 1]-triangle[:, 0],
+                         triangle[:, 2]-triangle[:, 1],
+                         triangle[:, 0]-triangle[:, 2]), axis=1)
+        local_spacing = nearest[selected]
+        suspicious = np.linalg.norm(edge, axis=2).max(axis=1) > 3*local_spacing.min(axis=1)
+        if not suspicious.any():
+            continue
+        t = triangle[suspicious]
+        samples = np.stack((t.mean(axis=1), (t[:, 0]+t[:, 1])*.5,
+                            (t[:, 1]+t[:, 2])*.5, (t[:, 2]+t[:, 0])*.5), axis=1)
+        distances = tree.query(samples.reshape(-1, 2))[0].reshape(-1, 4)
+        radius = np.median(local_spacing[suspicious], axis=1)*3
+        keep[start + np.flatnonzero(suspicious)] = np.all(distances <= radius[:, None], axis=1)
+    return faces[keep]
 
 
 def circumcircle_neighbours(positions, faces, bounds_min, bounds_max):
@@ -196,8 +231,10 @@ class SurfaceBuildService:
             idx = reader.index
             identity = {"layout_fingerprint": int(idx.layout_fingerprint),
                         "source_set_fingerprint": hashlib.sha256(idx.sources.tobytes()).hexdigest()}
-            container = DerivedContainer.import_base(project_container_path(self.dataset),
-                idx.path, reader.pc_path, identity, self._stop)
+            container = reader.container
+            if container is None:
+                container = DerivedContainer.import_base(project_container_path(self.dataset),
+                    idx.path, reader.pc_path, identity, self._stop)
             last = None
             while not self._stop.is_set():
                 with self._condition:
@@ -273,6 +310,8 @@ class SurfaceBuildService:
         if max(map(halo_count, neighbours_by_node.values())) > 160000:
             raise SurfaceBudgetExceeded("coarsest common Surface halo exceeds RAM budget")
         metadata = dict(identity, algorithm_version=ALGORITHM_VERSION,
+                        SURFACE_SECTION_VERSION=1, surface_algorithm_version=ALGORITHM_VERSION,
+                        occupied_footprint="LOCAL_NEAREST_SUPPORT_V1",
                         settings_fingerprint=hashlib.sha256(json.dumps((max_edge, support)).encode()).hexdigest())
         section = container.directory["sections"].get("SURFACE_DATA", {})
         stored = section.get("blocks", {}) if section.get("metadata") == metadata else {}
