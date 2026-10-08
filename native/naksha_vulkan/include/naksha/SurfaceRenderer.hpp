@@ -361,6 +361,7 @@ private:
 
     VkPipeline pipelineSolid_ = VK_NULL_HANDLE;
     VkPipeline indexedPipeline_ = VK_NULL_HANDLE;
+    VkPipeline indexedWireframePipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout indexedLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout cellLayout_ = VK_NULL_HANDLE;
     ShaderModule indexedVs_ = {}, indexedFs_ = {};

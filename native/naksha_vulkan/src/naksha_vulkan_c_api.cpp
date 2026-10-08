@@ -910,6 +910,19 @@ NKV_API int nkv_set_streaming_surface_active(NkvHandle handle, int active) {
     return 1;
 }
 
+NKV_API int nkv_set_surface_debug_wireframe(NkvHandle handle, int enabled) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    Instance* inst = Resolve(handle);
+    if (!inst || (enabled && !inst->surface.IsWireframeSupported())) return 0;
+    inst->surface.SetShadingMode(enabled ? ShadingMode::Wireframe : ShadingMode::Flat);
+    return 1;
+}
+
+NKV_API int nkv_get_surface_debug_wireframe(NkvHandle handle) {
+    Instance* inst = Resolve(handle);
+    return inst && inst->surface.GetShadingMode() == ShadingMode::Wireframe;
+}
+
 NKV_API int nkv_get_surface_draw_proof(NkvHandle handle, uint64_t* out_counts) {
     std::lock_guard<std::mutex> lock(gMutex);
     Instance* inst = Resolve(handle);
