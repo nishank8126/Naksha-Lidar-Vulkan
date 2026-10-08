@@ -86,10 +86,14 @@ def place_cache(source_path: str) -> CachePlacement:
     it fall back, and then it PRINTS the fallback rather than doing it silently.
     """
     from .index import project_paths
+    if isinstance(source_path, (list, tuple)):
+        from .project_runtime import project_path
+        source_path = str(project_path(source_path))
     src_dir = os.path.dirname(os.path.abspath(source_path))
     if source_dir_writable(src_dir):
-        idx, pc, edit, _b = project_paths(os.path.abspath(source_path))
-        return CachePlacement(source_path, idx, pc, edit, False, "")
+        from .project_runtime import project_path
+        container = str(project_path(source_path))
+        return CachePlacement(source_path, container, container, container + ".nakshaedit", False, "")
 
     root = fallback_cache_dir()
     try:
@@ -102,8 +106,8 @@ def place_cache(source_path: str) -> CachePlacement:
     import hashlib
     tag = hashlib.sha1(os.path.abspath(source_path).encode("utf-8", "replace")
                        ).hexdigest()[:12]
-    idx = os.path.join(root, f"{stem}.{tag}.nakshaidx")
-    pc = os.path.join(root, f"{stem}.{tag}.nakshapc")
+    idx = os.path.join(root, f"{stem}.{tag}.naksha")
+    pc = idx
     edit = os.path.join(root, f"{stem}.{tag}.nakshaedit")
     msg = ("Source cache directory not writable.\n"
            f"Using fallback cache:\n{root}")
@@ -172,6 +176,21 @@ def classify_cache(source_path: str,
     fingerprint, so a 100 GB source is never hashed on startup (PART 4).
     """
     place = placement or place_cache(source_path)
+    from .project_runtime import project_path, container_validity
+    from pathlib import Path
+    path = Path(place.idx_path)
+    if path.is_file():
+        try:
+            validity = container_validity(source_path, container_path=path)
+            if validity.ok:
+                return CacheState(state=STATE_HIT, reason=validity.reason,
+                    placement=place, validity=validity, leftover_tmp=_leftover_tmp(place),
+                    index_bytes=0, pc_bytes=validity.pc_bytes)
+            return CacheState(state=STATE_STALE, reason=validity.reason, placement=place)
+        except Exception as exc:
+            return CacheState(state=STATE_CORRUPT, reason=f"cache unreadable: {exc}", placement=place)
+    if isinstance(source_path, (list, tuple)):
+        return CacheState(state=STATE_MISS, reason="multi-source project not built", placement=place)
     st = CacheState(placement=place, leftover_tmp=_leftover_tmp(place))
     idx_ok = os.path.isfile(place.idx_path)
     pc_ok = os.path.isfile(place.pc_path)
@@ -268,7 +287,9 @@ class CacheBuildJob:
     def __init__(self, source_path: str,
                  placement: Optional[CachePlacement] = None,
                  workers: Optional[Dict] = None):
-        self.source_path = os.path.abspath(source_path)
+        from .project_runtime import source_paths, project_path
+        self.source_paths = source_paths(source_path)
+        self.source_path = str(project_path(source_path)) if len(self.source_paths) > 1 else self.source_paths[0]
         self.placement = placement or place_cache(source_path)
         self.workers = dict(workers or {})
         self.progress = BuildProgress()
@@ -335,18 +356,19 @@ class CacheBuildJob:
                              profile.ram_soft_limit_bytes //
                              max(1, len(self.workers)))
             chunk = int(max(500_000, min(4_000_000, per_worker)))
-            builder = NakshaPointCacheBuilder(self.source_path,
-                chunk_points=chunk,
-                output_path=self.placement.idx_path[:-len(".nakshaidx")],
-                scratch_path=os.path.dirname(self.placement.idx_path),
+            from .project_runtime import NakshaWriter, project_path
+            output = self.placement.idx_path
+            builder = NakshaWriter(output, chunk_points=chunk,
                 cancel_check=lambda: self.cancelled)
             self._advance(1, percent=8.0)
             emit()
-            builder.build([self.source_path], with_overview=True)
+            build_result = builder.build(self.source_paths)
+            report["compression"] = build_result["compression"]
+            report["placement"] = str(output)
             self._advance(len(STAGES) - 2, percent=92.0)
             emit()
             # Only now is a finalized cache on disk; validate it.
-            state = classify_cache(self.source_path, self.placement)
+            state = classify_cache(self.source_paths, self.placement)
             self.progress.percent = 100.0
             self.progress.stage = STAGES[-1]
             self.progress.stage_index = len(STAGES) - 1

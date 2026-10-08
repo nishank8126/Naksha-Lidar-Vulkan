@@ -7109,7 +7109,7 @@ class NakshaApp(QMainWindow):
                 self,
                 "Select File(s)",
                 "",
-                "LiDAR Files (*.las *.laz);;All Files (*.las *.laz *.ply *.ptc *.prj)",
+                "LiDAR Files (*.las *.laz *.naksha);;All Files (*.las *.laz *.naksha *.ply *.ptc *.prj)",
             )
             if not filenames:
                 print("   User cancelled")
@@ -7135,30 +7135,33 @@ class NakshaApp(QMainWindow):
         # If the cache is MISSING / STALE / CORRUPT it is now BUILT
         # AUTOMATICALLY (Part 6) instead of falling through to a full source
         # decode. The user never runs a script and never moves cache files.
-        if len(filenames) == 1 and not getattr(
+        from pathlib import Path
+        project_request = filenames[0] if len(filenames) == 1 else filenames
+        if filenames and all(Path(p).suffix.lower() in (".las", ".laz", ".naksha") for p in filenames) and not getattr(
                 self, "_force_legacy_load", False):
             from gui.naksha_cache.app_streaming import install_streaming
             from gui.naksha_cache.auto_cache import (
                 classify_cache, STATE_HIT)
-            _state = classify_cache(filenames[0])
+            _state = classify_cache(project_request)
             _valid = _state.validity
 
             if _state.state != STATE_HIT:
                 print(f"\nðŸ”§ CACHE {_state.state}: {_state.reason}")
                 print("   Building Naksha runtime cache automatically...")
-                if not self._build_cache_with_ui(filenames[0]):
+                if not self._build_cache_with_ui(project_request):
                     print("   âš ï¸ Cache build did not complete; "
                           "continuing without streaming.")
                     _valid = None
                 else:
                     from gui.naksha_cache.dataset_mode import cache_first_open
-                    _valid = cache_first_open(filenames[0])
+                    _valid = cache_first_open(project_request)
 
             if _valid is not None and _valid.ok:
                 print(f"\nðŸ“‚ CACHE-FIRST (Stage 3C): streaming from committed "
                       f"NAKSHA cache ({_valid.total_points:,} pts, "
                       f"{_valid.pc_bytes / 1024 ** 3:.2f} GiB NKPC)")
-                install_streaming(self, filenames[0], _valid)
+                install_streaming(self, _valid.source_path, _valid)
+                self.loaded_sources = filenames
                 self._set_loading_state("POINTS_READY")
                 self._set_loading_state("READY")
                 return

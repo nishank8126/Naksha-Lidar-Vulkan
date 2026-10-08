@@ -136,6 +136,12 @@ def cache_first_open(source_path: str) -> CacheValidity:
     and the source matches the fingerprint stored at build time (header-only
     probe -- zero point-body bytes read).
     """
+    from .project_runtime import project_path, container_validity
+    container = project_path(source_path)
+    if container.is_file():
+        valid = container_validity(source_path)
+        if valid.ok or isinstance(source_path, (list, tuple)) or str(source_path).lower().endswith(".naksha"):
+            return valid
     from gui.naksha_cache.index import project_paths, IndexReader
     from gui.naksha_cache.format import BUILD_FINALIZED
     idx_path, pc_path, edit_path, _ = project_paths(source_path)

@@ -55,7 +55,7 @@ class CacheBuildController(QObject):
 
     def __init__(self, source_path: str, parent=None):
         super().__init__(parent)
-        self.source_path = os.path.abspath(source_path)
+        self.source_path = [os.path.abspath(str(p)) for p in source_path] if isinstance(source_path, (list, tuple)) else os.path.abspath(source_path)
         self.placement = place_cache(self.source_path)
         self._thread = None
         self._worker = None
@@ -67,7 +67,7 @@ class CacheBuildController(QObject):
     def start(self) -> bool:
         if self.is_running():
             return False
-        self.state_changed.emit("BUILDING", self.source_path)
+        self.state_changed.emit("BUILDING", str(self.source_path))
         self._thread = QThread()
         self._worker = CacheBuildWorker(self.source_path, self.placement)
         self._worker.moveToThread(self._thread)
@@ -127,7 +127,7 @@ def build_progress_dialog(parent, source_path: str):
     title.setWordWrap(True)
     lay.addWidget(title)
 
-    name = QLabel(os.path.basename(source_path))
+    name = QLabel("\n".join(os.path.basename(str(p)) for p in source_path) if isinstance(source_path, (list, tuple)) else os.path.basename(source_path))
     name.setStyleSheet("color: palette(mid);")
     lay.addWidget(name)
 

@@ -872,7 +872,9 @@ class FastLodSelector:
         self.select(v, 0.0, 0.0, 1.0, 1.0, 0.15, 1, coherence=2.0)
         self.compile_ms += (time.perf_counter() - t) * 1000.0
         t = time.perf_counter()
-        self.select_uniform(v, 0.0, 0.0, 1.0, 1.0, 1)
+        _, _, _, arrays = self.select_uniform(v, 0.0, 0.0, 1.0, 1.0, 1)
+        from .frontier_continuity import constrain
+        constrain(self, arrays, self._masked, budget=1)
         self.compile_ms += (time.perf_counter() - t) * 1000.0
         self.coherence_changes = 0
         self.cur[:] = saved                      # warm-up must not bias state

@@ -5595,6 +5595,8 @@ class NakshaStreamManager:
         n_out, n_vis, _lim, arrs = fs.select_uniform(
             sel, vcx, vcy, ppm, err_t, budget, masked=fs.full_counts,
             hysteresis=self._uniform_hysteresis(), state=1)
+        from .frontier_continuity import constrain
+        constrain(fs, arrs, fs.full_counts, budget=budget)
         if n_out == 0:
             return [], int(n_vis), 0
         row = arrs[0].copy()
@@ -5892,23 +5894,24 @@ class NakshaStreamManager:
                view[2] - 2.0 * hh * m, view[3] + 2.0 * hh * m)
         t = time.perf_counter()
         if alloc == "uniform":
-            _des = None
-            if streaming:
-                # The DESIRED rung of each node (all rungs available): hold-back
-                # only reacts to neighbours that are LAGGING behind it.
-                _dn, _dv, _dl, _da = fs.select_uniform(
-                    sel, vcx, vcy, ppm, err_t, budget, masked=fs.full_counts,
-                    hysteresis=self._uniform_hysteresis(), state=1)
-                _des = (_da[0].copy(), _da[1].copy())
             n_out, n_vis, _over, arrs = fs.select_uniform(
                 sel, vcx, vcy, ppm, err_t, budget,
-                coherence=(coh if streaming else 0.0), desired=_des,
+                coherence=0.0,
                 hysteresis=self._uniform_hysteresis(), state=0,
                 max_hold=self._hold_rungs())
+            from .frontier_continuity import constrain
+            continuity_violations = constrain(fs, arrs, fs._masked,
+                                               budget=budget)
         else:
+            # `share` is the ACCEPTED allocator: the reference path implements
+            # it and the kernel==reference parity tests hold it bit-exact. The
+            # continuity clamp/refill is an extension the reference does not
+            # have, so it belongs to the uniform allocator only - applying it
+            # here silently made the fast path disagree with the reference.
             n_out, n_vis, _over, arrs = fs.select(
                 sel, vcx, vcy, ppm, err_t, float(lod.hysteresis), budget,
                 coherence=coh)
+            continuity_violations = 0
         _k_ms = (time.perf_counter() - t) * 1000.0
         st["kernel_ms_sum"] += _k_ms
         st["selector_runs"] += 1
@@ -5945,11 +5948,42 @@ class NakshaStreamManager:
             ovt = res.get(ov) if ov is not None else None
             if n_unc > 0 and ovt is not None and ovt.state == GPU_RESIDENT \
                     and int(ovt.count) > 0 and ov not in keys:
-                keys.append(ov)
+                # The overview is a whole-dataset representation. Drawing it
+                # with leaves duplicates occupied pixels and exposes rectangles.
+                # Replace the frontier atomically when leaf coverage is complete.
+                keys = [ov]
             if not keys:
                 return None, "streaming_nothing_resident"
         else:
             self.screen_space_uncovered = 0
+        if continuity_violations:
+            # A residual violation means a neighbour rung is missing from this
+            # selection and no draw-time clamp can repair it. Order of
+            # preference: hold a complete prior frontier; else let the overview
+            # stand in WHILE some visible node is still uncovered; else wait for
+            # coverage. Complete coverage is never downgraded to the overview:
+            # it is a whole-dataset representation, so drawing it beside or
+            # instead of a fully covered frontier is exactly the square-fill
+            # behaviour this path exists to remove.
+            prior = list(getattr(self, "_active_screen_keys", ()) or ())
+            prior_rungs = {int(k[0]): int(k[1]) for k in prior}
+            selected_nodes = {int(nid[row[i]]) for i in range(n_out)}
+            prior_nodes = {int(k[0]) for k in prior}
+            # A held frontier must still be AT LEAST as fine as this selection.
+            # Holding the Fit frontier across a zoom-in keeps stale coarse rungs
+            # on screen: the nodes are all resident, so it looks healthy, while
+            # the zoomed view starves for points (measured: 396 empty cells).
+            rungs_ok = all(prior_rungs.get(int(nid[row[i]]), 99) <= int(lod_a[i])
+                           for i in range(n_out))
+            if (selected_nodes <= prior_nodes and rungs_ok and prior
+                    and all(k in res and res[k].state == GPU_RESIDENT for k in prior)):
+                keys = prior
+            elif self.screen_space_uncovered > 0:
+                ov = self._overview_key()
+                if ov in res and res[ov].state == GPU_RESIDENT:
+                    keys = [ov]
+                else:
+                    return None, "continuity_waiting_for_coverage"
         if streaming:
             st["streaming_selections"] = st.get("streaming_selections", 0) + 1
         self.screen_space_uncovered = int(getattr(
@@ -5968,7 +6002,9 @@ class NakshaStreamManager:
         self._active_screen_sig = None
         self._active_screen_keys = list(keys)
         win.store(key, sel, ppm)
-        diag = {"visible_nodes": int(n_vis), "gate_blocks": len(keys),
+        diag = {"continuity_violations": continuity_violations,
+                "continuity_handoff_waiting": bool(continuity_violations),
+                "visible_nodes": int(n_vis), "gate_blocks": len(keys),
                 "gate_points": int(sum(int(res[k].count) for k in keys)),
                 "target_points": int(getattr(self.density, "last_target", 0)
                                      or 0),

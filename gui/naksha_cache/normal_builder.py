@@ -41,7 +41,7 @@ from .format import ATTR_SOURCE_ID, ATTR_XYZ
 from .index import IndexReader, project_paths
 from .normals import (NormalCacheWriter, oct_encode, source_fingerprint)
 
-BUILDER_VERSION = 3
+BUILDER_VERSION = 4
 
 # Halo bounds in metres. Bounded on purpose: a giant halo would turn 393
 # independent tiles back into one global mesh.
@@ -104,10 +104,19 @@ def build_neighbour_index(nodes, lod0_node_ids: List[int],
     bmax = np.asarray(nodes["bounds_max"], dtype=np.float64)[ids]
     grown_min = bmin - halo_m
     grown_max = bmax + halo_m
-    overlap = np.all((grown_min[:, None, :] <= bmax[None, :, :]) &
-                     (grown_max[:, None, :] >= bmin[None, :, :]), axis=2)
-    return {int(nid): [int(ids[j]) for j in np.flatnonzero(overlap[i])]
-            for i, nid in enumerate(ids)}
+    from scipy.spatial import cKDTree
+    centres = (bmin + bmax) * .5
+    radii = np.linalg.norm((bmax-bmin) * .5, axis=1)
+    tree = cKDTree(centres)
+    maximum_radius = float(radii.max())
+    result = {}
+    for i, nid in enumerate(ids):
+        candidates = np.asarray(tree.query_ball_point(centres[i],
+            float(radii[i]) + maximum_radius + np.sqrt(3.) * halo_m), dtype=np.int64)
+        overlap = np.all((grown_min[i] <= bmax[candidates]) &
+                         (grown_max[i] >= bmin[candidates]), axis=1)
+        result[int(nid)] = [int(ids[j]) for j in np.sort(candidates[overlap])]
+    return result
 
 
 def tile_normals(central_xyz: np.ndarray,
@@ -204,7 +213,8 @@ class CanonicalNormalStore:
         self.mask[ids] = 1
 
     def missing_count(self) -> int:
-        return int((np.asarray(self.mask) == 0).sum())
+        return sum(int((self.mask[start:start + 1_000_000] == 0).sum())
+                   for start in range(0, self.n, 1_000_000))
 
     def flush(self) -> None:
         self.normals.flush()
@@ -249,8 +259,16 @@ def save_checkpoint(path: Path, fp: bytes, done) -> None:
 def normal_work_fingerprint(dataset: str, layout_fingerprint: int) -> bytes:
     """Bind resumable work to both source identity and the point-cache layout."""
     import hashlib
+    from .derived_container import project_container_path, DerivedContainer
+    container_path = project_container_path(dataset)
+    if container_path.is_file():
+        container = DerivedContainer(container_path)
+        if container.directory["sections"].get("BASE_POINTS", {}).get("version") == 2:
+            import json
+            return hashlib.blake2b(json.dumps(container.directory["identity"],
+                sort_keys=True).encode() + str(BUILDER_VERSION).encode(), digest_size=16).digest()
     return hashlib.blake2b(
-        source_fingerprint(dataset) + int(layout_fingerprint).to_bytes(8, "little"),
+        source_fingerprint(dataset) + int(layout_fingerprint).to_bytes(8, "little") + str(BUILDER_VERSION).encode(),
         digest_size=16).digest()
 
 
@@ -329,7 +347,7 @@ def _phase1(idx, lod0_blocks, reader, store, fp, ckpt, done, progress_every,
             continue
         t = reader.read_tile(nid, 0, only_attrs=REQUIRED_FOR_SCORED,
                              apply_edits=False, verify_crc=False,
-                             render_space=True)
+                             render_space=False)
         xyz = np.asarray(t["xyz"], dtype=np.float64)
         sid = np.asarray(t["source_id"], dtype=np.int64)
         if (len(sid) != len(xyz) or np.any(sid < 0) or np.any(sid >= store.n)
@@ -344,7 +362,7 @@ def _phase1(idx, lod0_blocks, reader, store, fp, ckpt, done, progress_every,
                 continue
             nt = reader.read_tile(other, 0, only_attrs=(ATTR_XYZ,),
                                   apply_edits=False, verify_crc=False,
-                                  render_space=True)
+                                  render_space=False)
             if nt is None:
                 continue
             nx = np.asarray(nt["xyz"], dtype=np.float64)
@@ -416,8 +434,9 @@ def build_normal_cache(dataset: str, *, resume: bool = True,
              reuse the SAME canonical normal, which is what keeps lighting
              stable across zoom levels.
     """
-    idx_path, _pc, _edit, _ = project_paths(str(dataset))
-    idx = IndexReader(idx_path)
+    from .reader import NakshaPointCacheReader
+    reader = NakshaPointCacheReader(str(dataset), verify_crc=False, load_edits=False)
+    idx = reader.index
     blocks = idx.blocks
     n_blocks = int(blocks.size)
     # The sidecar directory index IS the block id (O(1) lookup, no key table).
@@ -456,9 +475,6 @@ def build_normal_cache(dataset: str, *, resume: bool = True,
     store = CanonicalNormalStore(
         work, src_points, mode="r+" if (resume and work.exists() and done) else "w+")
 
-    from .reader import NakshaPointCacheReader
-    reader = NakshaPointCacheReader(str(dataset), verify_crc=False,
-                                    load_edits=False)
     print("")
     print("[NORMAL BUILD]")
     print(f"source_points: {src_points:,}   blocks: {n_blocks}   "
@@ -522,9 +538,15 @@ def build_normal_cache(dataset: str, *, resume: bool = True,
         layout_fp = int(getattr(idx, "layout_fingerprint", 0) or 0)
     except Exception:
         layout_fp = 0
-    writer = NormalCacheWriter(str(dataset), source_file_count=len(idx.sources),
+    writer_type = NormalCacheWriter
+    writer_extra = {}
+    if reader.container is not None:
+        from .container_normals import ContainerNormalWriter
+        writer_type = ContainerNormalWriter
+        writer_extra["block_count"] = n_blocks
+    writer = writer_type(str(dataset), source_file_count=len(idx.sources),
                                source_point_count=src_points,
-                               layout_fingerprint=layout_fp)
+                               layout_fingerprint=layout_fp, **writer_extra)
     normals_mm = store.normals
     mask_mm = store.mask
     # PHASE 2 read shape - THIS is why the first attempt returned None:
@@ -546,6 +568,11 @@ def build_normal_cache(dataset: str, *, resume: bool = True,
                   f"normals={writer.stored_points:,}")
     path = writer.commit()
     store.close()
+    reader.close()
+    if writer_extra:
+        for temporary in (work, Path(str(work) + ".mask"), ckpt):
+            if temporary.exists():
+                temporary.unlink()
     result.update({"sidecar": str(path), "stored_normals": writer.stored_points,
                    "bytes": path.stat().st_size,
                    "write_seconds": time.perf_counter() - t_w})
