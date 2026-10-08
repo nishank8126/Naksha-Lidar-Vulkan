@@ -1277,6 +1277,17 @@ def update_pointcloud(app, mode="rgb"):
     # Expand clipping range to include SNT overlay actors
     _sync_overlay_clipping_range(app)
 
+    # Native Vulkan viewport: mirror the display state VTK just received
+    # (colour LUTs, elevation/intensity ranges, display mode, point size) -
+    # uniform-only, never a re-upload, and a no-op unless Vulkan is active
+    # and already holds this cloud.
+    try:
+        _rb = getattr(app, "render_backend", None)
+        if _rb is not None and getattr(_rb, "active", False):
+            _rb.sync_point_shading(mode=mode)
+    except Exception as _rb_err:
+        print(f"⚠️ Vulkan shading sync failed (ignored): {_rb_err}")
+
 
 def force_interactor_ready(app, delay_ms=200):
     """Fully re-initialize VTK interactor."""
@@ -1364,9 +1375,20 @@ def fast_update_colors(app, changed_mask=None):
     from gui.unified_actor_manager import fast_palette_refresh, fast_undo_update
 
     if changed_mask is None:
-        return fast_palette_refresh(app, border_percent=getattr(app, "point_border_percent", 0.0))
+        result = fast_palette_refresh(app, border_percent=getattr(app, "point_border_percent", 0.0))
     else:
-        return fast_undo_update(app, changed_mask, border_percent=getattr(app, "point_border_percent", 0.0))
+        result = fast_undo_update(app, changed_mask, border_percent=getattr(app, "point_border_percent", 0.0))
+
+    # Palette / class-weight edits only change COLOURS: re-push the colour
+    # tables + ranges to the native viewport (uniform-only, no re-upload).
+    # No-op unless Vulkan is active and already holds this cloud.
+    try:
+        _rb = getattr(app, "render_backend", None)
+        if _rb is not None and getattr(_rb, "active", False):
+            _rb.sync_point_shading()
+    except Exception as _rb_err:
+        print(f"⚠️ Vulkan shading sync failed (ignored): {_rb_err}")
+    return result
 
 
 def fast_update_main_view(app):

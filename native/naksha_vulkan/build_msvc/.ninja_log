@@ -1,0 +1,85 @@
+# ninja log v6
+21	193	8129038003785477	shaders/surface.vert.spv	ab60fadf6506428f
+1880	2341	8129038020785970	CMakeFiles/naksha_vulkan_core.dir/src/core/renderer/CoreCamera.cpp.obj	34f8a6f786bdf495
+3	106	8129061697453556	shaders/point.vert.spv	57fbf738f7bba71e
+13	176	8129038003589561	shaders/point.frag.spv	dfb1d6cc997bc5bb
+176	301	8129038004900768	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.frag.spv	8868e60c5bc9a77d
+11	1612	8129050817058136	CMakeFiles/naksha_surface_acceptance.dir/src/naksha_vulkan_c_api.cpp.obj	da00ddadfb079f4b
+201	859	8129038003954564	CMakeFiles/naksha_vulkan_tiling_test.dir/src/SurfaceTiling.cpp.obj	30b2299c6676a62
+1	144	8131404032106574	build.ninja	e8d3bbb185a683df
+3	106	8129061697453556	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.vert.spv	57fbf738f7bba71e
+34	208	8129038003923812	shaders/instant.vert.spv	e5efa0f378dccd7e
+13	176	8129038003589561	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/point.frag.spv	dfb1d6cc997bc5bb
+1174	2139	8129038013718338	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanRenderPass.cpp.obj	5255a0d95a1fc0c2
+28	201	8129038003854601	shaders/surface.frag.spv	3be7702efa6ca183
+28	201	8129038003854601	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.frag.spv	3be7702efa6ca183
+21	193	8129038003785477	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface.vert.spv	ab60fadf6506428f
+1943	2300	8129038021405708	CMakeFiles/naksha_vulkan_core.dir/src/core/renderer/Camera.cpp.obj	22210f0b4181813d
+3	332	8129038002004811	CMakeFiles/volk.dir/H_/tools/Include/Volk/volk.c.obj	a65af33d5cc7a444
+835	1943	8129038010329586	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanDevice.cpp.obj	f1e1f39db04fcfa9
+186	373	8129038003833442	CMakeFiles/naksha_startup_probe.dir/diagnostics/startup_probe.cpp.obj	ecc1ccc3520639ea
+2694	2881	8129038028831022	CMakeFiles/naksha_startup_core_probe.dir/diagnostics/startup_core_probe.cpp.obj	86e751ad1c8ea381
+332	840	8129038005300127	volk.lib	dc11c3b93d1563d3
+308	1051	8129038005057104	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanCommandPool.cpp.obj	5cd71e7d71ba3876
+840	1748	8129038010337258	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanFrameManager.cpp.obj	bb1e9971ec712bea
+3516	3637	8129038037131741	naksha_startup_probe.exe	aeff23dde954bae0
+373	1174	8129038005705569	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanDescriptorManager.cpp.obj	33385cc565000798
+1115	2086	8129038013128663	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanPipelineManager.cpp.obj	7046c8fc842f27f6
+304	1115	8129038005017118	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanAllocator.cpp.obj	63777f49e816e2d4
+301	2013	8129038004982706	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VmaImplementation.cpp.obj	9ba23fcdefeb2eb7
+859	1880	8129038010560164	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanInstance.cpp.obj	a38a1e8c48279887
+3637	3755	8129038038330262	naksha_vulkan_tiling_test.exe	617e32e4cdb4e505
+1325	2522	8129038015223781	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanShaderManager.cpp.obj	38df76fc2fb185d2
+1051	2264	8129038012414350	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanPhysicalDevice.cpp.obj	81748b3aa3477a9a
+2	38	8125360350944379	clean	2105ae1dbfa498eb
+7	820	8129050816923337	CMakeFiles/naksha_surface_acceptance.dir/tests/surface_acceptance_main.cpp.obj	9f68aa2a7b60bd36
+2013	3515	8129038022108218	CMakeFiles/naksha_vulkan_core.dir/src/Buffer.cpp.obj	d70e02bb0a555b66
+2264	4398	8129038024620062	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+193	835	8129038003913564	CMakeFiles/naksha_vulkan_tiling_test.dir/tests/tiling_test_main.cpp.obj	3eb6ee8d7baef8db
+176	301	8129038004900768	shaders/splat.frag.spv	8868e60c5bc9a77d
+3	1525	8129680303444752	CMakeFiles/naksha_vulkan_core.dir/src/PointCloudRenderer.cpp.obj	ee3eeb4f11196da9
+7	1532	8129680303619788	CMakeFiles/naksha_vulkan.dir/src/naksha_vulkan_c_api.cpp.obj	ea3f9f9c272e5c9d
+4518	4735	8129038047164519	naksha_vulkan_benchmark.exe	6ecde3371a0e61e9
+1748	2694	8129038019425822	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanSwapchain.cpp.obj	760155b3bb7ecd5f
+311	1324	8129038005087105	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanContext.cpp.obj	85af253ed9f94d8b
+1612	2266	8129050833073344	naksha_surface_acceptance.exe	66de414dafdecbe7
+2341	4249	8129038025348337	CMakeFiles/naksha_vulkan_benchmark.dir/tests/benchmark_main.cpp.obj	22c43bcc16286be3
+3	2378	8129678359276844	CMakeFiles/naksha_vulkan_core.dir/src/Renderer.cpp.obj	563f708f174476ef
+1525	1640	8129680318800830	naksha_vulkan_core.lib	8820305b9e15942d
+4530	4662	8129038047231391	naksha_startup_core_probe.exe	8d0057dd249349a5
+49	229	8129038004168367	shaders/splat.vert.spv	3bc8c6dcd6ee6bf7
+1640	2029	8129680319949572	naksha_vulkan.dll	91379dca1e9ab401
+40	220	8129038004068282	shaders/instant.frag.spv	d6e2c50788a61edd
+1640	2029	8129680319949572	naksha_vulkan.lib	91379dca1e9ab401
+2300	3019	8129038024974255	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceTiling.cpp.obj	cdd4e003c3879b2e
+34	208	8129038003923812	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.vert.spv	e5efa0f378dccd7e
+40	220	8129038004068282	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/instant.frag.spv	d6e2c50788a61edd
+49	229	8129038004168367	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/splat.vert.spv	3bc8c6dcd6ee6bf7
+2	132	8131409930676862	shaders/surface_indexed.vert.spv	5a2bec0e887c46ea
+2	132	8131409930676862	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.vert.spv	5a2bec0e887c46ea
+9	134	8131409930696866	shaders/surface_indexed.frag.spv	aef5d357ed79d3eb
+9	134	8131409930696866	H:/naksha-lidar 2/native/naksha_vulkan/build_msvc/shaders/surface_indexed.frag.spv	aef5d357ed79d3eb
+134	1506	8131409930717991	CMakeFiles/naksha_vulkan_core.dir/src/core/vulkan/VulkanDevice.cpp.obj	f1e1f39db04fcfa9
+150	1922	8131409930960389	CMakeFiles/naksha_vulkan.dir/src/naksha_vulkan_c_api.cpp.obj	ea3f9f9c272e5c9d
+146	2153	8131409930920392	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+142	2157	8131409930880402	CMakeFiles/naksha_vulkan_core.dir/src/Renderer.cpp.obj	563f708f174476ef
+2157	2276	8131409951033114	naksha_vulkan_core.lib	8820305b9e15942d
+2276	2630	8131409954046051	naksha_vulkan.dll	373740446af4da7d
+2276	2630	8131409954046051	naksha_vulkan.lib	373740446af4da7d
+13	2075	8131414104285183	CMakeFiles/naksha_vulkan.dir/src/naksha_vulkan_c_api.cpp.obj	ea3f9f9c272e5c9d
+8	2173	8131414104231032	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+3	2526	8131414104181056	CMakeFiles/naksha_vulkan_core.dir/src/Renderer.cpp.obj	563f708f174476ef
+2526	2975	8131414129416467	naksha_vulkan_core.lib	8820305b9e15942d
+15	688	8131414327137004	naksha_vulkan.dll	373740446af4da7d
+15	688	8131414327137004	naksha_vulkan.lib	373740446af4da7d
+15	821	8131439498066052	CMakeFiles/naksha_surface_acceptance.dir/tests/surface_acceptance_main.cpp.obj	9f68aa2a7b60bd36
+7	1563	8131439497986669	CMakeFiles/naksha_vulkan_benchmark.dir/tests/benchmark_main.cpp.obj	22c43bcc16286be3
+20	1676	8131439498107848	CMakeFiles/naksha_surface_acceptance.dir/src/naksha_vulkan_c_api.cpp.obj	da00ddadfb079f4b
+11	1777	8131439497996802	CMakeFiles/naksha_vulkan.dir/src/naksha_vulkan_c_api.cpp.obj	ea3f9f9c272e5c9d
+3	1900	8131439497910659	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+1900	2096	8131439516845625	naksha_vulkan_core.lib	8820305b9e15942d
+2110	2233	8131439518992357	naksha_startup_core_probe.exe	8d0057dd249349a5
+2096	2379	8131439518790461	naksha_vulkan_benchmark.exe	6ecde3371a0e61e9
+2104	2454	8131439518946762	naksha_vulkan.dll	373740446af4da7d
+2104	2454	8131439518946762	naksha_vulkan.lib	373740446af4da7d
+2115	2487	8131439519040300	naksha_surface_acceptance.exe	66de414dafdecbe7

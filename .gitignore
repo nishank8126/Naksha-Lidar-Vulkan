@@ -62,3 +62,17 @@ tests/
 patch_backups/
 .commandcode/
 .workbuddy-ai/
+
+# --- Local session artifacts (not part of the project source) ---
+/diagnostics/
+/scratch/
+/logs/
+/.freebuff/
+/*.err
+/*.txt
+/*.png
+/*.jsonl
+/null
+vulkan_*_output/
+*.shards/
+*.naksha*

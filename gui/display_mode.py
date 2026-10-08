@@ -17,6 +17,23 @@ from PySide6.QtWidgets import (
     QMessageBox
 )
 from gui.class_display import update_class_mode
+
+# Phase 6B: the ONE canonical .ptc parser. The record shape used to be parsed
+# twice, inline (here and in AppWindow._load_ptc_file), and neither copy could
+# say WHERE a file was malformed nor parse without mutating live state.
+from gui.ptc_table import (
+    CLASS_DEFAULT_RGB,
+    CLASS_ID_MAX,
+    CLASS_ID_MIN,
+    PTC_BINDING_SETTING,
+    PtcParseError,
+    bind_project_ptc,
+    default_palette,
+    parse_ptc_file,
+    recent_ptc_dir,
+    resolve_project_ptc,
+    unbind_project_ptc,
+)
 from gui.theme_manager import get_dialog_stylesheet
 from gui.popup_guard import InputPopupMixin
 
@@ -170,7 +187,7 @@ def restore_display_settings_for_file(app, filepath, refresh=True):
         import os
 
         file_key = os.path.abspath(filepath)
-        settings = QSettings("NakshaAI", "LidarApp")
+        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
 
         print("=" * 60)
         print(f"ðŸ”„ RESTORING DISPLAY SETTINGS FOR {os.path.basename(filepath)}")
@@ -494,7 +511,7 @@ def restore_global_display_settings(app):
     """Restore global display settings that apply to ANY file."""
     try:
         from PySide6.QtCore import QSettings
-        settings = QSettings("NakshaAI", "LidarApp")
+        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
 
         print("=" * 60)
         print(f"ðŸŒ RESTORING GLOBAL DISPLAY SETTINGS")
@@ -908,17 +925,127 @@ class DisplayModeDialog(QDialog):
 
     def _display_ptc_name(self) -> str:
         path = getattr(self, "current_ptc_path", None)
-        return os.path.basename(path) if path else "No PTC loaded"
+        return os.path.basename(path) if path else "Naksha Default"
 
     def _update_window_title(self) -> None:
-        ptc_name = self._display_ptc_name()
-        if ptc_name == "No PTC loaded":
-            self.setWindowTitle("Display Mode")
-        else:
-            self.setWindowTitle(f"Display Mode - {ptc_name}")
+        self.setWindowTitle(f"Display Mode - {self._display_ptc_name()}")
 
     def _refresh_ptc_label(self) -> None:
-        return
+        """Phase 6B.4: state the ACTIVE PTC inside the dialog itself.
+
+        The window title alone is not enough - this dialog can be minimised or
+        lose focus, and then nothing on screen says which table is driving the
+        colours. This reads the SAME `current_ptc_path` the title, the class
+        table and the GPU LUT use, so there is one source of truth and no
+        second UI state to keep in sync.
+        """
+        name = self._display_ptc_name()
+        self.ptc_status_text = f"Active PTC:\n{name}"
+        label = getattr(self, "ptc_label", None)
+        if label is not None:
+            try:
+                label.setText(self.ptc_status_text)
+                label.setToolTip(str(getattr(self, "current_ptc_path", "") or
+                                     "Built-in Naksha class palette"))
+            except Exception:
+                pass
+
+    # ── Phase 6B.3: explicit, reusable palette actions ──────────────────────
+    def _project_dataset(self):
+        """The dataset this project currently has open (the 6B.5 binding key)."""
+        app = self._get_app_window()
+        return getattr(app, "loaded_file", None) if app is not None else None
+
+    def _remember_project_ptc(self, path):
+        """Record `path` as the palette for THIS dataset only (Phase 6B.5).
+
+        The old code wrote one global `last_ptc_path`, and startup applied it to
+        whatever file was opened next - a cross-project palette leak. The path
+        is still remembered (the picker reopens where the user last was), but it
+        is bound to the dataset it was chosen for and never auto-applied
+        elsewhere.
+        """
+        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings.setValue(
+            PTC_BINDING_SETTING,
+            bind_project_ptc(settings.value(PTC_BINDING_SETTING),
+                             self._project_dataset(), path))
+        settings.setValue("last_ptc_path", path)      # recent-location UX only
+        settings.remove("global_last_ptc_path")       # never an auto-apply key
+        settings.sync()
+        self.last_ptc_dir = os.path.dirname(str(path))
+
+    def reload_current_ptc(self):
+        """Re-read the ACTIVE path through the same transactional loader."""
+        path = str(getattr(self, "current_ptc_path", "") or "")
+        if not path:
+            print("[PTC] Reload ignored: the Naksha default palette is active")
+            return self.use_default_palette()
+        if not os.path.isfile(path):
+            self._show_front_message(
+                QMessageBox.Warning, "PTC RELOAD FAILED",
+                f"File:\n{path}\n\nReason:\nthe active file no longer exists."
+                f"\n\nPrevious PTC remains active.")
+            return False
+        return bool(self.load_classes_from_path(path, force_colors=True))
+
+    def use_default_palette(self):
+        """Phase 6B.3: explicitly restore the built-in Naksha palette."""
+        return self._apply_default_palette("default palette requested")
+
+    def clear_ptc(self):
+        """Phase 6B.3: drop the external PTC and return to the Naksha default."""
+        return self._apply_default_palette("PTC cleared")
+
+    def _palette_codes(self):
+        """Class ids to keep when a palette is defined from scratch."""
+        codes = set()
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 1)
+                if item is not None:
+                    codes.add(int(str(item.text()).strip()))
+        except Exception:
+            pass
+        app = self._get_app_window()
+        palette = getattr(app, "class_palette", None)
+        if isinstance(palette, dict):
+            for code in palette:
+                try:
+                    codes.add(int(code))
+                except Exception:
+                    pass
+        if not codes:
+            # Nothing to preserve -> the fully specified default (every class
+            # grey, shown, weight 1.0), exactly the fallback the LUT builder
+            # documents, so no class id is left undefined (6B.7).
+            return list(range(CLASS_ID_MIN, CLASS_ID_MAX + 1))
+        return sorted(codes)
+
+    def _apply_default_palette(self, reason: str):
+        """The ONE landing point for Clear / Use Default (6B.3, 6B.4)."""
+        if getattr(self, "_ptc_load_in_progress", False):
+            print("[PTC] default palette request ignored - a load is in progress")
+            return False
+        if self.current_slot != 0:
+            self._show_front_message(
+                QMessageBox.Warning, "Restricted Action",
+                "Cannot change the class table in Cross-Section View.")
+            return False
+        palette = default_palette(codes=self._palette_codes())
+        if not self._install_palette(palette, None, True, "default"):
+            return False
+        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
+        settings.setValue(
+            PTC_BINDING_SETTING,
+            unbind_project_ptc(settings.value(PTC_BINDING_SETTING),
+                               self._project_dataset()))
+        settings.remove("last_ptc_path")
+        settings.remove("global_last_ptc_path")
+        settings.sync()
+        self.last_ptc_dir = ""
+        print(f"[PTC] Naksha default palette active ({reason})", flush=True)
+        return True
 
     def __init__(self, parent):
         self._app_window = parent
@@ -939,6 +1066,15 @@ class DisplayModeDialog(QDialog):
         self.resize(520, 680)
         self.setMinimumSize(420, 400)
         self.current_ptc_path = None
+
+        # Phase 6B.4: what the dialog reports as the ACTIVE table. "Naksha
+        # Default" is the built-in palette Clear / Use Default return to.
+        self.ptc_status_text = "Active PTC:\nNaksha Default"
+        # Phase 6B.5: remembered LOCATION for the file picker, deliberately
+        # separate from the active PTC: remembering where a file was must not
+        # re-apply another project's palette.
+        self.last_ptc_dir = ""
+        self._ptc_parse_ms = 0.0
         ##
         self.view_borders = {i: 0 for i in range(6)}
         ##
@@ -971,7 +1107,7 @@ class DisplayModeDialog(QDialog):
 
 
         from PySide6.QtCore import QSettings
-        settings = QSettings("NakshaAI", "LidarApp")
+        settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
 
         saved_geo = settings.value("display_mode_dialog_geometry")
         if saved_geo:
@@ -1022,7 +1158,12 @@ class DisplayModeDialog(QDialog):
 
         # Clear stale file-specific display state from older builds so fresh
         # loads do not revive per-file UI state.
-        settings.remove("global_last_ptc_path")
+        # Phase 6B.5: the remembered path is now a LOCATION for the file
+        # picker, never a palette that re-applies itself to whatever dataset
+        # happens to be open next.
+        self.last_ptc_dir = recent_ptc_dir(
+            settings.value("last_ptc_path", "")
+            or settings.value("global_last_ptc_path", ""))
         for key in settings.allKeys():
             if (
                 key.startswith("file_ptc/")
@@ -1054,10 +1195,17 @@ class DisplayModeDialog(QDialog):
         save_action  = file_menu.addAction("Save...")
         save_as_action = file_menu.addAction("Save As...")
         file_menu.addSeparator()
+        reload_action  = file_menu.addAction("Reload Current PTC")
+        clear_action   = file_menu.addAction("Clear PTC")
+        default_action = file_menu.addAction("Use Default Palette")
+        file_menu.addSeparator()
         exit_action  = file_menu.addAction("Close")
         load_action.triggered.connect(self.load_classes)
         save_action.triggered.connect(self.save_classes)
         save_as_action.triggered.connect(lambda: self.save_classes_as(update_active=False))
+        reload_action.triggered.connect(self.reload_current_ptc)
+        clear_action.triggered.connect(self.clear_ptc)
+        default_action.triggered.connect(self.use_default_palette)
         exit_action.triggered.connect(self.close)
 
         controls_card = QFrame()
@@ -1143,6 +1291,13 @@ class DisplayModeDialog(QDialog):
         # Never scan a potentially multi-million-entry source-ID array merely
         # to construct Display Mode. Discovery runs when Lines is requested.
         self._rebuild_lines_menu(allow_recovery=False)
+
+        # Phase 6B.4: the ACTIVE PTC, stated in the dialog itself rather than
+        # only in a window title that can be minimised away.
+        self.ptc_label = QLabel(self.ptc_status_text)
+        self.ptc_label.setObjectName("displayPtcLabel")
+        self.ptc_label.setToolTip("Built-in Naksha class palette")
+        main_layout.addWidget(self.ptc_label)
 
         main_layout.addWidget(controls_card)
 
@@ -1396,7 +1551,7 @@ class DisplayModeDialog(QDialog):
             print(f"âœ… Synced {len(parent.view_palettes)} view palettes from app")
 
         ptc_loaded = False
-        settings   = QSettings("NakshaAI", "LidarApp")
+        settings   = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
 
         pending_ptc = None
         if parent:
@@ -1423,24 +1578,40 @@ class DisplayModeDialog(QDialog):
                     del parent.pending_ptc_restore
 
         if not ptc_loaded:
+            # Phase 6B.5: NO cross-project auto-apply. The only automatic
+            # source is a palette BOUND to this dataset; the remembered path
+            # survives solely so the picker reopens where the user last was.
+            self.last_ptc_dir = recent_ptc_dir(
+                settings.value("last_ptc_path", "")
+                or settings.value("global_last_ptc_path", ""))
+            project_ptc = resolve_project_ptc(
+                settings.value(PTC_BINDING_SETTING),
+                getattr(parent, "loaded_file", None) if parent else None)
             if getattr(parent, '_block_ptc_autoload', False):
-                print("   â­ï¸ Global PTC auto-load blocked (shortcut in progress)")
-            else:
-
-                global_last_ptc = settings.value("global_last_ptc_path")
-                if global_last_ptc and os.path.exists(global_last_ptc):
-                    print(f"ðŸ“‚ Restoring LAST USED PTC (Global): {global_last_ptc}")
-                    self.load_classes_from_path(global_last_ptc)
+                print("   PTC auto-load blocked (shortcut in progress)")
+            elif project_ptc:
+                print(f"   Restoring project PTC: {os.path.basename(project_ptc)}")
+                if self.load_classes_from_path(project_ptc):
                     ptc_loaded = True
 
         if not ptc_loaded:
-            print(f"\n{'=' * 60}")
-            print(f"ðŸ”§ INITIALIZING DISPLAY MODE WITH DEFAULT CLASSES")
-            existing_weights = {}
-            if parent and hasattr(parent, 'view_palettes') and 0 in parent.view_palettes:
-                for code, info in parent.view_palettes[0].items():
-                    existing_weights[code] = info.get('weight', 1.0)
-            print(f"   âœ… Added {self.table.rowCount()} default classes")
+            # Phase 6B.4/6B.5: fall back to the palette the APPLICATION is
+            # actually rendering (which belongs to the open dataset) or to the
+            # built-in Naksha default - never to another project's file.
+            app_live = getattr(parent, "class_palette", None) if parent else None
+            if isinstance(app_live, dict) and app_live:
+                print(f"\n{'=' * 60}")
+                print("SETTING UP DISPLAY MODE FROM THE ACTIVE PROJECT PALETTE")
+                print(f"{'=' * 60}")
+                self._install_palette({int(k): dict(v) for k, v in app_live.items()},
+                                      None, False, "app")
+            else:
+                print(f"\n{'=' * 60}")
+                print("SETTING UP DISPLAY MODE WITH THE NAKSHA DEFAULT PALETTE")
+                print(f"{'=' * 60}")
+                self._install_palette(default_palette(codes=self._palette_codes()),
+                                      None, True, "default")
+            ptc_loaded = True
 
         default_palette_template = {}
         for row in range(self.table.rowCount()):
@@ -1543,11 +1714,17 @@ class DisplayModeDialog(QDialog):
             # Save the outgoing mesh-quality choice before changing context.
             previous = int(getattr(self, "_quality_mode_context", self.color_mode.currentIndex()))
             if hasattr(self, "shading_quality"):
+                # NOTE: this combo is the SHADING quality control. Its value
+                # must only ever be stored as the shading quality - writing it
+                # into _surface_quality_value silently cross-wired the two, so
+                # picking "Slow" for Shading also switched Surface to Slow
+                # (uncapped: ~54M triangles on a 27M-point file). Surface's own
+                # value is persisted separately via global_surface_quality.
                 current_value = str(self.shading_quality.currentData() or "normal")
                 if previous == 1:
                     self._shading_quality_value = current_value
                 elif previous == 6:
-                    self._surface_quality_value = current_value
+                    self._shading_quality_value = current_value
 
             self.color_mode.setVisible(True)
             # Cross-sections (slots 1-4) support Class/Depth/Intensity/RGB/
@@ -2054,17 +2231,18 @@ class DisplayModeDialog(QDialog):
 
     def save_classes_as(self, update_active=False):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Class Table As", "", "Point Class Table (*.ptc)"
+            self, "Save Class Table As", getattr(self, "last_ptc_dir", "") or "",
+            "Point Class Table (*.ptc)"
         )
         if not path:
             return
         self._write_ptc(path)
         if update_active:
             self.current_ptc_path = path
+            self.last_ptc_dir = os.path.dirname(str(path))
             self._update_window_title()
             self._refresh_ptc_label()
-            settings = QSettings("NakshaAI", "LidarApp")
-            settings.setValue("last_ptc_path", path)
+            self._remember_project_ptc(path)
 
     def _write_ptc(self, path):
         with open(path, "w") as f:
@@ -2098,82 +2276,113 @@ class DisplayModeDialog(QDialog):
             )
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Class Table", "", "Point Class Table (*.ptc)"
+            self, "Open Class Table", getattr(self, "last_ptc_dir", "") or "",
+            "Point Class Table (*.ptc);;All Files (*)"
         )
         if not path:
             return
         self.load_classes_from_path(path, force_colors=True)
 
     def load_classes_from_path(self, path, force_colors=False):
-        """Load a PTC file and rebuild view palettes.
+        """Load a .ptc file and rebuild the view palettes. True on success.
+
+        TRANSACTIONAL (Phase 6B.2). The previous implementation assigned
+        `current_ptc_path`, cleared the class table and only THEN opened and
+        parsed the file - with the record loop unguarded. A malformed or
+        unreadable file therefore DESTROYED the active palette and left a
+        broken one installed. Now the whole file is parsed into a temporary
+        palette first; nothing is touched - not the path, not the table, not
+        the LUT, not the GPU - unless that parse succeeds.
 
         Parameters
         ----------
         path : str
-            Path to the .ptc file.
+            Path to the .ptc file. Any filesystem location is valid; the path is
+            never normalised into a project folder.
         force_colors : bool, optional
-            When *True* (explicit user "Load PTC" action), the PTC colours
-            overwrite every view slot unconditionally.
-            When *False* (auto-reload during dialog open / grid switch),
-            existing per-view colour, show and weight customisations set
-            by DisplayMode presets are preserved for classes that already
-            exist in the view palette.
+            True for an explicit user action: the PTC colours overwrite every
+            view slot. False preserves existing per-view show/colour/weight
+            customisations for classes that already exist.
         """
         if getattr(self, "_ptc_load_in_progress", False):
-            print("â­ï¸ PTC load already in progress - skipping re-entrant call")
-            return
+            print("PTC load already in progress - skipping re-entrant call")
+            return False
+        from time import perf_counter as _perf
+        t0 = _perf()
+        try:
+            palette, warnings = parse_ptc_file(path)
+        except PtcParseError as exc:
+            # Nothing was modified: the previous PTC is still active and the
+            # user is told exactly which file, which line and why.
+            print(f"[PTC LOAD FAILED] {exc.format_message()}", flush=True)
+            self._show_front_message(QMessageBox.Critical, "PTC LOAD FAILED",
+                                     exc.as_dialog_text())
+            return False
+        except Exception as exc:                                    # noqa: BLE001
+            print(f"[PTC LOAD FAILED] {path}: {exc!r}", flush=True)
+            self._show_front_message(
+                QMessageBox.Critical, "PTC LOAD FAILED",
+                f"File:\n{path}\n\nReason:\n{exc}\n\n"
+                f"Previous PTC remains active.")
+            return False
+        for warning in warnings:
+            print(f"[PTC WARNING] {warning}", flush=True)
+        self._ptc_parse_ms = (_perf() - t0) * 1000.0
+        return self._install_palette(palette, path, force_colors, "file")
 
+    def _install_palette(self, palette, path, force_colors, source):
+        """The ONLY method that changes the active class table.
+
+        It receives an already-validated palette (or the built-in default), so
+        every entry point - file load, reload, Clear, Use Default, dialog
+        startup - commits identically: table -> per-view palettes -> app state ->
+        class LUT. That is what keeps 6B.9's sequence A -> B -> C -> Reload ->
+        Clear -> Default -> A consistent, and what guarantees a PTC switch is a
+        LUT-only change: no XYZ upload, no normal rebuild, no triangulation.
+        """
+        from time import perf_counter as _perf
+        t0 = _perf()
+        parse_ms = float(getattr(self, "_ptc_parse_ms", 0.0) or 0.0)
+        self._ptc_parse_ms = 0.0
+        app = self._get_app_window()
         table_updates_were_enabled = True
         try:
             self._ptc_load_in_progress = True
             self._bulk_ptc_loading = True
-
             table_updates_were_enabled = self.table.updatesEnabled()
             self.table.setUpdatesEnabled(False)
             self.table.blockSignals(True)
 
-            self.current_ptc_path = path
+            # ── COMMIT POINT: reached only with a fully validated palette ──
+            self.current_ptc_path = path if source == "file" else None
+            if source == "file" and path:
+                self.last_ptc_dir = os.path.dirname(str(path))
             self._update_window_title()
             self._refresh_ptc_label()
             self.table.setRowCount(0)
 
-            with open(path, "r") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-
-            class_0_found      = False
+            class_0_found = False
             class_0_was_hidden = False
-
             print(f"\n{'=' * 60}")
-            print(f"ðŸ“‚ LOADING PTC: {os.path.basename(path)}")
+            print(f"LOADING PTC: "
+                  f"{os.path.basename(str(path)) if path else 'Naksha Default'}"
+                  f" (source={source})")
             print(f"{'=' * 60}")
-
-            for i in range(0, max(0, len(lines) - 1), 2):
-                header = lines[i].split("\t")
-                detail = lines[i + 1].split("\t")
-                if len(header) < 2 or len(detail) < 5:
-                    continue
-
-                code   = int(header[0])
-                desc   = header[1]
-                lvl    = header[2] if len(header) > 2 else ""
-                draw   = detail[1] if len(detail) > 1 else ""
-                rgb_raw = [int(c) for c in detail[3].split(",")] if len(detail) > 3 else [128, 128, 128]
-                if len(rgb_raw) < 3:
-                    rgb_raw = (rgb_raw + [128, 128, 128])[:3]
-                rgb    = rgb_raw[:3]
-                show   = (len(detail) > 4 and detail[4] == "1")
-                weight = float(detail[5]) if len(detail) > 5 else 1.0
-                color  = QColor(*rgb)
-
+            for code in sorted(palette):
+                info = palette[code]
+                code = int(code)
+                show = bool(info.get("show", True))
+                weight = float(info.get("weight", 1.0) or 1.0)
+                color = tuple(info.get("color", CLASS_DEFAULT_RGB))[:3]
                 if code == 0:
-                    class_0_found      = True
+                    class_0_found = True
                     class_0_was_hidden = not show
-
-                self.add_class(code, desc, draw, lvl, color, show, weight)
+                self.add_class(code, str(info.get("description", "")),
+                               str(info.get("draw", "")),
+                               str(info.get("lvl", "")),
+                               QColor(*color), show, weight)
                 print(f"   Class {code:3d}: weight={weight:.1f}, show={show}")
-
-            print(f"   âœ… All classes loaded")
-
+            t_table = _perf()
             app = self._get_app_window()
             if force_colors and app:
                 # Loading a PTC through the explicit user action is a fresh
@@ -2336,18 +2545,21 @@ class DisplayModeDialog(QDialog):
                     except Exception as e:
                         print(f"âš ï¸ Failed to update Class Picker: {e}")
 
-            self.current_ptc_path = path
-            settings = QSettings("NakshaAI", "LidarApp")
-            settings.setValue("global_last_ptc_path", path)
-            settings.sync()
-            print(f"âœ… Loaded {self.table.rowCount()} classes from {os.path.basename(path)}")
-            print(f"{'=' * 60}\n")
+            # ── 6B.5: this palette belongs to THIS dataset only ────────────
+            if source == "file" and path:
+                self._remember_project_ptc(path)
+            t_end = _perf()
+            print(f"[PTC PERF] source={source} parse={parse_ms:.1f}ms "
+                  f"table={((t_table - t0) * 1000.0):.1f}ms "
+                  f"total={((t_end - t0) * 1000.0 + parse_ms):.1f}ms",
+                  flush=True)
             self.connect_existing_checkboxes()
-
-        except Exception as e:
-            print(f"Failed to load PTC: {e}")
+            return True
+        except Exception as exc:                                    # noqa: BLE001
+            print(f"[PTC LOAD FAILED] palette commit failed: {exc!r}")
             import traceback
             traceback.print_exc()
+            return False
         finally:
             try:
                 self.table.blockSignals(False)
@@ -3805,7 +4017,7 @@ class DisplayModeDialog(QDialog):
             from PySide6.QtCore import QSettings
             import os
 
-            settings = QSettings("NakshaAI", "LidarApp")
+            settings = QSettings(QSettings.defaultFormat(), QSettings.UserScope, "NakshaAI", "LidarApp")
 
             # Always save geometry and column widths of the dialog, even if a temporary tool blocks saving full settings
             try:
@@ -3895,7 +4107,14 @@ class DisplayModeDialog(QDialog):
 
             # 5. Save PTC path
             if self.current_ptc_path and os.path.exists(self.current_ptc_path):
-                settings.setValue("global_last_ptc_path", self.current_ptc_path)
+                # Phase 6B.5: recorded against the OPEN dataset (see
+                # _remember_project_ptc) instead of one global auto-apply key.
+                settings.setValue(
+                    PTC_BINDING_SETTING,
+                    bind_project_ptc(settings.value(PTC_BINDING_SETTING),
+                                     getattr(self._get_app_window(),
+                                             "loaded_file", None),
+                                     self.current_ptc_path))
 
             # 6. Save color mode & structured border mode
             settings.setValue("global_color_mode", self.color_mode.currentIndex())

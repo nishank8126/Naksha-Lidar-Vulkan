@@ -34,6 +34,11 @@ import os
 import weakref
 import hashlib
 
+# Every telemetry/logging hook on a render path goes through this one boundary
+# (see gui/naksha_telemetry.py). It can never raise into the renderer and can
+# never change a renderer success/failure result - it only records one.
+from gui.naksha_telemetry import safe_emit_telemetry  # noqa: E402
+
 _LARGE_MESH_THRESHOLD = 50_000_000
 _MAX_STORED_SHADING_CACHES = 4
 _MAX_STORED_REPRESENTATIVE_CACHES = 4
@@ -87,6 +92,73 @@ def _emit_shading_profile(scope, timings, **meta):
     except Exception:
         # Profiling must never break shading.
         pass
+    # [SHADING PERFORMANCE] keep the most recent profile in memory so the
+    # consolidated report can be produced on demand (Ctrl+Shift+V) instead of
+    # forcing the user to scrape SHADING_PROFILE lines out of the log.
+    try:
+        _LAST_SHADING_PROFILE["scope"] = scope
+        _LAST_SHADING_PROFILE["timings"] = dict(timings)
+        _LAST_SHADING_PROFILE["meta"] = dict(meta)
+    except Exception:
+        pass
+
+
+# Most recent shading profile, for [SHADING PERFORMANCE].
+_LAST_SHADING_PROFILE = {"scope": None, "timings": {}, "meta": {}}
+
+
+# Maps the pipeline's internal checkpoint names onto the coarse stages a human
+# reads. Several checkpoints roll up into one row on purpose - e.g. the three
+# face filters are all "Face processing".
+_SHADING_STAGE_GROUPS = (
+    ("Filtering", ("finite_filter", "normalize_extent", "visibility_mask",
+                   "visible_indices", "visible_xyz_copy",
+                   "unique_materialize")),
+    ("Dedup", ("dedup_pass1", "dedup_lod_extra", "adaptive_refinement")),
+    ("Delaunay", ("delaunay",)),
+    ("Face processing", ("degenerate_filter", "edge_filter", "feature_filter",
+                         "compaction")),
+    ("Normals", ("face_normals", "vertex_normals")),
+    ("Colour", ("face_shade", "vertex_shade", "class_map_lut_setup",
+                "inplace_color_update_and_overlays")),
+    ("Boundary", ("boundary_unavailable", "empty_or_numba_unavailable")),
+)
+
+
+def shading_performance_report() -> str:
+    """[SHADING PERFORMANCE] - the shading pipeline, grouped and in ms.
+
+    Reads the stage timings the pipeline already records (instrumentation only;
+    it changes nothing about how shading is computed). A row with no recorded
+    stage prints "not run" rather than 0.00, because 0.00 would read as a
+    real measurement of a stage that never executed.
+    """
+    p = _LAST_SHADING_PROFILE
+    timings = p.get("timings") or {}
+    lines = ["[SHADING PERFORMANCE]", ""]
+    if not timings:
+        lines.append("  no shading profile recorded yet - run a shaded-class "
+                     "or surface build first")
+        return "\n".join(lines)
+    lines.append(f"  scope: {p.get('scope')}")
+    lines.append("")
+    total = 0.0
+    for label, keys in _SHADING_STAGE_GROUPS:
+        secs = sum(float(timings[k]) for k in keys if k in timings)
+        if secs:
+            total += secs
+            lines.append(f"  {label:<20} {secs * 1000.0:10,.1f} ms")
+        else:
+            lines.append(f"  {label:<20} {'not run':>13}")
+    reported = float(timings.get("total_backend", 0.0) or 0.0)
+    lines.append(f"  {'Total (sum)':<20} {total * 1000.0:10,.1f} ms")
+    if reported:
+        lines.append(f"  {'Total (backend)':<20} {reported * 1000.0:10,.1f} ms")
+    meta = p.get("meta") or {}
+    for k in ("faces", "vertices", "points", "points_in", "target"):
+        if k in meta:
+            lines.append(f"    {k}: {meta[k]}")
+    return "\n".join(lines)
 
 
 class ShadingEditKind(Enum):
@@ -325,6 +397,306 @@ class _ShadingComputationWorker(QThread):
         except Exception:
             import traceback
             self.error_signal.emit(traceback.format_exc())
+
+
+# ============================================================================
+# [SHADED CLASS] PROGRESSIVE PREVIEW -> FINAL
+# ============================================================================
+# Mirrors the Surface two-stage design onto Shaded Class. The final build
+# already runs on a QThread, but it must FINISH before _render_mesh() uploads
+# anything, so the viewport shows nothing for the whole build. This adds a
+# cheap STAGE 1 that runs the SAME backend on a pre-subsampled input and pushes
+# the result straight to the existing Vulkan seam, so a coarse shaded mesh is on
+# screen while the full-quality build continues in the background.
+#
+# Additive only: reuses _compute_shading_geometry_backend (no new algorithm),
+# set_shaded_class_surface (the existing seam) and the same LUT derivation, so
+# colours cannot drift. Creates NO VTK actors and does not gate the final path.
+
+_SHADED_PREVIEW_FRACTION = 0.06
+# Ceiling is deliberately well below _grid_dedup_at_precision's comfortable
+# working size. The shading backend only takes its fast count-first path when
+# n_pts > TARGET_MAX * 1.30 (~1.95M), so anything under that falls back to the
+# legacy grid+sort dedup, which measured ~2.1s at 400k points. 150k keeps the
+# preview inside the sub-second budget on the slow path too.
+_SHADED_PREVIEW_CEILING = 150_000
+_SHADED_PREVIEW_FLOOR = 40_000
+
+_SHADED_PREVIEW_STATE = {
+    "ran": 0, "input_points": None, "preview_points": None,
+    "preview_faces": None, "preview_s": None, "preview_upload_s": None,
+    "uploaded": False, "preview_timings": None,
+    "final_points": None, "final_faces": None, "final_s": None,
+    "final_upload_s": None, "final_timings": None,
+}
+
+
+def _shaded_class_preview_subsample(n_total: int, want: int):
+    """Deterministic stride over the visible indices, or None to use all.
+
+    A stride rather than a grid pass, because the point of this stage is speed:
+    the expensive dedup/Delaunay then run on a few hundred thousand points
+    instead of the whole dataset.
+    """
+    try:
+        n_total = int(n_total)
+        want = max(int(want), 3)
+        if n_total <= want:
+            return None
+        return np.unique(np.linspace(0, n_total - 1, want, dtype=np.int64))
+    except Exception:
+        return None
+
+
+def _shaded_class_preview_upload(app, res, classes_full):
+    """Push a preview result through the existing Vulkan shaded seam.
+
+    Returns True only if the native side accepted the mesh. Never raises and
+    never creates a VTK actor.
+    """
+    try:
+        if not isinstance(res, dict) or res.get("empty", False):
+            return False
+        _rb = getattr(app, "render_backend", None)
+        if (_rb is None or not getattr(_rb, "active", False)
+                or getattr(_rb, "vulkan_backend", None) is None):
+            return False
+
+        xyz = np.ascontiguousarray(res["xyz_final"], dtype=np.float64)
+        faces = np.ascontiguousarray(res["faces"], dtype=np.int32)
+        if len(faces) == 0 or len(xyz) < 3:
+            return False
+
+        # res["unique_indices"] is in CANONICAL GLOBAL index space (the
+        # backend maps through source_global_indices, or falls back to
+        # positional indices when that is None). Because the preview passes
+        # source_global_indices=sub_idx, these index the FULL class array -
+        # indexing the subsampled array instead is an out-of-bounds error.
+        uidx = np.asarray(res["unique_indices"], dtype=np.int64).reshape(-1)
+        cls_full = np.asarray(classes_full).reshape(-1)
+        if len(uidx) and (uidx.max() >= len(cls_full) or uidx.min() < 0):
+            print("SHADED_CLASS_PREVIEW index_space_mismatch "
+                  f"max={int(uidx.max())} classes={len(cls_full)}")
+            return False
+        cm = cls_full.astype(np.int32)[uidx]
+
+        vc = _get_shading_visibility(app)
+        mc = max(int(cm.max()) + 1 if len(cm) else 0, 256)
+        lut = np.zeros((mc, 3), dtype=np.float32)
+        for c, e in app.class_palette.items():
+            ci = int(c)
+            if ci < mc and ci in vc:
+                lut[ci] = e.get("color", (128, 128, 128))
+        lut_u8 = np.clip(lut[:256], 0, 255).astype(np.uint8)
+
+        # Empty mixed-face set: the preview is a coarse stand-in, and mixed
+        # faces only affect class-edge blending at full density.
+        mixed = np.empty(0, dtype=np.int32)
+        _t0 = time.perf_counter()
+        _ok = bool(_rb.vulkan_backend.set_shaded_class_surface(
+            xyz, faces, np.clip(cm, 0, 255).astype(np.uint8), lut_u8, mixed))
+
+        # Same constants the final path pushes, so the preview is not lit
+        # differently from the mesh that replaces it.
+        try:
+            _sharp_norm, _sharp_od = _shading_sharpness_response(
+                float(_shading_sharpness_angle(app)))
+            _key_i, _fill_i = _shading_key_fill_intensities(app, _sharp_norm, _sharp_od)
+            _rb.vulkan_backend.set_crisp_shading_parameters(
+                float(getattr(app, "last_shade_azimuth", 45.0)),
+                float(_shading_sharpness_angle(app)),
+                float(np.clip(getattr(app, "shade_ambient", 0.25), 0.0, 1.0)),
+                float(_key_i), float(_fill_i))
+            _push_vulkan_shading_parity(app, _rb.vulkan_backend)
+        except Exception:
+            pass
+
+        _SHADED_PREVIEW_STATE.update(
+            ran=_SHADED_PREVIEW_STATE["ran"] + 1,
+            preview_points=len(xyz), preview_faces=len(faces),
+            preview_upload_s=time.perf_counter() - _t0, uploaded=_ok)
+        print(
+            f'SHADED_CLASS_PREVIEW status={"uploaded" if _ok else "failed"} '
+            f'points={len(xyz):,} faces={len(faces):,} '
+            f'upload_ms={(time.perf_counter() - _t0) * 1000:.1f} '
+            f'surface_upload_count={_rb.vulkan_backend.get_surface_upload_count()}')
+        return _ok
+    except Exception as exc:
+        print(f"SHADED_CLASS_PREVIEW upload_failed={exc!r} (final path unaffected)")
+        return False
+
+
+def print_shaded_class_preview_report():
+    """[SHADED CLASS PREVIEW] - observation only."""
+    t = _SHADED_PREVIEW_STATE
+
+    def _n(v):
+        return "n/a" if v is None else f"{int(v):,}"
+
+    def _ms(v):
+        return "n/a" if v is None else f"{float(v) * 1000.0:,.1f}"
+
+    print("\n".join([
+        "[SHADED CLASS PREVIEW]", "",
+        f"  Input points:      {_n(t.get('input_points'))}",
+        f"  Preview points:    {_n(t.get('preview_points'))}",
+        f"  Preview faces:     {_n(t.get('preview_faces'))}",
+        f"  Generation time:   {_ms(t.get('preview_s'))} ms",
+        f"  GPU upload:        {_ms(t.get('preview_upload_s'))} ms",
+        f"  Uploaded:          {'YES' if t.get('uploaded') else 'NO'}",
+        "  VTK actors:        0 (preview bypasses VTK entirely)", "",
+    ]))
+
+
+if QThread is not None and Signal is not None:
+    class _ShadedPreviewWorker(QThread):
+        """Runs the coarse STAGE 1 build off the GUI thread.
+
+        The GUI thread must not block: the whole point of the preview is that
+        the viewport stays responsive while the final build is still pending.
+        """
+        done_signal = Signal(dict, object, object)   # res, cls_sub, sub_idx
+
+        def __init__(self, xyz_raw, classes_raw, visible_classes, azimuth,
+                     angle, ambient, max_edge_factor, single_class_max_edge,
+                     quality_mode):
+            super().__init__()
+            self.xyz_raw = xyz_raw
+            self.classes_raw = classes_raw
+            self.visible_classes = visible_classes
+            self.azimuth = azimuth
+            self.angle = angle
+            self.ambient = ambient
+            self.max_edge_factor = max_edge_factor
+            self.single_class_max_edge = single_class_max_edge
+            self.quality_mode = quality_mode
+            self.sub_idx = None
+            self.cls_sub = None
+            self.error = None
+
+        def run(self):
+            try:
+                n_total = len(self.xyz_raw)
+                want = int(n_total * _SHADED_PREVIEW_FRACTION)
+                want = min(max(want, _SHADED_PREVIEW_FLOOR), _SHADED_PREVIEW_CEILING)
+                sub_idx = _shaded_class_preview_subsample(n_total, want)
+                if sub_idx is None:
+                    self.done_signal.emit({}, None, None)
+                    return
+                xyz_sub = np.ascontiguousarray(self.xyz_raw[sub_idx], dtype=np.float64)
+                cls_sub = np.ascontiguousarray(self.classes_raw[sub_idx])
+                self.sub_idx, self.cls_sub = sub_idx, cls_sub
+                # source_global_indices maps the subsample back to canonical
+                # global indices, so res["unique_indices"] stays meaningful
+                # against the FULL arrays. Without it the backend would emit
+                # positional indices for a 400k subsample.
+                res = _compute_shading_geometry_backend(
+                    xyz_sub, cls_sub, self.visible_classes, self.azimuth,
+                    self.angle, self.ambient, self.max_edge_factor,
+                    self.single_class_max_edge, _compute_xyz_hash(xyz_sub),
+                    representative_seed=None, boundary_flags=None,
+                    quality_mode=self.quality_mode,
+                    source_global_indices=sub_idx,
+                    line_filter_active=False)
+                self.done_signal.emit(res, self.classes_raw, sub_idx)
+            except Exception:
+                import traceback
+                self.error = traceback.format_exc()
+else:
+    _ShadedPreviewWorker = None
+
+
+def print_shaded_class_performance_report():
+    """[SHADED CLASS PERFORMANCE] - observation only.
+
+    CPU stages are read from the shading backend's own profile_timings, so the
+    numbers are measured per stage rather than apportioned by guesswork.
+    """
+    t = _SHADED_PREVIEW_STATE
+    tm = t.get("final_timings") or {}
+
+    def _n(v):
+        return "n/a" if v is None else f"{int(v):,}"
+
+    def _ms(v):
+        return "n/a" if v is None else f"{float(v) * 1000.0:,.1f}"
+
+    return "\n".join([
+        "[SHADED CLASS PERFORMANCE]", "",
+        "Preview:",
+        f"  Points:       {_n(t.get('preview_points'))}",
+        f"  Faces:        {_n(t.get('preview_faces'))}",
+        f"  Generation:   {_ms(t.get('preview_s'))} ms",
+        f"  Upload:       {_ms(t.get('preview_upload_s'))} ms", "",
+        "Final:",
+        f"  Points:       {_n(t.get('final_points'))}",
+        f"  Faces:        {_n(t.get('final_faces'))}",
+        f"  Generation:   {_ms(t.get('final_s'))} ms",
+        f"  Upload:       {_ms(t.get('final_upload_s'))} ms", "",
+        "CPU stages (final build, ms):",
+        f"  Dedup:           {_ms(tm.get('representative_select', tm.get('dedup_pass1')))}",
+        f"  Delaunay:        {_ms(tm.get('delaunay'))}",
+        f"  Face processing: {_ms(tm.get('edge_filter'))}",
+        f"  Class blend:     {_ms(tm.get('vertex_shade', tm.get('shade')))}",
+        f"  Lighting:        {_ms(tm.get('face_colors'))}", "",
+        "CPU stages (preview build, ms):",
+        f"  Dedup:           {_ms((t.get('preview_timings') or {}).get('representative_select'))}",
+        f"  Delaunay:        {_ms((t.get('preview_timings') or {}).get('delaunay'))}",
+        f"  Face processing: {_ms((t.get('preview_timings') or {}).get('edge_filter'))}",
+        f"  Lighting:        {_ms((t.get('preview_timings') or {}).get('face_colors'))}", "",
+    ])
+
+
+def _start_shaded_class_async_preview(app, xyz_raw, classes_raw, visible_classes,
+                                      azimuth, angle, ambient, max_edge_factor,
+                                      single_class_max_edge, quality_mode):
+    """Stage 1: coarse shaded-class mesh pushed straight to Vulkan.
+
+    Returns True if a preview was *started*. Every failure path returns False so
+    the caller simply proceeds to the normal full-quality build.
+    """
+    t_start = time.perf_counter()
+    try:
+        if _ShadedPreviewWorker is None or QThread is None:
+            return False
+        n_total = len(xyz_raw)
+        _SHADED_PREVIEW_STATE["input_points"] = int(n_total)
+        if n_total < 1000:
+            return False
+        want = int(n_total * _SHADED_PREVIEW_FRACTION)
+        want = min(max(want, _SHADED_PREVIEW_FLOOR), _SHADED_PREVIEW_CEILING)
+        if _shaded_class_preview_subsample(n_total, want) is None:
+            return False  # already small enough; the final build is quick
+
+        worker = _ShadedPreviewWorker(
+            xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
+            max_edge_factor, single_class_max_edge, quality_mode)
+        _SHADED_PREVIEW_STATE["_t_start"] = t_start
+
+        def _done(res, classes_full, sub_idx):
+            try:
+                _SHADED_PREVIEW_STATE["preview_s"] = time.perf_counter() - t_start
+                if not isinstance(res, dict) or res.get("empty", False):
+                    return
+                # Keep the backend's own per-stage timings so the preview cost
+                # can be attributed to a named stage instead of guessed at.
+                _SHADED_PREVIEW_STATE["preview_timings"] = dict(
+                    res.get("profile_timings") or {})
+                _shaded_class_preview_upload(app, res, classes_full)
+                print_shaded_class_preview_report()
+            except Exception:
+                pass
+
+        def _failed():
+            print("SHADED_CLASS_PREVIEW error (final path unaffected)")
+
+        worker.done_signal.connect(_done)
+        app._shaded_preview_worker = worker
+        worker.start()
+        return True
+    except Exception as exc:
+        print(f"SHADED_CLASS_PREVIEW start_failed={exc!r} (final path unaffected)")
+        return False
 
 
 def _extract_boundary_flags_for_shading(app, expected_len):
@@ -1016,7 +1388,12 @@ def _print_accel_status():
         pass
     print(f"{'='*60}\n")
 
-_print_accel_status()
+try:
+    _print_accel_status()
+except Exception:
+    # Diagnostic only - never let console encoding problems (a redirected
+    # cp1252 stdout on Windows, for example) abort the whole GUI import.
+    pass
 
 if HAS_NUMBA:
     @njit(parallel=True, fastmath=True)
@@ -1110,7 +1487,11 @@ if HAS_NUMBA:
                 or changed_vertex[faces[i, 2]]
             )
 
-    @njit(parallel=True, fastmath=True)
+    # cache=True persists the compiled kernel to disk. These two filters were
+    # the entire cost of a Shaded Class preview (~1.5s of a 1.7s build) yet the
+    # work itself is trivial - almost all of it was numba JIT compilation, which
+    # was repeated on every process start because the kernels were uncached.
+    @njit(parallel=True, fastmath=True, cache=True)
     def _numba_edge_filter(faces, xy, max_edge_sq):
         n = faces.shape[0]
         keep = np.empty(n, dtype=np.bool_)
@@ -1162,7 +1543,7 @@ if HAS_NUMBA:
                 remove[i] = True
         return remove
 
-    @njit(parallel=True, fastmath=True)
+    @njit(parallel=True, fastmath=True, cache=True)
     def _numba_degenerate_filter(faces, xy, min_area, min_aspect):
         n = faces.shape[0]
         keep = np.empty(n, dtype=np.bool_)
@@ -2118,6 +2499,34 @@ def _build_static_multiclass_blend_overlays(app, cache, vertex_classes,
     blend_actor_count = 0
     sharp_tip_faces = 0
     sharp_tip_actors = 0
+    # ── PERFORMANCE PHASE 1: no duplicate VTK multiclass blend/tip actors ──
+    # This loop creates one vtkOpenGLPolyDataMapper + GPU copy per chunk of
+    # the shaded-class mesh (the "shaded_mesh_static_multiclass_blend_*" and
+    # "..._tip_*" actors). When Vulkan owns the LiDAR viewport it already
+    # draws this mesh, so every chunk is duplicate GPU memory for pixels the
+    # opaque Vulkan surface hides. Skip the whole loop rather than guarding
+    # each add_mesh; the chunk maths below is only used to build these actors.
+    from gui.unified_actor_manager import _vulkan_owns_lidar as _vul_owns
+    if _vul_owns(app):
+        try:
+            from gui.unified_actor_manager import _note_vtk_lidar_skipped
+            _note_vtk_lidar_skipped(app, len(cache.xyz_final)
+                                    if getattr(cache, "xyz_final", None) is not None
+                                    else 0)
+        except Exception:
+            pass
+        print(f"   ➜ VTK multiclass blend/tip actors SKIPPED "
+              f"(0 of {len(ids)} chunk faces built) - Vulkan owns the LiDAR "
+              f"viewport")
+        # Still record the empty overlay set so any later cleanup sees a
+        # consistent state, but return the SAME 2-tuple shape as the other
+        # exit paths (0, 0 at the top, and (blend_actor_count,
+        # total_vertices) at the end). Returning bare `entries` here made
+        # every caller unpack a list, which raised
+        # "ValueError: not enough values to unpack (expected 2, got 0)"
+        # whenever the list was empty under the Vulkan-owned path.
+        app._shading_static_blend_overlays = entries
+        return 0, 0
     for chunk_no, begin in enumerate(range(0, len(ids), chunk_faces)):
         chunk_ids = ids[begin:begin + chunk_faces]
         base_faces = np.asarray(cache.faces[chunk_ids], dtype=np.int32)
@@ -2443,6 +2852,104 @@ def _rebuild_crisp_live_edit_overlays(app, cache, classes_raw,
     )
     return pure_count, mixed_count, pure_vertices + mixed_vertices
 
+def _shading_key_fill_intensities(app, sharpness, sharpness_overdrive):
+    """Key/fill intensities of the Nakshatech multi-class shading model.
+
+    Single source of truth: the VTK light rig
+    (_configure_nakshatech_color_blend_lighting) AND the native Vulkan
+    push-constant path (nkv_set_crisp_shading_parameters -> surface.frag
+    shadeParamsB) both read these numbers, so the two renderers cannot drift
+    apart. Sharpness only redistributes a constant directional energy between
+    the key and its mirrored fill; Ambient stays the brightness control.
+    """
+    if ('NAKSHA_SHADING_BLEND_KEY_INTENSITY' in os.environ
+            or 'NAKSHA_SHADING_BLEND_FILL_INTENSITY' in os.environ):
+        try:
+            key_intensity = float(os.environ.get(
+                'NAKSHA_SHADING_BLEND_KEY_INTENSITY', '0.85'))
+        except Exception:
+            key_intensity = 0.85
+        try:
+            fill_intensity = float(os.environ.get(
+                'NAKSHA_SHADING_BLEND_FILL_INTENSITY', '0.18'))
+        except Exception:
+            fill_intensity = 0.18
+    else:
+        try:
+            total_directional = float(os.environ.get(
+                'NAKSHA_SHADING_DIRECTIONAL_ENERGY', '1.05'))
+        except Exception:
+            total_directional = 1.05
+        total_directional = float(np.clip(total_directional, 0.25, 1.50))
+        # 0..90 is unchanged: key_ratio runs 0.58 -> 0.95. Most overdrive
+        # contrast is deliberately distributed across 90..200, with a smaller
+        # tail through 999 instead of visually saturating immediately after 90.
+        # Total directional energy stays constant, so Ambient remains the
+        # brightness control while facet-to-facet contrast gets stronger.
+        key_ratio = (
+            0.58
+            + 0.37 * float(sharpness)
+            + 0.049 * float(sharpness_overdrive)
+        )
+        key_ratio = float(np.clip(key_ratio, 0.50, 0.999))
+        key_intensity = total_directional * key_ratio
+        fill_intensity = total_directional * (1.0 - key_ratio)
+
+    return (float(np.clip(key_intensity, 0.0, 2.0)),
+            float(np.clip(fill_intensity, 0.0, 1.0)))
+
+
+def _push_vulkan_shading_parity(app, backend) -> bool:
+    """Push the GPU's shading-parity state, derived from the CPU path.
+
+    The Vulkan viewport has to be indistinguishable from the VTK one, so every
+    value here comes from the SAME Python function the VTK path uses - nothing is
+    re-invented or hardcoded in the shader:
+
+      colour mode     gui.render_backend.color_parity_mode(): 1 makes the shaders
+                      pre-compensate the swapchain's sRGB encode, so the
+                      framebuffer holds exactly the byte _crisp_shade_chunk() /
+                      _shading_palette_rgb() produced;
+      ambient floor   _crisp_blend_ambient_floor(app) - the crisp shadow floor;
+      base elevation  _shading_fixed_light_elevation(app) - the 45-degree anchor
+                      the contrast remap re-centres on;
+      debug stage     gui.render_backend.shading_debug_stage(): 0 final colour,
+                      1 face normal, 2 lighting factor, 3 class colour, 4 raw N.L.
+
+    Push-constant only: no geometry rebuild, no colour re-upload.
+    """
+    if backend is None:
+        return False
+    try:
+        from gui import render_backend as _rb_mod
+        color_mode = int(_rb_mod.color_parity_mode())
+        debug_stage = int(_rb_mod.shading_debug_stage())
+    except Exception:
+        return False
+    try:
+        floor = float(_crisp_blend_ambient_floor(app))
+        base_elevation = float(_shading_fixed_light_elevation(app))
+    except Exception:
+        return False
+    try:
+        ok = bool(backend.set_color_parity_params(
+            color_mode, debug_stage, floor, base_elevation))
+    except Exception:
+        return False
+
+    signature = (color_mode, debug_stage, round(floor, 4), round(base_elevation, 4))
+    if getattr(app, '_shading_vulkan_parity_signature', None) != signature:
+        app._shading_vulkan_parity_signature = signature
+        print(
+            'SHADING_VULKAN_PARITY '
+            f'status={"pushed" if ok else "failed"} color_mode={color_mode} '
+            f'debug_stage={debug_stage} ambient_floor={floor:.3f} '
+            f'base_light_elevation={base_elevation:.2f} '
+            'source=cpu_single_truth buffers_untouched=1'
+        )
+    return ok
+
+
 def _configure_nakshatech_color_blend_lighting(app, actor=None):
     """Flat faceted lighting with Sharpness independent of brightness.
 
@@ -2481,45 +2988,10 @@ def _configure_nakshatech_color_blend_lighting(app, actor=None):
 
     # Keep directional energy roughly constant. Sharpness only redistributes it
     # between key and opposite fill, increasing face-to-face contrast without
-    # acting like a brightness slider.
-    if ('NAKSHA_SHADING_BLEND_KEY_INTENSITY' in os.environ or
-            'NAKSHA_SHADING_BLEND_FILL_INTENSITY' in os.environ):
-        try:
-            key_intensity = float(os.environ.get(
-                'NAKSHA_SHADING_BLEND_KEY_INTENSITY', '0.85'
-            ))
-        except Exception:
-            key_intensity = 0.85
-        try:
-            fill_intensity = float(os.environ.get(
-                'NAKSHA_SHADING_BLEND_FILL_INTENSITY', '0.18'
-            ))
-        except Exception:
-            fill_intensity = 0.18
-    else:
-        try:
-            total_directional = float(os.environ.get(
-                'NAKSHA_SHADING_DIRECTIONAL_ENERGY', '1.05'
-            ))
-        except Exception:
-            total_directional = 1.05
-        total_directional = float(np.clip(total_directional, 0.25, 1.50))
-        # 0..90 is unchanged: key_ratio runs 0.58 -> 0.95. Most overdrive
-        # contrast is deliberately distributed across 90..200, with a smaller
-        # tail through 999 instead of visually saturating immediately after 90.
-        # Total directional energy stays constant, so Ambient remains the
-        # brightness control while facet-to-facet contrast gets stronger.
-        key_ratio = (
-            0.58
-            + 0.37 * sharpness
-            + 0.049 * sharpness_overdrive
-        )
-        key_ratio = float(np.clip(key_ratio, 0.50, 0.999))
-        key_intensity = total_directional * key_ratio
-        fill_intensity = total_directional * (1.0 - key_ratio)
-
-    key_intensity = float(np.clip(key_intensity, 0.0, 2.0))
-    fill_intensity = float(np.clip(fill_intensity, 0.0, 1.0))
+    # acting like a brightness slider. Shared with the native Vulkan path (see
+    # _shading_key_fill_intensities) so both renderers use identical numbers.
+    key_intensity, fill_intensity = _shading_key_fill_intensities(
+        app, sharpness, sharpness_overdrive)
 
     key_light = getattr(app, '_shading_nakshatech_key_light', None)
     fill_light = getattr(app, '_shading_nakshatech_fill_light', None)
@@ -3568,11 +4040,490 @@ def _prepare_scene_for_shading(app):
     )
 
 
+# Printed at most once per session so selecting the legacy fallback is visible
+# without spamming a line on every azimuth/ambient slider tick.
+_legacy_shaded_notice_shown = False
+
+
+def _instant_shaded_streaming(app) -> bool:
+    """True when the dataset is served from the committed NKPC cache
+    (DatasetMode.STREAMING).
+
+    In that mode app.data is deliberately EMPTY - the points, classes and
+    intensity live in the RESIDENT GPU buffer that VulkanTileRendererAdapter
+    uploaded with nkv_set_point_cloud(). That is exactly what makes the instant
+    renderer usable here: it draws that same buffer with a splat pass plus a
+    fullscreen depth-normal lighting pass and never touches the CPU arrays. The
+    legacy Delaunay TIN, by contrast, needs the full in-memory dataset and is
+    listed as TEMPORARILY_GATED in gui/naksha_cache/app_streaming.py.
+    """
+    mgr = getattr(app, 'naksha_stream', None)
+    if mgr is None:
+        return False
+    if getattr(mgr, 'adapter', None) is None:
+        return False
+    data = getattr(app, 'data', None)
+    return not (isinstance(data, dict) and data.get('xyz') is not None)
+
+
+def _instant_light_elevation(app, requested_angle, multi_class):
+    """Effective light elevation in degrees for the instant renderer.
+
+    Delegates to the SAME helpers the legacy path uses
+    (_resolve_requested_multiclass_sharpness / _shading_sharpness_response /
+    _shading_effective_light_elevation) rather than re-deriving the formula, so
+    the two renderers cannot drift apart as the Sharpness mapping changes.
+    """
+    try:
+        if multi_class:
+            sharpness = _resolve_requested_multiclass_sharpness(app, requested_angle)
+            _, overdrive = _shading_sharpness_response(sharpness)
+            return float(_shading_effective_light_elevation(app, overdrive))
+        if requested_angle is None:
+            return float(getattr(app, 'last_shade_angle', 45.0))
+        return float(requested_angle)
+    except Exception:
+        return 45.0
+
+
+def _instant_shaded_selected() -> bool:
+    """True when Display Mode -> Shaded Class should use the native INSTANT
+    renderer instead of the Delaunay/TIN path below.
+    Default: INSTANT. NAKSHA_SHADED_RENDERER=legacy selects the old mesh path
+    (the DEV-only fallback), and it is an explicit, once-per-session notice
+    rather than something that prints on every slider tick.
+    """
+    global _legacy_shaded_notice_shown
+    try:
+        from gui import render_backend as _rb
+        enabled = _rb.instant_shaded_renderer_enabled()
+    except Exception:
+        enabled = False
+    if not enabled and not _legacy_shaded_notice_shown:
+        _legacy_shaded_notice_shown = True
+        print('[INSTANT SHADED] renderer=legacy '
+              '(NAKSHA_SHADED_RENDERER=legacy -> Delaunay/TIN path)')
+    return bool(enabled)
+
+
+def _instant_shaded_available(app) -> bool:
+    """True when the native pass is really there: the Vulkan viewport is live,
+    the DLL exports the entry points, and the shaders/pipeline built."""
+    try:
+        rb = getattr(app, 'render_backend', None)
+        if rb is None or not getattr(rb, 'active', False):
+            return False
+        b = getattr(rb, 'vulkan_backend', None)
+        if b is None or not b.supports_instant_shaded():
+            return False
+        return bool(b.get_instant_shaded_available())
+    except Exception:
+        return False
+
+
+def _safe_counter(obj, method_name):
+    """Best-effort counter read for TELEMETRY. Never raises and never returns a
+    value the renderer is expected to act on: an unreadable counter reports
+    'n/a' instead of failing whatever called it."""
+    try:
+        fn = getattr(obj, method_name, None)
+        if fn is None:
+            return None
+        return fn()
+    except Exception:
+        return None
+
+
+def _activate_instant_shaded_renderer(app, azimuth, angle, ambient):
+    """RENDERER ONLY - performs the real activation and nothing else.
+
+    Contains NO telemetry: no after-the-fact counter reads, no frame-timing
+    reads, no payload formatting, no printing. The returned bool IS the renderer
+    result and is the ONLY thing allowed to decide whether the caller falls
+    back to the legacy TIN path.
+
+    A genuine renderer failure (native API error, missing adapter, refused
+    handoff) raises or returns False and MUST still surface as FAIL.
+    """
+    from gui import render_backend as _rb
+    rb = app.render_backend
+    b = rb.vulkan_backend
+    ambient_c = float(np.clip(ambient, 0.0, 1.0))
+    debug_stage = int(_rb.shaded_debug_view())
+    splat_px = float(_rb.shaded_splat_px_override())
+    normal_radius = int(_rb.shaded_normal_radius_px())
+
+    if _instant_shaded_streaming(app):
+        # STREAMING: app.data is empty, so sync_point_shading() (which reads it)
+        # cannot be used. Drive the RESIDENT GPU buffer directly through the very
+        # adapter that uploaded it - same buffers, same pipeline, no CPU arrays
+        # and no mesh.
+        #
+        # PART 10: the normal source must be chosen from what is ACTUALLY
+        # resident, not from what the sidecar would ideally provide. Claiming
+        # 'stored' with no stream resident means every normal decodes to +Z and
+        # the whole scene shades as flat ground - plausible, and wrong.
+        # Every read here is DEFENSIVE: this runs inside the renderer handoff,
+        # so a stub or a partially-constructed manager must degrade to the DEV
+        # fallback rather than raise and take the whole mode switch down with it.
+        # Telemetry must never be able to fail a render.
+        mgr = getattr(app, "naksha_stream", None)
+        # ROOT CAUSE (live): clicking Shaded only called adapter.push_instant_
+        # shaded(); it never told the STREAM MANAGER the mode changed. So
+        # mgr.display_mode stayed "rgb", mgr.shaded_mode stayed False, and
+        # _needs_normal() returned False - meaning normals were NEVER uploaded
+        # and resident_normal_points stayed 0 while the UI happily reported
+        # normal_source=stored. Part 6: a mode change must itself drive
+        # attribute completion, with no camera movement required.
+        if mgr is not None and hasattr(mgr, "set_display_mode"):
+            try:
+                mgr.set_display_mode("shaded")
+            except Exception as exc:
+                print(f"[INSTANT SHADED] stream manager mode switch failed: {exc!r}")
+        try:
+            want_stored = (getattr(mgr, "normal_source", "screen") == "stored")
+        except Exception:
+            want_stored = False
+        resident_normals = 0
+        try:
+            resident_normals = int(b.get_point_normal_count())
+        except Exception:
+            resident_normals = 0
+        if want_stored and resident_normals <= 0:
+            want_stored = False
+            print("[INSTANT SHADED] normal_source requested=stored but "
+                  f"resident normal points={resident_normals} "
+                  f"(normal_cache={getattr(getattr(mgr, 'normal_report', None), 'status', 'MISS')})"
+                  f" -> screen-space DEV fallback ACTIVE")
+        if hasattr(b, "set_instant_normal_source"):
+            try:
+                b.set_instant_normal_source(not want_stored)
+            except Exception:
+                pass
+        ok = bool(app.naksha_stream.adapter.push_instant_shaded(
+            float(azimuth), float(angle), ambient_c,
+            _rb.build_class_visibility(app),
+            debug_stage=debug_stage,
+            splat_px=splat_px,
+            normal_radius_px=normal_radius,
+            splat_footprint_m=_rb.instant_splat_footprint(app)))
+    else:
+        # Lighting first (push constants), then the mode switch itself: LUTs +
+        # splat band + visibility, then the single display-mode float that
+        # routes the frame through the splat + lighting passes.
+        ok = bool(b.set_instant_shading_parameters(
+            float(azimuth), float(angle), ambient_c, debug_stage))
+        if hasattr(b, "set_instant_normal_radius"):
+            b.set_instant_normal_radius(normal_radius)
+        # NORMAL SOURCE. 'stored' is the production choice, but it is only
+        # correct when an oct16 stream is actually resident: with none, the
+        # zero-filled stand-in decodes to +Z and every surface would shade as
+        # flat ground - a silent, plausible-looking regression. Fall back to
+        # screen-space, loudly, until a normal cache exists.
+        want = _rb.shaded_normal_source()
+        resident = b.get_point_normal_count() if hasattr(b, 'get_point_normal_count') else 0
+        if want == "stored" and not resident:
+            want = "screen"
+            print("[INSTANT SHADED] no oct16 normal stream resident "
+                  "(normal cache not built yet) -> screen-space fallback")
+        if hasattr(b, "set_instant_normal_source"):
+            b.set_instant_normal_source(want == "screen")
+        # The splat band itself is applied inside sync_point_shading(), which
+        # is the single authoritative place for it (and would otherwise be
+        # overwritten by the standard band it pushes first).
+        ok = bool(rb.sync_point_shading(present=True, mode='shaded_class')) and ok
+
+    if not ok:
+        return False
+
+    rb.mark_active('shaded_class')
+    # A TIN left behind by an earlier legacy run must never show through.
+    try:
+        act = getattr(app, '_shaded_mesh_actor', None)
+        if act is not None:
+            act.SetVisibility(False)
+    except Exception:
+        pass
+    return True
+
+
+def _instant_shaded_telemetry_payload(app, azimuth, angle, ambient,
+                                      operation_success, t0, before):
+    """Builds the telemetry record. Every field is best-effort: a missing or
+    broken accessor yields 'n/a'. Nothing here can raise into the renderer."""
+    b = getattr(getattr(app, 'render_backend', None), 'vulkan_backend', None)
+    xyz_after = _safe_counter(b, 'get_point_position_upload_count')
+    mesh_after = _safe_counter(b, 'get_surface_upload_count')
+    xyz_delta = ((xyz_after - before.get('xyz'))
+                 if (xyz_after is not None and before.get('xyz') is not None)
+                 else 'n/a')
+    mesh_delta = ((mesh_after - before.get('mesh'))
+                  if (mesh_after is not None and before.get('mesh') is not None)
+                  else 'n/a')
+    return {
+        'renderer': 'instant_shaded' if operation_success else 'legacy_fallback',
+        'operation_success': bool(operation_success),
+        'switch_cpu_ms': round((time.perf_counter() - t0) * 1000.0, 2),
+        'xyz_uploads': xyz_delta,
+        'mesh_uploads': mesh_delta,
+        'delaunay': 0,
+        'surface_rebuild': 0,
+        'full_recolor': 0,
+        'azimuth': round(float(azimuth), 1),
+        'elevation': round(float(angle), 1),
+        'ambient': round(float(ambient), 3),
+        'instant_frames': _safe_counter(b, 'get_instant_shaded_frame_count'),
+    }
+
+
+def _instant_shaded_perf_payload(app, base_payload):
+    """Second tag so a switch harness can grep timings without matching the
+    state line. CPU figures are MEASURED on this thread; the GPU figure is
+    reported only when the engine really produced a timestamp query, never
+    relabelled - this class of GPU has no timestamp period and says so instead
+    of inventing a number."""
+    b = getattr(getattr(app, 'render_backend', None), 'vulkan_backend', None)
+    t = _safe_counter(b, 'get_frame_timing')
+    if not isinstance(t, dict):
+        t = {}
+    try:
+        gpu = t.get('gpuRenderMs')
+        gpu_txt = (f'{float(gpu):.2f} ms' if t.get('valid') and gpu
+                   else 'not measured (no VK_QUERY_TYPE_TIMESTAMP on this device)')
+        submit = float(t.get('cpuSubmitMs', 0.0))
+        present = float(t.get('presentMs', 0.0))
+    except Exception:
+        gpu_txt, submit, present = 'unavailable', 'n/a', 'n/a'
+    payload = dict(base_payload or {})
+    payload.update({
+        'vk_queue_submit_ms': submit,
+        'vk_queue_present_ms': present,
+        'gpu_frame_ms': gpu_txt,
+        'xyz_upload_bytes': 0,
+        'mesh_upload_bytes': 0,
+    })
+    return payload
+
+
+def _emit_instant_shaded_draw(app, splat_px, normal_radius):
+    """PRIORITY-4 authoritative draw telemetry.
+
+    The "points=26960750" figure that shows up in the log is CACHE METADATA (the
+    dataset size), NOT the number of points actually rasterised. This reads the
+    real GPU-side counters instead:
+
+        resident_points   points in the native point buffer (nkv_get_point_count)
+        submitted_points  points inside the current LOD draw ranges
+                          (nkv_get_point_draw_range_points)
+        lod               number of contiguous draw ranges == the LOD/tile split
+
+    and divides by the real viewport pixel count so points-per-pixel - the
+    number that decides splat coverage and whether depth-normal reconstruction
+    has enough surface to work with - is measured, not guessed.
+    """
+    try:
+        from gui import render_backend as _rb
+        b = getattr(getattr(app, 'render_backend', None), 'vulkan_backend', None)
+        resident = _safe_counter(b, 'get_point_count')
+        submitted = _safe_counter(b, 'get_point_draw_range_points')
+        ranges = _safe_counter(b, 'get_point_draw_range_count')
+        ext = getattr(b, '_last_extent', (0, 0)) or (0, 0)
+        w, h = int(ext[0]), int(ext[1])
+        pixels = w * h if (w > 0 and h > 0) else None
+        ppp = (float(submitted) / pixels) if (pixels and submitted is not None) else None
+
+        source = getattr(app, 'total_points', None)
+        try:
+            source = int(source) if source is not None else None
+        except (TypeError, ValueError):
+            source = None
+
+        print(
+            "[INSTANT SHADED DRAW]\n"
+            f"source_points: {source if source is not None else 'null'}\n"
+            f"lod: {ranges if ranges is not None else 'null'}\n"
+            f"resident_points: {resident if resident is not None else 'null'}\n"
+            f"submitted_points: {submitted if submitted is not None else 'null'}\n"
+            f"viewport: {w}x{h}\n"
+            f"pixels: {pixels if pixels is not None else 'null'}\n"
+            f"points_per_pixel: {round(ppp, 2) if ppp is not None else 'null'}\n"
+            f"splat_px: {float(splat_px) if splat_px else 'auto(1..3)'}\n"
+            f"normal_radius_px: {int(normal_radius)}"
+        )
+        try:
+            from gui import instant_shaded_telemetry as ist
+            ist.emit('instant_shaded_draw', renderer='instant_shaded',
+                     source_points=source,
+                     lod_ranges=_safe_counter(b, 'get_point_draw_range_count'),
+                     resident_points=resident, submitted_points=submitted,
+                     viewport_w=w, viewport_h=h, pixels=pixels,
+                     points_per_pixel=ppp,
+                     splat_px=(float(splat_px) if splat_px else None),
+                     normal_radius_px=int(normal_radius),
+                     debug_view=str(__import__('os').environ.get(
+                         'NAKSHA_SHADED_DEBUG_VIEW', '') or 'final'))
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _emit_instant_shaded_switch(app, azimuth, angle, ambient,
+                                operation_success, base_payload, renderer_error):
+    """DEV instrumentation. Records ONE ``instant_shaded_switch`` event.
+
+    Telemetry ONLY. It reads counters and appends a line. It cannot change the
+    handoff result (that was captured before this is called), it cannot raise
+    into the renderer, and the analyzer runs later, on the file. It is called
+    from inside the already-isolated telemetry phase on purpose.
+    """
+    try:
+        from gui import instant_shaded_telemetry as ist
+        recorder = ist.get()
+        if recorder is None:
+            return
+        b = getattr(getattr(app, 'render_backend', None), 'vulkan_backend', None)
+        from_mode = recorder.swap_render_mode('instant_shaded')
+        cold = from_mode is None
+        ist.emit(
+            'instant_shaded_switch',
+            renderer='instant_shaded' if operation_success else 'legacy_fallback',
+            from_mode=from_mode,
+            to_mode='instant_shaded',
+            requested_mode='shaded_class',
+            operation_success=bool(operation_success),
+            fallback_triggered=not bool(operation_success),
+            switch_cpu_ms=ist.num(base_payload.get('switch_cpu_ms')),
+            resident_points=ist.num(_safe_counter(b, 'get_point_count')),
+            point_count=ist.num(getattr(app, 'total_points', None)),
+            dataset_path=(str(getattr(app, 'loaded_file', '') or '') or None),
+            render_mode='shaded_class',
+            cold=cold,
+            # This renderer stores NO normals - they are reconstructed in screen
+            # space from the depth it just wrote - so there is nothing to be
+            # non-resident and nothing to upload. Reported structurally, not
+            # guessed.
+            normal_resident=not cold,
+            normal_upload_delta=0,
+            # Structural zeros, not estimates: this code path provably runs no
+            # Delaunay, no surface or topology rebuild and no full recolour.
+            delaunay_delta=0,
+            surface_rebuild_delta=0,
+            topology_rebuild_delta=0,
+            full_recolor_delta=0,
+            # Real counters. Unavailable becomes JSON null, never a string.
+            xyz_upload_delta=ist.num(base_payload.get('xyz_uploads')),
+            mesh_upload_delta=ist.num(base_payload.get('mesh_uploads')),
+            # 256 * 4 B palette tail + 256 B visibility table.
+            lut_upload_bytes=1280,
+            azimuth=ist.num(azimuth),
+            elevation=ist.num(angle),
+            ambient=ist.num(ambient),
+            renderer_error=renderer_error,
+        )
+    except Exception:
+        return
+
+
+def _enter_instant_shaded(app, azimuth, angle, ambient) -> bool:
+    """Hand Display Mode -> Shaded Class to the native instant renderer.
+
+    Deliberately touches NO cache, does NOT triangulate and uploads NOTHING:
+    the frame is drawn from the already-resident point buffers by a splat pass
+    plus a fullscreen pass that reconstructs normals from the depth it just
+    wrote. Every value pushed here is a uniform.
+
+    ORDERING CONTRACT (this function was rewritten for a real bug):
+
+        1. RENDERER  -> operation_success, captured, then IMMUTABLE
+        2. TELEMETRY -> recorded through safe_emit_telemetry(), may fail
+        3. RETURN    -> operation_success, never the telemetry verdict
+
+    A telemetry failure yields a ``[TELEMETRY WARNING]`` and nothing else: it
+    does not fall back to the legacy TIN path, does not un-activate the
+    renderer, does not raise into the UI event loop and does not change this
+    return value. A genuine renderer failure still returns False.
+    """
+    t0 = time.perf_counter()
+
+    # ---- 1) RENDERER -------------------------------------------------------
+    # The counters are read here ONLY as a before-snapshot for the telemetry
+    # record; the reads are best-effort and cannot fail the activation.
+    _b = getattr(getattr(app, 'render_backend', None), 'vulkan_backend', None)
+    before = {'xyz': _safe_counter(_b, 'get_point_position_upload_count'),
+              'mesh': _safe_counter(_b, 'get_surface_upload_count')}
+
+    renderer_error = None
+    try:
+        operation_success = bool(_activate_instant_shaded_renderer(
+            app, azimuth, angle, ambient))
+    except Exception as exc:
+        # A REAL renderer failure. It must still fail - telemetry isolation must
+        # never convert a genuine renderer error into a success.
+        operation_success = False
+        renderer_error = f'{type(exc).__name__}: {exc}'
+
+    # ---- 2) TELEMETRY (isolated; cannot influence step 3) ----------------
+    try:
+        base_payload = _instant_shaded_telemetry_payload(
+            app, azimuth, angle, ambient, operation_success, t0, before)
+        if renderer_error:
+            base_payload['renderer_error'] = renderer_error
+        safe_emit_telemetry('INSTANT SHADED', base_payload)
+        safe_emit_telemetry('INSTANT SHADED PERF',
+                            _instant_shaded_perf_payload(app, base_payload))
+        # DEV instrumentation: the analyzer reads this line AFTER the session.
+        _emit_instant_shaded_switch(app, azimuth, angle, ambient,
+                                    operation_success, base_payload,
+                                    renderer_error)
+        try:
+            from gui import render_backend as _rb
+            _emit_instant_shaded_draw(app, float(_rb.shaded_splat_px_override()),
+                                      int(_rb.shaded_normal_radius_px()))
+        except Exception:
+            pass
+    except Exception:
+        # Belt and braces: the boundary already swallows everything, so this can
+        # only fire if the boundary itself were broken. Renderer result stands.
+        pass
+
+    # ---- 3) THE RENDERER RESULT DECIDES ------------------------------------
+    # Never operation_success and telemetry_success. That combination is the bug.
+    if not operation_success:
+        detail = f': {renderer_error}' if renderer_error else ''
+        print(f'[INSTANT SHADED] renderer handoff FAILED '
+              f'-> legacy TIN path{detail}')
+    return operation_success
+
+
 def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
                         max_edge_factor=3.0, force_rebuild=False,
                         single_class_max_edge=None, **kwargs):
     global _active_app_ref
     _active_app_ref = weakref.ref(app)
+
+    # ---------------------------------------------------------------------------
+    # INSTANT RENDERER, STREAMING datasets (evaluated BEFORE any data access).
+    # ---------------------------------------------------------------------------
+    # A cache-backed dataset keeps app.data EMPTY on purpose, so the checks
+    # below would return before the instant branch below them could ever run -
+    # which is precisely why "shaded-class shaded mesh" was TEMPORARILY_GATED
+    # while streaming. This branch is what un-gates it: the points and their
+    # classes are already resident on the GPU, and the instant renderer draws
+    # exactly those buffers with no CPU arrays, no Delaunay and no mesh.
+    if _instant_shaded_selected() and _instant_shaded_streaming(app):
+        try:
+            _prepare_scene_for_shading(app)
+        except Exception:
+            pass
+        _az = float(getattr(app, 'last_shade_azimuth', azimuth))
+        _amb = float(getattr(app, 'shade_ambient', ambient))
+        _elev = _instant_light_elevation(
+            app, angle, len(_get_shading_visibility(app)) > 1)
+        if _enter_instant_shaded(app, _az, _elev, _amb):
+            return
+        print('[INSTANT SHADED] streaming handoff unavailable -> legacy TIN path')
+
     data = getattr(app, "data", None)
     if not isinstance(data, dict):
         return
@@ -3682,6 +4633,26 @@ def update_shaded_class(app, azimuth=45., angle=None, ambient=0.25,
             if requested_angle is None else requested_angle
         )
         app.last_shade_angle = angle
+
+    # ---------------------------------------------------------------------------
+    # INSTANT RENDERER (DEFAULT): stop here. No Delaunay, no mesh, no rebuild.
+    # ---------------------------------------------------------------------------
+    # Everything above is shared with the legacy path on purpose - scene
+    # ownership and the azimuth / effective-elevation / ambient resolution - so
+    # both renderers derive the SAME light from the same sliders. Everything
+    # below this point is TIN-only work: cache key, triangulation, feature and
+    # edge filtering, representative boundaries, vertex/face buffers and the VTK
+    # actor build. None of it runs on this path; the frame is drawn from the
+    # already-resident point buffers by a splat pass plus a fullscreen pass that
+    # reconstructs normals from the depth it just wrote.
+    #
+    # NAKSHA_SHADED_RENDERER=legacy, an older DLL, or shaders that failed to
+    # build all fall through to that legacy path, so the mode still renders.
+    if _instant_shaded_selected():
+        if (_instant_shaded_available(app)
+                and _enter_instant_shaded(app, azimuth, angle, ambient)):
+            return
+        print('[INSTANT SHADED] native pass unavailable -> legacy TIN path')
 
     quality_mode = normalize_shading_quality(getattr(app, 'shading_quality', 'normal'))
     app.shading_quality = quality_mode
@@ -3939,6 +4910,19 @@ def _build_visible_geometry(app, xyz_raw, classes_raw, azimuth, angle,
                 boundary_flags = _extract_boundary_flags_for_shading(
                     app, len(xyz_raw)
                 )
+
+        # [SHADED CLASS PROGRESSIVE] Launch the cheap STAGE 1 preview BEFORE the
+        # full-quality build. It runs on its own QThread and uploads straight to
+        # the Vulkan seam, so a coarse shaded mesh appears while the final build
+        # continues below. It never blocks the GUI thread and never gates the
+        # final path - a preview failure just falls through silently.
+        try:
+            _start_shaded_class_async_preview(
+                app, xyz_raw, classes_raw, visible_classes,
+                azimuth, angle, ambient, max_edge_factor, single_class_max_edge,
+                normalize_shading_quality(getattr(app, 'shading_quality', 'normal')))
+        except Exception:
+            pass
 
         worker = _ShadingComputationWorker(
             xyz_raw, classes_raw, visible_classes, azimuth, angle, ambient,
@@ -4471,6 +5455,60 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
                 'fallback=full_vertex_blend'
             )
     app._shading_crisp_hybrid_active = bool(crisp_hybrid)
+
+    # ---- Native Vulkan seam (opt-in, NAKSHA_RENDER_BACKEND=vulkan only) ---
+    # Reuses the SAME geometry just computed above (cache.xyz_final / cache.faces /
+    # cm / mixed_faces) - does NOT recompute Delaunay/filtering/mixed-face
+    # detection a second time. Upload happens once per _render_mesh() call
+    # that reaches this point (i.e. once per real geometry rebuild); azimuth/
+    # sharpness/ambient-only changes must go through the separate
+    # set_crisp_shading_parameters() push-constant path elsewhere, never here.
+    try:
+        _rb = getattr(app, 'render_backend', None)
+        if crisp_hybrid and _rb is not None and getattr(_rb, 'active', False) and _rb.vulkan_backend is not None:
+            _t_vk0 = time.perf_counter()
+            _class_lut_u8 = np.clip(lut[:256], 0, 255).astype(np.uint8)
+            _vertex_class_u8 = np.clip(cm, 0, 255).astype(np.uint8)
+            _faces_i32 = np.ascontiguousarray(cache.faces, dtype=np.int32)
+            _mixed_i32 = np.ascontiguousarray(mixed_faces, dtype=np.int32)
+            _ok = _rb.vulkan_backend.set_shaded_class_surface(
+                cache.xyz_final, _faces_i32, _vertex_class_u8, _class_lut_u8, _mixed_i32,
+            )
+            # Key/fill come from the SAME derivation the VTK light rig uses
+            # (_shading_key_fill_intensities), so the native push constants
+            # cannot drift from gui/shading_display's crisp-hybrid model.
+            _sharp_norm, _sharp_od = _shading_sharpness_response(
+                float(_shading_sharpness_angle(app)))
+            _key_i, _fill_i = _shading_key_fill_intensities(app, _sharp_norm, _sharp_od)
+            _rb.vulkan_backend.set_crisp_shading_parameters(
+                float(getattr(app, 'last_shade_azimuth', 45.0)),
+                float(_shading_sharpness_angle(app)),
+                float(np.clip(getattr(app, 'shade_ambient', 0.25), 0.0, 1.0)),
+                float(_key_i), float(_fill_i),
+            )
+            # Colour-space/stage parity: same CPU functions the VTK path uses, so
+            # the two viewports cannot drift (see _push_vulkan_shading_parity).
+            _push_vulkan_shading_parity(app, _rb.vulkan_backend)
+            print(
+                f'SHADING_VULKAN_SEAM status={"uploaded" if _ok else "failed"} '
+                f'faces={nf:,} mixed_faces={mixed_count:,} '
+                f'key={_key_i:.3f} fill={_fill_i:.3f} '
+                f'upload_ms={(time.perf_counter()-_t_vk0)*1000:.1f} '
+                f'surface_upload_count={_rb.vulkan_backend.get_surface_upload_count()}'
+            )
+            if _ok:
+                print(f'[VULKAN] Surface received: {nf:,} faces')
+                print('[VULKAN] Crisp-hybrid pipeline: ACTIVE')
+                # The mesh replaces the raw cloud in this mode and the app just
+                # hid its point actors (_hide_point_cloud_actors_for_shading),
+                # so the native viewport must hide its cloud too - otherwise the
+                # points draw in front of the mesh. Buffers stay resident, so
+                # going back to a point mode is a flag write, never a re-upload.
+                _rb.vulkan_backend.set_point_cloud_visible(False)
+                _rb.mark_active('shaded_class')
+    except Exception as _vk_shaded_class_err:
+        print(f'SHADING_VULKAN_SEAM status=error (VTK path unaffected): {_vk_shaded_class_err!r}')
+
     # Enforce the current faceted-normal policy for newly built and cached meshes.
     # In blend mode the NORMAL is still flat; only class RGB is interpolated.
     smooth_all_classes = False
@@ -4769,13 +5807,32 @@ def _render_mesh(app, cache, classes_raw, saved_camera, cached_restore=False):
     app._shading_add_overlays = []
     app._shading_remove_overlays = []
 
-    app._shaded_mesh_actor = plotter.add_mesh(
-        mesh, scalars="RGB", rgb=True, show_edges=False,
-        lighting=bool(blend_class_colors and not crisp_hybrid),
-        smooth_shading=False if blend_class_colors else smooth_all_classes,
-        preference=("cell" if crisp_hybrid else ("point" if (blend_class_colors or smooth_all_classes) else "cell")),
-        name="shaded_mesh", render=False,
-    )
+    # ── PERFORMANCE PHASE 1: no duplicate VTK shaded-class actor ──────────
+    # When Vulkan owns the LiDAR viewport it already holds the shaded-class
+    # mesh, so building a second vtkOpenGLPolyDataMapper + GPU copy here is
+    # pure duplicate work for a slot the opaque Vulkan surface covers. The
+    # mesh itself is still computed (the Vulkan seam below consumes it) and
+    # the `if app._shaded_mesh_actor:` guards further down already tolerate
+    # a missing actor. Overlays are untouched.
+    from gui.unified_actor_manager import _vulkan_owns_lidar as _vul_owns
+    if _vul_owns(app):
+        app._shaded_mesh_actor = None
+        try:
+            from gui.unified_actor_manager import _note_vtk_lidar_skipped
+            _note_vtk_lidar_skipped(
+                app, len(mesh.points) if mesh is not None else 0)
+        except Exception:
+            pass
+        print("   ➜ VTK shaded-class actor SKIPPED - Vulkan owns the LiDAR "
+              "viewport (mesh retained for the Vulkan seam)")
+    else:
+        app._shaded_mesh_actor = plotter.add_mesh(
+            mesh, scalars="RGB", rgb=True, show_edges=False,
+            lighting=bool(blend_class_colors and not crisp_hybrid),
+            smooth_shading=False if blend_class_colors else smooth_all_classes,
+            preference=("cell" if crisp_hybrid else ("point" if (blend_class_colors or smooth_all_classes) else "cell")),
+            name="shaded_mesh", render=False,
+        )
     if app._shaded_mesh_actor:
         setattr(app._shaded_mesh_actor, "_is_shading_mesh", True)
         p2 = app._shaded_mesh_actor.GetProperty()
@@ -8451,12 +9508,50 @@ def update_shading_lighting_only(app, azimuth=None, angle=None, ambient=None):
 
     if _nakshatech_color_blend_enabled(app, cache):
         sharpness_angle = _shading_sharpness_angle(app, angle)
-        _, sharpness_overdrive = _shading_sharpness_response(sharpness_angle)
+        sharpness_angle_normalized, sharpness_overdrive = _shading_sharpness_response(
+            sharpness_angle)
         light_elevation = _shading_effective_light_elevation(
             app, sharpness_overdrive
         )
         app.shading_sharpness_angle = sharpness_angle
         app.last_shade_angle = light_elevation
+
+        # Native Vulkan seam: uniform/push-constant-only update, matching the
+        # "no geometry touch" contract this whole function exists to provide.
+        # Never calls set_shaded_class_surface() here - only when
+        # update_shaded_class() actually rebuilds geometry (see _render_mesh).
+        try:
+            _rb = getattr(app, 'render_backend', None)
+            if (bool(getattr(app, '_shading_crisp_hybrid_active', False))
+                    and _rb is not None and getattr(_rb, 'active', False)
+                    and _rb.vulkan_backend is not None):
+                _before_sharpness = getattr(cache, 'last_crisp_sharpness', None)
+                _upload_count_before = _rb.vulkan_backend.get_surface_upload_count()
+                # Same key/fill derivation as the VTK light rig, so a pure
+                # push-constant update can never diverge from the CPU model.
+                _key_i, _fill_i = _shading_key_fill_intensities(
+                    app, sharpness_angle_normalized, sharpness_overdrive)
+                _rb.vulkan_backend.set_crisp_shading_parameters(
+                    azimuth, sharpness_angle, ambient,
+                    float(_key_i), float(_fill_i),
+                )
+                # Same single-source-of-truth parity push as the geometry path:
+                # Azimuth/Sharpness/Ambient changes must not desync the GPU's
+                # colour space, shadow floor or base elevation.
+                _push_vulkan_shading_parity(app, _rb.vulkan_backend)
+                _upload_count_after = _rb.vulkan_backend.get_surface_upload_count()
+                if _before_sharpness is not None and abs(_before_sharpness - sharpness_angle) > 0.001:
+                    print(f'[VULKAN] Sharpness {_before_sharpness:.1f} -> {sharpness_angle:.1f}')
+                print('[VULKAN] Uniform update only')
+                print('[VULKAN] Geometry rebuild: NO')
+                print(f'[VULKAN] Surface reupload: {"NO" if _upload_count_after == _upload_count_before else "YES"} '
+                      f'(surface_upload_count={_upload_count_after})')
+                print(
+                    'SHADING_VULKAN_SEAM status=param_update_only geometry_touched=0 '
+                    f'shade_param_update_count={_rb.vulkan_backend.get_shade_param_update_count()}'
+                )
+        except Exception as _vk_param_err:
+            print(f'SHADING_VULKAN_SEAM status=param_update_error (VTK path unaffected): {_vk_param_err!r}')
 
         previous_crisp_sharpness = float(
             getattr(cache, 'last_crisp_sharpness', -1.0)

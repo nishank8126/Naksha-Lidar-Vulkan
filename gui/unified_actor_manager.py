@@ -3492,6 +3492,57 @@ import concurrent.futures
 UNIFIED_ACTOR_NAME = "_naksha_unified_cloud"
 MAIN_INTERACTION_ACTOR_NAME = "_naksha_main_interaction_lod"
 
+
+# ── PERFORMANCE PHASE 1: VTK LiDAR suppression ───────────────────────────
+# Counters surfaced in [VULKAN PERFORMANCE] so the duplicate pipeline can be
+# proven gone rather than assumed gone.
+_VTK_LIDAR_SKIPPED_BUILDS = 0
+_VTK_LIDAR_SKIPPED_POINTS = 0
+_VTK_LIDAR_BUILT = 0
+
+
+def _vulkan_owns_lidar(app) -> bool:
+    """True when Vulkan is the sole LiDAR renderer, so VTK must not build one.
+
+    Delegates to the single runtime check on the backend owner. Any failure
+    (no backend, no such method, an exception) resolves to False so the VTK
+    path keeps working - this is an optimisation, never a correctness
+    dependency.
+    """
+    try:
+        rb = getattr(app, "render_backend", None)
+        if rb is None:
+            return False
+        fn = getattr(rb, "vulkan_owns_lidar_viewport", None)
+        if fn is None:
+            return False
+        return bool(fn())
+    except Exception:
+        return False
+
+
+def _note_vtk_lidar_skipped(app, n_pts: int) -> None:
+    """Record and report one deliberately skipped VTK LiDAR build."""
+    global _VTK_LIDAR_SKIPPED_BUILDS, _VTK_LIDAR_SKIPPED_POINTS
+    _VTK_LIDAR_SKIPPED_BUILDS += 1
+    _VTK_LIDAR_SKIPPED_POINTS += int(n_pts or 0)
+    try:
+        app._naksha_vtk_lidar_skipped = True
+    except Exception:
+        pass
+    print(f"   \u2b1c VTK LiDAR build SKIPPED ({int(n_pts or 0):,} pts) - "
+          f"Vulkan owns the LiDAR viewport; no PolyData/mapper/actor/GL upload")
+
+
+def vtk_lidar_build_counters() -> dict:
+    """(built, skipped, skipped_points) for [VULKAN PERFORMANCE]."""
+    return {
+        "built": _VTK_LIDAR_BUILT,
+        "skipped": _VTK_LIDAR_SKIPPED_BUILDS,
+        "skipped_points": _VTK_LIDAR_SKIPPED_POINTS,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5736,6 +5787,35 @@ def build_unified_actor(
         print("      ℹ️ All flight lines are off — main point cloud hidden")
         return None
 
+    # ── PERFORMANCE PHASE 1: skip the duplicate VTK LiDAR pipeline ────────
+    # When Vulkan is the visible LiDAR renderer it already holds the point
+    # cloud / classification / intensity / elevation / shaded-class / surface
+    # data in its own buffers. Everything below this point - vtkPolyData
+    # construction, numpy_to_vtk mirrors, vtkOpenGLPolyDataMapper, the
+    # per-mode GPU shader setup, the actor upload and the deferred GL warm-up
+    # - would build a SECOND copy of the same geometry that no pixel can ever
+    # see, because the opaque Vulkan surface covers the slot.
+    #
+    # Only the LiDAR path is skipped. Overlays (SNT, digitizer,
+    # measurements, text, vectors, CAD) are untouched and keep working.
+    #
+    # Everything above this point still runs on purpose: app.data validation,
+    # the flight-line filter and app._main_global_indices / _main_lod_step
+    # are CPU-side bookkeeping that the classification/brush code and the
+    # Vulkan upload both rely on, and they are cheap.
+    if _vulkan_owns_lidar(app):
+        app._unified_actor = None
+        app._main_interaction_actor = None
+        app._unified_actor_building = False   # ← clear guard
+        # The palette/brush code treats a missing actor as "not ready" and
+        # no-ops, which is exactly right: there is nothing of ours to paint.
+        try:
+            _restore_snt_overlays(app)
+        except Exception:
+            pass
+        _note_vtk_lidar_skipped(app, len(vis_xyz))
+        return None
+
     cloud = pv.PolyData(vis_xyz)
     cloud_bounds = tuple(float(v) for v in cloud.GetBounds())
     print(
@@ -5961,6 +6041,8 @@ def build_unified_actor(
             print(f"      ⚠️ Could not schedule deferred init: {_te}")
 
     elapsed = (time.perf_counter() - t0) * 1000
+    global _VTK_LIDAR_BUILT
+    _VTK_LIDAR_BUILT += 1
     print(f"   🏗️ Unified actor built: {n_pts:,} pts in {elapsed:.1f} ms")
 
     app._unified_actor_building = False   # ← clear guard

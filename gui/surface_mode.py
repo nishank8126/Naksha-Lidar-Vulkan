@@ -779,12 +779,28 @@ def _compute_surface_geometry_backend(
     local_xy = np.ascontiguousarray(xyz[:, :2] - offset[:2], dtype=np.float64)
     _checkpoint("normalize_extent")
 
-    target_max = _surface_quality_target(quality_mode, len(xyz))
+    # Respect an explicitly supplied coarser target (the PREVIEW stage passes
+    # one). Previously this line unconditionally recomputed target_max from
+    # quality_mode alone, silently discarding the caller's value and making a
+    # preview build identical to the final build. Only fall back to the
+    # quality-derived cap when the caller did not ask for something tighter.
+    _derived_target = _surface_quality_target(quality_mode, len(xyz))
+    if target_max is None:
+        target_max = _derived_target
+    else:
+        try:
+            _caller_target = int(target_max)
+        except Exception:
+            _caller_target = _derived_target
+        target_max = min(max(_caller_target, 3), _derived_target) \
+            if _caller_target < _derived_target else _derived_target
     user_precision = max(float(precision or 0.0), 0.0)
 
     _emit(35, f"Selecting {quality_mode.title()} Surface representatives...")
-    if quality_mode == "slow":
-        # Do not allocate a 26M-entry arange just to select every point.
+    if quality_mode == "slow" and target_max >= len(xyz):
+        # Do not allocate a 26M-entry arange just to select every point. Only
+        # take this path when the caller did NOT ask for a coarser subset
+        # (the PREVIEW stage does), otherwise selection is skipped below.
         unique_local_idx = None
         selected_precision = 0.0
         rep_meta = {
@@ -2652,22 +2668,53 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
         except Exception:
             pass
 
-        upload_t0 = time.perf_counter()
-        actor = app.vtk_widget.add_mesh(
-            mesh,
-            scalars="RGB",
-            rgb=True,
-            show_edges=False,
-            lighting=False,
-            smooth_shading=False,
-            preference="cell",
-            name=SURFACE_ACTOR_NAME,
-            render=False,
-        )
-        upload_ms = (time.perf_counter() - upload_t0) * 1000.0
-        setattr(actor, "_is_surface_mesh", True)
-        setattr(actor, "_naksha_display_mode", "surface")
-        _configure_surface_base_actor(actor)
+        # ── PERFORMANCE PHASE 1: no duplicate VTK surface actor ────────────
+        # The mesh built above is still computed (Vulkan needs it, and the
+        # native buffers below come from it), but when Vulkan owns the LiDAR
+        # viewport we must not hand the same mesh to VTK: that creates a
+        # vtkOpenGLPolyDataMapper and a second GPU copy of every triangle for
+        # a slot the opaque Vulkan surface already covers. Overlays are
+        # untouched.
+        from gui.unified_actor_manager import _vulkan_owns_lidar as _vul_owns
+        if _vul_owns(app):
+            actor = None
+            # No VTK upload happened; keep the profile print below valid.
+            upload_ms = 0.0
+            try:
+                from gui.unified_actor_manager import _note_vtk_lidar_skipped
+                _note_vtk_lidar_skipped(app, len(mesh.points) if mesh is not None else 0)
+            except Exception:
+                pass
+            app._surface_mesh_actor = None
+            app._surface_mesh_polydata = mesh
+            app._surface_points = vtk_buffers[0]
+            app._surface_faces = vtk_buffers[1]
+            app._surface_vtk_buffers = vtk_buffers
+            print("   ➜ VTK surface actor SKIPPED - Vulkan owns the LiDAR "
+                  "viewport (mesh + native buffers retained for Vulkan)")
+        else:
+            upload_t0 = time.perf_counter()
+            actor = app.vtk_widget.add_mesh(
+                mesh,
+                scalars="RGB",
+                rgb=True,
+                show_edges=False,
+                lighting=False,
+                smooth_shading=False,
+                preference="cell",
+                name=SURFACE_ACTOR_NAME,
+                render=False,
+            )
+            upload_ms = (time.perf_counter() - upload_t0) * 1000.0
+            setattr(actor, "_is_surface_mesh", True)
+            setattr(actor, "_naksha_display_mode", "surface")
+            _configure_surface_base_actor(actor)
+        if actor is not None:
+            app._surface_mesh_actor = actor
+            app._surface_mesh_polydata = mesh
+            app._surface_points = vtk_buffers[0]
+            app._surface_faces = vtk_buffers[1]
+            app._surface_vtk_buffers = vtk_buffers
 
         # Surface mode should show the terrain mesh, not the class/RGB point actor.
         try:
@@ -2677,15 +2724,96 @@ def _set_mesh_actor(app, points: np.ndarray, faces: np.ndarray, colors: np.ndarr
         except Exception:
             pass
 
-        app._surface_mesh_actor = actor
-        app._surface_mesh_polydata = mesh
-        app._surface_points = vtk_buffers[0]
-        app._surface_faces = vtk_buffers[1]
-        app._surface_vtk_buffers = vtk_buffers
-
         hidden_points = _hide_point_cloud_actors_for_surface(app)
         if hidden_points:
             print(f"SURFACE_POINT_ISOLATION hidden={hidden_points} zfight_removed=1")
+
+        # ---- Native Vulkan seam (opt-in, NAKSHA_RENDER_BACKEND=vulkan only) --
+        # Hands the SAME geometry and the SAME CPU-baked per-face colours this
+        # VTK actor just received to the Vulkan SurfaceRenderer (which draws
+        # them pass-through, see NKV_SHADE_PASSTHROUGH). Upload happens once per
+        # real surface build; the surface algorithm above is untouched.
+        try:
+            _rb = getattr(app, "render_backend", None)
+            if (_rb is not None and getattr(_rb, "active", False)
+                    and getattr(_rb, "vulkan_backend", None) is not None):
+                _t_vk0 = time.perf_counter()
+                # Keep explicit references alive across the FFI call: these are
+                # ctypes.data_as() raw pointers, and a temporary could in
+                # principle be collected before the native side reads it.
+                _vk_positions = np.ascontiguousarray(points, dtype=np.float64)
+                _vk_faces = np.ascontiguousarray(faces, dtype=np.int32)
+                _vk_colors = np.ascontiguousarray(colors, dtype=np.uint8)
+                _vk_min_index = int(_vk_faces.min()) if _vk_faces.size else 0
+                _vk_max_index = int(_vk_faces.max()) if _vk_faces.size else 0
+                print(
+                    f'SURFACE_VULKAN_SEAM input: vertices={len(_vk_positions):,} '
+                    f'faces={len(_vk_faces):,} colors={len(_vk_colors):,} '
+                    f'face_index_range=[{_vk_min_index}, {_vk_max_index}]'
+                )
+                # Tiled path (Parts 6-9): the mesh is uploaded into a PENDING
+                # resource set and promoted at the next frame boundary, so the
+                # viewport keeps drawing the previous surface for the whole
+                # upload and there is no blank frame. The engine then culls
+                # per-tile and selects a LOD from the projected error every
+                # frame, with no further upload.
+                #
+                # is_preview marks a coarse interactive stand-in. A preview is
+                # only ever uploaded for the interactive/navigation path and is
+                # reported as PREVIEW_ACTIVE; the engineering-quality final
+                # surface is the is_preview=False upload below.
+                _quality = normalize_surface_quality(
+                    getattr(app, "surface_quality", "normal"))
+                _is_preview = bool(getattr(app, "_surface_vulkan_preview", False))
+                # Revision stamps for the native stale guard. The dataset
+                # revision tracks the loaded dataset identity; the surface
+                # revision is bumped for every new surface generation.
+                _ds_rev = int(getattr(app, "_vulkan_dataset_revision", 0) or 0)
+                _sf_rev = int(getattr(app, "_vulkan_surface_revision", 0) or 0)
+                _rb.vulkan_backend.set_dataset_revision(_ds_rev)
+                _rb.vulkan_backend.set_surface_revision(_sf_rev)
+                _ok = False
+                _tiled = False
+                if _rb.vulkan_backend.supports_tiled_surface():
+                    _ok = _rb.vulkan_backend.set_surface_tiled(
+                        _vk_positions, _vk_faces, _vk_colors,
+                        tile_count=0, base_cell_m=0.0,
+                        is_preview=_is_preview,
+                        dataset_revision=_ds_rev, surface_revision=_sf_rev,
+                    )
+                    _tiled = _ok
+                if not _ok:
+                    # Older DLL, or the upload was refused (e.g. the VRAM
+                    # budget). Fall back to the legacy single-resource path so
+                    # the surface still appears.
+                    _ok = _rb.vulkan_backend.set_surface(
+                        _vk_positions, _vk_faces, _vk_colors,
+                    )
+                print(
+                    f'SURFACE_VULKAN_SEAM status={"uploaded" if _ok else "failed"} '
+                    f'path={"tiled" if _tiled else "legacy"} '
+                    f'quality={_quality} preview={int(_is_preview)} '
+                    f'vertices={len(points):,} faces={len(faces):,} '
+                    f'upload_ms={(time.perf_counter() - _t_vk0) * 1000:.1f} '
+                    f'surface_upload_count={_rb.vulkan_backend.get_surface_upload_count()}'
+                    + ('' if _ok else
+                       f' reason={_rb.vulkan_backend.get_last_error()!r}')
+                )
+                # [SURFACE PIPELINE] telemetry only: observe the upload that
+                # just happened. Does not gate or alter it.
+                try:
+                    _surface_pipeline_note_upload(
+                        app, (time.perf_counter() - _t_vk0), _ok)
+                    print_surface_pipeline_report(app)
+                except Exception:
+                    pass
+                if _ok:
+                    # Surface mode shows the terrain mesh, not the raw cloud
+                    # (the VTK side hides the point actors one block above).
+                    _rb.vulkan_backend.set_point_cloud_visible(False)
+                    _rb.mark_active("surface")
+        except Exception as _vk_surface_err:
+            print(f'SURFACE_VULKAN_SEAM status=error (VTK path unaffected): {_vk_surface_err!r}')
 
         try:
             _restore_snt_grid_above_surface(app)
@@ -3140,6 +3268,388 @@ def _surface_async_settings_signature(app):
         return ("SURFACE_ASYNC_SETTINGS_ERROR",)
 
 
+# ============================================================================
+# [SURFACE PIPELINE] TELEMETRY  (observation only)
+# ============================================================================
+# Reads only state the pipeline already produces and formats it. It does not
+# call, reorder, gate or modify: surface algorithms, triangulation, the QThread
+# worker, the Vulkan upload path, shading, or any actor/swap. No control flow.
+# Anything not tracked today prints "n/a" rather than being guessed, so the
+# report can't be mistaken for a measurement of an uninstrumented stage.
+
+_SURFACE_PIPELINE_TELEMETRY = {
+    "runs": 0, "input_points": None, "selected_points": None, "target": None,
+    "strategy": None, "triangles": None, "timings": {}, "quality_mode": None,
+    "triangulator": None, "preview_actor": "INACTIVE",
+    "preview_triangles": None, "final_triangles": None, "upload_s": None,
+    "upload_count": None, "wall_s": None,
+    "preview_s": None, "preview_triangles": None, "preview_points": None,
+    "preview_subsampled": None, "preview_upload_s": None,
+    "preview_removed": None, "final_displayed": None,
+}
+
+
+def _surface_pipeline_note(**kwargs):
+    """Record observed surface-build facts. Never raises, never controls flow."""
+    try:
+        _SURFACE_PIPELINE_TELEMETRY["runs"] += 1
+        for _k, _v in kwargs.items():
+            _SURFACE_PIPELINE_TELEMETRY[_k] = _v
+    except Exception:
+        pass
+
+
+def _surface_pipeline_note_result(app, result, wall_s=None):
+    """Snapshot one finished worker result (read-only)."""
+    try:
+        if not isinstance(result, dict) or result.get("empty", False):
+            return
+        _rm = result.get("representative_meta") or {}
+        _tm = result.get("profile_timings") or {}
+        _faces = result.get("faces")
+        _pts = result.get("points")
+        _surface_pipeline_note(
+            selected_points=_rm.get("selected", (len(_pts) if _pts is not None else None)),
+            target=_rm.get("target"), strategy=_rm.get("strategy"),
+            triangles=(len(_faces) if _faces is not None else None),
+            timings={_k: float(_v) for _k, _v in _tm.items() if isinstance(_v, (int, float))},
+            quality_mode=result.get("quality_mode"),
+            triangulator=result.get("triangulator"),
+            final_triangles=(len(_faces) if _faces is not None else None),
+            wall_s=wall_s)
+        _pa = getattr(app, "_surface_preview_actor", None)
+        _SURFACE_PIPELINE_TELEMETRY["preview_actor"] = ("ACTIVE" if _pa is not None else "INACTIVE")
+    except Exception:
+        pass
+
+
+def _surface_pipeline_note_upload(app, upload_s, ok):
+    """Snapshot a Vulkan surface upload the caller already performed.
+
+    upload_s is in SECONDS, matching profile_timings, so _fmt_ms() converts
+    every timing in the report the same way.
+    """
+    try:
+        _rb = getattr(app, "render_backend", None)
+        _vb = getattr(_rb, "vulkan_backend", None) if _rb is not None else None
+        _c = _vb.get_surface_upload_count() if _vb is not None and hasattr(_vb, "get_surface_upload_count") else None
+        _surface_pipeline_note(upload_s=float(upload_s), upload_count=_c, upload_ok=bool(ok))
+    except Exception:
+        pass
+
+
+def _fmt_ms(_v):
+    return "n/a" if _v is None else f"{float(_v) * 1000.0:,.1f}"
+
+
+def _surface_pipeline_report(app=None):
+    """Format the [SURFACE PIPELINE] block. Pure read + string formatting."""
+    t = _SURFACE_PIPELINE_TELEMETRY
+    tm = t.get("timings") or {}
+
+    def _n(_v):
+        return "n/a" if _v is None else f"{int(_v):,}"
+
+    _pa = t.get("preview_actor", "INACTIVE")
+    _has_prev = t.get("preview_triangles") is not None
+    _has_final = t.get("final_triangles") is not None
+    _mode = "FINAL" if _has_final else ("PREVIEW" if _has_prev else "IDLE")
+
+    # ---- STAGE 1 -------------------------------------------------------
+    _L = ["[SURFACE PERFORMANCE]", "", "Preview:",
+          f"  Input points:            {_n(t.get('input_points'))}",
+          f"  Subsampled for preview:  {_n(t.get('preview_subsampled'))}",
+          f"  Selected points:         {_n(t.get('preview_points'))}",
+          f"  Triangles:               {_n(t.get('preview_triangles'))}",
+          f"  Generation:              {_fmt_ms(t.get('preview_s'))} ms",
+          f"  GPU upload:              {_fmt_ms(t.get('preview_upload_s'))} ms",
+          f"  First visible frame:     {'n/a (needs a visible window)'}",
+          "", "Final:",
+          f"  Input points:            {_n(t.get('input_points'))}",
+          f"  Selected points:         {_n(t.get('selected_points'))}",
+          f"  Triangles:               {_n(t.get('final_triangles'))}",
+          f"  Generation:              {_fmt_ms(tm.get('total_backend'))} ms",
+          f"  GPU upload:              {_fmt_ms(t.get('upload_s'))} ms",
+          "", "Swap:",
+          f"  Preview removed:         {'YES' if t.get('preview_removed') else 'NO'}",
+          f"  Final displayed:         {'YES' if t.get('final_displayed') else 'NO'}",
+          "", "[SURFACE PREVIEW]", "",
+          f"  Input points:            {_n(t.get('input_points'))}",
+          f"  Subsampled for preview:  {_n(t.get('preview_subsampled'))}",
+          f"  Triangles:               {_n(t.get('preview_triangles'))}",
+          f"  Generation time:         {_fmt_ms(t.get('preview_s'))} ms",
+          f"  GPU upload:              {_fmt_ms(t.get('preview_upload_s'))} ms",
+          f"  Displayed:               {_pa}", "",
+          "[SURFACE FINAL]", "",
+          f"  Input points:            {_n(t.get('selected_points'))}",
+          f"  Triangles:               {_n(t.get('final_triangles'))}",
+          f"  Generation time:         {_fmt_ms(tm.get('total_backend'))} ms",
+          f"  GPU upload:              {_fmt_ms(t.get('upload_s'))} ms", "",
+          "[SURFACE PIPELINE]", "", f"MODE: {_mode}", "", "Input:",
+          f"  Input points:            {_n(t.get('input_points'))}",
+          f"  Preview/selected points: {_n(t.get('selected_points'))}",
+          f"  Quality target:          {_n(t.get('target'))}",
+          f"  Selection strategy:      {t.get('strategy') or 'n/a'}",
+          f"  Quality mode:            {t.get('quality_mode') or 'n/a'}",
+          f"  Triangulator:            {t.get('triangulator') or 'n/a'}",
+          f"  Triangles:               {_n(t.get('triangles'))}", "",
+          "Timing (ms):",
+          f"  Dedup:                   {_fmt_ms(tm.get('representative_select'))} ms",
+          f"  Delaunay:                {_fmt_ms(tm.get('delaunay'))} ms",
+          f"  Face filtering:          {_fmt_ms(tm.get('edge_filter'))} ms",
+          f"  Normals:                 {_fmt_ms(tm.get('vertex_normals', tm.get('face_normals')))} ms",
+          f"  Shading:                 {_fmt_ms(tm.get('face_colors'))} ms",
+          f"  Total CPU:               {_fmt_ms(tm.get('total_backend'))} ms"]
+    if t.get("wall_s") is not None:
+        _L.append(f"  Wall (incl. thread hop):  {_fmt_ms(t['wall_s'])} ms")
+    _L += ["", "GPU upload:",
+           f"  Surface upload:          {_fmt_ms(t.get('upload_s'))} ms",
+           f"  Surface upload count:    {t.get('upload_count') if t.get('upload_count') is not None else 'n/a'}",
+           "", "Preview:",
+           f"  Preview actor:           {_pa}",
+           f"  Preview input points:    {_n(t.get('preview_points'))}",
+           f"  Preview triangles:       {_n(t.get('preview_triangles'))}",
+           f"  Preview time:            {_fmt_ms(t.get('preview_s'))} ms", "",
+           "Final:",
+           f"  Final input points:      {_n(t.get('selected_points'))}",
+           f"  Final triangles:         {_n(t.get('final_triangles'))}",
+           f"  Final time:              {_fmt_ms(tm.get('total_backend'))} ms", "",
+           f"  Completed builds observed: {t.get('runs', 0)}"]
+    return "\n".join(_L)
+
+
+# ============================================================================
+# [SURFACE PIPELINE] PROGRESSIVE PREVIEW -> FINAL
+# ============================================================================
+# Adds a cheap PREVIEW stage in front of the existing full-quality async
+# rebuild. Deliberately additive: it reuses _SurfaceComputationWorker (no new
+# thread type), _compute_surface_geometry_backend (no new algorithm),
+# _set_mesh_actor (the same atomic swap the final path already uses) and the
+# existing quality ladder. Nothing in the final path is replaced or gated.
+#
+# The preview worker starts first with a much smaller quality target, so it
+# normally completes well before the final worker. Each stage is stamped with
+# the topology generation; a stale stamp on return means the preview no longer
+# describes what is on screen, so it is discarded.
+
+_SURFACE_PREVIEW_FRACTION = 0.06
+_SURFACE_PREVIEW_CEILING = 400_000
+
+
+def _surface_preview_target(final_target: int) -> int:
+    """Coarse target for the preview stage. Always < final_target."""
+    try:
+        final_target = max(int(final_target), 3)
+    except Exception:
+        return 3
+    preview = min(int(final_target * _SURFACE_PREVIEW_FRACTION), _SURFACE_PREVIEW_CEILING)
+    # Keep the preview strictly coarser so the swap is a real refinement.
+    return max(3, min(preview, final_target - 1) if final_target > 4 else 3)
+
+
+def _surface_preview_subsample(xyz_all: np.ndarray, global_idx: np.ndarray,
+                               want: int):
+    """Cheap deterministic pre-subsample for the STAGE 1 preview.
+
+    The existing representative selection grids EVERY visible point (count
+    pass, up to two precision corrections, then a select pass). On 27M points
+    that alone costs ~0.9s before a single triangle exists, which is why the
+    preview could not land under a second.
+
+    For a preview we do not need grid-optimal spatial representatives - we need
+    a spatially unbiased sample fast enough to triangulate. A deterministic
+    stride over the spatially-sorted input is O(n) with no second pass, and the
+    downstream grid_count_first pass then refines it to the requested count.
+
+    Returns (subsampled_xyz, matching_global_idx). Falls back to the full input
+    if anything about the shape is unexpected, so this can never lose points.
+    """
+    try:
+        want = max(int(want), 3)
+        n = int(len(global_idx))
+        if n <= want:
+            return xyz_all[global_idx], global_idx
+
+        # Deterministic stride: evenly spaced across the array, no RNG, no
+        # sort. Cheap enough to run inline on tens of millions of points.
+        pick = np.linspace(0, n - 1, want, dtype=np.int64)
+        pick = np.unique(pick)
+        sub_idx = global_idx[pick]
+        return xyz_all[sub_idx], sub_idx
+    except Exception:
+        # Never drop geometry because a fast path failed.
+        return xyz_all[global_idx], global_idx
+
+
+def _surface_memory_ok(app, est_mb: float, headroom: float = 0.15) -> bool:
+    """[PART 2] Pre-flight VRAM check. True if the build is expected to fit.
+
+    Reserves `headroom` of the reported device VRAM for the point cloud that is
+    already resident, the swapchain and driver overhead. When no Vulkan backend
+    is active (headless/tests) this returns True so it never blocks a
+    legitimate programmatic build.
+    """
+    try:
+        rb = getattr(app, "render_backend", None)
+        vb = getattr(rb, "vulkan_backend", None) if rb is not None else None
+        if vb is None:
+            return True
+        total_mb = float(vb.get_vram_bytes()) / (1024.0 * 1024.0)
+        if total_mb <= 0:
+            return True
+        try:
+            used_mb = float(vb.get_vram_bytes()) / (1024.0 * 1024.0)
+        except Exception:
+            used_mb = 0.0
+        free_mb = max(total_mb - used_mb, 0.0)
+        budget = free_mb * (1.0 - float(headroom))
+        ok = float(est_mb) <= budget
+        print(f"SURFACE_MEMORY est={est_mb:,.0f} MB free={free_mb:,.0f} MB "
+              f"budget={budget:,.0f} MB ok={'YES' if ok else 'NO'}", flush=True)
+        return ok
+    except Exception:
+        return True
+
+
+def _clear_surface_preview_actor(app) -> bool:
+    """Retire preview bookkeeping after the final mesh has replaced it.
+
+    Only clears bookkeeping. The visible Surface is whatever _set_mesh_actor
+    last installed, so the final mesh is never disturbed here.
+    """
+    try:
+        had = getattr(app, "_surface_preview_actor", None) is not None
+        app._surface_preview_actor = None
+        app._surface_preview_worker = None
+        try:
+            _surface_pipeline_note(preview_removed=True, final_displayed=True)
+        except Exception:
+            pass
+        if had:
+            print("SURFACE_PREVIEW cleared=1 (final mesh retained)")
+        return had
+    except Exception:
+        return False
+
+
+def print_surface_pipeline_report(app=None):
+    """Emit the report. Wrapped so telemetry can never break the pipeline."""
+    try:
+        print(_surface_pipeline_report(app))
+    except Exception as exc:
+        print(f"[SURFACE PIPELINE] report unavailable: {exc}")
+
+
+def _start_surface_async_preview(app) -> bool:
+    """Run one coarse Surface pass and display it. True if started.
+
+    Failure is non-fatal by design: a missing preview must never prevent the
+    final stage from running, so every error path just returns False.
+    """
+    try:
+        if _SurfaceComputationWorker is None or QThread is None:
+            return False
+        if str(getattr(app, "display_mode", "") or "").lower() != "surface":
+            return False
+
+        data = getattr(app, "data", None)
+        xyz_all = data.get("xyz") if isinstance(data, dict) else None
+        if xyz_all is None or len(xyz_all) < 3:
+            return False
+
+        vis_mask = surface_visible_mask(app)
+        if vis_mask is None or len(vis_mask) != len(xyz_all):
+            vis_mask = np.ones(len(xyz_all), dtype=bool)
+        global_idx = np.flatnonzero(vis_mask).astype(np.int64, copy=False)
+        if global_idx.size < 3:
+            return False
+
+        quality_mode = normalize_surface_quality(getattr(app, "surface_quality", "normal"))
+        final_target = _surface_quality_target(quality_mode, int(global_idx.size))
+        preview_target = _surface_preview_target(final_target)
+        if preview_target >= final_target:
+            return False  # nothing coarser to do; the final stage handles it
+
+        # STAGE 1 speed-up: pre-subsample so the representative selection does
+        # not have to grid every one of the visible points. The worker still
+        # runs the same backend, just on a smaller, spatially unbiased input.
+        sub_xyz, sub_idx = _surface_preview_subsample(
+            xyz_all, global_idx, preview_target)
+        preview_target = _surface_quality_target(quality_mode, int(len(sub_idx)))
+        _surface_pipeline_note(preview_subsampled=len(sub_idx))
+
+        worker = _SurfaceComputationWorker(
+            sub_xyz, np.arange(len(sub_idx), dtype=np.int64),
+            float(getattr(app, "surface_dedup_precision", 0.0) or 0.0),
+            preview_target,
+            float(getattr(app, "surface_max_edge", 0.0) or 0.0),
+            float(getattr(app, "last_shade_azimuth", 45.0)),
+            float(getattr(app, "last_shade_angle", 45.0)),
+            float(getattr(app, "shade_ambient", 0.22)),
+            _normalize_surface_ramp(getattr(app, "surface_color_ramp", None)
+                                    or getattr(app, "elevation_color_ramp", None)),
+            quality_mode=quality_mode,
+            z_bounds=_surface_z_bounds_cached(app, xyz_all),
+        )
+        worker._naksha_surface_generation = int(
+            getattr(app, "_surface_topology_generation", 0) or 0)
+        worker._naksha_surface_settings_signature = _surface_async_settings_signature(app)
+        worker._naksha_surface_data_object_id = id(xyz_all)
+        worker._naksha_surface_raw_count = int(global_idx.size)
+        worker._naksha_surface_started_at = time.perf_counter()
+        print(f"SURFACE_PREVIEW started=1 subsampled={len(sub_idx):,} "
+              f"target={preview_target:,} final_target={final_target:,}")
+
+        def _progress(_v, _m):
+            # Silent by design: the preview must not raise a modal progress
+            # surface. The point cloud stays interactive behind it.
+            return None
+
+        def _error(_t):
+            print("SURFACE_PREVIEW error (final stage unaffected)")
+
+        def _finish(result):
+            try:
+                _d = getattr(app, "data", None)
+                _cur = _d.get("xyz") if isinstance(_d, dict) else None
+                same_data = _cur is not None and id(_cur) == worker._naksha_surface_data_object_id
+                same_gen = int(getattr(app, "_surface_topology_generation", 0) or 0) == \
+                    worker._naksha_surface_generation
+                same_settings = _surface_async_settings_signature(app) == \
+                    worker._naksha_surface_settings_signature
+                if not (same_data and same_gen and same_settings):
+                    print("SURFACE_PREVIEW stale=1 discarded=1")
+                    return
+                if not isinstance(result, dict) or result.get("empty", False):
+                    print("SURFACE_PREVIEW empty=1 (final stage unaffected)")
+                    return
+
+                _t0 = time.perf_counter()
+                if not _set_mesh_actor(app, result["points"], result["faces"], result["colors"]):
+                    print("SURFACE_PREVIEW actor_swap=failed (final stage unaffected)")
+                    return
+                app._surface_preview_actor = getattr(app, "_surface_mesh_actor", None)
+                _surface_pipeline_note(
+                    preview_triangles=len(result["faces"]),
+                    preview_points=len(result["points"]),
+                    preview_s=time.perf_counter() - _t0)
+                print("SURFACE_PREVIEW completed=1 "
+                      f"points={len(result['points']):,} faces={len(result['faces']):,} "
+                      f"actor_ms={(time.perf_counter() - _t0) * 1000.0:.1f}")
+            except Exception as exc:
+                print(f"SURFACE_PREVIEW failed={exc!r} (final stage unaffected)")
+
+        worker.finished_signal.connect(_finish)
+        worker.error_signal.connect(_error)
+        worker.progress_signal.connect(_progress)
+        app._surface_preview_worker = worker
+        worker.start()
+        return True
+    except Exception as exc:
+        print(f"SURFACE_PREVIEW start_failed={exc!r} (final stage unaffected)")
+        return False
+
+
 def _surface_print_backend_profile(result, quality_mode, raw_count, prefix="SURFACE_PROFILE"):
     """Emit the same stage profile for synchronous and asynchronous builds."""
     try:
@@ -3178,6 +3688,16 @@ def _surface_async_cleanup_worker(app, worker):
             app._surface_building = False
             app._surface_busy = False
             app._surface_input_blocked = False
+    except Exception:
+        pass
+    # Join the thread. Reference-dropping alone is what produced "QThread:
+    # Destroyed while thread is still running" at shutdown - if the object is
+    # collected before run() returns, Qt aborts the process. Bounded wait so a
+    # stuck worker cannot hang the app.
+    try:
+        if worker is not None and worker.isRunning():
+            if not worker.wait(15000):
+                print("SURFACE_ASYNC_CLEANUP worker_unresponsive=1")
     except Exception:
         pass
 
@@ -3244,6 +3764,56 @@ def _start_surface_async_exact_rebuild(app) -> bool:
     app.surface_quality = quality_mode
     precision = float(getattr(app, "surface_dedup_precision", 0.0) or 0.0)
     target_max = _surface_quality_target(quality_mode, int(global_idx.size))
+
+    # [SURFACE WARNING] Slow mode is the ONLY path where _surface_quality_target
+    # returns the uncapped eligible count, so it is the only mode that can build
+    # a mesh proportional to the whole dataset (26.9M points -> ~54M triangles).
+    # Ask before starting it rather than discovering it as a stall.
+    if quality_mode == "slow":
+        _n_in = int(global_idx.size)
+        _est_tris = _n_in * 2
+        # ~29 B per vertex (xyz f64 + class u8 + shade f32) + 4 B per index.
+        _est_mb = ((_est_tris / 3.0) * 29.0 + _est_tris * 4.0) / (1024.0 * 1024.0)
+        print(
+            "[SURFACE WARNING]\n"
+            "  Quality:               SLOW\n"
+            f"  Input points:          {_n_in:,}\n"
+            f"  Estimated triangles:   {_est_tris:,}\n"
+            f"  Estimated memory:      {_est_mb:,.0f} MB\n"
+            f"  (Normal would cap this at "
+            f"{_surface_quality_target('normal', _n_in):,} points.)",
+            flush=True,
+        )
+        # [PART 2] VRAM safety. A build that cannot fit should be refused
+        # BEFORE the buffers are allocated, not discovered as a driver reset.
+        if not _surface_memory_ok(app, _est_mb):
+            print("SURFACE_MEMORY refused=1 reason=insufficient_vram "
+                  "-> falling back to the normal quality cap")
+            quality_mode = "normal"
+            app.surface_quality = "normal"
+            target_max = _surface_quality_target(quality_mode, int(global_idx.size))
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            _ans = QMessageBox.warning(
+                getattr(app, "vtk_widget", None) or app,
+                "Slow Surface build",
+                f"Slow mode triangulates every visible point.\n\n"
+                f"  Input points:        {_n_in:,}\n"
+                f"  Estimated triangles: {_est_tris:,}\n"
+                f"  Estimated memory:    {_est_mb:,.0f} MB\n\n"
+                f"Normal mode caps this at "
+                f"{_surface_quality_target('normal', _n_in):,} points "
+                f"and is far faster.\n\nStart the uncapped Slow build?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if _ans != QMessageBox.Yes:
+                print("SURFACE_WARNING declined=1 -> slow build skipped")
+                return False
+        except Exception as exc:
+            # No UI available (headless/tests): warn, then continue, so the
+            # guard never silently blocks a legitimate programmatic build.
+            print(f"SURFACE_WARNING confirm_unavailable={exc!r} proceeding=1")
     max_edge = float(getattr(app, "surface_max_edge", 0.0) or 0.0)
     azimuth = float(getattr(app, "last_shade_azimuth", 45.0))
     angle = float(getattr(app, "last_shade_angle", 45.0))
@@ -3257,6 +3827,14 @@ def _start_surface_async_exact_rebuild(app) -> bool:
     generation = int(getattr(app, "_surface_topology_generation", 0) or 0)
     settings_sig = _surface_async_settings_signature(app)
     data_object_id = id(xyz_all)
+
+    # [SURFACE PIPELINE] Progressive: kick off the cheap PREVIEW stage first
+    # so a coarse surface is on screen immediately. It runs on its own worker
+    # and never blocks, gates, or replaces the final path below.
+    try:
+        _start_surface_async_preview(app)
+    except Exception:
+        pass
 
     worker = _SurfaceComputationWorker(
         xyz_all,
@@ -3329,6 +3907,19 @@ def _start_surface_async_exact_rebuild(app) -> bool:
                     _surface_schedule_latest_async_rebuild(app, 50)
                 return
 
+            # [SURFACE PIPELINE] telemetry only: snapshot the finished worker
+            # result, then print. Observation, not control flow.
+            try:
+                _surface_pipeline_note(
+                    input_points=int(
+                        getattr(worker, "_naksha_surface_raw_count", 0) or 0))
+                _surface_pipeline_note_result(
+                    app, result,
+                    wall_s=(time.perf_counter() - worker_t0))
+                print_surface_pipeline_report(app)
+            except Exception:
+                pass
+
             _surface_print_backend_profile(
                 result,
                 quality_mode,
@@ -3372,6 +3963,14 @@ def _start_surface_async_exact_rebuild(app) -> bool:
 
             app._surface_unique_global_indices = unique_global_idx
             app._surface_global_to_unique = None
+            # [SURFACE PIPELINE] The final mesh is now installed and visible;
+            # retire the preview bookkeeping. The visible actor is the final
+            # one installed by _set_mesh_actor above, so this only drops the
+            # preview reference.
+            try:
+                _clear_surface_preview_actor(app)
+            except Exception:
+                pass
             print(
                 "SURFACE_INDEX_MAP strategy=sorted_array "
                 f"count={len(unique_global_idx):,} python_dict=skipped"

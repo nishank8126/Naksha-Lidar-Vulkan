@@ -4,6 +4,188 @@ import os
 import sys
 import traceback
 from pathlib import Path
+# ---------------------------------------------------------------------------
+# PROJECT RUNTIME (production truth)
+# ---------------------------------------------------------------------------
+# The acceptance command is `py main.py`. `py` usually resolves to whatever
+# launcher is on PATH, which is NOT the interpreter this project is built and
+# tested against. Re-exec ONCE under the project venv so every fix in this
+# tree is the code that actually runs.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+VENV_PYTHON = os.path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe")
+
+
+def _ensure_project_runtime():
+    """Re-exec under the project venv, exactly once. Returns never (it execs)."""
+    try:
+        current = os.path.normcase(os.path.abspath(sys.executable))
+        wanted = os.path.normcase(os.path.abspath(VENV_PYTHON))
+        if current == wanted or os.environ.get("NAKSHA_VENV_REEXEC") == "1":
+            return False
+        if not os.path.isfile(VENV_PYTHON):
+            print("=" * 70)
+            print("FATAL: project virtual environment is missing.")
+            print(f"  expected: {VENV_PYTHON}")
+            print("  Refusing to continue under a different interpreter.")
+            print("  Restore the venv (or run this project with its own python).")
+            print("=" * 70)
+            raise SystemExit(2)
+        import subprocess
+        env = dict(os.environ)
+        env["NAKSHA_VENV_REEXEC"] = "1"
+        # The project root first, so nothing can import another tree.
+        env["PYTHONPATH"] = PROJECT_ROOT + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        print(f"[NAKSHA RUNTIME] relaunching under {VENV_PYTHON}")
+        print(f"[NAKSHA RUNTIME] (was {sys.executable})")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        code = subprocess.call([VENV_PYTHON, os.path.abspath(__file__)] + sys.argv[1:],
+                               env=env, cwd=os.getcwd())
+        raise SystemExit(code)
+    except SystemExit:
+        raise
+    except Exception as _re_err:
+        print(f"[NAKSHA RUNTIME] relaunch failed: {_re_err!r}")
+        return False
+
+
+_ensure_project_runtime()
+
+# PROJECT_ROOT first on sys.path: the real tree must win over any other
+# Naksha copy, site-packages shadow or reference checkout.
+if PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+
+
+def _runtime_self_check(win):
+    """Startup self-check: runtime, source tree, native build, main view.
+
+    Path/config sanity only - never loads a dataset. Prints the production
+    identity block so it is always obvious whether `py main.py` is running the
+    current tree, and STOPS if a module or the native DLL comes from anywhere
+    other than this project.
+    """
+    import importlib
+    import os as _os
+    import sys as _sys
+
+    failures = []
+
+    def _mod(name):
+        try:
+            m = importlib.import_module(name)
+            return _os.path.abspath(getattr(m, "__file__", "") or "")
+        except Exception as _e:
+            failures.append(f"import {name}: {_e!r}")
+            return "<unavailable>"
+
+    mods = {
+        "app_window": _mod("gui.app_window"),
+        "render_backend": _mod("gui.render_backend"),
+        "stream_manager": _mod("gui.naksha_cache.stream_manager"),
+        "app_streaming": _mod("gui.naksha_cache.app_streaming"),
+        "zoom_navigation": _mod("gui.zoom_navigation"),
+    }
+    root_norm = os.path.normcase(PROJECT_ROOT)
+    for _n, _p in mods.items():
+        _pn = os.path.normcase(_p)
+        if _pn == root_norm or _pn.startswith(root_norm + os.sep):
+            continue
+        failures.append(f"{_n} resolves OUTSIDE the project: {_p}")
+
+    print("\n" + "=" * 70)
+    print("[NAKSHA PRODUCTION RUNTIME]")
+    print(f"  python:          {_sys.executable}")
+    print(f"  project_root:    {PROJECT_ROOT}")
+    print(f"  main_py:         {_os.path.abspath(__file__)}")
+    for _n, _p in mods.items():
+        print(f"  {_n + ':':<18}{_p}")
+
+    # ---- native DLL: which one, and is it stale? (sections 9/10) ----------
+    dll_path = "<not found>"
+    dll_mtime = ""
+    src_mtime = ""
+    stale = False
+    try:
+        from gui import render_backend as _rb
+        _bk = getattr(_rb, "VulkanRenderBackend", None)
+        for _cand in (
+            _os.path.join(PROJECT_ROOT, "native", "naksha_vulkan",
+                          "build_msvc", "naksha_vulkan.dll"),
+            _os.path.join(PROJECT_ROOT, "naksha_vulkan.dll"),
+        ):
+            if _os.path.isfile(_cand):
+                dll_path = _cand
+                break
+        if dll_path != "<not found>":
+            dll_mtime = _os.path.getmtime(dll_path)
+            _latest = 0.0
+            _ndir = _os.path.join(PROJECT_ROOT, "native", "naksha_vulkan")
+            if _os.path.isdir(_ndir):
+                for _dp, _dn, _fs in _os.walk(_ndir):
+                    if "build" in _dp.replace("\\", "/").split("/"):
+                        continue
+                    for _f in _fs:
+                        if _f.endswith((".cpp", ".hpp", ".h", ".glsl")):
+                            try:
+                                _latest = max(_latest,
+                                              _os.path.getmtime(
+                                                  _os.path.join(_dp, _f)))
+                            except Exception:
+                                pass
+            src_mtime = _latest
+            stale = bool(_latest and _latest > dll_mtime)
+    except Exception as _e:
+        failures.append(f"native dll probe: {_e!r}")
+
+    print("[NAKSHA NATIVE BUILD]")
+    print(f"  dll_path:                    {dll_path}")
+    print(f"  dll_mtime:                   {dll_mtime}")
+    print(f"  native_source_latest_mtime:  {src_mtime}")
+    print(f"  stale:                       {'YES' if stale else 'NO'}")
+    if stale:
+        failures.append(
+            "NAKSHA VULKAN DLL IS STALE - REBUILD REQUIRED. Rebuild with the "
+            "existing native build (native\\naksha_vulkan\\build_msvc).")
+
+    # ---- which main view is actually visible (section 4/14) --------------
+    try:
+        from gui import render_backend as _rb2
+        _vk_on = _rb2.vulkan_viewport_enabled()
+    except Exception:
+        _vk_on = False
+    _rbo = getattr(win, "render_backend", None)
+    _vk_vis = False
+    try:
+        _vw = getattr(_rbo, "vulkan_widget", None)
+        _vk_vis = bool(_vw is not None and _vw.isVisible())
+    except Exception:
+        pass
+    print("[MAIN VIEW PRODUCTION PATH]")
+    print(f"  backend:                "
+          f"{'VULKAN' if (_vk_on and _vk_vis) else 'VTK'}")
+    print(f"  Vulkan main viewport:   {'YES' if _vk_on else 'NO'}")
+    print(f"  visible widget:         "
+          f"{'render_backend._VulkanSurfaceWidget' if _vk_vis else 'app_window vtk_widget'}")
+    print(f"  camera input owner:     gui/app_window.py")
+    print(f"  camera mirror owner:    gui/render_backend.py")
+    print(f"  stream manager:         gui/naksha_cache/stream_manager.py")
+
+    print("[NAKSHA BUILD]")
+    print(f"  python_build: {PROJECT_ROOT}")
+    print(f"  native_build: {dll_path}")
+
+    print("[NAKSHA RUNTIME SELF-CHECK] "
+          + ("PASS" if not failures else "FAIL"))
+    for f in failures:
+        print(f"  - {f}")
+    print("=" * 70 + "\n")
+    if failures:
+        raise SystemExit(
+            "NAKSHA startup self-check FAILED:\n  - "
+            + "\n  - ".join(failures))
  
  
 def _configure_console_utf8():
@@ -269,6 +451,8 @@ if __name__ == "__main__":
         win = NakshaApp()
         win.show()
 
+        _runtime_self_check(win)
+
         # Start the device-targeted updater after the heavy GUI startup has
         # settled. Checks repeat every six hours and never block the UI.
         def _start_automatic_update_check():
@@ -328,7 +512,7 @@ if __name__ == "__main__":
         QTimer.singleShot(15_000, _start_automatic_update_check)
 
         # Handle .snt file passed via Windows double-click / shell open
-        # Use app.arguments() as backup — Qt may strip sys.argv entries
+        # Use app.arguments() as backup Ã¢â‚¬â€ Qt may strip sys.argv entries
         _argv = sys.argv[1:]
         _app_args = app.arguments()[1:] if hasattr(app, 'arguments') else []
         _all_args = _argv + _app_args
@@ -339,8 +523,25 @@ if __name__ == "__main__":
         if _open_snt_paths:
             QTimer.singleShot(500, lambda paths=_open_snt_paths: win.open_snt_files_from_shell(paths))
 
-        sys.exit(app.exec())
-
+        # Dev instrumentation only: close the Instant Shaded telemetry session
+        # so the analyzer can distinguish a normal close from a cut-short log.
+        # Fully guarded - a telemetry problem must never change the app's exit
+        # code or block shutdown.
+        try:
+            _rc = int(app.exec())
+        finally:
+            try:
+                from gui.instant_shaded_telemetry import emit as _emit_tel
+                from gui.instant_shaded_telemetry import close as _close_tel
+                try:
+                    _emit_tel("application_shutdown",
+                              exit_code=int(locals().get("_rc", -1)),
+                              normal=locals().get("_rc", -1) == 0)
+                finally:
+                    _close_tel("normal" if locals().get("_rc", -1) == 0 else "abnormal")
+            except Exception:
+                pass
+        sys.exit(locals().get("_rc", 0))
 
  
     except SystemExit:

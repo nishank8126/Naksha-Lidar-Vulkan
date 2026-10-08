@@ -50,6 +50,8 @@ class LoadingProgressDialog(QWidget):
         super().__init__(parent)
 
         self._canceled = False
+        # Set by mark_loading_done(); show() refuses to re-show after this.
+        self._loading_done = False
         self._loading_active = True
         self._blocker = None
 
@@ -84,6 +86,31 @@ class LoadingProgressDialog(QWidget):
     # ── Public lifecycle ──────────────────────────────────────────────
 
     def show(self):
+        # DATA STATE MACHINE GUARD.
+        #
+        # This overlay is a CHILD widget of the main window, so it has no OS
+        # window handle of its own - but that also means it is re-shown
+        # whenever the parent is re-activated (focus change, Alt+Tab,
+        # restore from minimise) unless it has been explicitly taken out of
+        # the picture. finish_success() used to schedule the teardown on a
+        # 500 ms QTimer.singleShot, so on a large file (Vulkan uploading tens
+        # of millions of points) that timer could still be pending when the
+        # user clicked away and back - and the overlay came back.
+        #
+        # show() is therefore REFUSED once loading has completed. The overlay
+        # is owned by the load state machine, not by window events.
+        if getattr(self, "_loading_done", False):
+            # Belt and braces: if we are still in the widget tree, take it out
+            # of it, so no parent activation can ever raise it again. Hide
+            # UNCONDITIONALLY - a widget detached while still visible would
+            # otherwise survive this guard and stay "visible" with no parent,
+            # which relies on callers hiding before detaching.
+            try:
+                self._remove_blocker()
+                super().hide()
+            except Exception:
+                pass
+            return
         parent = self.parent()
         if parent and self._blocker is None:
             self._blocker = _ClickBlocker(parent)
@@ -102,6 +129,11 @@ class LoadingProgressDialog(QWidget):
 
     def mark_loading_done(self):
         self._loading_active = False
+        # Arm the show() guard. Without this, show() never refuses and a parent
+        # activation can re-raise the overlay - the exact regression this
+        # dialog exists to prevent. The previous version set only
+        # _loading_active, so the guard checked a flag that was never written.
+        self._loading_done = True
 
     def _remove_blocker(self):
         if self._blocker:
