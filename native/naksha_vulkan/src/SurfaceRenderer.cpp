@@ -131,6 +131,10 @@ bool SurfaceRenderer::Initialize(Renderer& renderer) {
         indexed.vertexInput.vertexAttributeDescriptionCount = 1;
         indexed.vertexInput.pVertexAttributeDescriptions = surfAttributes;
         indexedPipeline_ = renderer.Pipelines().CreateGraphicsPipeline(indexedLayout_, {indexedVs_, indexedFs_}, indexed, renderer.GetRenderPass(), 0);
+        if (wireframeSupported_) {
+            indexed.rasterizer.polygonMode = VK_POLYGON_MODE_LINE;
+            indexedWireframePipeline_ = renderer.Pipelines().CreateGraphicsPipeline(indexedLayout_, {indexedVs_, indexedFs_}, indexed, renderer.GetRenderPass(), 0);
+        }
     }
     initialized_ = true;
     return (pipelineSolid_ != VK_NULL_HANDLE && pipelineSolidOverlay_ != VK_NULL_HANDLE);
@@ -142,6 +146,7 @@ void SurfaceRenderer::Shutdown() {
     if (renderer_) {
         renderer_->Pipelines().DestroyPipeline(pipelineSolid_);
         renderer_->Pipelines().DestroyPipeline(indexedPipeline_);
+        renderer_->Pipelines().DestroyPipeline(indexedWireframePipeline_);
         renderer_->Pipelines().DestroyPipelineLayout(indexedLayout_);
         renderer_->Descriptors().DestroyLayout(cellLayout_);
         renderer_->Shaders().DestroyShaderModule(indexedVs_.module);
@@ -876,7 +881,8 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
             vkCmdBindVertexBuffers(cmd, 0, 1, &buffers.positions.buffer, &offset);
             vkCmdBindIndexBuffer(cmd, buffers.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
             VkDescriptorSet sets[] = {renderer_->GetFrameDescriptorSet(), buffers.cellSet};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, indexedPipeline_);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                shadingMode_ == ShadingMode::Wireframe ? indexedWireframePipeline_ : indexedPipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, indexedLayout_, 0, 2, sets, 0, nullptr);
             uint64_t submitted = 0;
             for (uint32_t index : active_->visibleTiles[lod]) {
@@ -941,6 +947,7 @@ void SurfaceRenderer::Record(VkCommandBuffer cmd, uint32_t frameSlot) {
             const SurfaceTile& tile = mesh.tiles[t];
             if (tile.indexCount == 0) continue;
             vkCmdDrawIndexed(cmd, tile.indexCount, 1, tile.firstIndex, 0, 0);
+            indexedDrawCalls_++;
             submitted += tile.triangleCount;
         }
         drawCalls_++;

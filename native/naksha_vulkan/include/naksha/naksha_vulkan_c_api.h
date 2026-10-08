@@ -367,6 +367,10 @@ NKV_API int nkv_set_surface_indexed_blocks(NkvHandle handle, const double* posit
     uint64_t dataset_revision, uint64_t surface_revision);
 /* 0 = points only, 1 = Surface only. Intended for the streaming mode owner. */
 NKV_API int nkv_set_streaming_surface_active(NkvHandle handle, int active);
+/* DEV-only raster diagnostic. Does not rebuild/upload geometry. Returns 0
+ * when wireframe is unsupported; disabled restores the filled pipeline. */
+NKV_API int nkv_set_surface_debug_wireframe(NkvHandle handle, int enabled);
+NKV_API int nkv_get_surface_debug_wireframe(NkvHandle handle);
 /* Fills out_counts[12] with the previous frame's REAL draw record:
  *   [0] streamingSurface active      [1] point draw calls
  *   [2] point count drawn            [3] indexed (triangle) draw calls

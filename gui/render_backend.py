@@ -1633,17 +1633,23 @@ class VulkanRenderBackend(RenderBackend):
         if not function(ctypes.c_uint64(self._handle), values):
             return {"supported": False}
         active = bool(values[0])
+        wireframe = False
+        raster = getattr(self._dll, "nkv_get_surface_debug_wireframe", None)
+        if raster is not None:
+            raster.argtypes = [ctypes.c_uint64]
+            raster.restype = ctypes.c_int
+            wireframe = bool(raster(self._handle))
         return dict(supported=True, native_mode="SURFACE" if active else "POINTS",
                     point_draw_calls=int(values[1]), point_draw_points=int(values[2]),
                     triangle_draw_calls=int(values[3]), triangle_count=int(values[4]),
                     indexed_draw_calls=int(values[3]), vkCmdDraw=int(values[1]),
-                    vkCmdDrawIndexed=int(values[3]), polygon_mode="FILL" if active else "N/A",
+                    vkCmdDrawIndexed=int(values[3]), polygon_mode=("LINE" if wireframe else "FILL") if active else "N/A",
                     surface_pipeline_bound=active and bool(values[3]), surface_point_overlay="OFF" if active else "N/A",
                     visible_tiles=int(values[5]), resident_tiles=int(values[6]),
                     selected_lod=int(values[7]), surface_state=int(values[8]),
                     surface_vertices=int(values[9]), surface_indices=int(values[10]),
                     surface_triangles=int(values[11]),
-                    indexed_triangles_drawn=active and int(values[3]) > 0 and int(values[4]) > 0,
+                    indexed_triangles_drawn=active and not wireframe and int(values[1]) == 0 and int(values[3]) > 0 and int(values[4]) > 0,
                     surface_vertex_shader="surface_indexed.vert.spv" if active else None,
                     surface_fragment_shader="surface_indexed.frag.spv" if active else None)
 

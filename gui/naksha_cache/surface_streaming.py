@@ -24,7 +24,7 @@ from .format import ATTR_XYZ, ATTR_SOURCE_ID, ATTR_CLASSIFICATION
 from .reader import NakshaPointCacheReader
 from .surface_cache import SurfaceBlockTriangulator, SurfaceBudgetExceeded
 
-ALGORITHM_VERSION = 1
+ALGORITHM_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,23 @@ def triangulate_identity_block(core, contexts, max_edge, max_vertices=160000):
     if len(positions) > max_vertices:
         raise SurfaceBudgetExceeded("Surface context exceeds block RAM budget; use a coarser common LOD")
     triangulator = SurfaceBlockTriangulator(max_edge=max_edge, max_triangles=max_vertices * 2)
-    faces = triangulator._delaunay(positions)
+    # Triangle's adaptive exact predicates keep overlapping halo triangulations
+    # consistent on nearly cocircular inputs; Qhull's per-context tolerances
+    # otherwise choose different diagonals at block boundaries.
+    from gui.surface_mode import _triangulate_surface_xy
+    # Canonical-ID perturbation resolves cocircular diagonals identically in
+    # every overlapping halo. It affects predicates only: uploaded positions,
+    # Z, normals, and persisted vertex references retain their original values.
+    # 0.1 micrometre is far below the source coordinate precision.
+    hashes = ids.copy()
+    hashes ^= hashes >> np.uint64(30)
+    hashes *= np.uint64(0xbf58476d1ce4e5b9)
+    hashes ^= hashes >> np.uint64(27)
+    hashes *= np.uint64(0x94d049bb133111eb)
+    hashes ^= hashes >> np.uint64(31)
+    jitter = np.column_stack((hashes & np.uint64(0xffffffff), hashes >> np.uint64(32)))
+    xy = positions[:, :2] + (jitter.astype(np.float64) / 4294967295.0 - .5) * 2e-7
+    faces, _ = _triangulate_surface_xy(np.ascontiguousarray(xy))
     if len(faces):
         from gui.surface_mode import _filter_long_edges
         faces = _filter_long_edges(faces, positions[:, :2], max_edge)
@@ -78,11 +94,39 @@ def triangulate_identity_block(core, contexts, max_edge, max_vertices=160000):
         faces = faces[owned].copy()
         cross = np.cross(positions[faces[:, 1]] - positions[faces[:, 0]],
                          positions[faces[:, 2]] - positions[faces[:, 0]])
+        valid = cross[:, 2] != 0
+        faces, cross = faces[valid], cross[valid]
         down = cross[:, 2] < 0
         faces[down] = faces[down][:, [0, 2, 1]]
     used, inverse = np.unique(faces.reshape(-1), return_inverse=True)
     return {"refs": references[used], "ids": ids[used],
             "faces": inverse.reshape(-1, 3).astype(np.uint32), "xyz": positions[used]}
+
+
+def circumcircle_neighbours(positions, faces, bounds_min, bounds_max):
+    """All node AABBs intersecting a retained face's Delaunay circumcircle.
+
+    Edge-length halos alone miss distant points influencing skinny hull faces.
+    Expanding until every intersecting node is included certifies those faces
+    against the complete dataset, with bounded batches and no global mesh.
+    """
+    found = np.zeros(len(bounds_min), dtype=bool)
+    for start in range(0, len(faces), 128):
+        p = positions[faces[start:start+128], :2]
+        a, b = p[:, 1]-p[:, 0], p[:, 2]-p[:, 0]
+        d = 2*(a[:, 0]*b[:, 1]-a[:, 1]*b[:, 0])
+        valid = d != 0
+        p, a, b, d = p[valid], a[valid], b[valid], d[valid]
+        aa, bb = np.sum(a*a, axis=1), np.sum(b*b, axis=1)
+        delta = np.column_stack(((aa*b[:, 1]-bb*a[:, 1])/d,
+                                 (a[:, 0]*bb-b[:, 0]*aa)/d))
+        centers = p[:, 0]+delta
+        radius2 = np.sum(delta*delta, axis=1)
+        separation = np.maximum(np.maximum(bounds_min[None, :, :2]-centers[:, None, :],
+                                             centers[:, None, :]-bounds_max[None, :, :2]), 0)
+        distance2 = np.sum(separation*separation, axis=2)
+        found |= np.any(distance2 <= radius2[:, None]*(1+1e-10)+1e-6, axis=0)
+    return np.flatnonzero(found)
 
 
 class SurfaceBuildService:
@@ -252,17 +296,22 @@ class SurfaceBuildService:
                 hits += 1
             else:
                 core = self._read(reader, int(nid), lod, support)
-                neighbours = neighbours_by_node[int(nid)]
+                included = {int(nid)}
                 contexts = []
-                for other in neighbours:
-                    if other == nid:
-                        continue
-                    part = self._read(reader, int(other), lod, support)
-                    keep = np.all(part["xyz"][:, :2] >= bounds_min[nid, :2]-max_edge, axis=1) & np.all(part["xyz"][:, :2] <= bounds_max[nid, :2]+max_edge, axis=1)
-                    contexts.append({k: v[keep] for k, v in part.items()})
-                    if sum(len(p["xyz"]) for p in contexts) > 160000:
-                        raise SurfaceBudgetExceeded("Surface halo exceeds bounded context")
-                block = triangulate_identity_block(core, contexts, max_edge)
+                required = set(map(int, neighbours_by_node[int(nid)]))
+                while True:
+                    for other in sorted(required-included):
+                        part = self._read(reader, other, lod, support)
+                        contexts.append(part)
+                        included.add(other)
+                    if len(core["xyz"]) + sum(len(p["xyz"]) for p in contexts) > 160000:
+                        raise SurfaceBudgetExceeded("certified Surface halo exceeds bounded context")
+                    block = triangulate_identity_block(core, contexts, max_edge)
+                    required = set(map(int, circumcircle_neighbours(block["xyz"], block["faces"], bounds_min, bounds_max)))
+                    if required <= included:
+                        break
+                    if not self._current(request):
+                        raise InterruptedError("Surface request superseded")
                 self.triangulation_calls += 1
                 builds += 1
                 self.timestamps.setdefault("T2", time.perf_counter())

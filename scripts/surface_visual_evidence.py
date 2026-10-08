@@ -39,6 +39,8 @@ def capture_surface_reference(window, manager, candidate, output):
     result = manager.surface_result
     service = manager.surface_service
     positions = result.positions
+    np.savez(output / "surface_mesh.npz", positions=positions, indices=result.indices,
+             colors=result.colors, counts=result.counts)
     azimuth, angle, ambient, _, _, ramp = result.request.style
     maximum_edge = result.request.settings[0]
     if maximum_edge <= 0:
@@ -70,12 +72,34 @@ def capture_surface_reference(window, manager, candidate, output):
     # away and produced a ~3 KB all-black PNG. Re-derive near/far from the
     # actor bounds, exactly as the legacy surface viewport does.
     renderer.ResetCameraClippingRange()
+    near, far = camera.GetClippingRange()
+    focal = np.array(camera.GetFocalPoint())
+    distance = float(np.linalg.norm(np.array(camera.GetPosition()) - focal))
+    radius = max(distance-near, far-distance)
+    near, far = distance-radius, distance+radius
+    camera.SetClippingRange(near, far)
+    backend = window.render_backend.vulkan_backend
+    import ctypes
+    setter = backend._dll.nkv_set_camera_ortho
+    setter.argtypes = [ctypes.c_uint64] + [ctypes.c_double] * 10
+    setter.restype = ctypes.c_int
+    if not setter(backend._handle, *focal, 0., 0., -1., camera.GetParallelScale(),
+                  candidate.shape[1]/candidate.shape[0], near, far):
+        raise RuntimeError("diagnostic camera synchronization failed")
+    candidate = backend.capture_frame()
+    candidate_camera = camera_state(window, "surface")
+    candidate_camera.update(position=list(camera.GetPosition()), focal_point=list(focal),
+                            view_up=list(camera.GetViewUp()), clipping_range=[near, far])
     render_window = vtk.vtkRenderWindow()
     render_window.SetOffScreenRendering(1)
     render_window.SetMultiSamples(0)
     render_window.SetSize(candidate.shape[1], candidate.shape[0])
     render_window.AddRenderer(renderer)
     render_window.Render()
+    reference_camera = camera_state(window, "surface")
+    reference_camera.update(position=list(camera.GetPosition()),
+        focal_point=list(camera.GetFocalPoint()), view_up=list(camera.GetViewUp()),
+        clipping_range=list(camera.GetClippingRange()))
     grab = vtk.vtkWindowToImageFilter()
     grab.SetInput(render_window)
     grab.SetInputBufferTypeToRGB()
@@ -91,12 +115,20 @@ def capture_surface_reference(window, manager, candidate, output):
             raise ValueError('fixed VTK reference differs; choose a new evidence directory')
     else:
         Image.fromarray(reference).save(reference_path)
-        save_camera(reference_path, window, 'surface')
+        reference_path.with_suffix(".camera.json").write_text(json.dumps(reference_camera, indent=2))
     candidate_path = output / 'vulkan_surface_candidate.png'
     Image.fromarray(candidate[:, :, :3]).save(candidate_path)
-    save_camera(candidate_path, window, 'surface')
+    candidate_path.with_suffix(".camera.json").write_text(json.dumps(candidate_camera, indent=2))
     difference = np.abs(reference.astype(np.int16)-candidate[:, :, :3].astype(np.int16))
     Image.fromarray(np.minimum(difference*4, 255).astype(np.uint8)).save(output / 'surface_difference.png')
+    canonical = np.sort(result.indices, axis=1)
+    _, repeats = np.unique(canonical, axis=0, return_counts=True)
+    edges = np.sort(np.concatenate((canonical[:, [0, 1]], canonical[:, [1, 2]], canonical[:, [0, 2]])), axis=1)
+    _, incidence = np.unique(edges, axis=0, return_counts=True)
+    topology_audit = dict(duplicate_triangles=int(np.sum(repeats-1)),
+        nonmanifold_edges=int(np.count_nonzero(incidence > 2)),
+        boundary_edges=int(np.count_nonzero(incidence == 1)),
+        note="boundary edges include footprint and deliberate gap filtering; not all are cracks")
     prop = actor.GetProperty()
     def topology(points, faces):
         # Coordinates, rather than local index order, identify the same faces.
@@ -104,7 +136,7 @@ def capture_surface_reference(window, manager, candidate, output):
         # Lexicographically sorted rows permit a stable order-independent hash.
         rows = np.sort(tri.reshape(len(faces), 9).view(np.dtype((np.void, 72))).reshape(-1))
         return hashlib.sha256(rows.tobytes()).hexdigest()
-    metadata = dict(camera=camera_state(window, 'surface'),
+    metadata = dict(camera=reference_camera, camera_parity=reference_camera == candidate_camera, topology_audit=topology_audit,
         reference_scope='bounded visible representatives at the production common LOD',
         legacy_triangulator=legacy['triangulator'], representative_selection=legacy['representative_meta'],
         max_edge=maximum_edge, elevation_percentiles=service.elevation_bounds,

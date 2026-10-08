@@ -83,3 +83,11 @@
 2104	2454	8131439518946762	naksha_vulkan.dll	373740446af4da7d
 2104	2454	8131439518946762	naksha_vulkan.lib	373740446af4da7d
 2115	2487	8131439519040300	naksha_surface_acceptance.exe	66de414dafdecbe7
+3	2023	8131555501962602	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+2023	2703	8131555522112919	naksha_vulkan_core.lib	8820305b9e15942d
+2703	3507	8131555528956429	naksha_vulkan.dll	373740446af4da7d
+2703	3507	8131555528956429	naksha_vulkan.lib	373740446af4da7d
+42	1605	8131560865336180	CMakeFiles/naksha_vulkan.dir/src/naksha_vulkan_c_api.cpp.obj	ea3f9f9c272e5c9d
+38	1692	8131560865306137	CMakeFiles/naksha_vulkan_core.dir/src/SurfaceRenderer.cpp.obj	f925eee98b84c5f9
+34	1965	8131560865256148	CMakeFiles/naksha_vulkan_core.dir/src/Renderer.cpp.obj	563f708f174476ef
+1966	2581	8131560884580147	naksha_vulkan_core.lib	8820305b9e15942d
